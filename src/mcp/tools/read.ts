@@ -20,7 +20,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('doctor', {
-    title: 'Doctor', description: 'Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, daemon state. Recommends installing pm2 or setting hosts.<host>.pm2 / pm2_home when pm2 is missing or unusable.',
+    title: 'Doctor', description: 'Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state. Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable.',
     inputSchema: commonInput, annotations: RO,
   }, (args) => runTool(async () => {
     const { manifest } = await prep({ project: args.project });

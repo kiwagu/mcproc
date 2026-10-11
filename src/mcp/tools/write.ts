@@ -6,7 +6,9 @@ import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '..
 import { flushLogs } from '../../core/logs.js';
 import { initProject } from '../../core/init.js';
 import type { LsRow } from '../../core/list.js';
-import { renderLs, startNote } from '../render.js';
+import { createTransport } from '../../transport/index.js';
+import { unpack, defaultUnpackDeps } from '../../runtime/unpack.js';
+import { renderLs, renderUnpack, startNote } from '../render.js';
 
 export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
   const guarded = async (args: { project?: string; host?: string }, check: (p: ReturnType<typeof prepare>) => void): Promise<Context> => {
@@ -70,5 +72,27 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     const ctx = await guarded(args, (p) => { if (args.app) assertApp(p.manifest, args.app); });
     const r = await flushLogs(ctx, args.app);
     return { text: r.length ? r.map((x) => `${x.app}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush (no pm2 processes for this project here)', data: { host: ctx.host.name, flushed: r } };
+  }));
+
+  server.registerTool('unpack', {
+    title: 'Unpack runtime',
+    description: 'Make a host self-sufficient: copy a pm2 tree (assembled once on this machine with npm from the lockfile mcproc ships; needs npm, tar and registry access the first time) and an official Node build when the host has no Node >= 18 (downloaded once from nodejs.org, checked against SHASUMS256), into <cwd>/.mcproc/runtime on that host or into dir, plus a copy of the manifest. Idempotent: same versions change nothing. Refused on readonly hosts and on a dir whose bin/ it did not write.',
+    inputSchema: {
+      ...commonInput,
+      dir: z.string().optional().describe('Absolute runtime directory on the host; default <host cwd>/.mcproc/runtime'),
+      with_node: z.enum(['auto', 'always', 'never']).optional().describe('auto (default): bring Node only when the host has none >= 18'),
+      node_version: z.string().optional().describe('Exact Node version; default: the newest LTS'),
+      force: z.boolean().optional().describe('Rewrite even when versions match, and overwrite a hand-written manifest on the host'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, (args) => runTool(async () => {
+    const p = prepare({ project: args.project, host: args.host, roots: await deps.roots() });
+    assertWritable(p.host);
+    const r = await unpack(
+      { manifest: p.manifest, host: p.host, transport: createTransport(p.host, deps.spawner) },
+      { dir: args.dir, withNode: args.with_node, nodeVersion: args.node_version, force: args.force },
+      deps.unpack ?? defaultUnpackDeps(),
+    );
+    return { text: renderUnpack(r), data: r as unknown as Record<string, unknown> };
   }));
 }

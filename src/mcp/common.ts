@@ -2,12 +2,13 @@ import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { isMcprocError, McprocError } from '../core/errors.js';
 import type { Spawner } from '../transport/types.js';
+import type { UnpackDeps } from '../runtime/unpack.js';
 
 export const commonInput = {
   project: z.string().optional().describe('Project root. Default: MCPROC_PROJECT, then CLAUDE_PROJECT_DIR, then the client roots, then the server cwd; the manifest is searched upward from there.'),
   host: z.string().optional().describe('Host name from the manifest hosts: section. Default: local.'),
 };
-export interface ToolDeps { roots: () => Promise<string[]>; spawner?: Spawner }
+export interface ToolDeps { roots: () => Promise<string[]>; spawner?: Spawner; unpack?: UnpackDeps }
 
 export const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 export const MUT = (destructive: boolean, idempotent: boolean) => ({ readOnlyHint: false, destructiveHint: destructive, idempotentHint: idempotent, openWorldHint: false });

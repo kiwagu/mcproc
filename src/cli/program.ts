@@ -1,13 +1,16 @@
 import { Command } from 'commander';
 import { VERSION } from '../version.js';
-import { isMcprocError } from '../core/errors.js';
+import { McprocError, isMcprocError } from '../core/errors.js';
+import { createTransport } from '../transport/index.js';
+import { unpack, defaultUnpackDeps } from '../runtime/unpack.js';
+import type { WithNode } from '../runtime/decide.js';
 import { prepare, connect, assertApp, assertWritable, resolveProjectDir, type Context } from '../core/resolve.js';
 import { listApps, portsReport, hostsInfo, describeApp, describeProject } from '../core/list.js';
 import { readLogs, flushLogs } from '../core/logs.js';
 import { doctor } from '../core/doctor.js';
 import { initProject } from '../core/init.js';
 import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '../core/actions.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, startNote } from '../mcp/render.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, renderUnpack, startNote } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { runMonit } from '../monit/tui.js';
@@ -98,6 +101,23 @@ export function buildProgram(io: Io = defaultIo): Command {
     .action(wrap(async (g, o) => {
       if (o.once) { io.out(await monitOnce({ project: g.project, host: g.host, lines: Number(o.lines) || 200 })); return; }
       await runMonit({ project: g.project, host: g.host, intervalMs: Math.max(500, Number(o.interval) || 2000), lines: Number(o.lines) || 200 });
+    }));
+  program.command('unpack').description('bring pm2 (assembled with npm from the lockfile mcproc ships) and Node when missing to the host, into <cwd>/.mcproc/runtime or --dir')
+    .option('--dir <path>', 'absolute runtime directory on the host')
+    .option('--with-node <mode>', 'auto | always | never', 'auto')
+    .option('--node-version <version>', 'exact Node version (default: newest LTS)')
+    .option('--force', 'rewrite even when versions match; overwrite a hand-written manifest on the host')
+    .action(wrap(async (g, o) => {
+      const p = prepare({ project: g.project, host: g.host });
+      assertWritable(p.host);
+      const mode = String(o.withNode ?? 'auto');
+      if (!['auto', 'always', 'never'].includes(mode)) throw new McprocError('BAD_ARGUMENT', `--with-node must be auto, always or never, got "${mode}"`);
+      const r = await unpack(
+        { manifest: p.manifest, host: p.host, transport: createTransport(p.host) },
+        { dir: o.dir as string | undefined, withNode: mode as WithNode, nodeVersion: o.nodeVersion as string | undefined, force: Boolean(o.force) },
+        defaultUnpackDeps(),
+      );
+      emit(g, renderUnpack(r), r);
     }));
   program.command('mcp').description('run the MCP server on stdio (register this command in your agent client)')
     .action(wrap(async () => { await serveStdio(); }));

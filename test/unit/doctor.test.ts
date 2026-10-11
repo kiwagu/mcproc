@@ -44,4 +44,27 @@ describe('doctor', () => {
     const reps = await doctor(loadManifest(basic), 'prod', spawner);
     expect(reps.map((r) => r.host)).toEqual(['prod']);
   });
+  it('recommends unpack when a host lacks pm2, Node or tar, and reports the unpacked runtime versions', async () => {
+    const sp: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (argv.includes('stand')) {
+        if (cmd.includes('__MCPROC_DOCTOR__')) return { code: 0, stdout: '__MCPROC_DOCTOR__\nNODE_NONE\ntool ps yes\ntool ss yes\ntool tar no\npm2home \nRUNTIME no\n__MCPROC_LOCK__\n', stderr: '' };
+        if (cmd.includes('bin/pm2')) return { code: 0, stdout: 'PATH_NONE\nNODE_NONE\n', stderr: '' };
+      }
+      if (argv.includes('prod')) {
+        if (cmd.includes('__MCPROC_DOCTOR__')) return { code: 0, stdout: `__MCPROC_DOCTOR__\nv20.1.0\ntool ps yes\ntool ss yes\ntool tar yes\npm2home /home/node/.pm2\nRUNTIME yes\n__MCPROC_LOCK__\n${JSON.stringify({ pm2: '7.0.4', node: 'v24.21.0' })}\n`, stderr: '' };
+        if (cmd.includes('jlist')) return { code: 0, stdout: '[]', stderr: '' };
+        if (cmd.includes('bin/pm2')) return { code: 0, stdout: 'RUNTIME\nPATH_NONE\nv20.1.0\n', stderr: '' };
+      }
+      return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+    };
+    const m = loadManifest(basic);
+    const [stand] = await doctor(m, 'stand', sp);
+    const recs = stand.recommendations.join('\n');
+    expect(recs).toMatch(/Run unpack for this host/);
+    expect(recs).toMatch(/with_node/);
+    expect(recs).toMatch(/no tar: unpack cannot/);
+    const [prod] = await doctor(m, 'prod', sp);
+    expect(prod).toMatchObject({ runtime_present: true, runtime_pm2: '7.0.4', runtime_node: 'v24.21.0', pm2: { source: 'runtime' } });
+  });
 });

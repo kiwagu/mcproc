@@ -9,12 +9,13 @@ import { createServer, INSTRUCTIONS } from '../../src/mcp/server.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { probeOut } from '../helpers/probe.js';
 import type { Spawner } from '../../src/transport/types.js';
+import type { UnpackDeps } from '../../src/runtime/unpack.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
 
-async function client(spawner?: Spawner) {
-  const server = createServer({ spawner });
+async function client(spawner?: Spawner, unpackDeps?: UnpackDeps) {
+  const server = createServer({ spawner, unpack: unpackDeps });
   const [c, s] = InMemoryTransport.createLinkedPair();
   await server.connect(s);
   const cl = new Client({ name: 'test', version: '0.0.0' });
@@ -25,14 +26,17 @@ const neverSpawn: Spawner = async (argv) => { throw new Error(`spawner must not 
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 12 tools with annotations and short instructions', async () => {
+  it('registers the 13 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
-    expect(Object.keys(byName).sort()).toEqual(['delete', 'describe', 'doctor', 'flush', 'hosts', 'init', 'logs', 'ls', 'ports', 'restart', 'start', 'stop']);
+    expect(Object.keys(byName).sort()).toEqual(['delete', 'describe', 'doctor', 'flush', 'hosts', 'init', 'logs', 'ls', 'ports', 'restart', 'start', 'stop', 'unpack']);
     for (const n of ['hosts', 'doctor', 'ls', 'describe', 'logs', 'ports']) expect(byName[n].annotations?.readOnlyHint).toBe(true);
     for (const n of ['stop', 'delete', 'flush']) expect(byName[n].annotations?.destructiveHint).toBe(true);
     expect(byName.start.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
+    expect(byName.unpack.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true });
+    expect(byName.unpack.description).toMatch(/npm/); // pm2 is assembled with npm from the shipped lockfile, never inside the package
+    expect(byName.unpack.description).not.toMatch(/bundled with mcproc|ships inside/);
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -83,5 +87,24 @@ describe('mcp server', () => {
     expect(r.isError).toBeFalsy();
     expect(fs.readFileSync(path.join(dir, '.mcproc', '.gitignore'), 'utf8')).toBe('*\n');
     expect(r.structuredContent.candidates).toBe(1);
+  });
+  it('unpack refuses readonly hosts first and runs end to end over a fake ssh host', async () => {
+    const ro = await (await client(neverSpawn)).callTool({ name: 'unpack', arguments: { project: basic, host: 'prod' } });
+    expect(text(ro)).toContain('READONLY_HOST');
+    const sp: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('__MCPROC_UNPACK__')) return { code: 0, stdout: '__MCPROC_UNPACK__\nLinux x86_64\nNODE v22.11.0\nTAR_OK\nMANIFEST_NONE\n__MCPROC_LOCK__\n', stderr: '' };
+      if (cmd.includes('require(process.argv[1]).version')) return { code: 0, stdout: '7.0.4\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const fakeDeps: UnpackDeps = {
+      pm2Bundle: async () => ({ version: '7.0.4', sha256: 'x', data: Buffer.from('t'), path: '/tmp/x.tgz' }),
+      nodeVersion: async () => 'v24.21.0', nodeTarball: async () => ({ data: Buffer.from('n'), sha256: 'y' }),
+      hostname: () => 'agent', now: () => new Date(0),
+    };
+    const r: any = await (await client(sp, fakeDeps)).callTool({ name: 'unpack', arguments: { project: basic, host: 'stand' } });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent).toMatchObject({ host: 'stand', pm2: { version: '7.0.4', written: true }, manifest_copy: 'written' });
+    expect(text(r)).toContain("'/srv/demo/.mcproc/runtime/bin/pm2' monit");
   });
 });

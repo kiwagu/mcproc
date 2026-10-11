@@ -2,6 +2,8 @@ import type { LsRow, HostInfo } from '../core/list.js';
 import type { DoctorReport } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
+import type { UnpackResult } from '../runtime/unpack.js';
+import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
   if (ms === null) return '-';
@@ -71,11 +73,22 @@ export function renderDoctor(reps: DoctorReport[]): string {
     if (r.reachable) {
       L.push(`  node: ${r.node ?? 'missing'}  tools: ps=${r.tools.ps} ss=${r.tools.ss} tar=${r.tools.tar}`);
       L.push(`  pm2: ${r.pm2 ? `${r.pm2.source} (${r.pm2.reason})${r.pm2.version ? ` ${r.pm2.version}` : ''}` : 'none'}  daemon: ${r.daemon}, ${r.processes} processes, ${r.in_namespace} in this project`);
-      L.push(`  PM2_HOME: ${r.pm2_home ?? 'default (~/.pm2)'}  runtime: ${r.runtime_present ? r.runtime_dir : 'not unpacked'}`);
+      L.push(`  PM2_HOME: ${r.pm2_home ?? 'default (~/.pm2)'}  runtime: ${r.runtime_present ? `${r.runtime_dir} (pm2 ${r.runtime_pm2 ?? '?'}${r.runtime_node ? `, node ${r.runtime_node}` : ''})` : 'not unpacked'}`);
+      if (r.runtime_present) L.push(`  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`);
     }
     for (const rec of r.recommendations) L.push(`  → ${rec}`);
     return L.join('\n');
   }).join('\n');
+}
+export function renderUnpack(r: UnpackResult): string {
+  const L = [`${r.host}: runtime at ${r.runtime_dir}${r.noop ? ', already up to date' : ''}`];
+  L.push(`  pm2 ${r.pm2.version} ${r.pm2.written ? 'unpacked' : 'kept'}`);
+  if (r.node) L.push(`  node ${r.node.version} (${r.node.platform}) ${r.node.written ? 'unpacked' : 'kept'}`);
+  L.push(`  manifest copy on the host: ${r.manifest_copy}`);
+  if (r.runtime_line) L.push(`  add to .mcproc/mcproc.yaml so later calls find it: ${r.runtime_line}`);
+  L.push(`  watch it from a shell there: ${r.monit}`);
+  if (r.update_hint) L.push(`  note: ${r.update_hint}`);
+  return L.join('\n');
 }
 export function renderLogs(l: LogsResult): string {
   const parts: string[] = [];

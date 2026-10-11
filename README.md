@@ -84,6 +84,7 @@ checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload` |
 | `restart`, `stop`, `delete <target>` | by app or profile |
 | `flush [app]` | truncate pm2 log files |
+| `unpack` | bring pm2 (assembled with npm from the lockfile mcproc ships), and Node when the host has none ≥ 18, into `<cwd>/.mcproc/runtime` on that host |
 
 Every tool takes `project` and `host`. Read-only tools are annotated as such; mutating tools refuse
 `readonly` hosts and unknown app names before touching the host.
@@ -129,10 +130,34 @@ Ports published by Docker containers show the container name instead of a pid.
 
 ## What a host needs
 
-`ps`, `ss` (or `/proc`), and pm2 on the login-shell PATH running on Node 18 or newer.
-mcproc itself is only installed where the agent runs; locally it ships its own pm2.
-`doctor` tells you which pm2 a host would use and why, or why none is usable.
+`ps`, `ss` (or `/proc`) and `tar`. pm2 comes from the host's login-shell PATH (Node 18 or newer)
+or from `unpack`. mcproc itself is only installed where the agent runs; locally it ships its own
+pm2. `doctor` tells you which pm2 a host would use and why, or why none is usable.
 `curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`).
+
+## Hosts without pm2: `unpack`
+
+`unpack` makes a host self-sufficient without installing anything system-wide. mcproc does not
+contain pm2 (pm2 is AGPL-3.0, mcproc is MIT): it ships pm2's lockfile and assembles the tree once on
+your machine with `npm ci` (needs `npm`, `tar` and access to the npm registry the first time; cached
+in `~/.cache/mcproc/pm2` afterwards), then copies it into `<cwd>/.mcproc/runtime` on that host (or
+`--dir`, which must be a directory of its own: a `bin/` mcproc did not write is refused). When the
+host has no Node 18 or newer it also brings an official Node build: downloaded once on your machine
+from nodejs.org, checked against the release's `SHASUMS256.txt`, cached in `~/.cache/mcproc/node`,
+then streamed to the host, which needs no internet access. It copies the manifest there too, but never
+over a hand-written one unless `--force`. Running it again changes nothing while the versions match
+(an unpacked Node stays at its version until you pass `--node-version` or `--force`); a newer pm2 or
+Node lands next to the old one, and for a daemon that is already running mcproc prints the
+`bin/pm2 update` command instead of running it.
+
+```bash
+mcproc unpack --host stand                    # pm2 only, when the host has Node >= 18
+mcproc unpack --host box --with-node always   # bare images such as alpine
+mcproc unpack --host stand --dir /opt/mcproc/runtime   # then add hosts.stand.runtime: /opt/mcproc/runtime
+```
+Hosts without bash (alpine, busybox) need `shell: /bin/sh -c` in their `hosts:` entry. The official
+Node builds are linked against the C++ runtime library, so a bare alpine needs `apk add libstdc++`
+first (glibc distributions already have it); `unpack` checks this before downloading anything.
 
 ## License
 

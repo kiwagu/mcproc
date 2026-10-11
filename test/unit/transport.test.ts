@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
 import { buildArgv, withEnv, describeHost, createTransport, ensureOk } from '../../src/transport/index.js';
 import type { Host } from '../../src/core/manifest.js';
 import type { Spawner } from '../../src/transport/types.js';
@@ -64,6 +65,12 @@ describe('createTransport with nodeSpawner', () => {
     const t = createTransport(ssh, fake);
     await t.exec('true');
     expect(calls[0][0]).toBe('ssh');
+  });
+  it('passes binary stdin through unchanged', async () => {
+    const t = createTransport(local);
+    const data = Buffer.from(Array.from({ length: 200_000 }, (_, i) => (i * 7919) % 256));
+    const r = await t.exec("sha256sum | cut -d' ' -f1", { stdin: data });
+    expect(r.stdout.trim()).toBe(createHash('sha256').update(data).digest('hex'));
   });
 });
 

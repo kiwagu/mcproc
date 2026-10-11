@@ -1,0 +1,6 @@
+{
+  "name": "mcproc-pm2-runtime",
+  "private": true,
+  "description": "What mcproc's unpack installs on a host: the pinned pm2 and its dependencies, assembled with npm ci from the lockfile next to this file",
+  "dependencies": { "pm2": "7.0.4" }
+}

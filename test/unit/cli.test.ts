@@ -45,7 +45,15 @@ describe('cli', () => {
   });
   it('lists every command in --help', () => {
     const help = buildProgram(capture().io).helpInformation();
-    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'mcp']) expect(help).toContain(cmd);
+    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'unpack', 'mcp']) expect(help).toContain(cmd);
+  });
+  it('unpack refuses readonly hosts and a bad --with-node before touching any host', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['unpack', '--project', basic, '--host', 'prod'], { from: 'user' });
+    expect(c.err[0]).toContain('READONLY_HOST');
+    const c2 = capture();
+    await buildProgram(c2.io).parseAsync(['unpack', '--project', basic, '--with-node', 'sometimes'], { from: 'user' });
+    expect(c2.err[0]).toContain('BAD_ARGUMENT');
   });
   it('monit --once reports MANIFEST_NOT_FOUND cleanly outside a project', async () => {
     const c = capture();

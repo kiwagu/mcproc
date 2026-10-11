@@ -48,7 +48,7 @@ describe('shipEcosystem', () => {
     expect(call.cmd).toContain(`mkdir -p '/srv/demo/.mcproc/.generated'`);
     expect(call.cmd).toContain(`printf '*\\n' > '/srv/demo/.mcproc/.gitignore'`);
     expect(call.cmd).toContain(`cat > '/srv/demo/.mcproc/.generated/ecosystem.json'`);
-    const json = JSON.parse(call.opts.stdin!);
+    const json = JSON.parse(String(call.opts.stdin));
     expect(json.apps.map((a: { name: string }) => a.name)).toEqual(['demo-api-build', 'demo-api', 'demo-worker']);
     expect(json.apps[1].cwd).toBe('/srv/demo');
   });

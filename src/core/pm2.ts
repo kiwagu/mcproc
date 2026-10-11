@@ -12,7 +12,7 @@ export interface Pm2Process {
   uptime_ms: number | null; cpu: number; memory: number; watch: boolean;
 }
 
-export const PM2_NOT_FOUND_HINT = 'No usable pm2 on this host. Install pm2 there (Node 18 or newer) or set hosts.<host>.pm2 to a working pm2 command.';
+export const PM2_NOT_FOUND_HINT = 'No usable pm2 on this host. Run unpack for it (brings pm2, and Node when missing), install pm2 there (Node 18 or newer), or set hosts.<host>.pm2.';
 
 type RawProc = { pid?: number; name: string; pm_id: number; monit?: { memory?: number; cpu?: number }; pm2_env?: Record<string, unknown> };
 
@@ -97,7 +97,7 @@ export function bundledPm2Bin(): string {
   return `${shq(process.execPath)} ${shq(pm2Path)}`;
 }
 
-function nodeMajor(v: string | null): number {
+export function nodeMajor(v: string | null): number {
   const m = /^v?(\d+)/.exec(v ?? '');
   return m ? Number(m[1]) : 0;
 }

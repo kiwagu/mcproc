@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { startNote, renderLs, renderPorts, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
+import { startNote, renderLs, renderPorts, renderDoctor, renderUnpack, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
 
@@ -50,5 +50,29 @@ describe('renderLs with tree metrics', () => {
     const t = renderPorts({ port: null, listeners: [{ proto: 'tcp', addr: '0.0.0.0', port: 55321, pid: null, pids: [], command: null, container: 'supabase_kong_zero-memory', app: null }] }, 'local');
     expect(t).toMatch(/CONTAINER/);
     expect(t).toContain('supabase_kong_zero-memory');
+  });
+});
+
+describe('renderDoctor', () => {
+  it('prints the monit command when a runtime is unpacked on the host', () => {
+    const t = renderDoctor([{ host: 'stand', transport: 'ssh stand', reachable: true, error: null, node: 'v22.1.0', pm2: { source: 'runtime', bin: 'x', version: null, reason: 'r' }, tools: { ps: true, ss: true, tar: true }, pm2_home: '/h', runtime_dir: '/opt/rt', runtime_present: true, runtime_pm2: '7.0.4', runtime_node: null, daemon: 'answers', processes: 0, in_namespace: 0, recommendations: [] }]);
+    expect(t).toContain('/opt/rt (pm2 7.0.4)');
+    expect(t).toContain("PM2_HOME='/h' '/opt/rt/bin/pm2' monit");
+  });
+});
+
+describe('renderUnpack', () => {
+  it('tells what was unpacked, the line to add, the monit command and the update hint', () => {
+    const t = renderUnpack({
+      host: 'stand', runtime_dir: '/opt/rt', noop: false, pm2: { version: '7.0.4', written: true },
+      node: { version: 'v24.21.0', platform: 'linux-x64-musl', written: true }, manifest_copy: 'kept-hand-written',
+      runtime_line: 'hosts.stand.runtime: /opt/rt', monit: "'/opt/rt/bin/pm2' monit", update_hint: 'a pm2 daemon is already running there; …',
+    });
+    expect(t).toContain('pm2 7.0.4 unpacked');
+    expect(t).toContain('node v24.21.0 (linux-x64-musl) unpacked');
+    expect(t).toContain('hosts.stand.runtime: /opt/rt');
+    expect(t).toContain("'/opt/rt/bin/pm2' monit");
+    expect(t).toContain('kept-hand-written');
+    expect(t).toContain('daemon is already running');
   });
 });

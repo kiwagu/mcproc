@@ -7,12 +7,13 @@
   "bin": {
     "mcproc": "dist/cli.js"
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "runtime/package.json", "runtime/package-lock.json", "README.md"],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsup",
+    "prepublishOnly": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:it": "MCPROC_IT=1 vitest run test/integration",
