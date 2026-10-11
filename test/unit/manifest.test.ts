@@ -86,4 +86,11 @@ describe('validation', () => {
     expect(m.hosts.local.shell).toEqual({ bin: '/bin/sh', flags: ['-c'] });
     expect(m.hosts.local.pm2).toBe('/opt/pm2');
   });
+  it('accepts an http(s) url per app and rejects anything else', () => {
+    const m = parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n    port: 3100\n    url: http://localhost:3100/\n');
+    expect(m.apps.web.url).toBe('http://localhost:3100/');
+    expect(parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n').apps.web.url).toBeNull();
+    expect(() => parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n    url: localhost:3100\n')).toThrow(/url/);
+    expect(() => parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n    url: ftp://x/\n')).toThrow(/url/);
+  });
 });

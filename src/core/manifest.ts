@@ -21,6 +21,7 @@ const appSchema = z.object({
   env: z.record(envValue).default({}),
   port: portNo.optional(),
   ports: z.array(portNo).optional(),
+  url: z.string().regex(/^https?:\/\/\S+$/, 'url must start with http:// or https:// (it is opened in a browser and checked with one HTTP request)').optional(),
   watch: z.union([z.boolean(), z.array(z.string())]).optional(),
   watch_delay: z.number().int().min(0).optional(),
   ignore_watch: z.array(z.string()).optional(),
@@ -56,7 +57,7 @@ export const manifestSchema = z.object({
 export type AppKind = 'build' | 'server' | 'worker';
 export interface App {
   name: string; description: string; kind: AppKind; run: string; cwd: string;
-  env: Record<string, string>; ports: number[];
+  env: Record<string, string>; ports: number[]; url: string | null;
   watch?: boolean | string[]; watch_delay?: number; ignore_watch?: string[];
   depends_on: string[]; autorestart: boolean; pm2: Record<string, unknown>;
 }
@@ -133,7 +134,7 @@ export function parseManifest(text: string, root: string, manifestPath: string):
     for (const k of PROTECTED_PM2_KEYS) if (k in a.pm2) problems.push(`apps.${n}.pm2.${k}: managed by mcproc, cannot be overridden`);
     apps[n] = {
       name: n, description: a.description, kind: a.kind, run: a.run, cwd: a.cwd,
-      env: stringifyEnv(a.env), ports: a.ports ?? (a.port !== undefined ? [a.port] : []),
+      env: stringifyEnv(a.env), ports: a.ports ?? (a.port !== undefined ? [a.port] : []), url: a.url ?? null,
       watch: a.watch, watch_delay: a.watch_delay ?? (a.watch ? 1000 : undefined), ignore_watch: a.ignore_watch,
       depends_on: a.depends_on, autorestart: a.autorestart, pm2: a.pm2,
     };

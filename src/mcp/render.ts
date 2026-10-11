@@ -24,7 +24,7 @@ export function fmtPorts(p: AppPorts): string {
   for (const c of p.checks) {
     if (c.status === 'listening') parts.push(`:${c.port} ✓`);
     else if (c.held_by) {
-      const who = c.held_by.app ? `app ${c.held_by.app}` : c.held_by.pid !== null ? `pid ${c.held_by.pid}${c.held_by.command ? ` (${c.held_by.command})` : ''}` : "another user's process";
+      const who = c.held_by.app ? `app ${c.held_by.app}` : c.held_by.container ? `container ${c.held_by.container}` : c.held_by.pid !== null ? `pid ${c.held_by.pid}${c.held_by.command ? ` (${c.held_by.command})` : ''}` : "another user's process";
       parts.push(`:${c.port} ✗ held by ${who}`);
     } else parts.push(`:${c.port} ✗ nothing listens`);
   }
@@ -35,10 +35,21 @@ export function table(rows: string[][]): string {
   const w = rows[0].map((_, i) => Math.max(...rows.map((r) => (r[i] ?? '').length)));
   return rows.map((r) => r.map((c, i) => (c ?? '').padEnd(w[i])).join('  ').trimEnd()).join('\n');
 }
+export function fmtCpu(c: number | null): string { return c === null ? '-' : `${c.toFixed(1)}%`; }
+export function cut(s: string, n: number): string { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+/** The declared url with its HTTP answer when one was requested; the bare url when not (monit's live screen never asks). */
+export function fmtUrl(r: LsRow): string {
+  if (!r.url) return '-';
+  if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}`;
+  if (r.url_status === 'error') return `${r.url} ✗ ${r.url_code}`;
+  if (r.url_status === 'down') return `${r.url} ✗ down`;
+  return r.url;
+}
 export function renderLs(rows: LsRow[], host: string): string {
   return `host: ${host}\n` + table([
-    ['APP', 'KIND', 'STATUS', 'PID', 'UPTIME', 'RESTARTS', 'MEM', 'PORTS'],
-    ...rows.map((r) => [r.app, r.kind, r.status, r.pid === null ? '-' : String(r.pid), fmtUptime(r.uptime_ms), String(r.restarts), r.memory ? fmtBytes(r.memory) : '-', fmtPorts(r.ports)]),
+    ['APP', 'KIND', 'STATUS', 'PID', 'UPTIME', 'RESTARTS', 'MEM', 'CPU', 'PORTS', 'URL', 'RUNTIME', 'DESCRIPTION'],
+    ...rows.map((r) => [r.app, r.kind, r.status, r.pid === null ? '-' : String(r.pid), fmtUptime(r.uptime_ms), String(r.restarts),
+      r.memory ? fmtBytes(r.memory) : '-', r.status === 'online' ? fmtCpu(r.cpu) : '-', fmtPorts(r.ports), fmtUrl(r), r.runtime ? cut(r.runtime, 32) : '-', cut(r.description.split('\n')[0], 40)]),
   ]);
 }
 /** A port sampled right after start may simply not be bound yet; say so instead of letting "✗" read as a failure. */
@@ -49,7 +60,7 @@ export function startNote(rows: LsRow[]): string {
 
 export function renderPorts(rep: { port: number | null; listeners: Array<Listener & { app: string | null }> }, host: string): string {
   if (rep.listeners.length === 0) return `host: ${host}\n${rep.port ? `nothing listens on port ${rep.port}` : 'no listening sockets visible'}`;
-  return `host: ${host}\n` + table([['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP'], ...rep.listeners.map((l) => [l.proto, l.addr, String(l.port), l.pid === null ? '?' : String(l.pid), l.command ?? '?', l.app ?? '-'])]);
+  return `host: ${host}\n` + table([['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'], ...rep.listeners.map((l) => [l.proto, l.addr, String(l.port), l.pid === null ? '?' : String(l.pid), l.command ?? '?', l.app ?? '-', l.container ?? '-'])]);
 }
 export function renderHosts(info: HostInfo[]): string {
   return table([['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME'], ...info.map((h) => [h.name, h.transport, h.cwd, h.readonly ? 'yes' : 'no', h.pm2_home ?? '-'])]);
@@ -72,9 +83,9 @@ export function renderLogs(l: LogsResult): string {
   if (l.err !== undefined) parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
 }
-export function renderProject(d: { project: string; root: string; apps: { name: string; kind: string; description: string; ports: number[]; depends_on: string[] }[]; profiles: Record<string, string[]>; hosts: HostInfo[]; readme: string | null }): string {
+export function renderProject(d: { project: string; root: string; apps: { name: string; kind: string; description: string; ports: number[]; url: string | null; depends_on: string[] }[]; profiles: Record<string, string[]>; hosts: HostInfo[]; readme: string | null }): string {
   const L = [`project: ${d.project} (${d.root})`, 'apps:'];
-  for (const a of d.apps) L.push(`  ${a.name} [${a.kind}]${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`);
+  for (const a of d.apps) L.push(`  ${a.name} [${a.kind}]${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`);
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles)) L.push(`  ${p}: ${apps.join(', ')}`);
   L.push('hosts:', renderHosts(d.hosts).split('\n').map((x) => '  ' + x).join('\n'));

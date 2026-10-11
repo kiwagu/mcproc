@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MARK, probeScript } from '../../src/shell/snippets.js';
+import { MARK, probeScript, STAT_AWK, RSS_AWK } from '../../src/shell/snippets.js';
 import { parsePs, parseSs, parseProcNet, parseFdMap, parseProbe, descendants, joinPorts, hexToIp, splitAddr } from '../../src/core/ports.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import type { App } from '../../src/core/manifest.js';
@@ -10,12 +10,12 @@ import { probeOut } from '../helpers/probe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fx = (p: string) => fs.readFileSync(path.join(here, '..', 'fixtures', 'probe', p), 'utf8');
-const app = (name: string, ports: number[] = []): App => ({ name, description: name, kind: 'server', run: 'x', cwd: '.', env: {}, ports, depends_on: [], autorestart: true, pm2: {} });
+const app = (name: string, ports: number[] = []): App => ({ name, description: name, kind: 'server', run: 'x', cwd: '.', env: {}, ports, url: null, depends_on: [], autorestart: true, pm2: {} });
 
 describe('probeScript', () => {
   it('contains every marker and the pm2 command', () => {
     const s = probeScript("'/usr/bin/node' '/x/pm2'");
-    for (const m of Object.values(MARK)) expect(s).toContain(m);
+    for (const m of Object.values(MARK)) if (m !== MARK.STAT2) expect(s).toContain(m); // STAT2 only with cpuSample
     expect(s).toContain("'/usr/bin/node' '/x/pm2' jlist");
     expect(s).toContain('ss -ltnp');
     expect(s).toContain('/proc/net/tcp');
@@ -32,9 +32,10 @@ describe('parsers', () => {
   it('parseSs keeps listeners without a pid and takes the first pid of many', () => {
     const l = parseSs(fx('ss-tcp.txt'), 'tcp');
     expect(l).toHaveLength(5);
-    expect(l[0]).toEqual({ proto: 'tcp', addr: '127.0.0.1', port: 8222, pid: null, command: null });
-    expect(l[1]).toEqual({ proto: 'tcp', addr: '*', port: 3310, pid: 69265, command: 'node' });
-    expect(l[2]).toEqual({ proto: 'tcp', addr: '::', port: 3000, pid: 4242, command: 'node' });
+    expect(l[0]).toMatchObject({ proto: 'tcp', addr: '127.0.0.1', port: 8222, pid: null, command: null });
+    expect(l[1]).toMatchObject({ proto: 'tcp', addr: '*', port: 3310, pid: 69265, command: 'node' });
+    expect(l[2]).toMatchObject({ proto: 'tcp', addr: '::', port: 3000, pid: 4242, command: 'node' });
+    expect(l[2].pids).toEqual([4242, 4243]);
     expect(parseSs(fx('ss-udp.txt'), 'udp')[1]).toMatchObject({ proto: 'udp', port: 41234, pid: 69265 });
   });
   it('parsePs builds pid→ppid and descendants walks it', () => {
@@ -60,10 +61,61 @@ describe('parsers', () => {
     expect(d.listeners.filter((l) => l.proto === 'udp')).toHaveLength(2);
     const p = parseProbe(probeOut({ rc: 127, ps: fx('ps.txt'), tcp: `${MARK.PROC}\n${fx('proc-net-tcp.txt')}`, udp: `${MARK.PROC}\n`, fd: fx('proc-fd.txt') }));
     expect(p.jlistRc).toBe(127);
-    expect(p.listeners).toEqual([
-      { proto: 'tcp', addr: '127.0.0.1', port: 8222, pid: 392433, command: null },
-      { proto: 'tcp', addr: '0.0.0.0', port: 3310, pid: 69265, command: null },
-    ]);
+    expect(p.listeners).toHaveLength(2);
+    expect(p.listeners[0]).toMatchObject({ proto: 'tcp', addr: '127.0.0.1', port: 8222, pid: 392433, command: null });
+    expect(p.listeners[1]).toMatchObject({ proto: 'tcp', addr: '0.0.0.0', port: 3310, pid: 69265, command: null });
+  });
+});
+
+describe('probe stats, shared sockets and docker ports', () => {
+  it('probeScript emits the stat/rss/args/docker sections, the second CPU sample only on request', () => {
+    const once = probeScript('pm2');
+    for (const m of [MARK.STAT, MARK.RSS, MARK.ARGS, MARK.DOCKER]) expect(once).toContain(m);
+    expect(once).not.toContain(MARK.STAT2);
+    const two = probeScript('pm2', { cpuSample: true });
+    expect(two).toContain(MARK.STAT2);
+    expect(two).toContain('sleep 0.5');
+    expect(once).toContain(MARK.URL);
+    expect(once).not.toContain('curl');
+    const u = probeScript('pm2', { urls: ['http://localhost:3100/', "http://h/it's"] });
+    expect(u).toContain("curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' 'http://localhost:3100/'"); // -k: a liveness check, self-signed dev certs must not read as down
+    expect(u).toContain('wget -q --no-check-certificate -T 2');
+    expect(u).toContain("'http://h/it'\\''s'");
+  });
+  it('probe sections survive a hung docker and a process that exits mid-pass', () => {
+    const s = probeScript('pm2');
+    expect(s).toContain('timeout 3 docker ps');                       // a wedged docker daemon must not stall the whole probe
+    expect(s).toContain('cat /proc/[0-9]*/stat 2>/dev/null | ' + STAT_AWK);     // mawk/busybox awk abort at the first vanished file of a file list
+    expect(s).toContain('cat /proc/[0-9]*/status 2>/dev/null | ' + RSS_AWK);
+  });
+  it('parseUrlChecks maps each url to its HTTP code, 0 for no answer, null without curl/wget', () => {
+    const d = parseProbe(probeOut({ ps: fx('ps.txt'), tcp: fx('ss-tcp.txt'), urls: 'http://localhost:3100/\t200\nhttp://localhost:3200/\t000\nhttp://localhost:3300/\t-\nnoise\n' }));
+    expect(d.urls.get('http://localhost:3100/')).toBe(200);
+    expect(d.urls.get('http://localhost:3200/')).toBe(0);
+    expect(d.urls.get('http://localhost:3300/')).toBeNull();
+    expect(d.urls.size).toBe(3);
+    expect(parseProbe(probeOut({})).urls.size).toBe(0);
+  });
+  it('parseProbe carries stats and attributes docker-published ports', () => {
+    const d = parseProbe(probeOut({ ps: fx('ps.txt'), tcp: `${fx('ss-tcp.txt')}LISTEN 0 4096 0.0.0.0:55321 0.0.0.0:*\n`, stat: 'CLK 100\n69265 69253 500\n', stat2: 'CLK 100\n69265 69253 550\n', rss: '69265 151552\n', args: '69265 bun --watch src/index.ts\n', docker: 'supabase_kong_zero-memory\t0.0.0.0:55321->8000/tcp\n' }));
+    expect(d.stats.clkTck).toBe(100);
+    expect(d.stats.samples).toHaveLength(2);
+    expect(d.stats.samples[1].ticks.get(69265)).toBe(550);
+    expect(d.stats.rssKb.get(69265)).toBe(151552);
+    expect(d.stats.args.get(69265)).toBe('bun --watch src/index.ts');
+    expect(d.listeners.find((l) => l.port === 55321)).toMatchObject({ pid: null, container: 'supabase_kong_zero-memory' });
+    expect(d.listeners.find((l) => l.port === 3000)).toMatchObject({ pid: 4242, pids: [4242, 4243], container: null });
+  });
+  it('a socket shared by several processes is attributed when any of them is in the tree', () => {
+    const jlist = JSON.stringify([{ pid: 4243, name: 'demo-front', pm_id: 2, pm2_env: { status: 'online', namespace: 'demo' } }]);
+    const data = parseProbe(probeOut({ jlist, ps: fx('ps.txt'), tcp: fx('ss-tcp.txt') }));
+    const r = joinPorts({ front: app('front', [3000]) }, parseJlist(data.jlistRaw), data, 'demo');
+    expect(r.front.checks).toEqual([{ port: 3000, status: 'listening' }]);
+  });
+  it('held_by names the container for a docker-published declared port', () => {
+    const data = parseProbe(probeOut({ jlist: '[]', ps: fx('ps.txt'), tcp: 'LISTEN 0 4096 0.0.0.0:55321 0.0.0.0:*\n', docker: 'supabase_kong_zero-memory\t0.0.0.0:55321->8000/tcp\n' }));
+    const r = joinPorts({ kong: app('kong', [55321]) }, [], data, 'demo');
+    expect(r.kong.checks[0].held_by).toEqual({ pid: null, command: null, container: 'supabase_kong_zero-memory' });
   });
 });
 

@@ -45,6 +45,11 @@ describe('cli', () => {
   });
   it('lists every command in --help', () => {
     const help = buildProgram(capture().io).helpInformation();
-    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'mcp']) expect(help).toContain(cmd);
+    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'mcp']) expect(help).toContain(cmd);
+  });
+  it('monit --once reports MANIFEST_NOT_FOUND cleanly outside a project', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['monit', '--once', '--project', fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'))], { from: 'user' });
+    expect(c.err[0]).toContain('MANIFEST_NOT_FOUND');
   });
 });

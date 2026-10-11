@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { startNote } from '../../src/mcp/render.js';
+import { startNote, renderLs, renderPorts, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
 
 const row = (status: string, checks: PortCheck[]): LsRow => ({
   app: 'web', kind: 'server', description: '', status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0,
+  procs: 1, runtime: null, pm2_memory: 0, pm2_cpu: 0, metrics_source: 'tree', url: null, url_status: 'unchecked', url_code: null,
   ports: { actual: [], declared: checks.map((c) => c.port), checks, undeclared: [] },
 });
 
@@ -16,5 +17,38 @@ describe('startNote', () => {
     expect(startNote([row('online', [{ port: 3000, status: 'listening' }])])).toBe('');
     expect(startNote([row('online', [{ port: 3000, status: 'declared-not-listening', held_by: { pid: 9, command: 'x' } }])])).toBe('');
     expect(startNote([row('errored', [{ port: 3000, status: 'declared-not-listening' }])])).toBe('');
+  });
+});
+
+describe('renderLs with tree metrics', () => {
+  const base = row('online', [{ port: 3000, status: 'listening' }]);
+  it('shows tree memory, cpu, runtime and a truncated description; cpu "-" when unknown', () => {
+    const r = { ...base, memory: 2_200_000_000, cpu: 84.4, procs: 3, runtime: 'next-server (v16.2.9)', pm2_memory: 9_000_000, pm2_cpu: 0, metrics_source: 'tree' as const, description: 'a'.repeat(60) };
+    const t = renderLs([r], 'local');
+    expect(t).toMatch(/APP\s+KIND\s+STATUS\s+PID\s+UPTIME\s+RESTARTS\s+MEM\s+CPU\s+PORTS\s+URL\s+RUNTIME\s+DESCRIPTION/);
+    expect(t).toContain('2.05G');
+    expect(t).toContain('84.4%');
+    expect(t).toContain('next-server (v16.2.9)');
+    expect(t).toContain('a'.repeat(39) + '…');
+    expect(fmtCpu(null)).toBe('-');
+    expect(renderLs([{ ...r, cpu: null }], 'local')).toMatch(/84\.4%|\s-\s/);
+  });
+  it('fmtUrl shows the url alone when unchecked and with its HTTP answer when checked', () => {
+    const u = { ...base, url: 'http://localhost:3000/' };
+    expect(fmtUrl(base)).toBe('-');
+    expect(fmtUrl(u)).toBe('http://localhost:3000/');
+    expect(fmtUrl({ ...u, url_status: 'ok', url_code: 200 })).toBe('http://localhost:3000/ ✓ 200');
+    expect(fmtUrl({ ...u, url_status: 'error', url_code: 503 })).toBe('http://localhost:3000/ ✗ 503');
+    expect(fmtUrl({ ...u, url_status: 'down' })).toBe('http://localhost:3000/ ✗ down');
+    expect(renderLs([{ ...u, url_status: 'ok', url_code: 200 }], 'local')).toContain('http://localhost:3000/ ✓ 200');
+  });
+  it('fmtPorts names the container holding a declared port', () => {
+    const r = row('online', [{ port: 55321, status: 'declared-not-listening', held_by: { pid: null, command: null, container: 'supabase_kong_zero-memory' } }]);
+    expect(renderLs([r], 'local')).toContain(':55321 ✗ held by container supabase_kong_zero-memory');
+  });
+  it('renderPorts shows the container of a docker-published port', () => {
+    const t = renderPorts({ port: null, listeners: [{ proto: 'tcp', addr: '0.0.0.0', port: 55321, pid: null, pids: [], command: null, container: 'supabase_kong_zero-memory', app: null }] }, 'local');
+    expect(t).toMatch(/CONTAINER/);
+    expect(t).toContain('supabase_kong_zero-memory');
   });
 });

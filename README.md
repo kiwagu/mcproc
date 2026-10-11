@@ -49,6 +49,7 @@ apps:
     cwd: .                     # relative to the project root
     env: { PORT: 3310 }
     port: 3310                 # declared listening port (or ports: [3310, 9230])
+    url: http://localhost:3310/   # optional: the address to open; ls/describe show it with the HTTP answer, monit shows it
     watch: [dist/apps/api]     # pm2 restarts the server when the build output changes
     depends_on: [api-build]    # start order
 profiles:
@@ -74,8 +75,8 @@ checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe
 
 | tool | what it does |
 |------|--------------|
-| `describe [app]` | project summary with descriptions, profiles, hosts and the notes file; or one app in detail |
-| `ls [app]` | one row per app: pm2 status, pid, uptime, restarts, memory, ports with `✓`/`✗` against the declared ones |
+| `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
+| `ls [app]` | one row per app: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs <app>` | tail of the pm2 out/err logs, ANSI stripped (`lines`, `stream`) |
 | `hosts`, `doctor` | hosts from the manifest; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
@@ -86,6 +87,27 @@ checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe
 
 Every tool takes `project` and `host`. Read-only tools are annotated as such; mutating tools refuse
 `readonly` hosts and unknown app names before touching the host.
+
+## `mcproc monit`
+
+A terminal dashboard on the same data: a table of apps with real memory and CPU (summed over each
+app's process tree, which is what `bun run dev` or `next dev` hide behind their launcher), the ports
+with ✓/✗, the runtime command, a live log tail with history, and the selected app's details.
+`↑`/`↓` select, `r`/`s`/`x` restart/start/stop, `o`/`e`/`b` switch the log stream, `h` cycles hosts,
+`q` quits. `mcproc monit --once` prints one frame as text, which is what an agent or a script reads.
+
+Memory is the sum of each process's resident set, so shared pages count once per process; pm2's own
+root-pid figure is shown next to it in the details. CPU is per core over the refresh interval.
+
+## URLs
+
+An app may declare `url`, the address you open in a browser; `init` drafts `http://localhost:<port>`
+for every server it finds a port for. `ls`, `describe` and `monit --once` request it from the host
+(`curl`, or `wget` when there is no curl, which only tells answered from not) and report `ok` (2xx/3xx),
+`error` (4xx/5xx: up but refusing), `down` (nothing answered) or `unchecked` (the host has neither tool).
+It is a liveness check, not a trust check: self-signed development certificates are accepted.
+The interactive `monit` shows the URL but never requests it, so your dev servers' request logs stay yours.
+The request is made on the host, so on a remote host declare an address the host can reach itself.
 
 ## Process names
 
@@ -103,12 +125,14 @@ or to another checkout that declares the same `project`; give that checkout its 
 descendants are matched to listening sockets, then compared with the declared ports:
 `listening`, `declared-not-listening` (naming the process that holds the port, if any), `undeclared`.
 Ports of processes owned by other users show without a pid, as the kernel reports them.
+Ports published by Docker containers show the container name instead of a pid.
 
 ## What a host needs
 
 `ps`, `ss` (or `/proc`), and pm2 on the login-shell PATH running on Node 18 or newer.
 mcproc itself is only installed where the agent runs; locally it ships its own pm2.
 `doctor` tells you which pm2 a host would use and why, or why none is usable.
+`curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`).
 
 ## License
 

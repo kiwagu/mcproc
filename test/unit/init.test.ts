@@ -72,6 +72,7 @@ describe('renderDraft / initProject', () => {
     expect(draft).toContain('version: 1');
     expect(draft).toContain('# api-dev:');
     expect(draft).toContain('#   port: 4100');
+    expect(draft).toContain('#   url: http://localhost:4100');
     expect(() => parseManifest(draft, root, 'x')).toThrowError(/at least one app/);
     // uncomment exactly one candidate block (its header line plus the indented field lines that follow)
     const lines = draft.split('\n');
@@ -81,7 +82,7 @@ describe('renderDraft / initProject', () => {
     const block = lines.slice(start, end).map((l, i) => (i === 0 ? l.replace('  # ', '  ') : l.replace('  #   ', '    '))).join('\n').replace('description: ""', 'description: api');
     const uncommented = [...lines.slice(0, start), block, ...lines.slice(end)].join('\n');
     const m = parseManifest(uncommented, root, 'x');
-    expect(m.apps['api-dev']).toMatchObject({ run: 'yarn dev', cwd: 'packages/api', ports: [4100] });
+    expect(m.apps['api-dev']).toMatchObject({ run: 'yarn dev', cwd: 'packages/api', ports: [4100], url: 'http://localhost:4100' });
   });
   it('initProject writes .gitignore, README and draft; refuses to overwrite without force', () => {
     const r = initProject(root);

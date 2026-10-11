@@ -29,7 +29,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('ls', {
-    title: 'List apps', description: 'One row per manifest app: pm2 status, pid, uptime, restarts, memory, and the ports it really listens on compared with the declared ones. Answers "is it up and on which port".',
+    title: 'List apps', description: 'One row per manifest app: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open".',
     inputSchema: { ...commonInput, app: z.string().optional().describe('Only this app') }, annotations: RO,
   }, (args) => runTool(async () => {
     const p = await prep(args);
@@ -40,7 +40,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('describe', {
-    title: 'Describe', description: 'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, ports and generated pm2 config.',
+    title: 'Describe', description: 'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config.',
     inputSchema: { ...commonInput, app: z.string().optional() }, annotations: RO,
   }, (args) => runTool(async () => {
     const p = await prep(args);

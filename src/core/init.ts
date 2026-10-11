@@ -180,6 +180,7 @@ export function renderDraft(root: string, project: string, d: Discovery): string
     '# Fields: kind build|server|worker; run = shell command; cwd relative to the project root;',
     '# port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its',
     '# build output changes); depends_on = start order; profiles = named groups of apps;',
+    '# url = the address to open in a browser; ls/describe show it with the HTTP answer, monit shows it;',
     '# hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container).',
   ];
   for (const n of d.notes) L.push(`# note: ${n}`);
@@ -192,6 +193,7 @@ export function renderDraft(root: string, project: string, d: Discovery): string
     L.push(`  #   run: ${yamlStr(c.run)}`);
     if (c.cwd !== '.') L.push(`  #   cwd: ${c.cwd}`);
     if (c.port) L.push(`  #   port: ${c.port}`);
+    if (c.port && c.kind !== 'worker') L.push(`  #   url: http://localhost:${c.port}`);
   }
   L.push('profiles:', '  # base: [api-build, api]', 'hosts:', '  # stand: { ssh: my-alias, cwd: /srv/project }', '  # prod: { ssh: prod-alias, cwd: /srv/project, readonly: true }', '');
   return L.join('\n');

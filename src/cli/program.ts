@@ -9,6 +9,8 @@ import { initProject } from '../core/init.js';
 import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '../core/actions.js';
 import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, startNote } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
+import { monitOnce } from '../monit/once.js';
+import { runMonit } from '../monit/tui.js';
 
 export interface Io { out: (s: string) => void; err: (s: string) => void }
 type Globals = { project?: string; host?: string; json?: boolean };
@@ -88,6 +90,14 @@ export function buildProgram(io: Io = defaultIo): Command {
       const p = prepare({ project: g.project, host: g.host }); if (app) assertApp(p.manifest, app); assertWritable(p.host);
       const ctx = await connect(p); const r = await flushLogs(ctx, app);
       emit(g, r.length ? r.map((x) => `${x.app}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush', r);
+    }));
+  program.command('monit').description('terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)')
+    .option('--once', 'print one frame as text and exit')
+    .option('--interval <ms>', 'refresh interval', '2000')
+    .option('--lines <n>', 'log lines of history', '200')
+    .action(wrap(async (g, o) => {
+      if (o.once) { io.out(await monitOnce({ project: g.project, host: g.host, lines: Number(o.lines) || 200 })); return; }
+      await runMonit({ project: g.project, host: g.host, intervalMs: Math.max(500, Number(o.interval) || 2000), lines: Number(o.lines) || 200 });
     }));
   program.command('mcp').description('run the MCP server on stdio (register this command in your agent client)')
     .action(wrap(async () => { await serveStdio(); }));

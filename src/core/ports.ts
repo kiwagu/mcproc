@@ -1,10 +1,11 @@
 import type { App } from './manifest.js';
 import { findProcess, type Pm2Process } from './pm2.js';
 import { MARK } from '../shell/snippets.js';
+import { EMPTY_STATS, parseArgs, parseDockerPorts, parseRss, parseStat, type ProcStats } from './stats.js';
 
-export interface Listener { proto: 'tcp' | 'udp'; addr: string; port: number; pid: number | null; command: string | null }
-export interface ProbeData { jlistRaw: string; jlistRc: number; tree: Map<number, number>; listeners: Listener[] }
-export interface PortCheck { port: number; status: 'listening' | 'declared-not-listening'; held_by?: { pid: number | null; command: string | null; app?: string } }
+export interface Listener { proto: 'tcp' | 'udp'; addr: string; port: number; pid: number | null; pids: number[]; command: string | null; container: string | null }
+export interface ProbeData { jlistRaw: string; jlistRc: number; tree: Map<number, number>; listeners: Listener[]; stats: ProcStats; urls: Map<string, number | null> }
+export interface PortCheck { port: number; status: 'listening' | 'declared-not-listening'; held_by?: { pid: number | null; command: string | null; app?: string; container?: string } }
 export interface AppPorts { actual: Listener[]; declared: number[]; checks: PortCheck[]; undeclared: number[] }
 
 export function splitAddr(s: string): { addr: string; port: number } {
@@ -30,9 +31,9 @@ export function parseSs(text: string, proto: 'tcp' | 'udp'): Listener[] {
     if (tok.length < 5) continue;
     const { addr, port } = splitAddr(tok[3]);
     if (!Number.isInteger(port) || port <= 0) continue;
-    const pid = /pid=(\d+)/.exec(line);
+    const pids = [...line.matchAll(/pid=(\d+)/g)].map((h) => Number(h[1]));
     const cmd = /users:\(\("([^"]*)"/.exec(line);
-    out.push({ proto, addr, port, pid: pid ? Number(pid[1]) : null, command: cmd ? cmd[1] : null });
+    out.push({ proto, addr, port, pid: pids[0] ?? null, pids, command: cmd ? cmd[1] : null, container: null });
   }
   return out;
 }
@@ -75,6 +76,17 @@ export function parseFdMap(text: string): Map<number, number> {
   return m;
 }
 
+/** "<url>\t<code>" lines of the probe's URL section: the HTTP status, 0 when nothing answered, null when the host has neither curl nor wget. */
+export function parseUrlChecks(text: string): Map<string, number | null> {
+  const m = new Map<string, number | null>();
+  for (const raw of text.split('\n')) {
+    const [url, code] = raw.split('\t');
+    if (!url || code === undefined) continue;
+    m.set(url, /^\d{3}$/.test(code.trim()) ? Number(code) : null);
+  }
+  return m;
+}
+
 function sections(stdout: string, marks: string[]): Record<string, string> {
   const lines = stdout.split('\n');
   const idx = marks.map((m) => lines.findIndex((l) => l.trim() === m));
@@ -89,7 +101,7 @@ function sections(stdout: string, marks: string[]): Record<string, string> {
 }
 
 export function parseProbe(stdout: string): ProbeData {
-  const sec = sections(stdout, [MARK.JLIST, MARK.PS, MARK.TCP, MARK.UDP, MARK.FD]);
+  const sec = sections(stdout, [MARK.JLIST, MARK.PS, MARK.TCP, MARK.UDP, MARK.FD, MARK.STAT, MARK.STAT2, MARK.RSS, MARK.ARGS, MARK.DOCKER, MARK.URL]);
   const rc = new RegExp(`${MARK.JLIST_RC} (\\d+)`).exec(sec[MARK.JLIST]);
   const jlistRaw = sec[MARK.JLIST].replace(new RegExp(`${MARK.JLIST_RC} \\d+\\s*$`), '');
   const tree = parsePs(sec[MARK.PS]);
@@ -97,12 +109,21 @@ export function parseProbe(stdout: string): ProbeData {
   const listeners: Listener[] = [];
   for (const [proto, text] of [['tcp', sec[MARK.TCP]], ['udp', sec[MARK.UDP]]] as const) {
     if (text.trim().startsWith(MARK.PROC)) {
-      for (const e of parseProcNet(text.replace(MARK.PROC, ''), proto)) listeners.push({ proto, addr: e.addr, port: e.port, pid: fd.get(e.inode) ?? null, command: null });
+      for (const e of parseProcNet(text.replace(MARK.PROC, ''), proto)) listeners.push({ proto, addr: e.addr, port: e.port, pid: fd.get(e.inode) ?? null, pids: fd.has(e.inode) ? [fd.get(e.inode)!] : [], command: null, container: null });
     } else {
       listeners.push(...parseSs(text, proto));
     }
   }
-  return { jlistRaw, jlistRc: rc ? Number(rc[1]) : -1, tree, listeners };
+  const s1 = parseStat(sec[MARK.STAT]);
+  const samples = [s1.sample];
+  if (sec[MARK.STAT2].trim()) samples.push(parseStat(sec[MARK.STAT2]).sample);
+  // docker-published ports do not depend on /proc: a host without stat samples (no tree metrics) still attributes them
+  const dockerPorts = parseDockerPorts(sec[MARK.DOCKER]);
+  const stats: ProcStats = s1.sample.ticks.size === 0 ? { ...EMPTY_STATS, dockerPorts } : {
+    clkTck: s1.clkTck, samples, rssKb: parseRss(sec[MARK.RSS]), args: parseArgs(sec[MARK.ARGS]), dockerPorts,
+  };
+  for (const l of listeners) if (l.pid === null) l.container = stats.dockerPorts.get(l.port) ?? null;
+  return { jlistRaw, jlistRc: rc ? Number(rc[1]) : -1, tree, listeners, stats, urls: parseUrlChecks(sec[MARK.URL]) };
 }
 
 export function descendants(tree: Map<number, number>, root: number): Set<number> {
@@ -121,24 +142,31 @@ export function descendants(tree: Map<number, number>, root: number): Set<number
 export function holderOf(listeners: Listener[], port: number, pidToApp: Map<number, string>): PortCheck['held_by'] | undefined {
   const l = listeners.find((x) => x.port === port && x.proto === 'tcp') ?? listeners.find((x) => x.port === port);
   if (!l) return undefined;
-  const app = l.pid !== null ? pidToApp.get(l.pid) : undefined;
-  return app ? { pid: l.pid, command: l.command, app } : { pid: l.pid, command: l.command };
+  const app = l.pids.map((p) => pidToApp.get(p)).find(Boolean);
+  const base = { pid: l.pid, command: l.command, ...(l.container ? { container: l.container } : {}) };
+  return app ? { ...base, app } : base;
+}
+
+/** pm2 root pid plus every descendant, per manifest app; an app without a running process gets an empty set. */
+export function appPids(apps: Record<string, App>, procs: Pm2Process[], tree: Map<number, number>, project: string): Map<string, Set<number>> {
+  const out = new Map<string, Set<number>>();
+  for (const app of Object.values(apps)) {
+    const p = findProcess(procs, project, app.name);
+    const set = p && p.pid > 0 ? descendants(tree, p.pid) : new Set<number>();
+    if (p && p.pid > 0) set.add(p.pid);
+    out.set(app.name, set);
+  }
+  return out;
 }
 
 export function joinPorts(apps: Record<string, App>, procs: Pm2Process[], data: ProbeData, project: string): Record<string, AppPorts> {
-  const pidsOf = new Map<string, Set<number>>();
-  for (const app of Object.values(apps)) {
-    const p = findProcess(procs, project, app.name);
-    const set = p && p.pid > 0 ? descendants(data.tree, p.pid) : new Set<number>();
-    if (p && p.pid > 0) set.add(p.pid);
-    pidsOf.set(app.name, set);
-  }
+  const pidsOf = appPids(apps, procs, data.tree, project);
   const pidToApp = new Map<number, string>();
   for (const [name, set] of pidsOf) for (const pid of set) pidToApp.set(pid, name);
   const result: Record<string, AppPorts> = {};
   for (const app of Object.values(apps)) {
     const pids = pidsOf.get(app.name)!;
-    const actual = data.listeners.filter((l) => l.pid !== null && pids.has(l.pid));
+    const actual = data.listeners.filter((l) => l.pids.some((p) => pids.has(p)));
     const actualPorts = new Set(actual.map((l) => l.port));
     const checks: PortCheck[] = app.ports.map((port) => {
       if (actualPorts.has(port)) return { port, status: 'listening' };

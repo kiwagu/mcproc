@@ -11,6 +11,7 @@ apps:
     cwd: .
     env: { PORT: 3310, DEBUG: true }
     port: 3310
+    url: http://localhost:3310/health
     watch: [dist/apps/api]
     depends_on: [api-build]
   worker:
