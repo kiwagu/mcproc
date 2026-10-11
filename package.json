@@ -1,0 +1,35 @@
+{
+  "name": "mcproc",
+  "version": "0.1.0",
+  "description": "pm2 process control for agents over MCP: local and remote hosts, per-app ports, one manifest per project",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "mcproc": "dist/cli.js"
+  },
+  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:it": "MCPROC_IT=1 vitest run test/integration",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "commander": "^15.0.0",
+    "pm2": "7.0.4",
+    "yaml": "^2.9.1",
+    "zod": "^3.25"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

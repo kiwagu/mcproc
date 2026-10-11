@@ -1,0 +1,5 @@
+[32m[PM2] [39mSpawning PM2 daemon with pm2_home=/tmp/mcproc-x/home
+[32m[PM2] [39mPM2 Successfully daemonized
+[PM2] This PM2 is not UP TO DATE
+[PM2] Upgrade to version 7.0.4
+[{"pid":69265,"name":"api","pm_id":0,"monit":{"memory":51200000,"cpu":0.3},"pm2_env":{"status":"online","namespace":"demo","pm_cwd":"/p","pm_out_log_path":"/h/logs/api-out.log","pm_err_log_path":"/h/logs/api-error.log","restart_time":2,"unstable_restarts":0,"pm_uptime":1760000000000,"watch":["dist"]}}]

@@ -1,0 +1,33 @@
+version: 1
+project: demo
+apps:
+  api-build:
+    description: tsc watch build of the API into dist/
+    kind: build
+    run: npx tsc -w -p apps/api
+  api:
+    description: HTTP API serving /health
+    run: node dist/apps/api/main.js
+    cwd: .
+    env: { PORT: 3310, DEBUG: true }
+    port: 3310
+    watch: [dist/apps/api]
+    depends_on: [api-build]
+  worker:
+    description: queue worker, no port
+    kind: worker
+    run: node dist/apps/worker/main.js
+    ports: []
+    pm2: { kill_timeout: 3000 }
+profiles:
+  base: [api-build, api]
+hosts:
+  stand:
+    ssh: stand
+    cwd: /srv/demo
+  prod:
+    ssh: prod
+    docker: { container: demo-app, user: node }
+    cwd: /home/node/demo
+    readonly: true
+    pm2_home: /home/node/.pm2

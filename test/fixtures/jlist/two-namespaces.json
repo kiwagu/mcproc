@@ -1,0 +1,5 @@
+[
+ {"pid":100,"name":"demo-web","pm_id":0,"monit":{"memory":1,"cpu":0},"pm2_env":{"status":"online","namespace":"demo","pm_cwd":"/p","pm_out_log_path":"/h/logs/web-out.log","pm_err_log_path":"/h/logs/web-error.log","restart_time":0,"unstable_restarts":0,"pm_uptime":1760000000000}},
+ {"pid":200,"name":"other-web","pm_id":1,"monit":{"memory":1,"cpu":0},"pm2_env":{"status":"online","namespace":"other","pm_cwd":"/q","pm_out_log_path":"/h/logs/web-out-1.log","pm_err_log_path":"/h/logs/web-error-1.log","restart_time":0,"unstable_restarts":0,"pm_uptime":1760000000000}},
+ {"pid":0,"name":"demo-worker","pm_id":2,"monit":{"memory":0,"cpu":0},"pm2_env":{"status":"stopped","namespace":"demo","pm_cwd":"/p","pm_out_log_path":"/h/logs/worker-out.log","pm_err_log_path":"/h/logs/worker-error.log","restart_time":5,"unstable_restarts":1}}
+]

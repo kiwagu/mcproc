@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+refs/
+.mcproc/
+!test/fixtures/**/.mcproc/
+*.log
+.DS_Store

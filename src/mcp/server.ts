@@ -1,0 +1,34 @@
+import { fileURLToPath } from 'node:url';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { VERSION } from '../version.js';
+import type { Spawner } from '../transport/types.js';
+import { registerReadTools } from './tools/read.js';
+import { registerWriteTools } from './tools/write.js';
+
+export const INSTRUCTIONS = [
+  'mcproc drives pm2 for the current project from its .mcproc/mcproc.yaml manifest (apps with descriptions, declared ports, profiles, hosts).',
+  'Loop: (1) no manifest → call init, then fill in a description per app in .mcproc/mcproc.yaml and verify with start + ls (ports) + logs.',
+  '(2) manifest present → call describe first, then act by app or profile name: start, restart, stop, logs. ls answers "is it up and on which port"; ports answers "who holds port N".',
+  'host defaults to local; remote hosts come from the manifest, readonly ones refuse changes. doctor explains why a host cannot be driven.',
+  'Never compose pm2 or shell commands by hand for apps the manifest knows.',
+].join(' ');
+
+export function createServer(deps: { spawner?: Spawner } = {}): McpServer {
+  const server = new McpServer({ name: 'mcproc', version: VERSION }, { instructions: INSTRUCTIONS });
+  const roots = async (): Promise<string[]> => {
+    try {
+      if (!server.server.getClientCapabilities()?.roots) return [];
+      const r = await server.server.listRoots();
+      return r.roots.map((x) => (x.uri.startsWith('file://') ? fileURLToPath(x.uri) : x.uri));
+    } catch { return []; }
+  };
+  registerReadTools(server, { roots, spawner: deps.spawner });
+  registerWriteTools(server, { roots, spawner: deps.spawner });
+  return server;
+}
+
+export async function serveStdio(): Promise<void> {
+  const server = createServer();
+  await server.connect(new StdioServerTransport());
+}
