@@ -45,7 +45,7 @@ describe('cli', () => {
   });
   it('lists every command in --help', () => {
     const help = buildProgram(capture().io).helpInformation();
-    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'unpack', 'mcp']) expect(help).toContain(cmd);
+    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'unpack', 'install', 'mcp']) expect(help).toContain(cmd);
   });
   it('unpack refuses readonly hosts and a bad --with-node before touching any host', async () => {
     const c = capture();
@@ -54,6 +54,14 @@ describe('cli', () => {
     const c2 = capture();
     await buildProgram(c2.io).parseAsync(['unpack', '--project', basic, '--with-node', 'sometimes'], { from: 'user' });
     expect(c2.err[0]).toContain('BAD_ARGUMENT');
+  });
+  it('logs resolves apps and profiles before connecting: an unknown target is refused without touching a host', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['logs', 'nope', '--project', basic], { from: 'user' });
+    expect(c.err[0]).toContain('UNKNOWN_APP');
+    const c2 = capture();
+    await buildProgram(c2.io).parseAsync(['logs', 'api', '--project', basic, '--host', 'stand', '--lines', '0'], { from: 'user' });
+    expect(c2.err[0]).toMatch(/TRANSPORT_FAILED|PM2_NOT_FOUND/); // a real target reaches the (unreachable) host: the command shape is accepted
   });
   it('monit --once reports MANIFEST_NOT_FOUND cleanly outside a project', async () => {
     const c = capture();

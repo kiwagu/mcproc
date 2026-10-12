@@ -50,7 +50,7 @@ export class LogFollower {
 
 const STAMP = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/;
 /** Stamped lines are ordered by pm2's timestamp prefix (stable); lines without a stamp keep their positions. */
-export function sortByStamp(lines: LogLine[]): LogLine[] {
+export function sortByStamp<T extends { text: string }>(lines: T[]): T[] {
   const keyed = lines.map((l, i) => ({ l, i, k: STAMP.exec(l.text)?.[1] ?? null }));
   const stamped = keyed.filter((x) => x.k !== null).sort((a, b) => (a.k! < b.k! ? -1 : a.k! > b.k! ? 1 : a.i - b.i));
   let j = 0;

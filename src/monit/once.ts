@@ -17,7 +17,7 @@ export async function monitOnce(opts: { project?: string; host?: string; lines: 
   if (proc) {
     const paths = { out: proc.out_log, err: proc.err_log };
     const { lines } = await new LogFollower(ctx, paths, opts.lines).poll();
-    state = reduce(state, { type: 'logs', lines, paths });
+    state = reduce(state, { type: 'logs', app: row!.app, lines, paths });
   }
   return frameToText(renderFrame(state, { width: opts.width ?? (process.stdout.columns || 120), height: 40 }));
 }

@@ -6,13 +6,15 @@ import { unpack, defaultUnpackDeps } from '../runtime/unpack.js';
 import type { WithNode } from '../runtime/decide.js';
 import { prepare, connect, assertApp, assertWritable, resolveProjectDir, type Context } from '../core/resolve.js';
 import { listApps, portsReport, hostsInfo, describeApp, describeProject } from '../core/list.js';
-import { readLogs, flushLogs } from '../core/logs.js';
+import { flushLogs } from '../core/logs.js';
+import { streamLogs, defaultStreamDeps } from '../core/logstream.js';
 import { doctor } from '../core/doctor.js';
 import { initProject } from '../core/init.js';
 import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '../core/actions.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, renderUnpack, startNote } from '../mcp/render.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderProject, renderUnpack, startNote } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
+import { installShortcut } from './install.js';
 import { runMonit } from '../monit/tui.js';
 
 export interface Io { out: (s: string) => void; err: (s: string) => void }
@@ -71,12 +73,30 @@ export function buildProgram(io: Io = defaultIo): Command {
       const d = await describeApp(ctx, app);
       emit(g, `${d.app.name} [${d.app.kind}]: ${d.app.description}\nrun: ${d.app.run}\ncwd: ${d.app.cwd}\n${renderLs([d.row], ctx.host.name)}\nlogs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`, d);
     }));
-  program.command('logs <app>').description('tail pm2 logs of an app').option('-n, --lines <n>', 'lines (default 100, max 2000)').option('--out', 'stdout only').option('--err', 'stderr only')
-    .action(wrap(async (g, o, [app]) => {
-      const p = prepare({ project: g.project, host: g.host }); assertApp(p.manifest, app);
+  program.command('logs [targets...]').description('logs of apps or profiles (default: all apps), one labeled line per entry like docker compose; -f keeps streaming')
+    .option('-f, --follow', 'keep streaming until Ctrl-C')
+    .option('-n, --lines <n>', 'history lines per app (default 100, max 2000)')
+    .option('--out', 'stdout only').option('--err', 'stderr only')
+    .option('--interval <ms>', 'poll interval while following', '1000')
+    .option('--no-color', 'plain labels (also when NO_COLOR is set or stdout is not a terminal)')
+    .action(wrap(async (g, o, args) => {
+      const targets = ((args[0] as unknown as string[] | undefined) ?? []);
+      const p = prepare({ project: g.project, host: g.host });
+      const apps = [...new Set((targets.length ? targets : ['all']).flatMap((t) => resolveTargets(p.manifest, t)))];
       const ctx = await connect(p);
-      const r = await readLogs(ctx, app, { lines: o.lines ? Number(o.lines) : undefined, stream: o.out ? 'out' : o.err ? 'err' : 'both' });
-      emit(g, renderLogs(r), r);
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      process.once('SIGINT', stop);
+      // a reader that closes early (`| head`) raises EPIPE asynchronously on stdout, possibly after the stream already returned:
+      // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
+      process.stdout.on('error', (e: NodeJS.ErrnoException) => { if (e.code === 'EPIPE') ac.abort(); else throw e; });
+      try {
+        await streamLogs(ctx, apps, {
+          lines: Math.min(Math.max(1, Number(o.lines) || 100), 2000), follow: Boolean(o.follow), intervalMs: Math.max(200, Number(o.interval) || 1000),
+          color: o.color !== false && !process.env.NO_COLOR && Boolean(process.stdout.isTTY), json: Boolean(g.json),
+          stream: o.out ? 'out' : o.err ? 'err' : 'both', signal: ac.signal,
+        }, defaultStreamDeps());
+      } finally { process.off('SIGINT', stop); }
     }));
   program.command('ports [port]').description('who listens on which port on the host')
     .action(wrap(async (g, _o, [port]) => { const ctx = await ctxOf(g); const r = await portsReport(ctx, port ? Number(port) : undefined); emit(g, renderPorts(r, ctx.host.name), r); }));
@@ -118,6 +138,16 @@ export function buildProgram(io: Io = defaultIo): Command {
         defaultUnpackDeps(),
       );
       emit(g, renderUnpack(r), r);
+    }));
+  program.command('install').description('put a `mcproc` shortcut on your shell PATH for this checkout (a launcher in ~/.local/bin), or remove it')
+    .option('--bin-dir <dir>', 'where the launcher goes (default ~/.local/bin)')
+    .option('--uninstall', 'remove the launcher written by a previous install')
+    .action(wrap(async (g, o) => {
+      const r = installShortcut({ binDir: o.binDir as string | undefined, uninstall: Boolean(o.uninstall) });
+      const lines = r.removed ? [`removed ${r.launcher}`]
+        : r.written ? [`wrote ${r.launcher} → node ${r.cli}`, r.rcUpdated ? `added a PATH line for ${r.binDir} to ${r.rcFile}` : r.onPath ? `${r.binDir} is already on PATH` : `${r.rcFile} already has the PATH line`]
+        : [];
+      emit(g, [...lines, ...r.next.map((n) => `→ ${n}`)].join('\n'), r);
     }));
   program.command('mcp').description('run the MCP server on stdio (register this command in your agent client)')
     .action(wrap(async () => { await serveStdio(); }));

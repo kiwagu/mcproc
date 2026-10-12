@@ -11,6 +11,8 @@ and `docker exec`. The processes are plain pm2 processes: `pm2 monit` in any she
 npm i -g mcproc            # or run it with: npx -y mcproc
 claude mcp add -s user mcproc -- mcproc mcp       # Claude Code, once, user scope
 ```
+From a checkout instead: `bun run build && node dist/cli.js install` writes a `mcproc` launcher into
+`~/.local/bin` (adding that directory to your shell rc when it is not on `PATH` yet); `install --uninstall` removes it.
 Codex (`~/.codex/config.toml`):
 ```toml
 [mcp_servers.mcproc]
@@ -94,8 +96,12 @@ Every tool takes `project` and `host`. Read-only tools are annotated as such; mu
 A terminal dashboard on the same data: a table of apps with real memory and CPU (summed over each
 app's process tree, which is what `bun run dev` or `next dev` hide behind their launcher), the ports
 with ✓/✗, the runtime command, a live log tail with history, and the selected app's details.
-`↑`/`↓` select, `r`/`s`/`x` restart/start/stop, `o`/`e`/`b` switch the log stream, `h` cycles hosts,
-`q` quits. `mcproc monit --once` prints one frame as text, which is what an agent or a script reads.
+`j`/`k` (or Tab) select an app, `↑`/`↓`, PageUp/PageDown and the mouse wheel scroll the log pane (End
+returns to the tail), `r`/`s`/`x` restart/start/stop, `o`/`e`/`b` switch the log stream, `f` switches to the
+flat view (every app's logs merged into one labeled stream, `app | line`, `app ! line` for stderr, one
+color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. Long log lines
+wrap with indented continuations. `mcproc monit --once` prints one frame as text, which is what an
+agent or a script reads.
 
 Memory is the sum of each process's resident set, so shared pages count once per process; pm2's own
 root-pid figure is shown next to it in the details. CPU is per core over the refresh interval.

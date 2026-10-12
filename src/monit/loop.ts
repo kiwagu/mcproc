@@ -34,7 +34,7 @@ export class MonitLoop {
     private readonly deps: LoopDeps,
     private readonly opts: { lines: number },
     private readonly getState: () => MonitState,
-    private readonly dispatch: (a: MonitAction) => void,
+    public readonly dispatch: (a: MonitAction) => void,
   ) {}
 
   /** One refresh of the current host; a refresh of the same generation already in flight is shared, not duplicated. */
@@ -60,26 +60,32 @@ export class MonitLoop {
       if (gen !== this.gen) return; // a host switch happened meanwhile
       if (snap.stats.samples[0]) this.prev = { sample: snap.stats.samples[0], at: snap.sampledAt };
       this.dispatch({ type: 'rows', rows: this.deps.rows(ctx, snap), at: new Date() });
-      const row = selectedRow(this.getState());
-      const proc = row ? findProcess(snap.procs, ctx.manifest.project, row.app) : undefined;
-      if (!row || !proc) return;
-      const paths = { out: proc.out_log, err: proc.err_log };
-      let f = this.followers.get(row.app);
-      if (!f) { f = this.deps.follower(ctx, paths, this.opts.lines); this.followers.set(row.app, f); }
-      const r = await f.poll();
-      if (gen !== this.gen || selectedRow(this.getState())?.app !== row.app) return; // the selection or the host moved on during the poll
-      this.dispatch({ type: 'logs', lines: r.lines, reset: r.reset, paths });
+      // every app gets its own buffer and follower; the dashboard polls the selected app, the flat view every running one.
+      // Lines are consumed from the file by offset, so a poll's result always lands in its app's buffer — even if the
+      // selection moved on meanwhile (the reducer only shows the selected app; nothing is lost).
+      const selected = selectedRow(this.getState())?.app;
+      const apps = this.getState().view === 'flat' ? Object.keys(ctx.manifest.apps) : selected ? [selected] : [];
+      for (const app of apps) {
+        const proc = findProcess(snap.procs, ctx.manifest.project, app);
+        if (!proc) continue;
+        const paths = { out: proc.out_log, err: proc.err_log };
+        let f = this.followers.get(app);
+        if (!f) { f = this.deps.follower(ctx, paths, this.opts.lines); this.followers.set(app, f); }
+        const r = await f.poll();
+        if (gen !== this.gen) return; // the host moved on during the poll
+        this.dispatch({ type: 'logs', app, lines: r.lines, reset: r.reset, paths });
+      }
     } catch (e) {
       if (gen === this.gen) this.dispatch({ type: 'error', message: describeError(e) });
     }
   }
 
-  /** The user moved the selection: the newly selected app's log view starts from its history. */
+  /** The user moved the selection: refresh so an app seen for the first time gets its follower (history) at once. */
   dispatchSelect(delta: number): void {
     const before = selectedRow(this.getState())?.app;
     this.dispatch({ type: 'select', delta });
     const after = selectedRow(this.getState())?.app;
-    if (after && after !== before) { this.followers.delete(after); void this.refreshAfterCurrent(); }
+    if (after && after !== before) void this.refreshAfterCurrent();
   }
 
   async switchHost(next: string): Promise<void> {

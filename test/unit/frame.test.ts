@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { initialState, reduce } from '../../src/monit/state.js';
-import { renderFrame, frameToText } from '../../src/monit/frame.js';
+import { renderFrame, frameToText, paneTitle, wrapText } from '../../src/monit/frame.js';
 import type { LsRow } from '../../src/core/list.js';
 
 const web: LsRow = { app: 'web', kind: 'server', description: 'dashboard (Next dev)', status: 'online', pm_id: 1, pid: 971175, uptime_ms: 22 * 60_000, restarts: 0, cpu: 84.4, memory: 2_200_000_000, procs: 3, runtime: 'next-server (v16.2.9) with a very long tail of arguments that must be cut', pm2_cpu: 0, pm2_memory: 9_000_000, metrics_source: 'tree', url: 'http://localhost:3100/', url_status: 'ok', url_code: 200,
@@ -32,11 +32,72 @@ describe('renderFrame', () => {
     let s = reduce(base(), { type: 'error', message: 'TRANSPORT_FAILED: ssh stand: Connection refused' });
     expect(renderFrame(s, { width: 120, height: 30 }).footer).toContain('ERROR: TRANSPORT_FAILED');
     expect(renderFrame(s, { width: 80, height: 24 }).footer).toMatch(/^ERROR: TRANSPORT_FAILED: ssh stand: Connection refused/); // the error leads: a narrow terminal must not hide it behind the key legend
-    expect(renderFrame(base(), { width: 80, height: 24 }).footer).toMatch(/^↑↓ app/);
-    s = reduce(base(), { type: 'logs', lines: Array.from({ length: 50 }, (_, i) => ({ stream: 'out' as const, text: `2026-10-11T13:00:${String(i).padStart(2, '0')}: line ${i}` })) });
+    expect(renderFrame(base(), { width: 80, height: 24 }).footer).toMatch(/^j\/k app/);
+    s = reduce(base(), { type: 'logs', app: 'web', lines: Array.from({ length: 50 }, (_, i) => ({ stream: 'out' as const, text: `2026-10-11T13:00:${String(i).padStart(2, '0')}: line ${i}` })) });
     const f = renderFrame(s, { width: 120, height: 24 });
-    expect(f.logs.length).toBeLessThan(50);
+    expect(f.logs.length).toBe(10); // 24 rows − header − 3 table lines − 3 pane titles − 6 details − footer: borderless panes, no frame rows
     expect(f.logs.at(-1)).toContain('line 49');
     expect(frameToText(f)).toContain('line 49');
+  });
+  it('log lines wrap at the width with indented continuations instead of being cut; the pane shows the last rows that fit', () => {
+    expect(wrapText('abcdefghij', 4, 1)).toEqual(['abcd', ' efg', ' hij']);
+    expect(wrapText('short', 10, 2)).toEqual(['short']);
+    const long = 'x'.repeat(150);
+    const s = reduce(base(), { type: 'logs', app: 'web', lines: [{ stream: 'out', text: 'first' }, { stream: 'err', text: long }] });
+    const f = renderFrame(s, { width: 60, height: 30 });
+    expect(f.logs[0]).toBe('  first');
+    expect(f.logs.slice(1)).toEqual([`! ${'x'.repeat(58)}`, `  ${'x'.repeat(58)}`, `  ${'x'.repeat(34)}`]);
+    for (const line of f.logs) expect(line.length).toBeLessThanOrEqual(60);
+    const tiny = renderFrame(s, { width: 60, height: 14 }); // 3 rows of logs fit: the tail of the wrapped text, not its head
+    expect(tiny.logs.at(-1)).toBe(`  ${'x'.repeat(34)}`);
+    expect(tiny.logs).toHaveLength(3);
+  });
+  it('a scrolled log pane hides that many newest entries and shows the tail of the rest; the footer names the scroll keys', () => {
+    let s = reduce(base(), { type: 'logs', app: 'web', lines: Array.from({ length: 30 }, (_, i) => ({ stream: 'out' as const, text: `2026-10-11T13:00:${String(i).padStart(2, '0')}: line ${i}` })) });
+    expect(renderFrame(s, { width: 120, height: 24 }).logs.at(-1)).toContain('line 29');
+    s = reduce(s, { type: 'scroll', delta: 5 });
+    const f = renderFrame(s, { width: 120, height: 24 });
+    expect(f.logs.at(-1)).toContain('line 24');
+    expect(f.logs).toHaveLength(10);
+    expect(f.footer).toContain('↑↓ scroll');
+    expect(f.footer).toContain('j/k app');
+    let flat = reduce(reduce(base(), { type: 'view', view: 'flat' }), { type: 'logs', app: 'web', lines: Array.from({ length: 30 }, (_, i) => ({ stream: 'out' as const, text: `line ${i}` })) });
+    flat = reduce(flat, { type: 'scroll', delta: 3 });
+    expect(renderFrame(flat, { width: 120, height: 24 }).logs.at(-1)).toContain('line 26');
+  });
+  it('scrolling stops at the top with a full pane (the view never shrinks) and the frame reports the ceiling', () => {
+    let s = reduce(base(), { type: 'logs', app: 'web', lines: Array.from({ length: 30 }, (_, i) => ({ stream: 'out' as const, text: `line ${i}` })) });
+    s = reduce(s, { type: 'scroll', delta: 100, max: 1000 });
+    const f = renderFrame(s, { width: 120, height: 24 }); // 10 log rows
+    expect(f.logs).toHaveLength(10);
+    expect(f.logs[0]).toBe('  line 0');
+    expect(f.logs[9]).toBe('  line 9');
+    expect(f.maxScroll).toBe(20);
+    expect(f.scroll).toBe(20);
+    const long = 'x'.repeat(150); // 3 rows each at width 60
+    let w = reduce(base(), { type: 'logs', app: 'web', lines: Array.from({ length: 4 }, () => ({ stream: 'err' as const, text: long })) });
+    w = reduce(w, { type: 'scroll', delta: 50, max: 50 });
+    const g = renderFrame(w, { width: 60, height: 14 }); // 3 log rows: one wrapped entry fills the pane
+    expect(g.maxScroll).toBe(3);
+    expect(g.logs).toEqual([`! ${'x'.repeat(58)}`, `  ${'x'.repeat(58)}`, `  ${'x'.repeat(34)}`]);
+  });
+  it('flat view: no table or details, every app\'s lines labeled and padded, continuations indented under the text, f returns', () => {
+    let s = reduce(base(), { type: 'view', view: 'flat' });
+    s = reduce(s, { type: 'logs', app: 'web', lines: [{ stream: 'out', text: '2026-10-11T13:00:07: hello' }] });
+    s = reduce(s, { type: 'logs', app: 'docs', lines: [{ stream: 'err', text: '2026-10-11T13:00:08: ' + 'y'.repeat(80) }] });
+    const f = renderFrame(s, { width: 60, height: 20 });
+    expect(f.table).toEqual([]);
+    expect(f.details).toEqual([]);
+    expect(f.logs[0]).toBe('web  | 2026-10-11T13:00:07: hello');
+    expect(f.logs[1]).toBe(`docs ! 2026-10-11T13:00:08: ${'y'.repeat(60 - 28)}`);
+    expect(f.logs[2]).toMatch(/^ {7}y+$/);
+    expect(f.footer).toContain('f dashboard');
+    expect(f.footer).not.toContain('r restart');
+    expect(frameToText(f)).toContain('web  | 2026-10-11T13:00:07: hello');
+  });
+  it('pane titles are one full-width rule with the label inset, so a selection copies text, never a frame', () => {
+    expect(paneTitle('apps', 20)).toBe('── apps ' + '─'.repeat(12));
+    expect(paneTitle('logs · server · both', 10)).toHaveLength(10);
+    expect(paneTitle('logs · server · both', 10)).toMatch(/^── logs/);
   });
 });

@@ -44,9 +44,18 @@ describe('MonitLoop', () => {
     await h.loop.refresh();
     expect(h.actions.map((a) => a.type)).toEqual(['rows', 'logs']);
     expect(h.state.logPaths).toEqual({ out: '/l/api-out', err: '/l/api-err' });
-    expect(h.state.logs.map((l) => l.text)).toEqual(['line']);
+    expect(h.state.logs.api.map((l) => l.text)).toEqual(['line']);
   });
 
+  it('flat view: a refresh polls every running app and dispatches labeled flat lines instead of the selected app\'s logs', async () => {
+    const polled: string[] = [];
+    const h = harness('local', { follower: (_c, paths) => ({ poll: async () => { polled.push(paths.out); return { lines: [{ stream: 'out', text: `from ${paths.out}` }], reset: false }; } }) });
+    h.loop.dispatch({ type: 'view', view: 'flat' });
+    await h.loop.refresh();
+    expect(polled).toEqual(['/l/api-out', '/l/w-out']);
+    expect(h.actions.map((a) => a.type)).toEqual(['view', 'rows', 'logs', 'logs']);
+    expect(h.state.logs).toEqual({ api: [{ stream: 'out', text: 'from /l/api-out' }], worker: [{ stream: 'out', text: 'from /l/w-out' }] });
+  });
   it('refuses commands on a readonly host before touching it, and the failure stays in the footer', async () => {
     const h = harness('prod'); // readonly in the fixture
     await h.loop.refresh();
@@ -68,7 +77,7 @@ describe('MonitLoop', () => {
     expect(h.state.busy).toBe(false);
   });
 
-  it('log lines of an app deselected during the poll never land in the new selection', async () => {
+  it('log lines of an app deselected during the poll land in that app\'s own buffer, never in the new selection', async () => {
     const d = deferred<{ lines: { stream: 'out'; text: string }[]; reset: boolean }>();
     const h = harness('local', { follower: () => ({ poll: () => d.promise }) });
     const p = h.loop.refresh();
@@ -77,7 +86,8 @@ describe('MonitLoop', () => {
     h.loop.dispatchSelect(1);                       // the user presses ↓: "worker" is selected, its log view is empty
     d.resolve({ lines: [{ stream: 'out', text: 'from api' }], reset: false });
     await p;
-    expect(h.state.logs).toEqual([]);
+    expect(h.state.logs.api?.map((l) => l.text)).toEqual(['from api']); // consumed from the file, so it must be kept
+    expect(h.state.logs.worker).toBeUndefined();
     expect(h.state.logPaths).toBeNull();
   });
 
