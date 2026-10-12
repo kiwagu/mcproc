@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { initialState, reduce } from '../../src/monit/state.js';
 import { renderFrame, frameToText, paneTitle, wrapText } from '../../src/monit/frame.js';
+import { displayWidth } from '../../src/monit/screentext.js';
 import type { LsRow } from '../../src/core/list.js';
 
 const web: LsRow = { app: 'web', host: 'local', kind: 'server', description: 'dashboard (Next dev)', status: 'online', pm_id: 1, pid: 971175, uptime_ms: 22 * 60_000, restarts: 0, cpu: 84.4, memory: 2_200_000_000, procs: 3, runtime: 'next-server (v16.2.9) with a very long tail of arguments that must be cut', pm2_cpu: 0, pm2_memory: 9_000_000, metrics_source: 'tree', url: 'http://localhost:3100/', url_status: 'ok', url_code: 200,
@@ -108,5 +109,31 @@ describe('renderFrame', () => {
     expect(f.table[2]).toMatch(/^ docs\s+box\s+online/);
     expect(f.details.join('\n')).toContain('zero-memory-web on local');
     expect(renderFrame(base(), { width: 160, height: 40 }).table[0]).not.toContain('HOST');
+  });
+  it('wraps by terminal columns: a wide character takes two and is never split across rows', () => {
+    expect(wrapText('中文中文中', 4, 0)).toEqual(['中文', '中文', '中']);
+    expect(wrapText('ab中文', 3, 1)).toEqual(['ab', ' 中', ' 文']);
+  });
+  it('every row of the screen fits the width in terminal columns and carries no emoji, whatever the logs, descriptions or errors hold', () => {
+    const noisy = 'msg=🚀 AI API ✅ ok ⚠️ warn 👨‍👩‍👧 🇺🇦 中文 字符 ' + 'x'.repeat(40) + '\tend\rlast segment ' + '中'.repeat(30);
+    const ports = { ...web.ports, actual: [{ ...web.ports.actual[0], command: 'srv🚀\tx' }], checks: [{ port: 3100, status: 'declared-not-listening' as const, held_by: { pid: 7, command: '🚀holder' } }] };
+    let s = reduce(base(), { type: 'rows', rows: [{ ...web, description: '🚀 dashboard ✅', runtime: 'next-server 🚀 中文', ports }, docs], at: new Date('2026-10-11T13:41:07') });
+    s = reduce(s, { type: 'logs', app: 'web', lines: [{ stream: 'out', text: noisy }, { stream: 'err', text: '✅'.repeat(50) }] });
+    s = reduce(s, { type: 'error', message: 'boom 🚀 ' + '中'.repeat(60) });
+    for (const view of ['dashboard', 'flat'] as const) {
+      const f = renderFrame(reduce(s, { type: 'view', view }), { width: 60, height: 30 });
+      for (const line of [f.header, ...f.table, ...f.logs, ...f.details, f.footer]) {
+        expect(displayWidth(line), line).toBeLessThanOrEqual(60);
+        expect(line).not.toMatch(/\p{Emoji_Presentation}|[\t\r]/u);
+      }
+      expect(f.logs.join('')).toContain('last segment');
+      expect(f.logs.join('')).not.toContain('x'.repeat(40) + ' '); // the text before the carriage return is gone
+    }
+  });
+  it('a pm2 line keeps its time stamp when carriage returns overwrote the text after it', () => {
+    const s = reduce(base(), { type: 'logs', app: 'web', lines: [{ stream: 'out', text: '2026-10-11T13:00:07: progress 10%\rprogress 50%\rprogress 100%' }] });
+    expect(renderFrame(s, { width: 120, height: 24 }).logs.at(-1)).toBe('  2026-10-11T13:00:07: progress 100%');
+    const flat = reduce(s, { type: 'view', view: 'flat' });
+    expect(renderFrame(flat, { width: 120, height: 24 }).logs.at(-1)).toBe('web  | 2026-10-11T13:00:07: progress 100%');
   });
 });
