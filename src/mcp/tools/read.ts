@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { commonInput, RO, runTool, type ToolDeps } from '../common.js';
+import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { prepare, connect } from '../../core/resolve.js';
 import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
 import { Fleet, defaultConnector, listFleet, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
 import { doctor } from '../../core/doctor.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, hostsOf } from '../render.js';
+import { takeIncidents } from '../../core/incidents/store.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, renderIncidents, hostsOf } from '../render.js';
 
 export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   const prep = async (args: { project?: string; host?: string }) => prepare({ project: args.project, host: args.host, roots: await deps.roots() });
@@ -72,5 +73,24 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     const ctx = await connect(await prep(args), { spawner: deps.spawner });
     const r = await portsReport(ctx, args.port);
     return { text: renderPorts(r, ctx.host.name), data: { host: ctx.host.name, ...r } };
+  }));
+
+  server.registerTool('incidents', {
+    title: 'Incidents',
+    description: 'Only the errors that are NEW since they were last taken, each with lines of context before and after (a folded stack trace included), plus crashes and restarts. A call takes what it returns: the pick-up point, kept in .mcproc/incidents.json and shared by every session, agent and CLI call, moves past them, so nobody gets them twice; peek: true looks without taking. A log clear (flush, or c in monit) starts incidents over from there. Cheap to poll: nothing new is one short line. During long work on running apps call it periodically, with your client\'s own loop/cron/monitor if it has one; read logs only for an incident worth a closer look.',
+    inputSchema: {
+      ...commonInput,
+      app: z.string().optional().describe('An app or a profile; default all apps'),
+      peek: z.boolean().optional().describe('Look without taking: the pick-up point stays (default false)'),
+      since: z.number().int().min(1).max(1440).optional().describe('First call only: minutes to look back in each log (default 15)'),
+      max: z.number().int().min(1).max(100).optional().describe('Most incidents returned, newest first (default 20)'),
+      context: z.tuple([z.number().int().min(0).max(50), z.number().int().min(0).max(50)]).optional().describe('[lines before, lines after] (default per app, 3 and 5)'),
+    },
+    annotations: MUT(false, false), // taking writes the local pick-up point; nothing changes on the hosts
+  }, (args) => runTool(async () => {
+    const fleet = await fleetOf(args);
+    const names = fleet.select([args.app ?? 'all']);
+    const { answer } = await takeIncidents(fleet, names, { peek: args.peek, sinceMin: args.since, max: args.max, context: args.context });
+    return { text: renderIncidents(answer), data: answer as unknown as Record<string, unknown> };
   }));
 }

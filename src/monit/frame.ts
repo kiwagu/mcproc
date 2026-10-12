@@ -3,6 +3,8 @@ import { fmtBytes, fmtCpu, fmtPorts, fmtUptime, fmtUrl, table } from '../mcp/ren
 import { selectedRow, visibleFlat, visibleLogs, type MonitState } from './state.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
 import { stripAnsi } from '../core/logs.js';
+import { markKey } from '../core/incidents/cursor.js';
+import { localStamp } from '../core/incidents/store.js';
 
 export interface Frame {
   header: string; table: string[]; logs: string[]; details: string[]; footer: string;
@@ -108,7 +110,7 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
     const label = Math.max(1, ...Object.keys(s.apps).map((a) => a.length));
     const logH = Math.max(3, size.height - 3); // header, the pane title, footer
     const p = pane(visibleFlat(s), s.logScroll, logH, (l) => cachedRows(flatRows, l, `${w}|${label}`, () => wrapText(`${l.app.padEnd(label)} ${l.stream === 'err' ? '!' : '|'} ${logText(l.text)}`, w, label + 3)));
-    const keys = '↑↓ scroll  f dashboard  o/e/b logs  h host  q quit';
+    const keys = '↑↓ scroll  c clear  f dashboard  o/e/b logs  h host  q quit';
     return { header, table: [], logs: p.rows, details: [], footer: cut(right ? `${right}  │ ${keys}` : keys, w), scroll: p.scroll, maxScroll: p.maxScroll };
   }
   const multi = new Set(s.rows.map((r) => r.host)).size > 1; // apps of several hosts on one screen: say where each runs
@@ -130,9 +132,18 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
     cut(screenText(`url: ${fmtUrl(r)}`), w),
     cut(screenText(`logs: ${s.logPaths ? `${s.logPaths.out} | ${s.logPaths.err}` : '-'}`), w),
   ] : ['no app selected'];
-  const keys = 'j/k app  ↑↓ scroll  r restart  s start  x stop  o/e/b logs  f flat  h host  q quit';
+  const keys = 'j/k app  ↑↓ scroll  r restart  s start  x stop  c clear  o/e/b logs  f flat  h host  q quit';
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return { header, table: tableLines, logs, details, footer, scroll: p.scroll, maxScroll: p.maxScroll };
+}
+
+/** The log pane's title: whose logs, which stream, the last clear of the apps shown, how far it is scrolled. */
+export function logsTitle(s: MonitState, scroll: number, now = new Date()): string {
+  const shown = s.view === 'flat' ? s.rows : [selectedRow(s)].filter((r): r is LsRow => r !== null);
+  const at = shown.map((r) => s.cleared[markKey(r.host, r.app)] ?? '').filter(Boolean).sort().at(-1);
+  const when = at ? ` · cleared ${at.slice(0, 10) === localStamp(now).slice(0, 10) ? at.slice(11, 16) : `${at.slice(0, 10)} ${at.slice(11, 16)}`}` : '';
+  const who = s.view === 'flat' ? 'all apps' : selectedRow(s)?.app ?? '-';
+  return `logs · ${who} · ${s.stream}${when}${scroll ? ` · ↑${scroll} (End: tail)` : ''}`;
 }
 
 /** A pane's one-line title rule: `── label ─────…` cut to the width. Panes have no frames, so a terminal selection copies text only. */

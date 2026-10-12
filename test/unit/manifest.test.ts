@@ -122,3 +122,22 @@ describe('scopeManifest', () => {
     expect(fleet.apps.web.depends_on).toEqual(['watch']); // the full manifest is untouched
   });
 });
+
+describe('errors settings', () => {
+  const app = (extra: string) => parse(`version: 1\napps:\n  a: { description: d, run: r${extra} }\n`).apps.a;
+  it('defaults: built-in markers on, stderr not an error, 3 lines before and 5 after', () => {
+    expect(app('').errors).toEqual({ match: [], ignore: [], context: [3, 5], stderr: false, defaults: true });
+  });
+  it('per-app settings; errors: false turns detection off', () => {
+    expect(app(`, errors: { match: ['5\\d\\d'], ignore: [healthcheck], context: [1, 2], stderr: true, defaults: false }`).errors)
+      .toEqual({ match: ['5\\d\\d'], ignore: ['healthcheck'], context: [1, 2], stderr: true, defaults: false });
+    expect(app(', errors: false').errors).toBeNull();
+  });
+  it('an invalid pattern is MANIFEST_INVALID naming the app and the pattern; context is bounded', () => {
+    expectInvalid(`version: 1\napps:\n  a: { description: d, run: r, errors: { match: ['(unclosed'] } }\n`, 'apps.a.errors.match: invalid pattern "(unclosed"');
+    expectInvalid('version: 1\napps:\n  a: { description: d, run: r, errors: { context: [3, 99] } }\n', 'errors.context');
+  });
+  it('a pattern that repeats a repeat (exponential on a near-miss line) is MANIFEST_INVALID with how to fix it', () => {
+    expectInvalid(`version: 1\napps:\n  a: { description: d, run: r, errors: { ignore: ['(\\w+\\s*)+healthcheck'] } }\n`, 'apps.a.errors.ignore: pattern "(\\w+\\s*)+healthcheck" repeats a group that ends in a repeat');
+  });
+});

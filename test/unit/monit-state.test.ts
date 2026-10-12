@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { initialState, reduce, keyIntent, selectedRow, visibleLogs, visibleFlat, monitViews, viewLabel, type MonitState } from '../../src/monit/state.js';
+import { CONFIRM_MS, initialState, reduce, keyIntent, selectedRow, visibleLogs, visibleFlat, monitViews, viewLabel, type MonitState } from '../../src/monit/state.js';
 import type { LsRow } from '../../src/core/list.js';
 
 const row = (app: string, status = 'online'): LsRow => ({ app, host: 'local', kind: 'server', description: `${app} desc`, status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0, procs: 1, runtime: null, pm2_cpu: 0, pm2_memory: 0, metrics_source: 'tree', url: null, url_status: 'unchecked', url_code: null, ports: { actual: [], declared: [], checks: [], undeclared: [] } });
@@ -158,5 +158,26 @@ describe('selection while hosts answer one by one', () => {
     s = reduce(s, { type: 'host', host: 'local' });                // a new view starts unchosen again
     s = reduce(s, { type: 'rows', rows: [row('web'), row('api')], at: new Date(3) });
     expect(selectedRow(s)?.app).toBe('web');
+  });
+});
+
+describe('the clear key', () => {
+  const rows = () => reduce(s0(), { type: 'rows', rows: [row('api'), row('web', 'stopped'), row('worker')] });
+  it('c arms with a notice naming the running apps; c again within CONFIRM_MS clears them; later it arms again', () => {
+    const i1 = keyIntent('c', rows(), 1000);
+    expect(i1).toEqual({ kind: 'action', action: { type: 'arm', at: 1000, apps: ['api', 'worker'] } });
+    const s1 = reduce(rows(), { type: 'arm', at: 1000, apps: ['api', 'worker'] });
+    expect(s1.notice).toBe('press c again to clear the logs of api, worker (incidents start over there)');
+    expect(keyIntent('c', s1, 1000 + CONFIRM_MS)).toEqual({ kind: 'clear', apps: ['api', 'worker'] });
+    expect(keyIntent('c', s1, 1001 + CONFIRM_MS)).toMatchObject({ kind: 'action', action: { type: 'arm', at: 1001 + CONFIRM_MS } });
+  });
+  it('a cancel takes the prompt away; with nothing running, or while busy, c does nothing', () => {
+    const s1 = reduce(rows(), { type: 'arm', at: 1000, apps: ['api'] });
+    expect(reduce(s1, { type: 'arm', at: null })).toMatchObject({ armedAt: null, notice: null });
+    expect(keyIntent('c', reduce(rows(), { type: 'busy', busy: true }), 0)).toBeNull();
+    expect(keyIntent('c', reduce(s0(), { type: 'rows', rows: [row('api', 'stopped')] }), 0)).toBeNull();
+  });
+  it('the recorded clears are kept as the store has them', () => {
+    expect(reduce(s0(), { type: 'cleared', cleared: { 'local/api': '2026-10-12T15:04:05' } }).cleared).toEqual({ 'local/api': '2026-10-12T15:04:05' });
   });
 });

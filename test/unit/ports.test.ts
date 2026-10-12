@@ -10,7 +10,7 @@ import { probeOut } from '../helpers/probe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fx = (p: string) => fs.readFileSync(path.join(here, '..', 'fixtures', 'probe', p), 'utf8');
-const app = (name: string, ports: number[] = []): App => ({ name, description: name, kind: 'server', run: 'x', cwd: '.', env: {}, ports, url: null, depends_on: [], autorestart: true, pm2: {}, host: null });
+const app = (name: string, ports: number[] = []): App => ({ name, description: name, kind: 'server', run: 'x', cwd: '.', env: {}, ports, url: null, depends_on: [], autorestart: true, pm2: {}, host: null, errors: null });
 
 describe('probeScript', () => {
   it('contains every marker and the pm2 command', () => {

@@ -8,7 +8,7 @@ import { Fleet, type Connector } from '../../src/core/fleet.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import type { LsRow, Snapshot } from '../../src/core/list.js';
 import { EMPTY_STATS, type StatSample } from '../../src/core/stats.js';
-import { MonitLoop, type LoopDeps } from '../../src/monit/loop.js';
+import { MonitLoop, type Follower, type LoopDeps } from '../../src/monit/loop.js';
 import { appInfos, initialState, monitViews, reduce, viewLabel, type MonitAction, type MonitState } from '../../src/monit/state.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +42,8 @@ function harness(requested: string | undefined, over: Partial<LoopDeps> = {}, op
     rows: (ctx, _snap, apps) => apps.filter((a) => a !== 'api-build').map((a) => row(a, ctx.host.name)),
     follower: () => ({ poll: async () => ({ lines: [{ stream: 'out', text: 'line' }], reset: false }) }),
     command: async (f, cmd, app) => { commands.push(`${cmd} ${app} via ${f.requested ?? 'all'}`); },
+    clear: async (_f, apps) => apps.map((app) => ({ app, host: 'local', out_bytes: 0, err_bytes: 0 })),
+    cleared: () => ({ at: {}, gen: {} }),
     ...over,
   };
   const loop = new MonitLoop(fleet, deps, { lines: 10 }, () => state, (a) => { actions.push(a); state = reduce(state, a); });
@@ -127,6 +129,73 @@ describe('MonitLoop', () => {
     expect(h.state.error).toContain('TRANSPORT_FAILED');
     expect(h.state.rows).toHaveLength(2);
     expect(h.state.busy).toBe(false);
+  });
+  it('runClear clears the running apps through the store, skips and names those on a readonly host, then shows the clear', async () => {
+    const asked: string[][] = [];
+    let store: Record<string, string> = {};
+    const h = harness(undefined, {
+      clear: async (_f, apps) => { asked.push(apps); store = { 'local/watch': '2026-10-12T15:04:05' }; return apps.map((app) => ({ app, host: 'local', out_bytes: 2048, err_bytes: 0 })); },
+      cleared: () => ({ at: store, gen: {} }),
+    }, { dir: fleetDir });
+    await h.loop.runClear(['watch', 'audit']);
+    expect(asked).toEqual([['watch']]);
+    expect(h.state.notice).toBe('cleared logs of watch (2K); incidents start here; skipped audit (readonly host)');
+    expect(h.state.cleared).toEqual({ 'local/watch': '2026-10-12T15:04:05' });
+    expect(h.state.busy).toBe(false);
+  });
+  it('runClear: only readonly apps clear nothing; a failed clear says why', async () => {
+    const h = harness(undefined, { clear: async () => { throw new McprocError('TRANSPORT_FAILED', 'ssh box: down'); } }, { dir: fleetDir });
+    await h.loop.runClear(['audit']);
+    expect(h.state.notice).toBe('nothing cleared; skipped audit (readonly host)');
+    await h.loop.runClear(['watch']);
+    expect(h.state.notice).toBe('clear failed: TRANSPORT_FAILED: ssh box: down');
+    const partial = harness(undefined, { clear: async () => [{ app: 'watch', host: 'local', out_bytes: 0, err_bytes: 0, failed: ['/l/watch-err'] }] }, { dir: fleetDir });
+    await partial.loop.runClear(['watch']);
+    expect(partial.state.notice).toBe('cleared logs of watch (0B); incidents start here; could not truncate /l/watch-err (its incidents go on from before)');
+    expect(h.state.busy).toBe(false);
+  });
+  it('a clear seen in the store starts that app\'s logs over: the buffer empties and a new follower reads the emptied file', async () => {
+    let store = { at: {} as Record<string, string>, gen: {} as Record<string, number> };
+    let made = 0;
+    const h = harness(undefined, { cleared: () => store, follower: () => { const n = ++made; return { poll: async () => ({ lines: [{ stream: 'out' as const, text: `line ${n}` }], reset: false }) }; } });
+    await h.loop.refresh();
+    expect(h.state.logs.api.map((l) => l.text)).toEqual(['line 1']);
+    store = { at: { 'local/api': '2026-10-12T15:04:05' }, gen: { 'local/api': 1 } }; // cleared by the CLI or an agent
+    await h.loop.refresh();
+    expect(made).toBe(2);
+    expect(h.state.logs.api.map((l) => l.text)).toEqual(['line 2']);
+    store = { at: store.at, gen: { 'local/api': 2 } }; // cleared again within the same second: the time shown is the same
+    await h.loop.refresh();
+    expect(made).toBe(3);
+    expect(h.state.logs.api.map((l) => l.text)).toEqual(['line 3']);
+  });
+  it('lines read across a clear are dropped: they come from before it', async () => {
+    let store = { at: {} as Record<string, string>, gen: {} as Record<string, number> };
+    const gate = deferred<Awaited<ReturnType<Follower['poll']>>>();
+    let made = 0;
+    const h = harness(undefined, {
+      cleared: () => store,
+      clear: async (_f, apps) => { store = { at: { 'local/api': '2026-10-12T15:04:05' }, gen: { 'local/api': 1 } }; return apps.map((app) => ({ app, host: 'local', out_bytes: 0, err_bytes: 0 })); },
+      follower: () => { const n = ++made; return { poll: () => (n === 1 ? gate.promise : Promise.resolve({ lines: [], reset: false })) }; },
+    });
+    const first = h.loop.refresh(); // api's first read waits
+    await tick();
+    const clearing = h.loop.runClear(['api']);
+    await tick();
+    gate.resolve({ lines: [{ stream: 'out', text: 'before the clear' }], reset: false });
+    await first;
+    await clearing;
+    expect((h.state.logs.api ?? []).map((l) => l.text)).toEqual([]);
+    expect(made).toBe(2);
+  });
+  it('every refresh re-reads the recorded clears, so a clear from the CLI or an agent shows too', async () => {
+    let store: Record<string, string> = {};
+    const h = harness(undefined, { cleared: () => ({ at: store, gen: {} }) });
+    await h.loop.refresh();
+    expect(h.actions.some((a) => a.type === 'cleared')).toBe(false); // unchanged: nothing dispatched
+    store = { 'local/api': '2026-10-12T15:04:05' };
+    await h.loop.refresh();
+    expect(h.state.cleared).toEqual({ 'local/api': '2026-10-12T15:04:05' });
   });
 });
 

@@ -2,13 +2,13 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, runTool, type ToolDeps } from '../common.js';
 import { prepare, assertWritable, resolveProjectDir } from '../../core/resolve.js';
-import { Fleet, defaultConnector, actOn, assertWritableRuns, type Act } from '../../core/fleet.js';
-import { flushLogs } from '../../core/logs.js';
+import { Fleet, defaultConnector, actOn, type Act } from '../../core/fleet.js';
+import { clearLogs } from '../../core/incidents/store.js';
 import { initProject } from '../../core/init.js';
 import type { LsRow } from '../../core/list.js';
 import { createTransport } from '../../transport/index.js';
 import { unpack, defaultUnpackDeps } from '../../runtime/unpack.js';
-import { renderLs, renderUnpack, startNote, hostsOf } from '../render.js';
+import { renderLs, renderUnpack, renderFlushed, startNote, hostsOf } from '../render.js';
 
 export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
   // apps run at their own host (`host:` in the manifest); host narrows a call to the apps that run there. Targets and
@@ -61,16 +61,14 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('flush', {
-    title: 'Flush logs', description: 'Truncate the pm2 log files of one app, or of every app of the project (each on the host it runs on; with host, the apps that run there).',
+    title: 'Flush logs', description: 'Truncate the pm2 log files of one app, or of every app of the project (each on the host it runs on; with host, the apps that run there). Incidents start over from the flush: nothing logged before it is reported again.',
     inputSchema: { ...commonInput, app: z.string().optional() }, annotations: MUT(true, true),
   }, (args) => runTool(async () => {
     const fleet = await fleetOf(args);
-    const groups = fleet.groups(fleet.select(args.app ? [args.app] : ['all']));
-    assertWritableRuns(fleet, groups);
-    const r = [];
-    for (const g of groups) r.push(...(await flushLogs(await fleet.ctx(g.host), g.apps)).map((x) => ({ ...x, host: g.host })));
-    const multi = groups.length > 1;
-    return { text: r.length ? r.map((x) => `${x.app}${multi ? ` (${x.host})` : ''}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush (no pm2 processes for this project there)', data: { hosts: groups.map((g) => g.host), flushed: r } };
+    const names = fleet.select(args.app ? [args.app] : ['all']);
+    const hosts = fleet.groups(names).map((g) => g.host);
+    const r = await clearLogs(fleet, names);
+    return { text: renderFlushed(r, hosts.length > 1), data: { hosts, flushed: r } };
   }));
 
   server.registerTool('unpack', {

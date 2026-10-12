@@ -4,11 +4,12 @@ import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
 import { LogFollower } from '../core/logfollow.js';
-import { appInfos, initialState, keyIntent, monitViews, selectedRow, viewLabel, type MonitState } from './state.js';
-import { paneTitle, renderFrame, type Frame } from './frame.js';
+import { appInfos, CONFIRM_MS, initialState, keyIntent, monitViews, viewLabel, type MonitState } from './state.js';
+import { logsTitle, paneTitle, renderFrame, type Frame } from './frame.js';
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
+import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 
 const deps = (manifest: Manifest): LoopDeps => ({
   fleet: (requested) => new Fleet(manifest, requested),
@@ -16,6 +17,8 @@ const deps = (manifest: Manifest): LoopDeps => ({
   rows: rowsFor,
   follower: (ctx, paths, lines) => new LogFollower(ctx, paths, lines),
   command: (fleet, cmd, app) => actOn(fleet, app, cmd),
+  clear: (fleet, apps) => clearLogs(fleet, apps),
+  cleared: (fleet) => { const s = readStore(storePath(fleet.manifest.path)); return { at: s.cleared, gen: s.clears }; },
 });
 
 /** The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. */
@@ -35,12 +38,12 @@ export async function runMonit(opts: { project?: string; host?: string; interval
   const header = box({ top: 0, height: 1 });
   const appsTitle = box({ top: 1, height: 1 });
   const tableBox = box({ top: 2, height: 1 });
-  const logsTitle = box({ top: 3, height: 1 });
+  const logsHead = box({ top: 3, height: 1 });
   const logBox = box({ top: 4, height: 5, scrollable: true, alwaysScroll: true });
   const detailsTitle = box({ bottom: 7, height: 1 });
   const detailsBox = box({ bottom: 1, height: 6 });
   const footer = box({ bottom: 0, height: 1 });
-  for (const b of [header, appsTitle, tableBox, logsTitle, logBox, detailsTitle, detailsBox, footer]) screen.append(b);
+  for (const b of [header, appsTitle, tableBox, logsHead, logBox, detailsTitle, detailsBox, footer]) screen.append(b);
 
   // labels get the same ANSI colors as `mcproc logs`; blessed renders SGR codes in content, and the log text itself is
   // reduced by screen text to the apps' own color codes in the form blessed reads; tags are off, so no escaping is involved
@@ -54,13 +57,12 @@ export async function runMonit(opts: { project?: string; host?: string; interval
   const size = () => ({ width: screen.width as number, height: screen.height as number });
   const show = (f: Frame) => {
     const { width: w, height: h } = size();
-    const scrolled = f.scroll ? ` · ↑${f.scroll} (End: tail)` : '';
     header.setContent(f.header);
     footer.setContent(f.footer);
     if (state.view === 'flat') {
       for (const b of [appsTitle, tableBox, detailsTitle, detailsBox]) b.hide();
-      logsTitle.top = 1;
-      logsTitle.setContent(paneTitle(`logs · all apps · ${state.stream}${scrolled}`, w));
+      logsHead.top = 1;
+      logsHead.setContent(paneTitle(logsTitle(state, f.scroll), w));
       logBox.top = 2;
       logBox.height = Math.max(3, h - 3);
       logBox.setContent(f.logs.map(colorLabel).join('\n'));
@@ -69,8 +71,8 @@ export async function runMonit(opts: { project?: string; host?: string; interval
       appsTitle.setContent(paneTitle('apps', w));
       tableBox.height = f.table.length;
       tableBox.setContent(f.table.join('\n'));
-      logsTitle.top = 2 + f.table.length;
-      logsTitle.setContent(paneTitle(`logs · ${selectedRow(state)?.app ?? '-'} · ${state.stream}${scrolled}`, w));
+      logsHead.top = 2 + f.table.length;
+      logsHead.setContent(paneTitle(logsTitle(state, f.scroll), w));
       logBox.top = 3 + f.table.length;
       logBox.height = Math.max(3, h - logBox.top - 8); // 8: details title + 6 details + footer
       logBox.setContent(f.logs.join('\n'));
@@ -89,14 +91,21 @@ export async function runMonit(opts: { project?: string; host?: string; interval
     const quit = () => { clearInterval(timer); screen.destroy(); resolve(); };
     screen.on('keypress', (_ch: string, key: { full?: string; name?: string }) => {
       const intent = keyIntent(key.full ?? key.name ?? '', state);
+      // a pending clear waits for its second c; any other key cancels it
+      if (state.armedAt !== null && !(intent?.kind === 'action' && intent.action.type === 'arm')) dispatch({ type: 'arm', at: null });
       if (!intent) return;
       if (intent.kind === 'quit') return quit();
       if (intent.kind === 'action') {
+        if (intent.action.type === 'arm') {
+          const at = intent.action.at;
+          setTimeout(() => { if (state.armedAt === at) dispatch({ type: 'arm', at: null }); }, CONFIRM_MS + 50).unref();
+        }
         if (intent.action.type === 'select') loop.dispatchSelect(intent.action.delta);
         else { dispatch(intent.action); if (intent.action.type === 'view') void loop.refresh(); } // fill the new view at once
         return;
       }
       if (intent.kind === 'host-next') return void loop.nextView();
+      if (intent.kind === 'clear') return void loop.runClear(intent.apps);
       void loop.runCommand(intent.cmd, intent.app);
     });
     screen.on('resize', paint);

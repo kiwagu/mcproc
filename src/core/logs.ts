@@ -1,5 +1,5 @@
 import { McprocError } from './errors.js';
-import { findProcess } from './pm2.js';
+import { findProcess, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
@@ -50,17 +50,23 @@ export async function readLogs(ctx: Context, app: string, opts: { lines?: number
   return result;
 }
 
-/** Truncate the log files of one app, of the listed apps, or of every app of the context's host. */
-export async function flushLogs(ctx: Context, app?: string | string[]): Promise<{ app: string; out_bytes: number; err_bytes: number }[]> {
+/**
+ * Truncate the log files of one app, of the listed apps, or of every app of the context's host; each with its pm2 process
+ * as it was and the files it could not truncate (a file is named there unless the host confirmed it is empty now).
+ */
+export async function flushLogs(ctx: Context, app?: string | string[]): Promise<{ app: string; out_bytes: number; err_bytes: number; failed: string[]; proc: Pm2Process }[]> {
   const procs = await ctx.pm2.jlist();
   const names = app === undefined ? Object.keys(ctx.manifest.apps) : typeof app === 'string' ? [app] : app;
   const targets = names.flatMap((n) => { const p = findProcess(procs, ctx.manifest.project, n); return p ? [{ n, p }] : []; });
   if (targets.length === 0) return [];
   const cmd = targets
     .flatMap(({ p }) => [p.out_log, p.err_log])
-    .map((f) => `{ wc -c < ${shq(f)} 2>/dev/null || echo 0; }; : > ${shq(f)} 2>/dev/null`)
+    .map((f) => `{ wc -c < ${shq(f)} 2>/dev/null || echo 0; }; if : > ${shq(f)} 2>/dev/null; then echo ok; else echo fail; fi`)
     .join('; ');
   const res = ensureOk(await ctx.transport.exec(cmd), ctx.host, 'flush logs');
-  const nums = res.stdout.trim().split('\n').map((s) => Number(s.trim()) || 0);
-  return targets.map(({ n }, i) => ({ app: n, out_bytes: nums[i * 2] ?? 0, err_bytes: nums[i * 2 + 1] ?? 0 }));
+  const out = res.stdout.trim().split('\n').map((s) => s.trim()); // per file: its size before, then ok or fail
+  return targets.map(({ n, p }, i) => ({
+    app: n, out_bytes: Number(out[i * 4]) || 0, err_bytes: Number(out[i * 4 + 2]) || 0,
+    failed: [p.out_log, p.err_log].filter((_, k) => out[i * 4 + k * 2 + 1] !== 'ok'), proc: p,
+  }));
 }

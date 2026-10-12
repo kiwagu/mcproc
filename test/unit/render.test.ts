@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { startNote, renderLs, renderPorts, renderDoctor, renderUnpack, renderHosts, renderProject, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
+import { startNote, renderLs, renderPorts, renderDoctor, renderUnpack, renderHosts, renderProject, renderIncidents, renderFlushed, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
 
@@ -94,5 +94,38 @@ describe('renderUnpack', () => {
     expect(t).toContain("'/opt/rt/bin/pm2' monit");
     expect(t).toContain('kept-hand-written');
     expect(t).toContain('daemon is already running');
+  });
+});
+
+describe('renderIncidents', () => {
+  const inc = { app: 'web', host: 'local', kind: 'error' as const, stream: 'out' as const, time: '2026-10-12T11:24:55', first_time: '2026-10-12T11:20:01', count: 3, line: 'TypeError: x', before: ['b1'], after: ['    at f (/a.js:1:1)'], fingerprint: 'f' };
+  const base = { skipped: [], errors: [], more: 0, apps: 3, hosts: 2, latest: '2026-10-12T11:24:55', taken: true, cleared_at: null };
+  it('one header per incident, the marker line between its context; then how to go on', () => {
+    const t = renderIncidents({ ...base, incidents: [inc] });
+    expect(t.split('\n').slice(0, 4)).toEqual(['web@local 2026-10-12T11:24:55 error ×3 (first 2026-10-12T11:20:01, out)', '  │ b1', '  ▶ TypeError: x', '  │     at f (/a.js:1:1)']);
+    expect(t).toContain('next: call incidents again later (these are taken now); full logs with logs app=web');
+    expect(renderIncidents({ ...base, taken: false, incidents: [inc] })).toContain('(peeked: nothing taken)');
+  });
+  it('nothing new is one short line, with the last clear; skipped bytes, unreachable hosts and more are one line each', () => {
+    expect(renderIncidents({ ...base, incidents: [] })).toBe('no new incidents since 2026-10-12T11:24:55 (3 apps on 2 hosts)');
+    expect(renderIncidents({ ...base, incidents: [], apps: 1, hosts: 1 })).toBe('no new incidents since 2026-10-12T11:24:55 (1 app on 1 host)');
+    expect(renderIncidents({ ...base, incidents: [], cleared_at: '2026-10-12T15:04:05' })).toBe('no new incidents since 2026-10-12T11:24:55 (3 apps on 2 hosts; logs cleared 2026-10-12T15:04:05)');
+    const t = renderIncidents({ ...base, incidents: [inc], more: 4, skipped: [{ app: 'web', host: 'local', stream: 'out', bytes: 3 * 1048576 }], errors: [{ host: 'box', apps: ['api'], message: 'TRANSPORT_FAILED: down' }] });
+    expect(t).toContain('+4 older incidents not shown, taken with these (read logs for them)');
+    expect(t).toContain('skipped 3.0M of web out on local');
+    expect(t).toContain('box: TRANSPORT_FAILED: down');
+    expect(renderIncidents({ ...base, taken: false, incidents: [inc], more: 4 })).toContain('+4 more incidents (raise max)');
+  });
+  it('colors the marker line on request', () => {
+    expect(renderIncidents({ ...base, incidents: [inc] }, { color: true })).toContain('\x1b[31m');
+  });
+});
+
+describe('renderFlushed', () => {
+  it('one line per app, the host when several answered, the files that could not be truncated named', () => {
+    const r = [{ app: 'web', host: 'local', out_bytes: 100, err_bytes: 20 }, { app: 'api', host: 'box', out_bytes: 5, err_bytes: 0, failed: ['/l/api-err'] }];
+    expect(renderFlushed(r, true)).toBe('web (local): freed 120 bytes\napi (box): freed 5 bytes; could not truncate /l/api-err');
+    expect(renderFlushed([r[0]], false)).toBe('web: freed 120 bytes');
+    expect(renderFlushed([], false)).toBe('nothing to flush (no pm2 processes for this project there)');
   });
 });

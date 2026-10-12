@@ -47,11 +47,15 @@ describe('readLogs', () => {
 
 describe('flushLogs', () => {
   it('truncates out/err of each existing process and reports freed bytes', async () => {
-    const ctx = fakeCtx(basic, 'local', [{ match: 'jlist', result: { stdout: jlist } }, { match: 'wc -c', result: { stdout: '120\n7\n' } }]);
+    const ctx = fakeCtx(basic, 'local', [{ match: 'jlist', result: { stdout: jlist } }, { match: 'wc -c', result: { stdout: '120\nok\n7\nok\n' } }]);
     const r = await flushLogs(ctx);
-    expect(r).toEqual([{ app: 'worker', out_bytes: 120, err_bytes: 7 }]);
+    expect(r).toMatchObject([{ app: 'worker', out_bytes: 120, err_bytes: 7, failed: [], proc: { out_log: '/h/logs/worker-out.log' } }]);
     expect(ctx.fake.calls[1].cmd).toContain(`: > '/h/logs/worker-out.log'`);
     expect(ctx.fake.calls[1].cmd).not.toContain('api-out');
+  });
+  it('names each file it could not truncate instead of counting it as flushed', async () => {
+    const ctx = fakeCtx(basic, 'local', [{ match: 'jlist', result: { stdout: jlist } }, { match: 'wc -c', result: { stdout: '120\nfail\n7\nok\n', code: 1 } }]);
+    expect(await flushLogs(ctx)).toMatchObject([{ app: 'worker', out_bytes: 120, err_bytes: 7, failed: ['/h/logs/worker-out.log'] }]);
   });
 });
 

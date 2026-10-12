@@ -6,12 +6,13 @@ import { unpack, defaultUnpackDeps } from '../runtime/unpack.js';
 import type { WithNode } from '../runtime/decide.js';
 import { prepare, connect, assertWritable, resolveProjectDir } from '../core/resolve.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
-import { flushLogs } from '../core/logs.js';
+import { takeIncidents, clearLogs } from '../core/incidents/store.js';
+import type { CursorState } from '../core/incidents/cursor.js';
 import { streamLogs, defaultStreamDeps, resolveColor, type LogSource } from '../core/logstream.js';
 import { doctor } from '../core/doctor.js';
 import { initProject } from '../core/init.js';
-import { Fleet, actOn, listFleet, assertWritableRuns, describeFleetApp, type Act } from '../core/fleet.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderProject, renderUnpack, startNote, hostsOf } from '../mcp/render.js';
+import { Fleet, actOn, listFleet, describeFleetApp, type Act } from '../core/fleet.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderProject, renderUnpack, renderIncidents, renderFlushed, startNote, hostsOf } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { installShortcut } from './install.js';
@@ -107,6 +108,47 @@ export function buildProgram(io: Io = defaultIo): Command {
         }, defaultStreamDeps());
       } finally { process.off('SIGINT', stop); }
     }));
+  program.command('incidents [targets...]').description('new errors with context since they were last taken, plus crashes and restarts; -f keeps watching')
+    .option('--peek', 'look without taking: the pick-up point stays')
+    .option('--since <min>', 'first poll: minutes to look back in each log', '15')
+    .option('--max <n>', 'most incidents per poll, newest first', '20')
+    .option('--context <before,after>', 'lines of context (default per app, 3,5)')
+    .option('-f, --follow', 'keep polling and print each new incident')
+    .option('--interval <s>', 'seconds between polls while following', '10')
+    .option('--color', 'colors even when stdout is not a terminal').option('--no-color', 'plain text')
+    .action(wrap(async (g, o, args) => {
+      const targets = ((args[0] as unknown as string[] | undefined) ?? []);
+      let context: [number, number] | undefined;
+      if (o.context !== undefined) {
+        const m = /^(\d{1,2}),(\d{1,2})$/.exec(String(o.context));
+        if (!m) throw new McprocError('BAD_ARGUMENT', `--context must be before,after (e.g. 3,5), got "${o.context}"`);
+        context = [Number(m[1]), Number(m[2])];
+      }
+      const fleet = fleetOf(g);
+      const names = fleet.select(targets.length ? targets : ['all']);
+      const color = resolveColor(o.color as boolean | undefined, process.env, Boolean(process.stdout.isTTY));
+      const peek = Boolean(o.peek);
+      let cursor: CursorState | undefined; // a peeking follower's own position; taking always goes on from the stored point
+      const poll = async () => {
+        const r = await takeIncidents(fleet, names, { peek, cursor, sinceMin: Number(o.since) || 15, max: Number(o.max) || 20, context });
+        if (peek) cursor = r.next;
+        return r.answer;
+      };
+      const first = await poll();
+      emit(g, renderIncidents(first, { color }), first);
+      if (!o.follow) return;
+      const ac = new AbortController();
+      const stop = () => ac.abort();
+      process.once('SIGINT', stop);
+      try {
+        while (!ac.signal.aborted) {
+          await new Promise((r) => setTimeout(r, Math.max(1, Number(o.interval) || 10) * 1000));
+          if (ac.signal.aborted) break;
+          const a = await poll();
+          if (a.incidents.length || a.errors.length) emit(g, renderIncidents(a, { color }), a);
+        }
+      } finally { process.off('SIGINT', stop); }
+    }));
   program.command('ports [port]').description('who listens on which port on the host')
     .action(wrap(async (g, _o, [port]) => { const ctx = await ctxOf(g); const r = await portsReport(ctx, port ? Number(port) : undefined); emit(g, renderPorts(r, ctx.host.name), r); }));
   program.command('start <target>').description('start an app or profile (dependencies first)').option('--reload', 'restart apps that are already online')
@@ -117,14 +159,13 @@ export function buildProgram(io: Io = defaultIo): Command {
     .action(wrap((g, _o, [t]) => mutate(g, t, 'stop')));
   program.command('delete <target>').description('remove app(s) from pm2')
     .action(wrap((g, _o, [t]) => mutate(g, t, 'delete')));
-  program.command('flush [app]').description('truncate pm2 log files')
+  program.command('flush [app]').description('truncate pm2 log files; incidents start over from there')
     .action(wrap(async (g, _o, [app]) => {
       const fleet = fleetOf(g);
-      const groups = fleet.groups(fleet.select(app ? [app] : ['all']));
-      assertWritableRuns(fleet, groups);
-      const r = [];
-      for (const gr of groups) r.push(...(await flushLogs(await fleet.ctx(gr.host), gr.apps)).map((x) => ({ ...x, host: gr.host })));
-      emit(g, r.length ? r.map((x) => `${x.app}${groups.length > 1 ? ` (${x.host})` : ''}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush', r);
+      const names = fleet.select(app ? [app] : ['all']);
+      const multi = fleet.groups(names).length > 1;
+      const r = await clearLogs(fleet, names);
+      emit(g, renderFlushed(r, multi), r);
     }));
   program.command('monit').description('terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)')
     .option('--once', 'print one frame as text and exit')

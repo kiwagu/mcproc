@@ -3,6 +3,7 @@ import type { DoctorReport } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
+import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -114,4 +115,34 @@ export function renderProject(d: { project: string; root: string; apps: { name: 
   L.push('hosts:', renderHosts(d.hosts).split('\n').map((x) => '  ' + x).join('\n'));
   if (d.readme) L.push('', 'README:', d.readme.trim());
   return L.join('\n');
+}
+
+/** Incidents newest first: a header, context lines `│`, the error line `▶`; then how to go on. Nothing new is one short line. */
+export function renderIncidents(a: TakenAnswer, opts: { color?: boolean } = {}): string {
+  const tail: string[] = [];
+  if (a.more > 0) tail.push(a.taken ? `+${a.more} older incidents not shown, taken with these (read logs for them)` : `+${a.more} more incidents (raise max)`);
+  for (const s of a.skipped) tail.push(`skipped ${fmtBytes(s.bytes)} of ${s.app} ${s.stream} on ${s.host} (too much new log; the most recent 1 MB was read)`);
+  for (const e of a.errors) tail.push(`${e.host}: ${e.message}`);
+  if (a.incidents.length === 0) {
+    const cleared = a.cleared_at ? `; logs cleared ${a.cleared_at}` : '';
+    return [`no new incidents since ${a.latest ?? 'the last call'} (${a.apps} app${a.apps === 1 ? '' : 's'} on ${a.hosts} host${a.hosts === 1 ? '' : 's'}${cleared})`, ...tail].join('\n');
+  }
+  const red = (s: string) => (opts.color ? `\x1b[31m${s}\x1b[0m` : s);
+  const L: string[] = [];
+  for (const i of a.incidents) {
+    const count = i.count > 1 ? ` ×${i.count}` : '';
+    const first = i.count > 1 && i.first_time && i.first_time !== i.time ? `first ${i.first_time}, ` : '';
+    L.push(`${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first}${i.stream})`);
+    for (const b of i.before) L.push(`  │ ${b}`);
+    L.push(red(`  ▶ ${i.line}`));
+    for (const x of i.after) L.push(`  │ ${x}`);
+  }
+  L.push(...tail, `next: call incidents again later (${a.taken ? 'these are taken now' : 'peeked: nothing taken'}); full logs with logs app=${a.incidents[0].app}`);
+  return L.join('\n');
+}
+
+/** What a flush did: one line per app (with its host when several answered), naming the files it could not truncate. */
+export function renderFlushed(r: Cleared[], multi: boolean): string {
+  if (r.length === 0) return 'nothing to flush (no pm2 processes for this project there)';
+  return r.map((x) => `${x.app}${multi ? ` (${x.host})` : ''}: freed ${x.out_bytes + x.err_bytes} bytes${x.failed?.length ? `; could not truncate ${x.failed.join(', ')}` : ''}`).join('\n');
 }

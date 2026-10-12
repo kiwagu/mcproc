@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { McprocError } from './errors.js';
+import { repeatsARepeat } from './incidents/detect.js';
 
 export const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 export const MANIFEST_REL = path.join('.mcproc', 'mcproc.yaml');
@@ -12,6 +13,14 @@ export const DEFAULT_SHELL = '/bin/bash -lc';
 const name = z.string().regex(NAME_RE, 'must match ^[a-z0-9][a-z0-9._-]*$');
 const envValue = z.union([z.string(), z.number(), z.boolean()]);
 const portNo = z.number().int().min(1).max(65535);
+
+const errorsSchema = z.union([z.literal(false), z.object({
+  match: z.array(z.string().min(1)).default([]),
+  ignore: z.array(z.string().min(1)).default([]),
+  context: z.tuple([z.number().int().min(0).max(50), z.number().int().min(0).max(50)]).default([3, 5]),
+  stderr: z.boolean().default(false),
+  defaults: z.boolean().default(true),
+}).strict()]);
 
 const appSchema = z.object({
   description: z.string().min(1),
@@ -29,6 +38,7 @@ const appSchema = z.object({
   autorestart: z.boolean().default(true),
   pm2: z.record(z.unknown()).default({}),
   host: name.optional(),
+  errors: errorsSchema.optional(),
 }).strict();
 
 const hostSchema = z.object({
@@ -56,6 +66,8 @@ export const manifestSchema = z.object({
 }).strict();
 
 export type AppKind = 'build' | 'server' | 'worker';
+/** What counts as an error in an app's logs (the `incidents` tool); null when the app turned detection off. */
+export interface ErrorSettings { match: string[]; ignore: string[]; context: [number, number]; stderr: boolean; defaults: boolean }
 export interface App {
   name: string; description: string; kind: AppKind; run: string; cwd: string;
   env: Record<string, string>; ports: number[]; url: string | null;
@@ -63,6 +75,7 @@ export interface App {
   depends_on: string[]; autorestart: boolean; pm2: Record<string, unknown>;
   /** the host this app always runs on; null = wherever the command points (--host, default local) */
   host: string | null;
+  errors: ErrorSettings | null;
 }
 export interface Host {
   name: string; local: boolean; ssh?: string; ssh_args: string[];
@@ -135,11 +148,21 @@ export function parseManifest(text: string, root: string, manifestPath: string):
     if (a.port !== undefined && a.ports !== undefined) problems.push(`apps.${n}: use either port or ports, not both`);
     for (const d of a.depends_on) if (!m.apps[d]) problems.push(`apps.${n}.depends_on: unknown app "${d}"`);
     for (const k of PROTECTED_PM2_KEYS) if (k in a.pm2) problems.push(`apps.${n}.pm2.${k}: managed by mcproc, cannot be overridden`);
+    const errors: ErrorSettings | null = a.errors === false ? null : {
+      match: a.errors?.match ?? [], ignore: a.errors?.ignore ?? [], context: a.errors?.context ?? [3, 5],
+      stderr: a.errors?.stderr ?? false, defaults: a.errors?.defaults ?? true,
+    };
+    for (const k of ['match', 'ignore'] as const) {
+      for (const p of errors?.[k] ?? []) {
+        try { new RegExp(p); } catch (e) { problems.push(`apps.${n}.errors.${k}: invalid pattern "${p}": ${(e as Error).message}`); continue; }
+        if (repeatsARepeat(p)) problems.push(`apps.${n}.errors.${k}: pattern "${p}" repeats a group that ends in a repeat (like (a+)+), which can run for minutes on a log line that almost matches; rewrite it without the nested repeat`);
+      }
+    }
     apps[n] = {
       name: n, description: a.description, kind: a.kind, run: a.run, cwd: a.cwd,
       env: stringifyEnv(a.env), ports: a.ports ?? (a.port !== undefined ? [a.port] : []), url: a.url ?? null,
       watch: a.watch, watch_delay: a.watch_delay ?? (a.watch ? 1000 : undefined), ignore_watch: a.ignore_watch,
-      depends_on: a.depends_on, autorestart: a.autorestart, pm2: a.pm2, host: a.host ?? null,
+      depends_on: a.depends_on, autorestart: a.autorestart, pm2: a.pm2, host: a.host ?? null, errors,
     };
   }
   const cycle = findCycle(apps);

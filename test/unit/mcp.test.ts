@@ -27,11 +27,12 @@ const neverSpawn: Spawner = async (argv) => { throw new Error(`spawner must not 
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 13 tools with annotations and short instructions', async () => {
+  it('registers the 14 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
-    expect(Object.keys(byName).sort()).toEqual(['delete', 'describe', 'doctor', 'flush', 'hosts', 'init', 'logs', 'ls', 'ports', 'restart', 'start', 'stop', 'unpack']);
+    expect(Object.keys(byName).sort()).toEqual(['delete', 'describe', 'doctor', 'flush', 'hosts', 'incidents', 'init', 'logs', 'ls', 'ports', 'restart', 'start', 'stop', 'unpack']);
+    expect(byName.incidents.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: false }); // taking writes the local pick-up point
     for (const n of ['hosts', 'doctor', 'ls', 'describe', 'logs', 'ports']) expect(byName[n].annotations?.readOnlyHint).toBe(true);
     for (const n of ['stop', 'delete', 'flush']) expect(byName[n].annotations?.destructiveHint).toBe(true);
     expect(byName.start.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
@@ -141,5 +142,32 @@ describe('mcp server', () => {
     expect(r.isError).toBeFalsy();
     expect(r.structuredContent).toMatchObject({ host: 'stand', pm2: { version: '7.0.4', written: true }, manifest_copy: 'written' });
     expect(text(r)).toContain("'/srv/demo/.mcproc/runtime/bin/pm2' monit");
+  });
+  it('incidents: errors with context, taken for every later call; a peek leaves them; the point lives next to the manifest', async () => {
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-inc-'));
+    fs.cpSync(basic, proj, { recursive: true });
+    const S = (s: number) => `2026-10-12T11:00:0${s}: `;
+    const jlist = JSON.stringify([{ pid: 10, name: 'demo-api', pm_id: 0, pm2_env: { status: 'online', namespace: 'demo', restart_time: 0, pm_out_log_path: '/l/api-out', pm_err_log_path: '/l/api-err' } }]);
+    const log = `${S(1)}ok\n${S(2)}TypeError: boom\n`;
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2')) return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'")) return { code: 0, stdout: jlist, stderr: '' };
+      if (cmd.includes('__MCPROC_INC_')) {
+        const out = [0, 1].map((id) => { const off = Number(new RegExp(`INC_${id}__[^]*?off=(-?\\d+)`).exec(cmd)![1]); const body = id === 0 ? log : ''; const sz = Buffer.byteLength(body); const st = off >= 0 && sz >= off ? off : 0; return `__MCPROC_INC_${id}__\n${sz} ${st} 0\n${body.slice(st)}`; }).join('');
+        return { code: 0, stdout: out, stderr: '' };
+      }
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    const cl = await client(spawner);
+    const peek: any = await cl.callTool({ name: 'incidents', arguments: { project: proj, app: 'api', peek: true } });
+    expect(text(peek)).toContain('▶ 2026-10-12T11:00:02: TypeError: boom');
+    expect(peek.structuredContent).toMatchObject({ taken: false });
+    const first: any = await cl.callTool({ name: 'incidents', arguments: { project: proj, app: 'api' } });
+    expect(first.isError).toBeFalsy();
+    expect(first.structuredContent).toMatchObject({ taken: true, incidents: [{ app: 'api', kind: 'error' }] });
+    expect(fs.existsSync(path.join(proj, '.mcproc', 'incidents.json'))).toBe(true);
+    const second: any = await cl.callTool({ name: 'incidents', arguments: { project: proj, app: 'api' } });
+    expect(text(second)).toMatch(/^no new incidents since/);
   });
 });

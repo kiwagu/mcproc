@@ -5,6 +5,8 @@ import { assertWritable, pickHost, type Context } from '../core/resolve.js';
 import type { Fleet, HostApps } from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
 import type { LogLine } from '../core/logfollow.js';
+import type { Cleared } from '../core/incidents/store.js';
+import { fmtBytes } from '../mcp/render.js';
 import { monitViews, selectedRow, viewLabel, type MonitAction, type MonitState } from './state.js';
 
 export type Cmd = 'start' | 'restart' | 'stop';
@@ -17,6 +19,10 @@ export interface LoopDeps {
   rows(ctx: Context, snap: Snapshot, apps: string[]): LsRow[];
   follower(ctx: Context, paths: { out: string; err: string }, lines: number): Follower;
   command(fleet: Fleet, cmd: Cmd, app: string): Promise<unknown>;
+  /** truncate the apps' logs and record the clear in the project's store (incidents start there) */
+  clear(fleet: Fleet, apps: string[]): Promise<Cleared[]>;
+  /** the clears recorded in the project's store, keyed host/app: when (shown in the title) and how many (a new one restarts that app's logs) */
+  cleared(fleet: Fleet): { at: Record<string, string>; gen: Record<string, number> };
 }
 
 export { describeError };
@@ -34,6 +40,8 @@ export class MonitLoop {
   private prev = new Map<string, { sample: StatSample; at: number }>(); // per host: cpu is a difference of two samples of one clock
   private latest = new Map<string, LsRow>(); // the newest row of each app in this view
   private errors = new Map<string, string>(); // hosts whose last refresh failed, and why
+  private epochs = new Map<string, number>(); // per app, bumped by each clear: a read begun before it is dropped
+  private seen: Record<string, number> = {}; // the clear counts of the store this screen has acted on
   private names: string[];
   private groups: HostApps[];
 
@@ -50,6 +58,7 @@ export class MonitLoop {
 
   /** One refresh of every host of the view (or of `hosts`); a host whose refresh of this generation is still in flight shares it. */
   refresh(hosts?: string[]): Promise<void> {
+    this.readCleared();
     const gen = this.gen;
     return Promise.all(this.groups.filter((g) => !hosts || hosts.includes(g.host)).map((g) => {
       const cur = this.inflight.get(g.host);
@@ -94,8 +103,10 @@ export class MonitLoop {
         const paths = { out: proc.out_log, err: proc.err_log };
         let f = this.followers.get(app);
         if (!f) { f = this.deps.follower(ctx, paths, this.opts.lines); this.followers.set(app, f); }
+        const epoch = this.epochs.get(app);
         const r = await f.poll();
         if (gen !== this.gen) return; // the view moved on during the poll
+        if (this.epochs.get(app) !== epoch) continue; // cleared during the read: these lines are from before the clear
         this.dispatch({ type: 'logs', app, lines: r.lines, reset: r.reset, paths });
       }
     } catch (e) {
@@ -161,6 +172,50 @@ export class MonitLoop {
     } catch (e) {
       // a notice, not an `error`: the next good refresh clears errors within the interval, but a failed command must stay readable
       this.dispatch({ type: 'notice', message: `${cmd} ${app} failed: ${describeError(e)}` });
+    } finally {
+      this.dispatch({ type: 'busy', busy: false });
+    }
+  }
+
+  /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
+  private readCleared(): void {
+    const { at, gen } = this.deps.cleared(this.fleet);
+    const again = Object.keys(gen).filter((key) => gen[key] !== this.seen[key]).map((key) => key.slice(key.indexOf('/') + 1));
+    this.seen = { ...gen };
+    this.restart(again.filter((a) => this.names.includes(a)));
+    if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared)) this.dispatch({ type: 'cleared', cleared: at });
+  }
+
+  /**
+   * The logs of these apps start over (they were cleared): buffers empty, the next refresh reads the emptied files with a
+   * new follower — the old one would go on at its offset if the file regrew past it — and a read begun before is dropped.
+   */
+  private restart(apps: string[]): void {
+    for (const app of apps) {
+      this.followers.delete(app);
+      this.epochs.set(app, (this.epochs.get(app) ?? 0) + 1);
+      this.dispatch({ type: 'logs', app, lines: [], reset: true });
+    }
+  }
+
+  /** `c` twice: clear the logs of the view's running apps; apps on a readonly host are skipped and named. */
+  async runClear(apps: string[]): Promise<void> {
+    const ro = apps.filter((a) => pickHost(this.fleet.manifest, this.fleet.hostOf(a)).readonly);
+    const go = apps.filter((a) => !ro.includes(a));
+    const skipped = ro.length ? `; skipped ${ro.join(', ')} (readonly host)` : '';
+    if (go.length === 0) return this.dispatch({ type: 'notice', message: `nothing cleared${skipped}` });
+    this.dispatch({ type: 'busy', busy: true });
+    this.dispatch({ type: 'notice', message: `clearing logs of ${go.join(', ')}…` });
+    try {
+      const r = await this.deps.clear(this.fleet, go);
+      const freed = r.reduce((t, x) => t + x.out_bytes + x.err_bytes, 0);
+      const failed = r.flatMap((x) => x.failed ?? []);
+      const kept = failed.length ? `; could not truncate ${failed.join(', ')} (its incidents go on from before)` : '';
+      this.dispatch({ type: 'notice', message: `cleared logs of ${go.join(', ')} (${fmtBytes(freed)}); incidents start here${skipped}${kept}` });
+      this.readCleared(); // the store counted the clear: the apps whose files emptied start over
+      await this.refreshAfterCurrent([...new Set(go.map((a) => this.fleet.hostOf(a)))]);
+    } catch (e) {
+      this.dispatch({ type: 'notice', message: `clear failed: ${describeError(e)}` });
     } finally {
       this.dispatch({ type: 'busy', busy: false });
     }

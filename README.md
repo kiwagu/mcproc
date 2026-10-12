@@ -121,11 +121,12 @@ A bound app always runs on its host. An app without `host:` runs wherever the co
 | `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs <app>` | tail of the pm2 out/err logs on the app's host, ANSI stripped (`lines`, `stream`) |
+| `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json`, `ecosystem.json`, `Procfile` |
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload` |
 | `restart`, `stop`, `delete <target>` | by app or profile |
-| `flush [app]` | truncate pm2 log files |
+| `flush [app]` | truncate pm2 log files; incidents start over from there |
 | `unpack` | bring pm2 (assembled with npm from the lockfile mcproc ships), and Node when the host has none ≥ 18, into `<cwd>/.mcproc/runtime` on that host |
 
 Every tool takes `project` and `host` (see *Apps on several hosts*: without `host`, each app is reached
@@ -138,7 +139,8 @@ A terminal dashboard on the same data: a table of apps with real memory and CPU 
 app's process tree, which is what `bun run dev` or `next dev` hide behind their launcher), the ports
 with ✓/✗, the runtime command, a live log tail with history, and the selected app's details.
 `j`/`k` (or Tab) select an app, `↑`/`↓`, PageUp/PageDown and the mouse wheel scroll the log pane (End
-returns to the tail), `r`/`s`/`x` restart/start/stop, `o`/`e`/`b` switch the log stream, `f` switches to the
+returns to the tail), `r`/`s`/`x` restart/start/stop, `c` twice clears the logs of the running apps in view
+(the log pane title then shows `cleared HH:MM`, and `incidents` starts over there), `o`/`e`/`b` switch the log stream, `f` switches to the
 flat view (every app's logs merged into one labeled stream, `app | line`, `app ! line` for stderr, one
 color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. With host-bound
 apps the screen opens on every app at its own host, with a HOST column, and reads each app's logs where
@@ -167,6 +169,41 @@ apps:
     run: npm run dev
     env: { FORCE_COLOR: 1 }
 ```
+
+## New errors at a glance: `incidents`
+
+`incidents` (MCP tool, and `mcproc incidents` on the CLI) returns only the errors that are new since they were last
+taken, each with lines of context before and after, a stack trace folded in, plus crashes and restarts pm2 saw. Nothing
+new is one short line, so an agent can poll it during long work with whatever its client offers (a loop, a cron, a
+monitor), and read `logs` only for an incident worth a closer look. `mcproc incidents -f` keeps watching in a terminal.
+
+A call takes what it returns: the pick-up point, kept in `.mcproc/incidents.json`, moves past those incidents for every
+session, agent and CLI call on this machine, so nobody gets the same incident twice. `peek` (`--peek`) looks without
+taking. A first call looks back 15 minutes (`since`). One poll reads at most 1 MB of new log per file (the most recent
+part) and says how much it skipped.
+
+Clearing logs starts it over: `flush`, or `c` twice in `mcproc monit` (the logs of the running apps in view), empties
+the log files and records when; nothing logged before the clear comes up again, and monit shows `cleared HH:MM` in the
+log pane title.
+
+What counts as an error: `level=error|fatal`, JSON `"level":"error"` or 50/60, `ERROR`/`FATAL` as a word, `SomeError:` /
+`…Exception`, `Traceback`, `panic:`, `Unhandled…`, and Node's `E…` codes such as `EADDRINUSE`. A lowercase "error" in
+a sentence does not count, and neither does a line merely being on stderr. Per app:
+
+```yaml
+apps:
+  api:
+    errors:
+      match: ['Request failed with status 5\d\d']   # more patterns (JavaScript regular expressions)
+      ignore: ['ECONNRESET.*healthcheck']            # never an incident
+      context: [3, 5]                                 # lines before and after
+      stderr: true                                    # every stderr line counts (default false)
+```
+
+`errors: false` turns it off for an app. Patterns are matched against the first 2000 characters of each line; a pattern
+that repeats a repeat, like `(a+)+` or `(\w+\s*)*`, is refused when the manifest loads, because on a line that almost
+matches it could run for minutes. Patterns that still take longer than 2 seconds on an app's log are stopped: that app
+reports an error and keeps its place until they are fixed, the other apps are not held up.
 
 ## URLs
 

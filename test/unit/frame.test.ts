@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { initialState, reduce } from '../../src/monit/state.js';
-import { renderFrame, frameToText, paneTitle, wrapText } from '../../src/monit/frame.js';
+import { renderFrame, frameToText, paneTitle, wrapText, logsTitle } from '../../src/monit/frame.js';
 import { displayWidth } from '../../src/monit/screentext.js';
 import type { LsRow } from '../../src/core/list.js';
 
@@ -153,5 +153,19 @@ describe('renderFrame', () => {
     expect(frameToText(f)).not.toContain('\x1b');
     const flat = renderFrame(reduce(s, { type: 'view', view: 'flat' }), { width: 60, height: 30 });
     expect(flat.logs[0]).toMatch(/^web  \| 2026-10-11T13:00:07: \x1b\[38;5;66mtimestamp=/);
+  });
+});
+
+describe('logsTitle', () => {
+  const cleared = (s: ReturnType<typeof base>) => reduce(s, { type: 'cleared', cleared: { 'local/web': '2026-10-12T15:04:05' } });
+  it('names the last clear of the apps shown: the time when it was today, the date too otherwise; then the scroll', () => {
+    expect(logsTitle(base(), 0)).toBe('logs · web · both');
+    expect(logsTitle(cleared(base()), 0, new Date(2026, 9, 12, 16, 0))).toBe('logs · web · both · cleared 15:04');
+    expect(logsTitle(cleared(base()), 3, new Date(2026, 9, 13, 9, 0))).toBe('logs · web · both · cleared 2026-10-12 15:04 · ↑3 (End: tail)');
+    expect(logsTitle(reduce(cleared(base()), { type: 'view', view: 'flat' }), 0, new Date(2026, 9, 12, 16, 0))).toBe('logs · all apps · both · cleared 15:04');
+  });
+  it('the key legends offer the clear', () => {
+    expect(renderFrame(base(), { width: 200, height: 30 }).footer).toContain('c clear');
+    expect(renderFrame(reduce(base(), { type: 'view', view: 'flat' }), { width: 200, height: 30 }).footer).toContain('c clear');
   });
 });

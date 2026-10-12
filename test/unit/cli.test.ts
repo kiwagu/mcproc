@@ -46,7 +46,7 @@ describe('cli', () => {
   });
   it('lists every command in --help', () => {
     const help = buildProgram(capture().io).helpInformation();
-    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'monit', 'unpack', 'install', 'mcp']) expect(help).toContain(cmd);
+    for (const cmd of ['init', 'hosts', 'doctor', 'ls', 'describe', 'logs', 'ports', 'start', 'restart', 'stop', 'delete', 'flush', 'incidents', 'monit', 'unpack', 'install', 'mcp']) expect(help).toContain(cmd);
   });
   it('unpack refuses readonly hosts and a bad --with-node before touching any host', async () => {
     const c = capture();
@@ -93,5 +93,16 @@ describe('cli', () => {
     const c2 = capture();
     await buildProgram(c2.io).parseAsync(['flush', '--project', fleet], { from: 'user' });
     expect(c2.err[0]).toContain('READONLY_HOST');
+  });
+  it('incidents: unknown targets, a target on another host and a bad --context are refused before any host is touched', async () => {
+    for (const [argv, code] of [[['incidents', 'nope', '--project', fleet], 'UNKNOWN_APP'], [['incidents', 'watch', '--host', 'box', '--project', fleet], 'WRONG_HOST'], [['incidents', '--context', 'x', '--project', fleet], 'BAD_ARGUMENT']] as const) {
+      const c = capture();
+      await buildProgram(c.io).parseAsync([...argv], { from: 'user' });
+      expect(c.err[0], argv.join(' ')).toContain(code);
+    }
+  });
+  it('incidents takes by default; --peek looks without taking, -f keeps watching', () => {
+    const cmd = buildProgram(capture().io).commands.find((c) => c.name() === 'incidents')!;
+    expect(cmd.options.map((o) => o.long)).toEqual(expect.arrayContaining(['--peek', '--follow', '--interval', '--since', '--max', '--context']));
   });
 });

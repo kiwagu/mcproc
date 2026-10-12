@@ -23,6 +23,10 @@ export interface MonitState {
   seq: number;
   maxLogs: number; logPaths: { out: string; err: string } | null;
   error: string | null; notice: string | null; busy: boolean; updatedAt: Date | null;
+  /** when c was pressed once: a second c within CONFIRM_MS clears */
+  armedAt: number | null;
+  /** the recorded clears, keyed host/app, as the project's store has them */
+  cleared: Record<string, string>;
 }
 export type MonitAction =
   | { type: 'rows'; rows: LsRow[]; at?: Date } // no `at`: nothing new was heard (a host failed), so the clock stays
@@ -34,7 +38,9 @@ export type MonitAction =
   | { type: 'error'; message: string | null }
   | { type: 'notice'; message: string | null }
   | { type: 'busy'; busy: boolean }
-  | { type: 'host'; host: string };
+  | { type: 'host'; host: string }
+  | { type: 'arm'; at: number | null; apps?: string[] }
+  | { type: 'cleared'; cleared: Record<string, string> };
 
 export function appInfos(m: Manifest): Record<string, AppInfo> {
   return Object.fromEntries(Object.values(m.apps).map((a) => [a.name, { description: a.description, run: a.run, cwd: a.cwd, pm2Name: pm2Name(m.project, a.name) }]));
@@ -52,7 +58,7 @@ export function monitViews(m: Manifest): (string | undefined)[] {
 export const viewLabel = (requested: string | undefined): string => requested ?? 'all';
 
 export function initialState(p: { project: string; host: string; hosts: string[]; apps: Record<string, AppInfo>; maxLogs?: number }): MonitState {
-  return { project: p.project, host: p.host, hosts: p.hosts, apps: p.apps, rows: [], selected: 0, chosen: false, stream: 'both', view: 'dashboard', logScroll: 0, logs: {}, seq: 0, maxLogs: p.maxLogs ?? 2000, logPaths: null, error: null, notice: null, busy: false, updatedAt: null };
+  return { project: p.project, host: p.host, hosts: p.hosts, apps: p.apps, rows: [], selected: 0, chosen: false, stream: 'both', view: 'dashboard', logScroll: 0, logs: {}, seq: 0, maxLogs: p.maxLogs ?? 2000, logPaths: null, error: null, notice: null, busy: false, updatedAt: null, armedAt: null, cleared: {} };
 }
 
 const clamp = (i: number, n: number) => (n === 0 ? 0 : Math.min(Math.max(i, 0), n - 1));
@@ -91,13 +97,20 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
     case 'error': return { ...s, error: a.message };
     case 'notice': return { ...s, notice: a.message };
     case 'busy': return { ...s, busy: a.busy };
+    case 'arm': return a.at === null
+      ? { ...s, armedAt: null, notice: s.armedAt !== null ? null : s.notice }
+      : { ...s, armedAt: a.at, notice: `press c again to clear the logs of ${(a.apps ?? []).join(', ')} (incidents start over there)` };
+    case 'cleared': return { ...s, cleared: a.cleared };
     case 'host': return { ...s, host: a.host, rows: [], logs: {}, logScroll: 0, logPaths: null, selected: 0, chosen: false, error: null, notice: `host: ${a.host}` };
   }
 }
 
-export type KeyIntent = { kind: 'action'; action: MonitAction } | { kind: 'command'; cmd: 'start' | 'restart' | 'stop'; app: string } | { kind: 'host-next' } | { kind: 'quit' } | null;
+export type KeyIntent = { kind: 'action'; action: MonitAction } | { kind: 'command'; cmd: 'start' | 'restart' | 'stop'; app: string } | { kind: 'clear'; apps: string[] } | { kind: 'host-next' } | { kind: 'quit' } | null;
 
-export function keyIntent(key: string, s: MonitState): KeyIntent {
+/** How long a first c waits for the second one. */
+export const CONFIRM_MS = 3000;
+
+export function keyIntent(key: string, s: MonitState, now = Date.now()): KeyIntent {
   const app = s.rows[s.selected]?.app;
   const canCommand = app && !s.busy && s.view === 'dashboard'; // commands act on the selected app, which only the dashboard shows
   switch (key) {
@@ -118,6 +131,12 @@ export function keyIntent(key: string, s: MonitState): KeyIntent {
     case 's': return canCommand ? { kind: 'command', cmd: 'start', app } : null;
     case 'x': return canCommand ? { kind: 'command', cmd: 'stop', app } : null;
     case 'h': return s.hosts.length > 1 ? { kind: 'host-next' } : null;
+    case 'c': {
+      // c clears every running app of the view, so it asks twice: a second c within CONFIRM_MS does it, any other key cancels
+      const apps = s.rows.filter((r) => r.status === 'online').map((r) => r.app);
+      if (s.busy || apps.length === 0) return null;
+      return s.armedAt !== null && now - s.armedAt <= CONFIRM_MS ? { kind: 'clear', apps } : { kind: 'action', action: { type: 'arm', at: now, apps } };
+    }
     case 'q': case 'C-c': case 'escape': return { kind: 'quit' };
     default: return null;
   }
