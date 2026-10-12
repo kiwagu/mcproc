@@ -14,13 +14,28 @@ export interface Frame {
  * The log pane: the last `logH` rows of the entries not hidden below the view. Scrolling stops where the pane is still
  * full: `maxScroll` = entries beyond the leading ones that fill the pane, so the window never shrinks near the top.
  */
-function pane<T>(entries: T[], scroll: number, logH: number, w: number, fmt: (e: T) => string, indent: number): { rows: string[]; scroll: number; maxScroll: number } {
+function pane<T>(entries: T[], scroll: number, logH: number, rowsOf: (e: T) => string[]): { rows: string[]; scroll: number; maxScroll: number } {
   let rows = 0; let k = 0;
-  while (k < entries.length && rows < logH) { rows += wrapText(fmt(entries[k]), w, indent).length; k++; }
+  while (k < entries.length && rows < logH) { rows += rowsOf(entries[k]).length; k++; }
   const maxScroll = Math.max(0, entries.length - k);
   const eff = Math.min(Math.max(0, scroll), maxScroll);
-  const shown = entries.slice(0, entries.length - eff);
-  return { rows: shown.slice(-logH).flatMap((e) => wrapText(fmt(e), w, indent)).slice(-logH), scroll: eff, maxScroll };
+  const end = entries.length - eff;
+  return { rows: entries.slice(Math.max(0, end - logH), end).flatMap(rowsOf).slice(-logH), scroll: eff, maxScroll };
+}
+
+/**
+ * The rows of one log entry, per pane and width. A line is cleaned and wrapped once and kept on its own object, so a
+ * render (and every scroll step is one) touches only lines it has not drawn before: the work stays the size of the pane.
+ */
+type RowCache = WeakMap<object, { key: string; rows: string[] }>;
+const dashboardRows: RowCache = new WeakMap();
+const flatRows: RowCache = new WeakMap();
+function cachedRows(cache: RowCache, entry: object, key: string, make: () => string[]): string[] {
+  const hit = cache.get(entry);
+  if (hit && hit.key === key) return hit.rows;
+  const rows = make();
+  cache.set(entry, { key, rows });
+  return rows;
 }
 
 const PM2_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}: /;
@@ -92,7 +107,7 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
     // compose style: every app, label padded to the longest name, `|` stdout / `!` stderr, continuations under the text
     const label = Math.max(1, ...Object.keys(s.apps).map((a) => a.length));
     const logH = Math.max(3, size.height - 3); // header, the pane title, footer
-    const p = pane(visibleFlat(s), s.logScroll, logH, w, (l) => `${l.app.padEnd(label)} ${l.stream === 'err' ? '!' : '|'} ${logText(l.text)}`, label + 3);
+    const p = pane(visibleFlat(s), s.logScroll, logH, (l) => cachedRows(flatRows, l, `${w}|${label}`, () => wrapText(`${l.app.padEnd(label)} ${l.stream === 'err' ? '!' : '|'} ${logText(l.text)}`, w, label + 3)));
     const keys = '↑↓ scroll  f dashboard  o/e/b logs  h host  q quit';
     return { header, table: [], logs: p.rows, details: [], footer: cut(right ? `${right}  │ ${keys}` : keys, w), scroll: p.scroll, maxScroll: p.maxScroll };
   }
@@ -103,7 +118,7 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
   ]).split('\n').map((l) => cut(l.replace(/^(.)\s\s/, '$1'), w));
   const detailsH = 6;
   const logH = Math.max(3, size.height - 1 - tableLines.length - 3 - detailsH - 1); // 3: one title rule per pane, no frames
-  const p = pane(visibleLogs(s), s.logScroll, logH, w, (l) => `${l.stream === 'err' ? '! ' : '  '}${logText(l.text)}`, 2);
+  const p = pane(visibleLogs(s), s.logScroll, logH, (l) => cachedRows(dashboardRows, l, `${w}`, () => wrapText(`${l.stream === 'err' ? '! ' : '  '}${logText(l.text)}`, w, 2)));
   const logs = p.rows;
   const r = selectedRow(s);
   const a = r ? s.apps[r.app] : null;

@@ -4,10 +4,11 @@ import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
 import { LogFollower } from '../core/logfollow.js';
-import { appInfos, initialState, keyIntent, monitViews, reduce, selectedRow, viewLabel, type MonitAction, type MonitState } from './state.js';
+import { appInfos, initialState, keyIntent, monitViews, selectedRow, viewLabel, type MonitState } from './state.js';
 import { paneTitle, renderFrame, type Frame } from './frame.js';
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, type LoopDeps } from './loop.js';
+import { screenDispatch } from './dispatch.js';
 
 const deps = (manifest: Manifest): LoopDeps => ({
   fleet: (requested) => new Fleet(manifest, requested),
@@ -50,12 +51,9 @@ export async function runMonit(opts: { project?: string; host?: string; interval
     return c ? `\x1b[${c}m${m[1]}\x1b[0m${line.slice(m[1].length)}` : line;
   };
 
-  let frame: Frame | null = null;
-  const paint = () => {
-    const w = screen.width as number;
-    const h = screen.height as number;
-    const f = renderFrame(state, { width: w, height: h });
-    frame = f;
+  const size = () => ({ width: screen.width as number, height: screen.height as number });
+  const show = (f: Frame) => {
+    const { width: w, height: h } = size();
     const scrolled = f.scroll ? ` · ↑${f.scroll} (End: tail)` : '';
     header.setContent(f.header);
     footer.setContent(f.footer);
@@ -82,10 +80,8 @@ export async function runMonit(opts: { project?: string; host?: string; interval
     logBox.setScrollPerc(100);
     screen.render();
   };
-  const dispatch = (a: MonitAction) => {
-    state = reduce(state, a.type === 'scroll' ? { ...a, max: frame?.maxScroll } : a); // the pane's real ceiling clamps the scroll
-    paint();
-  };
+  // reduce at once, paint once per burst (a wheel notch is three key presses), clamp a scroll by the pane as it is now
+  const { dispatch, paint } = screenDispatch({ get: () => state, set: (s) => { state = s; }, render: (s) => renderFrame(s, size()), show });
   const loop = new MonitLoop(fleet, deps(manifest), { lines: opts.lines }, () => state, dispatch);
 
   return new Promise<void>((resolve) => {

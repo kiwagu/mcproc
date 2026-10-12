@@ -6,7 +6,7 @@ import { sortByStamp, type LogLine } from '../core/logfollow.js';
 export type Stream = 'out' | 'err' | 'both';
 /** dashboard: table + the selected app's logs + details; flat: every app's logs merged into one labeled stream, compose style */
 export type View = 'dashboard' | 'flat';
-export interface FlatLine { app: string; stream: 'out' | 'err'; text: string }
+export interface FlatLine { app: string; stream: 'out' | 'err'; text: string; seq: number }
 export interface AppInfo { description: string; run: string; cwd: string; pm2Name: string }
 /** A buffered log line with its arrival number: hosts have their own clocks (and time zones), so across hosts arrival is the order. */
 export interface BufferedLine extends LogLine { seq: number }
@@ -138,9 +138,21 @@ export function visibleLogs(s: MonitState): LogLine[] {
 export function visibleFlat(s: MonitState): FlatLine[] {
   const hostOf = new Map(s.rows.map((r) => [r.app, r.host]));
   const entries = Object.entries(s.logs).filter(([, lines]) => lines.length > 0);
-  const oneClock = new Set(entries.map(([app]) => hostOf.get(app))).size <= 1;
-  const all = entries.flatMap(([app, lines]) => lines.map((l) => ({ app, stream: l.stream, text: l.text, seq: l.seq })));
+  const hosts = [...new Set(entries.map(([app]) => hostOf.get(app)))];
+  // scrolling and selection leave the buffers alone: the merge of the last render is still the answer
+  const key = `${s.stream}|${hosts.join(',')}`;
+  if (flatMemo && flatMemo.logs === s.logs && flatMemo.key === key) return flatMemo.out;
+  const all = entries.flatMap(([app, lines]) => lines.map((l) => flatLineOf(app, l)));
   const shown = s.stream === 'both' ? all : all.filter((l) => l.stream === s.stream);
-  const ordered = oneClock ? sortByStamp(shown) : shown.sort((a, b) => a.seq - b.seq);
-  return ordered.map(({ app, stream, text }) => ({ app, stream, text }));
+  const out = hosts.length <= 1 ? sortByStamp(shown) : shown.sort((a, b) => a.seq - b.seq);
+  flatMemo = { logs: s.logs, key, out };
+  return out;
 }
+/** One merged line per buffered line, for good: the screen keeps each line's rows cached on this object. */
+const flatLines = new WeakMap<BufferedLine, FlatLine>();
+function flatLineOf(app: string, l: BufferedLine): FlatLine {
+  let f = flatLines.get(l);
+  if (!f) { f = { app, stream: l.stream, text: l.text, seq: l.seq }; flatLines.set(l, f); }
+  return f;
+}
+let flatMemo: { logs: MonitState['logs']; key: string; out: FlatLine[] } | null = null;
