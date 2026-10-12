@@ -56,7 +56,7 @@ const STACK: RegExp[] = [
   /^\s*\^+\s*$/,
   /^goroutine \d+/,
 ];
-const PM2_STAMP = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}): /;
+const PM2_STAMP = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?): /; // seconds, or milliseconds
 export const MAX_FOLD = 30;
 export const MAX_AFTER = 60;
 export const MAX_LINE = 2000;

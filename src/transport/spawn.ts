@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { McprocError } from '../core/errors.js';
-import type { Spawner } from './types.js';
+import type { Spawner, Streamer } from './types.js';
 
 /**
  * The pids under `root` (its children, their children, …) from one `ps` listing. A timeout must take the whole command
@@ -84,3 +84,34 @@ export const nodeSpawner: Spawner = (argv, { stdin, timeoutMs }) =>
     });
     child.stdin.end(stdin ?? '');
   });
+
+/**
+ * Starts a long-running command; stderr is dropped. Its stdin stays open and silent while it runs: when this process
+ * kills it or goes away, the stdin closes, and that is how the command on the far side learns it is no longer read.
+ */
+export const nodeStreamer: Streamer = (argv) => {
+  const child = spawn(argv[0], argv.slice(1), {
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  child.stdin.on('error', () => {
+    /* EPIPE: the command ended first */
+  });
+  let exited = false;
+  const exits: ((code: number | null) => void)[] = [];
+  const finish = (code: number | null) => {
+    if (exited) return;
+    exited = true;
+    for (const cb of exits) cb(code);
+  };
+  child.on('error', () => finish(null));
+  child.on('close', (code) => finish(code));
+  return {
+    onData: (cb) => void child.stdout.on('data', cb),
+    onExit: (cb) => void exits.push(cb),
+    kill: () => {
+      child.kill('SIGTERM');
+      child.stdin.destroy();
+      child.stdout.destroy();
+    },
+  };
+};

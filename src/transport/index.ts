@@ -1,11 +1,24 @@
 import type { Host } from '../core/manifest.js';
 import { McprocError } from '../core/errors.js';
 import { shq, shjoin } from './quote.js';
-import { nodeSpawner } from './spawn.js';
-import type { ExecOptions, ExecResult, Spawner, Transport } from './types.js';
+import { nodeSpawner, nodeStreamer } from './spawn.js';
+import type {
+  ExecOptions,
+  ExecResult,
+  Spawner,
+  Streamer,
+  Transport,
+} from './types.js';
 
-export type { ExecOptions, ExecResult, Spawner, Transport } from './types.js';
-export { nodeSpawner } from './spawn.js';
+export type {
+  ExecOptions,
+  ExecResult,
+  Spawner,
+  StreamProc,
+  Streamer,
+  Transport,
+} from './types.js';
+export { nodeSpawner, nodeStreamer } from './spawn.js';
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -15,11 +28,15 @@ export function withEnv(cmd: string, env?: Record<string, string>): string {
   return `${entries.map(([k, v]) => `export ${k}=${shq(v)};`).join(' ')} ${cmd}`;
 }
 
-function shellArgv(host: Host, cmd: string): string[] {
-  return [host.shell.bin, ...host.shell.flags, cmd];
+type Shell = Host['shell'];
+/** no login profile: for a loop that only needs POSIX tools */
+const PLAIN_SH: Shell = { bin: 'sh', flags: ['-c'] };
+
+function shellArgv(shell: Shell, cmd: string): string[] {
+  return [shell.bin, ...shell.flags, cmd];
 }
 
-function dockerArgv(host: Host, cmd: string): string[] {
+function dockerArgv(host: Host, cmd: string, shell: Shell): string[] {
   const d = host.docker!;
   return [
     'docker',
@@ -27,14 +44,20 @@ function dockerArgv(host: Host, cmd: string): string[] {
     ...(d.user ? ['-u', d.user] : []),
     '-i',
     d.container,
-    ...shellArgv(host, cmd),
+    ...shellArgv(shell, cmd),
   ];
 }
 
 export const SSH_CONNECT_TIMEOUT_S = 10;
 
-export function buildArgv(host: Host, cmd: string): string[] {
-  const inner = host.docker ? dockerArgv(host, cmd) : shellArgv(host, cmd);
+export function buildArgv(
+  host: Host,
+  cmd: string,
+  shell: Shell = host.shell
+): string[] {
+  const inner = host.docker
+    ? dockerArgv(host, cmd, shell)
+    : shellArgv(shell, cmd);
   // a host that does not answer at all must fail in seconds, not hang a whole fleet of probes; after ssh_args, so a
   // ConnectTimeout given there wins (ssh keeps the first value it sees)
   if (host.ssh)
@@ -63,7 +86,8 @@ export function describeHost(host: Host): string {
 
 export function createTransport(
   host: Host,
-  spawner: Spawner = nodeSpawner
+  spawner: Spawner = nodeSpawner,
+  streamer: Streamer = nodeStreamer
 ): Transport {
   return {
     describe: () => describeHost(host),
@@ -74,6 +98,7 @@ export function createTransport(
         timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       });
     },
+    stream: (cmd: string) => streamer(buildArgv(host, cmd, PLAIN_SH)),
   };
 }
 

@@ -23,6 +23,18 @@ import {
 export type Cmd = 'start' | 'restart' | 'stop';
 export interface Follower {
   poll(): Promise<{ lines: LogLine[]; reset: boolean }>;
+  /** calls `wake` as soon as the followed files change, when the follower can tell */
+  watch?(wake: () => void): void;
+  /** stops the wakes */
+  close?(): void;
+}
+type Paths = { out: string; err: string };
+interface WakeQueue {
+  dirty: Set<string>;
+  /** a poll of these apps is scheduled or running */
+  running: boolean;
+  timer: NodeJS.Timeout | null;
+  last: number;
 }
 /** What the loop needs from the rest of mcproc, injectable so the races below are testable without a terminal. */
 export interface LoopDeps {
@@ -48,16 +60,25 @@ export interface LoopDeps {
 
 export { describeError };
 
+/** polls a wake asks for run at most this often: a chatty app repaints the screen in steps, not on every write */
+const WAKE_GAP_MS = 50;
+
 /**
  * The monit screen's data loop: periodic refreshes of every host the view reaches, each host on its own, log following
  * for the selected app (or every app in the flat view) on the host it runs on, view switches and commands. Every refresh
- * belongs to a generation; a view switch starts a new one, and whatever an older refresh still returns is dropped.
+ * belongs to a generation; a view switch starts a new one, and whatever an older refresh still returns is dropped. The
+ * followers of the apps on screen wake the loop when their files change, so new lines show without waiting for a
+ * refresh; the refresh stays as the clock behind them.
  */
 export class MonitLoop {
   private gen = 0;
   /** one refresh in flight per host: a host that hangs holds back only its own rows, never the others' */
   private inflight = new Map<string, { gen: number; done: Promise<void> }>();
-  private followers = new Map<string, Follower>(); // app names are unique across hosts
+  private followers = new Map<string, { f: Follower; paths: Paths }>(); // app names are unique across hosts
+  private watched = new Set<string>(); // apps whose follower wakes the loop: the ones on screen
+  /** per host: woken apps waiting for their poll — a slow host never holds another host's lines */
+  private wakes = new Map<string, WakeQueue>();
+  private closed = false;
   private prev = new Map<string, { sample: StatSample; at: number }>(); // per host: cpu is a difference of two samples of one clock
   private latest = new Map<string, LsRow>(); // the newest row of each app in this view
   private errors = new Map<string, string>(); // hosts whose last refresh failed, and why
@@ -81,6 +102,7 @@ export class MonitLoop {
   /** One refresh of every host of the view (or of `hosts`); a host whose refresh of this generation is still in flight shares it. */
   refresh(hosts?: string[]): Promise<void> {
     this.readCleared();
+    this.syncWatches();
     const gen = this.gen;
     return Promise.all(
       this.groups
@@ -153,13 +175,13 @@ export class MonitLoop {
         const proc = findProcess(snap.procs, this.fleet.manifest.project, app);
         if (!proc) continue;
         const paths = { out: proc.out_log, err: proc.err_log };
-        let f = this.followers.get(app);
-        if (!f) {
-          f = this.deps.follower(ctx, paths, this.opts.lines);
-          this.followers.set(app, f);
+        let e = this.followers.get(app);
+        if (!e) {
+          e = { f: this.deps.follower(ctx, paths, this.opts.lines), paths };
+          this.followers.set(app, e);
         }
         const epoch = this.epochs.get(app);
-        const r = await f.poll();
+        const r = await e.f.poll();
         if (gen !== this.gen) return; // the view moved on during the poll
         if (this.epochs.get(app) !== epoch) continue; // cleared during the read: these lines are from before the clear
         this.dispatch({
@@ -170,6 +192,7 @@ export class MonitLoop {
           paths,
         });
       }
+      this.syncWatches();
     } catch (e) {
       if (gen !== this.gen) return;
       // a host that did not answer keeps its apps' last rows (unreachable ones the first time); the footer says why
@@ -186,6 +209,107 @@ export class MonitLoop {
           );
       this.publish(false);
     }
+  }
+
+  /** the apps whose logs the screen shows: the selected one, or every app in the flat view */
+  private onScreen(): Set<string> {
+    const s = this.getState();
+    if (s.view === 'flat') return new Set(this.names);
+    const app = selectedRow(s)?.app;
+    return new Set(app ? [app] : []);
+  }
+
+  /** The followers of the apps on screen wake the loop; the others stop. */
+  private syncWatches(): void {
+    if (this.closed) return;
+    const want = this.onScreen();
+    for (const app of [...this.watched]) if (!want.has(app)) this.unwatch(app);
+    for (const app of want) {
+      const e = this.followers.get(app);
+      if (!e?.f.watch || this.watched.has(app)) continue;
+      this.watched.add(app);
+      e.f.watch(() => this.wake(app));
+    }
+  }
+
+  private unwatch(app: string): void {
+    if (this.watched.delete(app)) this.followers.get(app)?.f.close?.();
+  }
+
+  private wake(app: string): void {
+    if (!this.watched.has(app)) return;
+    const host = this.fleet.hostOf(app);
+    let q = this.wakes.get(host);
+    if (!q) {
+      q = { dirty: new Set(), running: false, timer: null, last: 0 };
+      this.wakes.set(host, q);
+    }
+    q.dirty.add(app);
+    this.kick(q);
+  }
+
+  /** Polls a host's woken apps now, or once the gap since its last such poll has passed. */
+  private kick(q: WakeQueue): void {
+    if (q.running || !q.dirty.size || this.closed) return;
+    q.running = true;
+    const run = () => {
+      q.timer = null;
+      void this.pollWoken(q);
+    };
+    const wait = q.last + WAKE_GAP_MS - Date.now();
+    if (wait > 0) q.timer = setTimeout(run, wait);
+    else queueMicrotask(run);
+  }
+
+  /** One poll of a host's woken apps; their lines are dispatched together, so the screen paints once. */
+  private async pollWoken(q: WakeQueue): Promise<void> {
+    const gen = this.gen;
+    const apps = [...q.dirty];
+    q.dirty.clear();
+    q.last = Date.now();
+    try {
+      const got = await Promise.allSettled(
+        apps.map(async (app) => {
+          const e = this.followers.get(app);
+          if (!e) return null;
+          const epoch = this.epochs.get(app);
+          return { app, e, epoch, r: await e.f.poll() }; // a host that fails here is reported by the next refresh
+        })
+      );
+      for (const g of got) {
+        if (g.status !== 'fulfilled' || !g.value) continue;
+        const { app, e, epoch, r } = g.value;
+        // the view moved on, the follower was replaced or the logs were cleared during the read
+        if (
+          gen !== this.gen ||
+          this.followers.get(app) !== e ||
+          this.epochs.get(app) !== epoch
+        )
+          continue;
+        if (!r.lines.length && !r.reset) continue;
+        this.dispatch({
+          type: 'logs',
+          app,
+          lines: r.lines,
+          reset: r.reset,
+          paths: e.paths,
+        });
+      }
+    } finally {
+      q.running = false;
+      this.kick(q);
+    }
+  }
+
+  /** The screen is going away: no follower wakes it any more. */
+  close(): void {
+    this.closed = true;
+    for (const q of this.wakes.values()) {
+      if (q.timer) clearTimeout(q.timer);
+      q.timer = null;
+      q.dirty.clear();
+    }
+    for (const app of [...this.watched]) this.unwatch(app);
   }
 
   /** The user moved the selection: refresh its host so an app seen for the first time gets its follower (history) at once. */
@@ -226,6 +350,7 @@ export class MonitLoop {
       this.fleet = fleet;
       this.names = names;
       this.groups = groups;
+      for (const app of [...this.watched]) this.unwatch(app);
       this.followers.clear();
       this.prev.clear();
       this.latest.clear();
@@ -287,6 +412,7 @@ export class MonitLoop {
    */
   private restart(apps: string[]): void {
     for (const app of apps) {
+      this.unwatch(app);
       this.followers.delete(app);
       this.epochs.set(app, (this.epochs.get(app) ?? 0) + 1);
       this.dispatch({ type: 'logs', app, lines: [], reset: true });

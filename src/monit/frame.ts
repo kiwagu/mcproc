@@ -186,7 +186,7 @@ function cachedRows(
   return rows;
 }
 
-const PM2_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}: /;
+const PM2_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?: /; // seconds, or milliseconds
 /** A log line as screen text; pm2's time stamp stays even when carriage returns overwrote the text after it. */
 function logText(text: string): string {
   const stamp = PM2_STAMP.exec(text)?.[0] ?? '';

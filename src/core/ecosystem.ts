@@ -2,6 +2,9 @@ import path from 'node:path';
 import type { App, Host, Manifest } from './manifest.js';
 import { pm2Name } from './pm2.js';
 
+/** The stamp pm2 writes before every log line; mcproc's log readers accept it and the older second-only form. */
+export const LOG_STAMP = 'YYYY-MM-DDTHH:mm:ss.SSS';
+
 export interface Pm2AppConfig {
   name: string;
   namespace: string;
@@ -12,7 +15,8 @@ export interface Pm2AppConfig {
   env: Record<string, string>;
   autorestart: boolean;
   treekill: true;
-  time: true;
+  /** pm2's stamp before every log line, to the millisecond (pm2 would overwrite it with seconds if `time` were set) */
+  log_date_format: string;
   watch?: boolean | string[];
   watch_delay?: number;
   ignore_watch?: string[];
@@ -46,7 +50,7 @@ export function buildEcosystem(
       env: { ...app.env, ...host.env },
       autorestart: app.autorestart,
       treekill: true,
-      time: true,
+      log_date_format: LOG_STAMP,
     };
     if (app.watch !== undefined) {
       base.watch = app.watch;

@@ -82,6 +82,29 @@ describe('buildArgv', () => {
       argv.indexOf('ConnectTimeout=10')
     );
   });
+  it('a stream runs under a plain sh -c on the host, never its login shell', () => {
+    const seen: string[][] = [];
+    const streamer = (argv: string[]) => {
+      seen.push(argv);
+      return { onData() {}, onExit() {}, kill() {} };
+    };
+    createTransport(both, undefined, streamer).stream!('echo hi');
+    createTransport(docker, undefined, streamer).stream!('echo hi');
+    expect(seen[0][8]).toBe(
+      `'docker' 'exec' '-u' 'node' '-i' 'app-1' 'sh' '-c' 'echo hi'`
+    );
+    expect(seen[1]).toEqual([
+      'docker',
+      'exec',
+      '-u',
+      'node',
+      '-i',
+      'app-1',
+      'sh',
+      '-c',
+      'echo hi',
+    ]);
+  });
   it('ssh + docker composes', () => {
     const argv = buildArgv(both, 'pm2 jlist');
     expect(argv.slice(0, 8)).toEqual([

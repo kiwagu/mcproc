@@ -3,7 +3,7 @@ import { prepare } from '../core/resolve.js';
 import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
-import { LogFollower } from '../core/logfollow.js';
+import { createFollower } from '../core/logfollow.js';
 import {
   appInfos,
   CONFIRM_MS,
@@ -29,7 +29,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   fleet: (requested) => new Fleet(manifest, requested),
   snapshot,
   rows: rowsFor,
-  follower: (ctx, paths, lines) => new LogFollower(ctx, paths, lines),
+  follower: createFollower,
   command: (fleet, cmd, app) => actOn(fleet, app, cmd),
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
@@ -158,6 +158,7 @@ export async function runMonit(opts: {
     }, opts.intervalMs);
     const quit = () => {
       clearInterval(timer);
+      loop.close();
       screen.destroy();
       resolve();
     };

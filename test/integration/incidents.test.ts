@@ -69,6 +69,8 @@ describe.skipIf(!RUN)('incidents against a real pm2', () => {
     const first = await takeIncidents(fleet, ['boom', 'crashy']);
     const boom = first.answer.incidents.find((i) => i.app === 'boom')!;
     expect(boom.line).toContain('TypeError: x is undefined');
+    expect(boom.line).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}: /); // pm2 stamps to the millisecond
+    expect(boom.time).toMatch(/\.\d{3}$/);
     expect(boom.after.some((l) => l.includes('    at '))).toBe(true);
     expect(fs.existsSync(path.join(base, '.mcproc', 'incidents.json'))).toBe(
       true

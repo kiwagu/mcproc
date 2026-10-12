@@ -151,6 +151,18 @@ agent or a script reads.
 Memory is the sum of each process's resident set, so shared pages count once per process; pm2's own
 root-pid figure is shown next to it in the details. CPU is per core over the refresh interval.
 
+### Live logs
+
+`monit` and `logs -f` show a line moments after the app writes it. On this machine mcproc reads the
+pm2 log files itself and the system tells it when they change, so no command runs per read. On a host
+reached over ssh or docker, one connection stays open while you watch: a small `sh` loop there checks
+the followed files four times a second and sends only what was added. If that connection drops, mcproc
+reconnects and meanwhile reads on its own clock (monit every 2 s, `logs -f` every second).
+
+pm2 stamps every line to the millisecond (`2026-10-12T21:00:00.123: …`). The flat view orders the lines
+of one host by that stamp, then by arrival; with apps on several hosts, whose clocks may differ, by
+arrival. Apps started before mcproc 0.3.2 keep second stamps until their next restart.
+
 ## Colors
 
 `mcproc logs` and `monit` show the colors your apps write, as on their own terminal. `logs` prints them only
@@ -235,7 +247,8 @@ Ports published by Docker containers show the container name instead of a pid.
 
 ## What a host needs
 
-`ps`, `ss` (or `/proc`) and `tar`. pm2 comes from the host's login-shell PATH (Node 18 or newer)
+`ps`, `ss` (or `/proc`) and `tar`. Following logs live uses only POSIX tools there (`sh`, `stat` or `wc`,
+`tail`, `head`, `od`). pm2 comes from the host's login-shell PATH (Node 18 or newer)
 or from `unpack`. mcproc itself is only installed where the agent runs; locally it ships its own
 pm2. `doctor` tells you which pm2 a host would use and why, or why none is usable.
 `curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`).

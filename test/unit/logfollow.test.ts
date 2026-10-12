@@ -5,7 +5,12 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
-import { LogFollower, sortByStamp } from '../../src/core/logfollow.js';
+import {
+  createFollower,
+  LogFollower,
+  readChunk,
+  sortByStamp,
+} from '../../src/core/logfollow.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -252,5 +257,160 @@ describe('LogFollower', () => {
       'no stamp',
       '2026-10-11T13:00:09: b',
     ]);
+  });
+  it('sortByStamp orders millisecond stamps within one second, and mixes them with second-only ones', () => {
+    const s = sortByStamp([
+      { stream: 'out', text: '2026-10-11T13:00:07.900: late' },
+      { stream: 'err', text: '2026-10-11T13:00:07.100: early' },
+      { stream: 'out', text: '2026-10-11T13:00:06: before' },
+    ]);
+    expect(s.map((l) => l.text.split(' ')[1])).toEqual([
+      'before',
+      'early',
+      'late',
+    ]);
+  });
+});
+
+describe('the local host reads its logs in-process', () => {
+  const tmp = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-lf-'));
+    return { out: path.join(dir, 'out.log'), err: path.join(dir, 'err.log') };
+  };
+  /** the same files followed twice: through the shell read (run by a real sh) and by the follower the local host gets */
+  const twins = (files: { out: string; err: string }) => {
+    const shellCtx = fakeCtx(basic, 'local', [
+      {
+        match: '__MCPROC_LF_out__',
+        result: (cmd: string) => ({
+          stdout: execFileSync('sh', ['-c', cmd], {
+            encoding: 'utf8',
+            maxBuffer: 64 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'ignore'], // a file not there yet: sh says so on stderr, as a host would
+          }),
+        }),
+      },
+    ]);
+    const localCtx = fakeCtx(basic, 'local', []);
+    return {
+      shell: new LogFollower(shellCtx, files, 5),
+      local: createFollower(localCtx, files, 5),
+      spawned: () => localCtx.fake.calls.length,
+    };
+  };
+  const lines = (n: number, tag: string, pad = 40) =>
+    Array.from(
+      { length: n },
+      (_, i) => `2026-10-12T20:00:00.000: ${tag} ${i} ${'x'.repeat(pad)}\n`
+    ).join('');
+
+  it('gives what the shell read gives (history, new bytes, a partial line, a burst, a replaced and a shrunk file, a file that appears later), spawning nothing', async () => {
+    const files = tmp();
+    fs.writeFileSync(files.out, lines(8_000, 'old')); // over the history window: the read starts inside a line
+    const { shell, local, spawned } = twins(files);
+    const step = async (what: string) => {
+      const [a, b] = [await shell.poll(), await local.poll()];
+      expect(b, what).toEqual(a);
+      expect(local.offsets, what).toEqual(shell.offsets);
+      return b;
+    };
+    expect((await step('history')).lines).toHaveLength(5);
+    fs.appendFileSync(files.out, 'next 1\nnext 2\nhalf');
+    expect((await step('new bytes')).lines.map((l) => l.text)).toEqual([
+      'next 1',
+      'next 2',
+    ]);
+    fs.appendFileSync(files.out, ' done\n');
+    expect((await step('the rest of a line')).lines.map((l) => l.text)).toEqual(
+      ['half done']
+    );
+    expect((await step('nothing new')).lines).toEqual([]);
+    fs.appendFileSync(files.out, lines(30_000, 'burst'));
+    expect((await step('a burst')).lines[0].text).toMatch(/skipped$/);
+    fs.writeFileSync(files.out, lines(40_000, 'rotated')); // replaced, already longer than the old position
+    expect((await step('replaced')).reset).toBe(true);
+    fs.writeFileSync(files.out, 'flushed\n');
+    expect((await step('shrunk')).reset).toBe(true);
+    fs.writeFileSync(files.err, '2026-10-12T20:00:01.000: late err\n');
+    expect((await step('a file that appears later')).lines).toEqual([
+      { stream: 'err', text: '2026-10-12T20:00:01.000: late err' },
+    ]);
+    expect(spawned()).toBe(0);
+  });
+  it.skipIf(process.getuid?.() === 0)(
+    'a log this process may not read goes through the shell instead',
+    async () => {
+      const files = tmp();
+      fs.writeFileSync(files.out, 'secret\n');
+      fs.writeFileSync(files.err, '');
+      fs.chmodSync(files.out, 0o000);
+      const ctx = fakeCtx(basic, 'local', [
+        {
+          match: '__MCPROC_LF_out__',
+          result: () => ({
+            stdout: `__MCPROC_LF_out__\n7 0 H\nsecret\n__MCPROC_LF_err__\n0 0 H\n`,
+          }),
+        },
+      ]);
+      const r = await createFollower(ctx, files, 5).poll();
+      expect(r.lines).toEqual([{ stream: 'out', text: 'secret' }]);
+      expect(ctx.fake.calls).toHaveLength(1);
+    }
+  );
+  it('a host reached over ssh or docker keeps the shell read', async () => {
+    const ctx = fakeCtx(basic, 'local', [
+      {
+        match: '__MCPROC_LF_out__',
+        result: {
+          stdout: '__MCPROC_LF_out__\n0 0 H\n__MCPROC_LF_err__\n0 0 H\n',
+        },
+      },
+    ]);
+    ctx.host = { ...ctx.host, local: false, ssh: 'box' };
+    await createFollower(ctx, paths, 5).poll();
+    expect(ctx.fake.calls).toHaveLength(1);
+  });
+});
+
+describe('readChunk', () => {
+  /** a file whose content the test swaps right after the reader's first read */
+  const swapping = (before: string, after: string, afterRead = 1) => {
+    let content = Buffer.from(before);
+    let reads = 0;
+    const fh = {
+      stat: async () => ({ size: content.length }),
+      read: async (buf: Buffer, off: number, len: number, pos: number) => {
+        const src = content.subarray(pos, pos + len);
+        src.copy(buf, off);
+        if (++reads === afterRead) content = Buffer.from(after); // truncated and rewritten meanwhile
+        return { bytesRead: src.length, buffer: buf };
+      },
+      close: async () => undefined,
+    };
+    return async () => fh as never;
+  };
+  const hexTail = (s: string) => Buffer.from(s).subarray(-16).toString('hex');
+
+  it('takes the anchor from the bytes it delivered, even when the file is rewritten during the read', async () => {
+    const old = 'old line one\nold line two\n';
+    const c = await readChunk(
+      { path: '/l/out.log', off: null, anchor: null },
+      swapping(old, 'NEW LINE ONE\nNEW LINE TWO\nmore\n')
+    );
+    expect(c.body).toBe(old);
+    expect(c.anchor).toBe(hexTail(old));
+  });
+  it('a short append reads the bytes before it in the same read, for its anchor', async () => {
+    const before = '2026-10-12T21:00:00.000: started\n';
+    const c = await readChunk(
+      {
+        path: '/l/out.log',
+        off: Buffer.byteLength(before),
+        anchor: hexTail(before),
+      },
+      swapping(`${before}ok\n`, 'x'.repeat(80), 2) // read 1 checks the old anchor, read 2 takes the bytes
+    );
+    expect(c).toMatchObject({ kind: 'N', body: 'ok\n', got: 3 });
+    expect(c.anchor).toBe(hexTail(`${before}ok\n`));
   });
 });

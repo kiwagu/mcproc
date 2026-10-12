@@ -375,3 +375,25 @@ describe('patterns that cannot stall a poll', () => {
     ).toEqual([near]);
   });
 });
+
+describe('millisecond stamps', () => {
+  it('stamps with milliseconds are read like the second-only ones: time, body, fingerprint', () => {
+    expect(stampOf('2026-10-12T11:00:00.123: x')).toBe(
+      '2026-10-12T11:00:00.123'
+    );
+    expect(stampOf('2026-10-12T11:00:00: x')).toBe('2026-10-12T11:00:00');
+    const [inc] = detect(
+      {
+        stream: 'out',
+        lines: ['2026-10-12T11:00:00.123: TypeError: boom'],
+        contextOnly: 0,
+      },
+      rules({ context: [0, 0] }),
+      who
+    );
+    expect(inc.time).toBe('2026-10-12T11:00:00.123');
+    expect(fingerprint('2026-10-12T11:00:00.123: TypeError: boom')).toBe(
+      fingerprint('2026-10-12T11:00:01: TypeError: boom')
+    );
+  });
+});

@@ -415,6 +415,19 @@ describe('renderFrame', () => {
     expect(renderFrame(flat, { width: 120, height: 24 }).logs.at(-1)).toBe(
       'web  | 2026-10-11T13:00:07: progress 100%'
     );
+    const ms = reduce(base(), {
+      type: 'logs',
+      app: 'web',
+      lines: [
+        {
+          stream: 'out',
+          text: '2026-10-11T13:00:07.123: progress 10%\rprogress 100%',
+        },
+      ],
+    });
+    expect(renderFrame(ms, { width: 120, height: 24 }).logs.at(-1)).toBe(
+      '  2026-10-11T13:00:07.123: progress 100%'
+    ); // a millisecond stamp too
   });
   it('colored text wraps by visible width; every row closes its colors and a continuation row reopens the active one', () => {
     expect(wrapText('\x1b[31mabcdef\x1b[0mgh', 4, 1)).toEqual([

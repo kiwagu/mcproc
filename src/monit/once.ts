@@ -1,7 +1,7 @@
 import { prepare } from '../core/resolve.js';
 import { Fleet, listFleet } from '../core/fleet.js';
 import { findProcess } from '../core/pm2.js';
-import { LogFollower } from '../core/logfollow.js';
+import { createFollower } from '../core/logfollow.js';
 import {
   appInfos,
   initialState,
@@ -47,11 +47,7 @@ export async function monitOnce(opts: {
       : undefined;
   if (row && probe?.ctx && proc) {
     const paths = { out: proc.out_log, err: proc.err_log };
-    const { lines } = await new LogFollower(
-      probe.ctx,
-      paths,
-      opts.lines
-    ).poll();
+    const { lines } = await createFollower(probe.ctx, paths, opts.lines).poll();
     state = reduce(state, { type: 'logs', app: row.app, lines, paths });
   }
   return frameToText(

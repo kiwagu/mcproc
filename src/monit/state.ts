@@ -374,10 +374,9 @@ export function visibleFlat(s: MonitState): FlatLine[] {
   );
   const shown =
     s.stream === 'both' ? all : all.filter((l) => l.stream === s.stream);
-  const out =
-    hosts.length <= 1
-      ? sortByStamp(shown)
-      : shown.sort((a, b) => a.seq - b.seq);
+  // one host: by stamp, and within a stamp by arrival (lines arrive as they are written); several hosts: by arrival
+  const byArrival = shown.sort((a, b) => a.seq - b.seq);
+  const out = hosts.length <= 1 ? sortByStamp(byArrival) : byArrival;
   flatMemo = { logs: s.logs, key, out };
   return out;
 }

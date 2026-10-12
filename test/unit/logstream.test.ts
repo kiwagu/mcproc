@@ -552,3 +552,116 @@ describe('streamLogs', () => {
     expect(attempts).toBe(2); // one failed retry printed nothing new: the outage was already announced
   });
 });
+
+describe('streamLogs follows on wakes', () => {
+  /** followers whose wakes the test fires; `next` holds an app's next lines */
+  function live(running: string[]) {
+    const h = harness(running, {});
+    const wakes = new Map<string, () => void>();
+    const next = new Map<string, string[]>();
+    const closed: string[] = [];
+    let snapshots = 0;
+    const deps: StreamDeps = {
+      ...h.deps,
+      snapshot: async () => {
+        snapshots++;
+        return h.deps.snapshot(h.ctx);
+      },
+      follower: (_ctx, paths) => {
+        const app = /\/l\/(.*)-out$/.exec(paths.out)![1];
+        return {
+          poll: async () => ({
+            lines: (next.get(app)?.splice(0) ?? []).map((text) => ({
+              stream: 'out' as const,
+              text,
+            })),
+            reset: false,
+          }),
+          watch: (w) => void wakes.set(app, w),
+          close: () => void closed.push(app),
+        };
+      },
+      sleep: () => new Promise<void>(() => {}), // the interval never elapses: only wakes move the stream
+    };
+    const say = (app: string, text: string) => {
+      next.set(app, [...(next.get(app) ?? []), text]);
+      wakes.get(app)!();
+    };
+    return {
+      ...h,
+      deps,
+      say,
+      wakes,
+      closed,
+      get snapshots() {
+        return snapshots;
+      },
+    };
+  }
+  const waitFor = async (cond: () => boolean) => {
+    for (let i = 0; i < 200 && !cond(); i++)
+      await new Promise((r) => setTimeout(r, 5));
+    expect(cond()).toBe(true);
+  };
+
+  it("prints a woken app's new lines without waiting for the interval, and stops at once when aborted", async () => {
+    const t = live(['api']);
+    const ac = new AbortController();
+    const done = streamLogs(
+      [{ host: 'local', apps: ['api'], ctx: t.ctx }],
+      { ...base, follow: true, signal: ac.signal },
+      t.deps
+    );
+    await waitFor(() => t.wakes.has('api'));
+    t.say('api', 'fresh');
+    await waitFor(() => t.out.some((l) => l.endsWith('fresh')));
+    ac.abort();
+    await done;
+    expect(t.closed).toEqual(['api']);
+  });
+  it('a long run of wakes piles no handlers onto a pending clock', async () => {
+    let thens = 0;
+    class Counting<T> extends Promise<T> {
+      // biome-ignore lint/suspicious/noThenProperty: counts the handlers attached to a pending clock
+      then<A = T, B = never>(
+        ok?: ((v: T) => A | PromiseLike<A>) | null,
+        bad?: ((r: unknown) => B | PromiseLike<B>) | null
+      ): Promise<A | B> {
+        thens++;
+        return super.then(ok, bad);
+      }
+    }
+    const t = live(['api']);
+    const ac = new AbortController();
+    const done = streamLogs(
+      [{ host: 'local', apps: ['api'], ctx: t.ctx }],
+      { ...base, follow: true, signal: ac.signal },
+      { ...t.deps, sleep: () => new Counting<void>(() => {}) }
+    );
+    await waitFor(() => t.wakes.has('api'));
+    for (let i = 0; i < 30; i++) {
+      t.say('api', `line ${i}`);
+      await waitFor(() => t.out.some((l) => l.endsWith(`line ${i}`)));
+    }
+    expect(thens).toBeLessThan(5);
+    ac.abort();
+    await done;
+  });
+  it('wakes do not re-probe for apps that are not started more often than the interval says', async () => {
+    const t = live(['api']); // worker not started
+    const ac = new AbortController();
+    const done = streamLogs(
+      [{ host: 'local', apps: ['api', 'worker'], ctx: t.ctx }],
+      { ...base, follow: true, signal: ac.signal, resolveEvery: 1 },
+      t.deps
+    );
+    await waitFor(() => t.wakes.has('api'));
+    for (let i = 0; i < 5; i++) {
+      t.say('api', `line ${i}`);
+      await waitFor(() => t.out.some((l) => l.endsWith(`line ${i}`)));
+    }
+    expect(t.snapshots).toBe(1); // the history probe only
+    ac.abort();
+    await done;
+  });
+});

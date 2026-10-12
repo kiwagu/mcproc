@@ -14,6 +14,8 @@ export const PROTECTED_PM2_KEYS = [
   'script',
   'args',
   'interpreter',
+  'time',
+  'log_date_format',
 ] as const;
 export const DEFAULT_SHELL = '/bin/bash -lc';
 

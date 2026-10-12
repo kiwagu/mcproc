@@ -604,3 +604,201 @@ describe('MonitLoop with host-bound apps', () => {
     expect(h.state.busy).toBe(false);
   });
 });
+
+/** followers that record their wakes and closes; `next` holds the lines their next poll returns */
+function liveFollowers() {
+  type Entry = {
+    wake: (() => void) | null;
+    watches: number;
+    closes: number;
+    polls: number;
+    next: string[];
+    gate?: Promise<void>;
+  };
+  const by = new Map<string, Entry>();
+  const all: Entry[] = [];
+  const follower: LoopDeps['follower'] = (_c, paths) => {
+    const app = /\/l\/(\w+)-out/.exec(paths.out)![1];
+    const e: Entry = { wake: null, watches: 0, closes: 0, polls: 0, next: [] };
+    by.set(app, e);
+    all.push(e);
+    return {
+      poll: async () => {
+        e.polls++;
+        const lines = e.next.splice(0).map((text) => ({
+          stream: 'out' as const,
+          text,
+        }));
+        if (e.gate) await e.gate;
+        return { lines, reset: false };
+      },
+      watch: (w) => {
+        e.watches++;
+        e.wake = w;
+      },
+      close: () => {
+        e.closes++;
+        e.wake = null;
+      },
+    };
+  };
+  return { by, all, follower };
+}
+const settle = async (ms = 5) => {
+  for (let i = 0; i < 3; i++) await tick();
+  await new Promise((r) => setTimeout(r, ms));
+};
+
+describe('MonitLoop live logs', () => {
+  it("shows the selected app's new lines as soon as its follower wakes, without a process snapshot", async () => {
+    const live = liveFollowers();
+    let snaps = 0;
+    const h = harness(undefined, {
+      follower: live.follower,
+      snapshot: async () => {
+        snaps++;
+        return snap();
+      },
+    });
+    await h.loop.refresh();
+    const api = live.by.get('api')!;
+    expect(api.wake).toBeTypeOf('function');
+    api.next.push('fresh');
+    api.wake!();
+    await settle();
+    expect(h.state.logs.api.map((l) => l.text)).toContain('fresh');
+    expect(snaps).toBe(1);
+    h.loop.close();
+  });
+  it('a burst of wakes polls once; a wake right after waits a moment, then polls once more', async () => {
+    const live = liveFollowers();
+    const h = harness(undefined, { follower: live.follower });
+    await h.loop.refresh();
+    const api = live.by.get('api')!;
+    const before = api.polls;
+    for (let i = 0; i < 5; i++) api.wake!();
+    await settle();
+    expect(api.polls).toBe(before + 1);
+    api.wake!();
+    api.wake!();
+    await settle(); // within the gap: not yet
+    expect(api.polls).toBe(before + 1);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(api.polls).toBe(before + 2);
+    h.loop.close();
+  });
+  it('moving the selection stops the old app waking the screen and watches the new one', async () => {
+    const live = liveFollowers();
+    const h = harness(undefined, { follower: live.follower });
+    await h.loop.refresh();
+    h.loop.dispatchSelect(1); // worker
+    await settle();
+    expect(live.by.get('api')!.closes).toBe(1);
+    expect(live.by.get('worker')!.wake).toBeTypeOf('function');
+    h.loop.close();
+  });
+  it('the flat view watches every running app; back on the dashboard only the selected one', async () => {
+    const live = liveFollowers();
+    const h = harness(undefined, { follower: live.follower });
+    h.loop.dispatch({ type: 'view', view: 'flat' });
+    await h.loop.refresh();
+    expect(live.by.get('api')!.wake).toBeTypeOf('function');
+    expect(live.by.get('worker')!.wake).toBeTypeOf('function');
+    live.by.get('worker')!.next.push('w1');
+    live.by.get('worker')!.wake!();
+    await settle();
+    expect(h.state.logs.worker.map((l) => l.text)).toContain('w1');
+    h.loop.dispatch({ type: 'view', view: 'dashboard' });
+    await h.loop.refresh();
+    expect(live.by.get('worker')!.closes).toBe(1);
+    expect(live.by.get('api')!.closes).toBe(0);
+    h.loop.close();
+  });
+  it("a clear, a view switch and quitting close the followers' wakes", async () => {
+    let store = {
+      at: {} as Record<string, string>,
+      gen: {} as Record<string, number>,
+    };
+    const live = liveFollowers();
+    const h = harness(undefined, {
+      follower: live.follower,
+      cleared: () => store,
+    });
+    await h.loop.refresh();
+    const first = live.by.get('api')!;
+    store = {
+      at: { 'local/api': '2026-10-12T21:00:00' },
+      gen: { 'local/api': 1 },
+    };
+    await h.loop.refresh(); // cleared elsewhere: a new follower reads the emptied file
+    expect(first.closes).toBe(1);
+    const second = live.by.get('api')!;
+    expect(second).not.toBe(first);
+    expect(second.wake).toBeTypeOf('function');
+    await h.loop.nextView();
+    expect(second.closes).toBe(1);
+    const third = live.by.get('api');
+    h.loop.close();
+    for (const e of live.all) expect(e.wake).toBeNull();
+    if (third && third !== second) expect(third.closes).toBe(1);
+  });
+  it("a wake's lines read across a clear are dropped: they come from before it", async () => {
+    let store = {
+      at: {} as Record<string, string>,
+      gen: {} as Record<string, number>,
+    };
+    const live = liveFollowers();
+    const h = harness(undefined, {
+      follower: live.follower,
+      cleared: () => store,
+    });
+    await h.loop.refresh();
+    const api = live.by.get('api')!;
+    const gate = deferred<void>();
+    api.gate = gate.promise;
+    api.next.push('before the clear');
+    api.wake!();
+    await settle(); // the wake's poll is in flight
+    store = {
+      at: { 'local/api': '2026-10-12T21:00:00' },
+      gen: { 'local/api': 1 },
+    };
+    await h.loop.refresh();
+    gate.resolve();
+    await settle();
+    expect((h.state.logs.api ?? []).map((l) => l.text)).not.toContain(
+      'before the clear'
+    );
+    h.loop.close();
+  });
+  it("a slow poll on one host never holds another host's woken lines", async () => {
+    const fleetProcs: Record<string, ReturnType<typeof jlistOf>> = {
+      local: jlistOf('fleet', ['watch', 'tool']),
+      box: jlistOf('fleet', ['web'], 21),
+    };
+    const live = liveFollowers();
+    const h = harness(
+      undefined,
+      {
+        snapshot: async (ctx) => snap(fleetProcs[ctx.host.name]),
+        rows: (ctx, _s, apps) => apps.map((a) => row(a, ctx.host.name)),
+        follower: live.follower,
+      },
+      { dir: fleetDir }
+    );
+    h.loop.dispatch({ type: 'view', view: 'flat' });
+    await h.loop.refresh();
+    const web = live.by.get('web')!;
+    const watch = live.by.get('watch')!;
+    const slow = deferred<void>();
+    web.gate = slow.promise; // the remote read hangs (its stream dropped, the shell read waits on ssh)
+    web.wake!();
+    await settle();
+    watch.next.push('local line');
+    watch.wake!();
+    await settle(80);
+    expect(h.state.logs.watch.map((l) => l.text)).toContain('local line');
+    slow.resolve();
+    h.loop.close();
+  });
+});

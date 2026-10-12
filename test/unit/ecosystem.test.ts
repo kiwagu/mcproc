@@ -33,11 +33,12 @@ describe('buildEcosystem', () => {
       env: { PORT: '3310', DEBUG: 'true' },
       autorestart: true,
       treekill: true,
-      time: true,
+      log_date_format: 'YYYY-MM-DDTHH:mm:ss.SSS',
       watch: ['dist/apps/api'],
       watch_delay: 1000,
     });
     expect(api).not.toHaveProperty('ignore_watch');
+    expect(api).not.toHaveProperty('time'); // pm2 would overwrite log_date_format with its seconds-only stamp
     const worker = eco.apps.find((a) => a.name === 'demo-worker')!;
     expect(worker.kill_timeout).toBe(3000);
     expect(worker).not.toHaveProperty('watch');

@@ -310,4 +310,11 @@ describe('errors settings', () => {
       expect.objectContaining({ code: 'UNKNOWN_APP' })
     );
   });
+  it("the log stamp pm2 writes is mcproc's to set: time and log_date_format are protected", () => {
+    for (const key of ['time: true', "log_date_format: 'YYYY'"])
+      expectInvalid(
+        `version: 1\napps:\n  a: { description: d, run: r, pm2: { ${key} } }\n`,
+        `apps.a.pm2.${key.split(':')[0]}: managed by mcproc`
+      );
+  });
 });

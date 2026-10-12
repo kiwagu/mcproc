@@ -1,7 +1,7 @@
 import type { Context } from './resolve.js';
 import { snapshot as probeSnapshot, type Snapshot } from './list.js';
 import { findProcess } from './pm2.js';
-import { LogFollower, sortByStamp, type LogLine } from './logfollow.js';
+import { createFollower, sortByStamp, type LogLine } from './logfollow.js';
 import { describeError } from './errors.js';
 import { stripAnsi } from './logs.js';
 
@@ -23,6 +23,10 @@ export interface LogSource {
 }
 export interface Follower {
   poll(): Promise<{ lines: LogLine[]; reset: boolean }>;
+  /** calls `wake` as soon as the followed files change, when the follower can tell */
+  watch?(wake: () => void): void;
+  /** stops the wakes */
+  close?(): void;
 }
 export interface StreamDeps {
   snapshot(ctx: Context): Promise<Snapshot>;
@@ -44,6 +48,36 @@ export interface StreamOptions {
   /** while following, re-probe every N ticks for apps that were not started yet */
   resolveEvery?: number;
   signal?: AbortSignal;
+}
+
+/** polls a wake asks for run at most this often: a chatty app is printed in steps, not on every write */
+const WAKE_GAP_MS = 50;
+
+/**
+ * What a follow loop waits for: its followers' wakes, its clock and the abort. A signal that comes while nobody waits
+ * is kept for the next wait. Each wait is one promise settled once, so nothing piles up however long the loop runs.
+ */
+function signals() {
+  const got = { wake: false, clock: false, abort: false };
+  let resume: (() => void) | null = null;
+  return {
+    fire: (k: keyof typeof got) => {
+      got[k] = true;
+      const r = resume;
+      resume = null;
+      r?.();
+    },
+    next: async () => {
+      if (!got.wake && !got.clock && !got.abort)
+        await new Promise<void>((r) => {
+          resume = r;
+        });
+      const now = { ...got };
+      got.wake = false;
+      got.clock = false;
+      return now;
+    },
+  };
 }
 
 const PALETTE = [36, 32, 33, 35, 34, 31]; // cyan, green, yellow, magenta, blue, red — one per app, like compose
@@ -85,7 +119,7 @@ export function resolveColor(
 export function defaultStreamDeps(): StreamDeps {
   return {
     snapshot: (ctx) => probeSnapshot(ctx, { cpu: 'none', urls: 'none' }),
-    follower: (ctx, paths, lines) => new LogFollower(ctx, paths, lines),
+    follower: createFollower,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     out: (s) => {
       process.stdout.write(`${s}\n`);
@@ -95,7 +129,8 @@ export function defaultStreamDeps(): StreamDeps {
 
 /**
  * Merged logs of several apps, possibly on several hosts, compose style: history first (app order), then, while
- * following, one loop per host polling its apps every interval — a slow or silent host never holds the others back.
+ * following, one loop per host polling its apps when their followers wake (their files changed) and every interval —
+ * a slow or silent host never holds the others back.
  * A host that does not answer gets one note line per app per outage and is tried again: its followers resume at the
  * byte offset they had, a host that was down at the start is connected on the re-probe ticks. If no host answers at
  * the start, the first error is thrown instead.
@@ -198,24 +233,64 @@ export async function streamLogs(
   }
   if (!opts.follow || closed) return;
   const every = opts.resolveEvery ?? 10;
-  await Promise.all(
-    sources.map(async (s) => {
-      for (let tick = 1; !opts.signal?.aborted && !closed; tick++) {
-        await deps.sleep(opts.intervalMs);
-        if (opts.signal?.aborted || closed) break;
+  const watched = new Set<Follower>();
+  try {
+    await Promise.all(
+      sources.map(async (s) => {
+        const sig = signals();
+        const onAbort = () => sig.fire('abort');
+        opts.signal?.addEventListener('abort', onAbort, { once: true });
+        const watch = () => {
+          for (const app of s.apps) {
+            const f = followers.get(app);
+            if (!f || watched.has(f)) continue;
+            watched.add(f);
+            f.watch?.(() => sig.fire('wake'));
+          }
+        };
+        watch();
+        // the interval is a clock of its own: wakes in between never push it back
+        let ticking = false;
+        let last = 0;
         try {
-          // apps that were not running (or a host that was not reached) are looked for again every `every` ticks
-          if (
-            (!s.ctx || s.apps.some((a) => !followers.has(a))) &&
-            tick % every === 0
-          )
-            await attach(s, true);
-          await poll(s, false);
-          down.delete(s);
-        } catch (e) {
-          announce(s, e);
+          for (let tick = 0; !opts.signal?.aborted && !closed; ) {
+            if (!ticking) {
+              ticking = true;
+              void deps.sleep(opts.intervalMs).then(() => {
+                ticking = false;
+                sig.fire('clock');
+              });
+            }
+            const why = await sig.next();
+            if (why.abort || opts.signal?.aborted || closed) break;
+            if (why.clock) tick++;
+            else {
+              const left = last + WAKE_GAP_MS - Date.now();
+              if (left > 0) await new Promise((r) => setTimeout(r, left));
+            }
+            last = Date.now();
+            try {
+              // apps that were not running (or a host that was not reached) are looked for again every `every` ticks
+              if (
+                why.clock &&
+                (!s.ctx || s.apps.some((a) => !followers.has(a))) &&
+                tick % every === 0
+              ) {
+                await attach(s, true);
+                watch();
+              }
+              await poll(s, false);
+              down.delete(s);
+            } catch (e) {
+              announce(s, e);
+            }
+          }
+        } finally {
+          opts.signal?.removeEventListener('abort', onAbort);
         }
-      }
-    })
-  );
+      })
+    );
+  } finally {
+    for (const f of watched) f.close?.();
+  }
 }

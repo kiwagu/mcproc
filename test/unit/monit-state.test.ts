@@ -466,3 +466,32 @@ describe('the clear key', () => {
     ).toEqual({ 'local/api': '2026-10-12T15:04:05' });
   });
 });
+
+describe('flat view order', () => {
+  it('lines of one host follow their stamp, then their arrival: never grouped app by app within a stamp', () => {
+    let s = reduce(s0(), { type: 'view', view: 'flat' });
+    for (const [app, text] of [
+      ['api', 'a1'],
+      ['web', 'w1'],
+      ['api', 'a2'],
+      ['web', 'w2'],
+    ])
+      s = reduce(s, {
+        type: 'logs',
+        app,
+        lines: [{ stream: 'out', text: `2026-10-12T11:00:00: ${text}` }],
+      });
+    s = reduce(s, {
+      type: 'logs',
+      app: 'web',
+      lines: [{ stream: 'out', text: '2026-10-11T23:59:59.999: older' }],
+    });
+    expect(visibleFlat(s).map((l) => l.text.split(' ')[1])).toEqual([
+      'older',
+      'a1',
+      'w1',
+      'a2',
+      'w2',
+    ]);
+  });
+});
