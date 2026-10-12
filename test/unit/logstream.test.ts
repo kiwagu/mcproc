@@ -5,7 +5,7 @@ import { fakeCtx } from '../helpers/ctx.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import { EMPTY_STATS } from '../../src/core/stats.js';
 import type { Snapshot } from '../../src/core/list.js';
-import { formatLine, colorFor, streamLogs, type StreamDeps } from '../../src/core/logstream.js';
+import { formatLine, colorFor, streamLogs, resolveColor, type StreamDeps } from '../../src/core/logstream.js';
 import { McprocError } from '../../src/core/errors.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -37,6 +37,28 @@ describe('formatLine', () => {
     expect(colorFor(0)).toBe(36);
     expect(colorFor(6)).toBe(colorFor(0)); // the palette wraps
     expect(new Set([0, 1, 2, 3, 4, 5].map(colorFor)).size).toBe(6);
+  });
+});
+
+describe('colors of the apps themselves', () => {
+  it('with colors on, the app\'s own colors pass through and every line ends with a reset; off, they are removed', () => {
+    expect(formatLine({ app: 'api', stream: 'out', text: '\x1b[35mlevel=\x1b[0minfo \x1b[32mok' }, 3, 36)).toBe('\x1b[36mapi\x1b[0m | \x1b[35mlevel=\x1b[0minfo \x1b[32mok\x1b[0m');
+    expect(formatLine({ app: 'api', stream: 'out', text: '\x1b[35mlevel=\x1b[0minfo \x1b[32mok' }, 3, null)).toBe('api | level=info ok');
+    expect(formatLine({ app: 'api', stream: 'out', text: 'plain' }, 3, 36)).toBe('\x1b[36mapi\x1b[0m | plain'); // no reset when the app wrote no colors
+  });
+  it('json lines carry the text without color codes', async () => {
+    const h = harness(['api'], { api: [{ lines: [{ stream: 'out', text: '\x1b[32mok\x1b[0m' }] }] });
+    await streamLogs([{ host: 'local', ctx: h.ctx, apps: ['api'] }], { ...base, follow: false, json: true, color: true }, h.deps);
+    expect(JSON.parse(h.out[0])).toEqual({ app: 'api', stream: 'out', text: 'ok' });
+  });
+  it('resolveColor: --no-color and NO_COLOR win, then --color and FORCE_COLOR, else only a terminal gets colors', () => {
+    expect(resolveColor(false, { FORCE_COLOR: '1' }, true)).toBe(false);
+    expect(resolveColor(undefined, { NO_COLOR: '1', FORCE_COLOR: '1' }, true)).toBe(false);
+    expect(resolveColor(true, {}, false)).toBe(true);
+    expect(resolveColor(undefined, { FORCE_COLOR: '1' }, false)).toBe(true);
+    expect(resolveColor(undefined, { FORCE_COLOR: '0' }, true)).toBe(false);
+    expect(resolveColor(undefined, {}, true)).toBe(true);
+    expect(resolveColor(undefined, {}, false)).toBe(false);
   });
 });
 

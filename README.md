@@ -149,6 +149,25 @@ agent or a script reads.
 Memory is the sum of each process's resident set, so shared pages count once per process; pm2's own
 root-pid figure is shown next to it in the details. CPU is per core over the refresh interval.
 
+## Colors
+
+`mcproc logs` and `monit` show the colors your apps write, as on their own terminal. `logs` prints them only
+to a terminal: `--color` (or `FORCE_COLOR`) forces them into a pipe, `--no-color` or `NO_COLOR` turns them
+off. `--json`, the MCP `logs` tool and `monit --once` always give plain text. Other escapes an app writes
+(cursor moves, window titles) are dropped.
+
+Many tools stop coloring when their output is not a terminal, and under pm2 it never is. Give such an app
+`FORCE_COLOR: 1` in its `env`. mcproc never sets it on its own, because it puts color codes into that app's
+pm2 log files:
+
+```yaml
+apps:
+  web:
+    description: Next.js dev server
+    run: npm run dev
+    env: { FORCE_COLOR: 1 }
+```
+
 ## URLs
 
 An app may declare `url`, the address you open in a browser; `init` drafts `http://localhost:<port>`

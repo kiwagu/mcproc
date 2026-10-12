@@ -42,7 +42,7 @@ export async function runMonit(opts: { project?: string; host?: string; interval
   for (const b of [header, appsTitle, tableBox, logsTitle, logBox, detailsTitle, detailsBox, footer]) screen.append(b);
 
   // labels get the same ANSI colors as `mcproc logs`; blessed renders SGR codes in content, and the log text itself is
-  // already ANSI-stripped by the follower, so no tag syntax and no escaping are involved
+  // reduced by screen text to the apps' own color codes in the form blessed reads; tags are off, so no escaping is involved
   const appColor = new Map(Object.keys(manifest.apps).map((a, i) => [a, colorFor(i)]));
   const colorLabel = (line: string) => {
     const m = /^(\S+)(\s*)( [|!] )/.exec(line); // continuation rows start with spaces and keep no label

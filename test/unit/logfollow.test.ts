@@ -24,7 +24,7 @@ describe('LogFollower', () => {
     ]);
     const f = new LogFollower(ctx, paths, 50);
     const first = await f.poll();
-    expect(first.lines).toEqual([{ stream: 'out', text: '2026-10-11T13:00:01: ready' }, { stream: 'out', text: '2026-10-11T13:00:02: GET / 200' }]);
+    expect(first.lines).toEqual([{ stream: 'out', text: '2026-10-11T13:00:01: \x1b[32mready\x1b[39m' }, { stream: 'out', text: '2026-10-11T13:00:02: GET / 200' }]);
     // reads are bounded to the size just measured: bytes appended between `wc -c` and `tail` belong to the next poll, never to both
     expect(ctx.fake.calls[0].cmd).toContain(`head -c "$sz" '${paths.out}' 2>/dev/null | tail -n 50`);
     expect(f.offsets).toEqual({ out: 100, err: 0 });
@@ -41,6 +41,15 @@ describe('LogFollower', () => {
     const r = await f.poll();
     expect(r).toEqual({ lines: [{ stream: 'out', text: 'fresh' }], reset: true });
     expect(f.offsets.out).toBe(12);
+  });
+  it('keeps the app\'s colors and drops every other escape; a color code cut by a read boundary arrives whole', async () => {
+    const ctx = scripted([
+      resp({ size: 40, body: '2026-10-11T13:00:01: \x1b[?25hstarting\x1b[2K\nx \x1b[3' }, { size: 0 }),
+      resp({ size: 60, body: '1mred\x1b[0m\n' }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 50);
+    expect((await f.poll()).lines).toEqual([{ stream: 'out', text: '2026-10-11T13:00:01: starting' }]);
+    expect((await f.poll()).lines).toEqual([{ stream: 'out', text: 'x \x1b[31mred\x1b[0m' }]);
   });
   it('keeps a partial last line until the rest arrives', async () => {
     const ctx = scripted([resp({ size: 10, body: 'hello wor' }, { size: 0 }), resp({ size: 14, body: 'ld\nnext\n' }, { size: 0 })]);

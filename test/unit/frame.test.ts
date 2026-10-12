@@ -136,4 +136,22 @@ describe('renderFrame', () => {
     const flat = reduce(s, { type: 'view', view: 'flat' });
     expect(renderFrame(flat, { width: 120, height: 24 }).logs.at(-1)).toBe('web  | 2026-10-11T13:00:07: progress 100%');
   });
+  it('colored text wraps by visible width; every row closes its colors and a continuation row reopens the active one', () => {
+    expect(wrapText('\x1b[31mabcdef\x1b[0mgh', 4, 1)).toEqual(['\x1b[31mabcd\x1b[0m', ' \x1b[31mef\x1b[0mg\x1b[0m', ' h']);
+    expect(wrapText('\x1b[32mok', 10, 0)).toEqual(['\x1b[32mok\x1b[0m']);
+    expect(wrapText('plain', 10, 0)).toEqual(['plain']);
+  });
+  it('the log panes show the apps\' colors; labels, details and errors stay plain; --once text has no escapes', () => {
+    const line = '2026-10-11T13:00:07: \x1b[38;5;66mtimestamp=\x1b[0m2026 \x1b[35mlevel=\x1b[0minfo \x1b[?25h' + 'x'.repeat(80);
+    let s = reduce(base(), { type: 'logs', app: 'web', lines: [{ stream: 'out', text: line }] });
+    s = reduce(s, { type: 'error', message: '\x1b[31mboom\x1b[0m' });
+    const f = renderFrame(s, { width: 60, height: 30 });
+    expect(f.logs.join('\n')).toContain('\x1b[35mlevel=');
+    expect(f.logs.join('\n')).not.toContain('\x1b[?25h');
+    for (const row of f.logs) { expect(displayWidth(row)).toBeLessThanOrEqual(60); if (row.includes('\x1b[')) expect(row.endsWith('\x1b[0m')).toBe(true); }
+    for (const l of [f.header, ...f.table, ...f.details, f.footer]) expect(l).not.toContain('\x1b');
+    expect(frameToText(f)).not.toContain('\x1b');
+    const flat = renderFrame(reduce(s, { type: 'view', view: 'flat' }), { width: 60, height: 30 });
+    expect(flat.logs[0]).toMatch(/^web  \| 2026-10-11T13:00:07: \x1b\[38;5;66mtimestamp=/);
+  });
 });

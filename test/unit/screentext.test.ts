@@ -66,3 +66,24 @@ describe('displayWidth', () => {
     expect(displayWidth('x́')).toBe(2);
   });
 });
+
+describe('screenText with colors', () => {
+  const C = { colors: true };
+  it('keeps the color codes where they are and cleans the text between them', () => {
+    expect(screenText('\x1b[38;5;66mtimestamp=\x1b[0m2026 \x1b[35mlevel=\x1b[0minfo', C)).toBe('\x1b[38;5;66mtimestamp=\x1b[0m2026 \x1b[35mlevel=\x1b[0minfo');
+    expect(screenText('\x1b[?25h\x1b[32mok🚀', C)).toBe('\x1b[32mok?');
+    expect(screenText('\x1b[31mred\x1b[0m ok')).toBe('red ok'); // without the option: plain, as for labels and errors
+  });
+  it('colon-form codes, which blessed cannot read, become their semicolon form or go: what blessed parses is what was measured', () => {
+    expect(screenText('\x1b[38:2::255:0:0mX\x1b[4:3mY\x1b[38:5:66mZ\x1b[48:2:1:2:3mW\x1b[1:2mV', C)).toBe('\x1b[38;2;255;0;0mX\x1b[4mY\x1b[38;5;66mZ\x1b[48;2;1;2;3mW\x1bV'.replace('\x1bV', 'V'));
+    for (const s of ['\x1b[38:2::255:0:0mX', '\x1b[0;1;31mbold red\x1b[m', '\x1b[58:2::1:2:3m\x1b[4:3mlint\x1b[59m']) {
+      const out = screenText(s, C);
+      for (const esc of out.match(/\x1b[^a-z]*[a-z]?/gi) ?? []) expect(esc, s).toMatch(/^\x1b\[[\d;]*m$/); // blessed keeps only ESC [ digits ; m
+    }
+  });
+  it('tab stops and the width ignore color codes; a color set before a carriage return still applies after it', () => {
+    expect(screenText('a\x1b[31m\tb', C)).toBe('a\x1b[31m       b');
+    expect(screenText('\x1b[31mprogress 10%\rprogress 100%', C)).toBe('\x1b[31mprogress 100%');
+    expect(displayWidth('\x1b[31mab\x1b[0m中')).toBe(4);
+  });
+});

@@ -6,7 +6,16 @@ import { ensureOk } from '../transport/index.js';
 
 // eslint-disable-next-line no-control-regex
 export const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
-export function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
+/** SGR sequences, the color and style codes an app writes (`ESC [ … m`, the colon form of true color included). */
+// eslint-disable-next-line no-control-regex
+export const SGR_RE = /\x1b\[[0-9;:]*m/g;
+/** Every other escape: OSC up to BEL, ST or the line end (titles, links; one an app never terminated must not eat what follows), other CSI (cursor, erase), two-byte escapes (charsets, keypad), a stray ESC. */
+// eslint-disable-next-line no-control-regex
+const NON_SGR_RE = /\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)?|\x1b\[[0-9;:?<=>]*[ -\/]*[@-ln-~]|\x1b(?!\[[0-9;:]*m)[ -\/]*[0-~]?/g;
+/** An app's colors stay, everything else a terminal would act on (cursor moves, titles) goes: what a log view can show. */
+export function keepSgr(s: string): string { return s.replace(NON_SGR_RE, ''); }
+/** Plain text: no escapes at all. */
+export function stripAnsi(s: string): string { return keepSgr(s).replace(SGR_RE, ''); }
 
 export type LogStream = 'out' | 'err' | 'both';
 export const MAX_LINES = 2000;

@@ -1,5 +1,5 @@
 import { charWidth, chars } from '@pm2/blessed/lib/unicode.js';
-import { stripAnsi } from '../core/logs.js';
+import { keepSgr, SGR_RE, stripAnsi } from '../core/logs.js';
 
 /*
  * Text for the monit screen. blessed keeps a model of the cells it has drawn and later redraws only the cells that
@@ -28,12 +28,12 @@ const NARROW: Record<string, string> = { '✅': '✔', '❌': '✖', '❎': '✖
 const TAB = 8;
 
 /**
- * Width of screen text the way blessed's line cut counts it: one per character, two per wide one. A kept zero-width
- * mark counts one here and none on the terminal, so text that fits this width always fits the columns.
+ * Width of screen text the way blessed's line cut counts it: one per character, two per wide one, nothing for a
+ * color code. A kept zero-width mark counts one here and none on the terminal, so text that fits always fits.
  */
 export function displayWidth(s: string): number {
   let w = 0;
-  for (const ch of s) w += charWidth(ch.codePointAt(0)!) === 2 ? 2 : 1;
+  for (const ch of s.includes('\x1b') ? s.replace(SGR_RE, '') : s) w += charWidth(ch.codePointAt(0)!) === 2 ? 2 : 1;
   return w;
 }
 
@@ -72,20 +72,48 @@ function cluster(c: string): string {
 }
 
 /**
- * One log line or label as the screen shows it: color codes gone, the part after the last carriage return (what a
- * terminal shows), line breaks as spaces, tabs expanded to 8-column stops, every character as described above.
+ * blessed reads only `ESC [ digits ; m`; the colon form (`38:2::r:g:b` true color, `38:5:n`, `4:3` curly underline)
+ * would show as text. Colors and underline get their semicolon form, any other colon code goes (never an empty code,
+ * which would read as a reset).
  */
-export function screenText(input: string): string {
-  const parts = stripAnsi(input).replace(/\r\n/g, '\n').split('\r');
-  let text = '';
-  for (let i = parts.length - 1; i >= 0; i--) if (parts[i] !== '') { text = parts[i]; break; }
+function blessedSgr(code: string): string {
+  if (!code.includes(':')) return code;
+  const groups = code.slice(2, -1).split(';').flatMap((g) => {
+    if (!g.includes(':')) return [g];
+    const [kind, mode, ...rest] = g.split(':');
+    if (kind === '4') return ['4'];
+    if (!['38', '48', '58'].includes(kind)) return [];
+    if (mode === '5' && rest[0]) return [`${kind};5;${rest[0]}`];
+    if (mode === '2' && rest.length >= 3) return [`${kind};2;${rest.slice(-3).join(';')}`];
+    return [];
+  });
+  return groups.length ? `\x1b[${groups.join(';')}m` : '';
+}
+
+const SGR_SPLIT = /(\x1b\[[0-9;:]*m)/;
+const visible = (t: string) => t.replace(SGR_RE, '');
+
+/**
+ * One log line or label as the screen shows it: the part after the last carriage return (what a terminal shows), line
+ * breaks as spaces, tabs expanded to 8-column stops, every character as described above. Without `colors` all escapes
+ * go; with it an app's color codes stay where they are (one set before a carriage return still applies after it) and
+ * every other escape goes.
+ */
+export function screenText(input: string, opts: { colors?: boolean } = {}): string {
+  const parts = (opts.colors ? keepSgr(input) : stripAnsi(input)).replace(/\r\n/g, '\n').split('\r');
+  let last = parts.length - 1;
+  while (last > 0 && visible(parts[last]) === '') last--;
+  const carried = parts.slice(0, last).flatMap((p) => p.match(SGR_RE) ?? []).join('');
   let out = '';
   let col = 0;
-  for (const { segment } of segmenter.segment(text.replace(LINE_BREAK, ' ').normalize('NFC'))) {
-    const piece = cluster(segment);
-    if (piece === '\t') { const n = TAB - (col % TAB); out += ' '.repeat(n); col += n; continue; }
-    out += piece;
-    col += columns(piece);
+  for (const piece of (carried + parts[last]).split(SGR_SPLIT)) {
+    if (SGR_SPLIT.test(piece) && piece.startsWith('\x1b')) { out += blessedSgr(piece); continue; }
+    for (const { segment } of segmenter.segment(piece.replace(LINE_BREAK, ' ').normalize('NFC'))) {
+      const c = cluster(segment);
+      if (c === '\t') { const n = TAB - (col % TAB); out += ' '.repeat(n); col += n; continue; }
+      out += c;
+      col += columns(c);
+    }
   }
   return out;
 }

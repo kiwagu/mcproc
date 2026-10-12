@@ -2,6 +2,7 @@ import type { LsRow } from '../core/list.js';
 import { fmtBytes, fmtCpu, fmtPorts, fmtUptime, fmtUrl, table } from '../mcp/render.js';
 import { selectedRow, visibleFlat, visibleLogs, type MonitState } from './state.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
+import { stripAnsi } from '../core/logs.js';
 
 export interface Frame {
   header: string; table: string[]; logs: string[]; details: string[]; footer: string;
@@ -26,26 +27,44 @@ const PM2_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}: /;
 /** A log line as screen text; pm2's time stamp stays even when carriage returns overwrote the text after it. */
 function logText(text: string): string {
   const stamp = PM2_STAMP.exec(text)?.[0] ?? '';
-  return stamp + screenText(text.slice(stamp.length));
+  return stamp + screenText(text.slice(stamp.length), { colors: true }); // the app's own colors, as on its terminal
+}
+
+const RESET = '\x1b[0m';
+const SGR_TOKEN = /(\x1b\[[0-9;:]*m)/;
+/** The color state after an SGR code: a reset (`ESC[m`, `ESC[0m`, `ESC[0;…m`) starts over, anything else adds to it. */
+function nextActive(active: string, code: string): string {
+  const params = code.slice(2, -1);
+  if (params === '' || params === '0') return '';
+  return params.split(/[;:]/)[0] === '0' ? code : active + code;
 }
 
 /**
- * Hard-wraps one line of screen text at the width in terminal columns (a wide character is never split); continuation
- * rows are indented so the text stays under the text, not under the marker.
+ * Hard-wraps one line of screen text at the width (a wide character is never split, color codes take no room);
+ * continuation rows are indented so the text stays under the text, not under the marker. Every row that carries a
+ * color closes it, and a continuation row reopens the color active at its start: each row stands alone, as the pane
+ * may show any of them without the rows above.
  */
 export function wrapText(text: string, width: number, indent: number): string[] {
-  if (width <= 0 || displayWidth(text) <= width) return [text];
+  const close = (r: string) => (r.includes('\x1b[') ? r + RESET : r);
+  if (width <= 0 || displayWidth(text) <= width) return [close(text)];
   const pad = ' '.repeat(Math.min(indent, width - 1));
   const rows: string[] = [];
   let row = '';
   let w = 0;
-  for (const ch of text) {
-    const cw = displayWidth(ch);
-    if (w + cw > width && row.length > pad.length) { rows.push(row); row = pad; w = pad.length; }
-    row += ch;
-    w += cw;
+  let filled = false;
+  let active = '';
+  for (const token of text.split(SGR_TOKEN)) {
+    if (token.startsWith('\x1b[')) { row += token; active = nextActive(active, token); continue; }
+    for (const ch of token) {
+      const cw = displayWidth(ch);
+      if (w + cw > width && filled) { rows.push(close(row)); row = pad + active; w = pad.length; filled = false; }
+      row += ch;
+      w += cw;
+      filled = true;
+    }
   }
-  rows.push(row);
+  rows.push(close(row));
   return rows;
 }
 
@@ -108,5 +127,5 @@ export function paneTitle(label: string, width: number): string {
 }
 
 export function frameToText(f: Frame): string {
-  return [f.header, '', ...f.table, '', 'logs:', ...f.logs, '', ...f.details, '', f.footer].join('\n');
+  return [f.header, '', ...f.table, '', 'logs:', ...f.logs.map(stripAnsi), '', ...f.details, '', f.footer].join('\n'); // text for agents: no escapes
 }

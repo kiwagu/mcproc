@@ -7,7 +7,7 @@ import type { WithNode } from '../runtime/decide.js';
 import { prepare, connect, assertWritable, resolveProjectDir } from '../core/resolve.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { flushLogs } from '../core/logs.js';
-import { streamLogs, defaultStreamDeps, type LogSource } from '../core/logstream.js';
+import { streamLogs, defaultStreamDeps, resolveColor, type LogSource } from '../core/logstream.js';
 import { doctor } from '../core/doctor.js';
 import { initProject } from '../core/init.js';
 import { Fleet, actOn, listFleet, assertWritableRuns, describeFleetApp, type Act } from '../core/fleet.js';
@@ -81,7 +81,8 @@ export function buildProgram(io: Io = defaultIo): Command {
     .option('-n, --lines <n>', 'history lines per app (default 100, max 2000)')
     .option('--out', 'stdout only').option('--err', 'stderr only')
     .option('--interval <ms>', 'poll interval while following', '1000')
-    .option('--no-color', 'plain labels (also when NO_COLOR is set or stdout is not a terminal)')
+    .option('--color', "colors (labels and the apps' own) even when stdout is not a terminal; also FORCE_COLOR")
+    .option('--no-color', 'plain text (also when NO_COLOR is set or stdout is not a terminal)')
     .action(wrap(async (g, o, args) => {
       const targets = ((args[0] as unknown as string[] | undefined) ?? []);
       const fleet = fleetOf(g);
@@ -101,7 +102,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       try {
         await streamLogs(sources, {
           lines: Math.min(Math.max(1, Number(o.lines) || 100), 2000), follow: Boolean(o.follow), intervalMs: Math.max(200, Number(o.interval) || 1000),
-          color: o.color !== false && !process.env.NO_COLOR && Boolean(process.stdout.isTTY), json: Boolean(g.json),
+          color: resolveColor(o.color as boolean | undefined, process.env, Boolean(process.stdout.isTTY)), json: Boolean(g.json),
           stream: o.out ? 'out' : o.err ? 'err' : 'both', signal: ac.signal,
         }, defaultStreamDeps());
       } finally { process.off('SIGINT', stop); }

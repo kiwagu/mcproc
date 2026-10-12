@@ -1,4 +1,4 @@
-import { stripAnsi } from './logs.js';
+import { keepSgr, SGR_RE } from './logs.js';
 import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
@@ -38,10 +38,14 @@ export class LogFollower {
       const size = Number(body.slice(0, nl).trim()) || 0;
       body = body.slice(nl + 1);
       if (body.startsWith(`${RESET}\n`)) { body = body.slice(RESET.length + 1); reset = true; this.pending[s] = ''; }
-      const chunk = this.pending[s] + stripAnsi(body);
+      const chunk = this.pending[s] + body;
       const complete = chunk.endsWith('\n') ? chunk : chunk.slice(0, chunk.lastIndexOf('\n') + 1);
       this.pending[s] = chunk.slice(complete.length);
-      for (const line of complete.split('\n')) if (line.length) out.push({ stream: s, text: line });
+      // escapes are cleaned per complete line: a color code cut by a read boundary waits in `pending` with its line
+      for (const line of complete.split('\n')) {
+        const text = keepSgr(line);
+        if (text.replace(SGR_RE, '').length) out.push({ stream: s, text });
+      }
       this.offsets[s] = size;
     }
     return { lines: out, reset };

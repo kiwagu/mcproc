@@ -3,6 +3,7 @@ import { snapshot as probeSnapshot, type Snapshot } from './list.js';
 import { findProcess } from './pm2.js';
 import { LogFollower, sortByStamp, type LogLine } from './logfollow.js';
 import { describeError } from './errors.js';
+import { stripAnsi } from './logs.js';
 
 export interface StreamLine { app: string; stream: 'out' | 'err'; text: string }
 /**
@@ -26,10 +27,22 @@ export interface StreamOptions {
 const PALETTE = [36, 32, 33, 35, 34, 31]; // cyan, green, yellow, magenta, blue, red — one per app, like compose
 export const colorFor = (index: number): number => PALETTE[index % PALETTE.length];
 
-/** `app    | text` for stdout, `app    ! text` for stderr; only the label is colored, so the text stays greppable. */
+/**
+ * `app    | text` for stdout, `app    ! text` for stderr. With colors (a color for the label) the app's own colors stay,
+ * closed by a reset so they never run into the next line; without, they are removed.
+ */
 export function formatLine(l: StreamLine, width: number, color: number | null): string {
   const label = l.app.padEnd(width);
-  return `${color === null ? label : `\x1b[${color}m${label}\x1b[0m`} ${l.stream === 'err' ? '!' : '|'} ${l.text}`;
+  const text = color === null ? stripAnsi(l.text) : l.text.includes('\x1b[') ? `${l.text}\x1b[0m` : l.text;
+  return `${color === null ? label : `\x1b[${color}m${label}\x1b[0m`} ${l.stream === 'err' ? '!' : '|'} ${text}`;
+}
+
+/** --no-color / --color win, then NO_COLOR, then FORCE_COLOR (0 or false = off), else colors only on a terminal. */
+export function resolveColor(flag: boolean | undefined, env: NodeJS.ProcessEnv, isTTY: boolean): boolean {
+  if (flag !== undefined) return flag;
+  if (env.NO_COLOR) return false;
+  if (env.FORCE_COLOR !== undefined && env.FORCE_COLOR !== '') return env.FORCE_COLOR !== '0' && env.FORCE_COLOR !== 'false';
+  return isTTY;
 }
 
 export function defaultStreamDeps(): StreamDeps {
@@ -55,7 +68,7 @@ export async function streamLogs(sources: LogSource[], opts: StreamOptions, deps
   let closed = false; // the reader went away (`| head`): stop quietly, no stack trace
   const emit = (l: StreamLine) => {
     if (closed || (opts.stream !== 'both' && l.stream !== opts.stream)) return;
-    try { deps.out(opts.json ? JSON.stringify(l) : formatLine(l, width, colors.get(l.app) ?? null)); }
+    try { deps.out(opts.json ? JSON.stringify({ ...l, text: stripAnsi(l.text) }) : formatLine(l, width, colors.get(l.app) ?? null)); }
     catch (e) { if ((e as { code?: string }).code === 'EPIPE') closed = true; else throw e; }
   };
   const followers = new Map<string, Follower>();
