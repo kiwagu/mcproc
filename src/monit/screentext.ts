@@ -24,7 +24,15 @@ const MARK = /\p{M}/u;
 const SPACING_MARK = /\p{Mc}/u;
 const BLESSED_WIDE = new RegExp(chars.wide.source); // the characters blessed gives a placeholder cell
 /** status emoji with a narrow look-alike that keeps their meaning */
-const NARROW: Record<string, string> = { '✅': '✔', '❌': '✖', '❎': '✖', '❗': '!', '❕': '!', '❓': '?', '❔': '?' };
+const NARROW: Record<string, string> = {
+  '✅': '✔',
+  '❌': '✖',
+  '❎': '✖',
+  '❗': '!',
+  '❕': '!',
+  '❓': '?',
+  '❔': '?',
+};
 const TAB = 8;
 
 /**
@@ -33,7 +41,8 @@ const TAB = 8;
  */
 export function displayWidth(s: string): number {
   let w = 0;
-  for (const ch of s.includes('\x1b') ? s.replace(SGR_RE, '') : s) w += charWidth(ch.codePointAt(0)!) === 2 ? 2 : 1;
+  for (const ch of s.includes('\x1b') ? s.replace(SGR_RE, '') : s)
+    w += charWidth(ch.codePointAt(0)!) === 2 ? 2 : 1;
   return w;
 }
 
@@ -52,7 +61,11 @@ function keepMark(ch: string, cp: number): boolean {
 function cluster(c: string): string {
   if (c === '\t') return c;
   const first = String.fromCodePoint(c.codePointAt(0)!);
-  if (REGIONAL.test(first)) return [...c].filter((ch) => REGIONAL.test(ch)).map((ch) => String.fromCharCode(ch.codePointAt(0)! - 0x1f1e6 + 65)).join(''); // 🇺🇦 → UA
+  if (REGIONAL.test(first))
+    return [...c]
+      .filter((ch) => REGIONAL.test(ch))
+      .map((ch) => String.fromCharCode(ch.codePointAt(0)! - 0x1f1e6 + 65))
+      .join(''); // 🇺🇦 → UA
   if (KEYCAP.test(c)) return c[0]; // 1️⃣ → 1
   if (PICTOGRAPH.test(first) || EMOJI_PRESENTATION.test(first)) {
     if (NARROW[first]) return NARROW[first];
@@ -63,8 +76,14 @@ function cluster(c: string): string {
   for (const ch of c) {
     if (INVISIBLE.test(ch)) continue;
     const cp = ch.codePointAt(0)!;
-    if (MARK.test(ch)) { if (keepMark(ch, cp)) out += ch; continue; }
-    if (cp > 0xffff || (cp >= 0xd800 && cp <= 0xdfff)) { out += '?'; continue; }
+    if (MARK.test(ch)) {
+      if (keepMark(ch, cp)) out += ch;
+      continue;
+    }
+    if (cp > 0xffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+      out += '?';
+      continue;
+    }
     // blessed has two tables of wide characters (the placeholder one and charWidth); where they disagree, it draws off by one
     out += (charWidth(cp) === 2) === BLESSED_WIDE.test(ch) ? ch : '?';
   }
@@ -78,15 +97,19 @@ function cluster(c: string): string {
  */
 function blessedSgr(code: string): string {
   if (!code.includes(':')) return code;
-  const groups = code.slice(2, -1).split(';').flatMap((g) => {
-    if (!g.includes(':')) return [g];
-    const [kind, mode, ...rest] = g.split(':');
-    if (kind === '4') return ['4'];
-    if (!['38', '48', '58'].includes(kind)) return [];
-    if (mode === '5' && rest[0]) return [`${kind};5;${rest[0]}`];
-    if (mode === '2' && rest.length >= 3) return [`${kind};2;${rest.slice(-3).join(';')}`];
-    return [];
-  });
+  const groups = code
+    .slice(2, -1)
+    .split(';')
+    .flatMap((g) => {
+      if (!g.includes(':')) return [g];
+      const [kind, mode, ...rest] = g.split(':');
+      if (kind === '4') return ['4'];
+      if (!['38', '48', '58'].includes(kind)) return [];
+      if (mode === '5' && rest[0]) return [`${kind};5;${rest[0]}`];
+      if (mode === '2' && rest.length >= 3)
+        return [`${kind};2;${rest.slice(-3).join(';')}`];
+      return [];
+    });
   return groups.length ? `\x1b[${groups.join(';')}m` : '';
 }
 
@@ -99,18 +122,36 @@ const visible = (t: string) => t.replace(SGR_RE, '');
  * go; with it an app's color codes stay where they are (one set before a carriage return still applies after it) and
  * every other escape goes.
  */
-export function screenText(input: string, opts: { colors?: boolean } = {}): string {
-  const parts = (opts.colors ? keepSgr(input) : stripAnsi(input)).replace(/\r\n/g, '\n').split('\r');
+export function screenText(
+  input: string,
+  opts: { colors?: boolean } = {}
+): string {
+  const parts = (opts.colors ? keepSgr(input) : stripAnsi(input))
+    .replace(/\r\n/g, '\n')
+    .split('\r');
   let last = parts.length - 1;
   while (last > 0 && visible(parts[last]) === '') last--;
-  const carried = parts.slice(0, last).flatMap((p) => p.match(SGR_RE) ?? []).join('');
+  const carried = parts
+    .slice(0, last)
+    .flatMap((p) => p.match(SGR_RE) ?? [])
+    .join('');
   let out = '';
   let col = 0;
   for (const piece of (carried + parts[last]).split(SGR_SPLIT)) {
-    if (SGR_SPLIT.test(piece) && piece.startsWith('\x1b')) { out += blessedSgr(piece); continue; }
-    for (const { segment } of segmenter.segment(piece.replace(LINE_BREAK, ' ').normalize('NFC'))) {
+    if (SGR_SPLIT.test(piece) && piece.startsWith('\x1b')) {
+      out += blessedSgr(piece);
+      continue;
+    }
+    for (const { segment } of segmenter.segment(
+      piece.replace(LINE_BREAK, ' ').normalize('NFC')
+    )) {
       const c = cluster(segment);
-      if (c === '\t') { const n = TAB - (col % TAB); out += ' '.repeat(n); col += n; continue; }
+      if (c === '\t') {
+        const n = TAB - (col % TAB);
+        out += ' '.repeat(n);
+        col += n;
+        continue;
+      }
       out += c;
       col += columns(c);
     }
@@ -129,5 +170,5 @@ export function cutWidth(s: string, width: number): string {
     out += ch;
     w += cw;
   }
-  return out + '…';
+  return `${out}…`;
 }

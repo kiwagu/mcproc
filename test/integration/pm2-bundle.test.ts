@@ -11,11 +11,15 @@ describe('ensurePm2Bundle (network: npm registry, real npm and tar)', () => {
     const a = await ensurePm2Bundle({ cacheDir });
     expect(a.version).toBe('7.0.4');
     expect(a.data.length).toBeLessThan(10 * 1048576);
-    const listing = execFileSync('tar', ['-tzf', a.path], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    const listing = execFileSync('tar', ['-tzf', a.path], {
+      encoding: 'utf8',
+      maxBuffer: 1 << 26,
+    });
     expect(listing).toContain('node_modules/pm2/bin/pm2');
     expect(listing).toContain('node_modules/pm2/LICENSE');
     const b = await ensurePm2Bundle({ cacheDir, force: true });
-    if (/GNU tar/.test(execFileSync('tar', ['--version']).toString())) expect(b.sha256).toBe(a.sha256);
+    if (/GNU tar/.test(execFileSync('tar', ['--version']).toString()))
+      expect(b.sha256).toBe(a.sha256);
     fs.rmSync(cacheDir, { recursive: true, force: true });
   }, 300_000);
 });

@@ -2,7 +2,11 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest } from '../../src/core/manifest.js';
-import { buildEcosystem, ecosystemPath, appCwd } from '../../src/core/ecosystem.js';
+import {
+  buildEcosystem,
+  ecosystemPath,
+  appCwd,
+} from '../../src/core/ecosystem.js';
 import { pm2Name } from '../../src/core/pm2.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -20,9 +24,18 @@ describe('buildEcosystem', () => {
     const eco = buildEcosystem(m, m.hosts.local);
     const api = eco.apps.find((a) => a.name === 'demo-api')!;
     expect(api).toMatchObject({
-      name: 'demo-api', namespace: 'demo', cwd: basic, script: '/bin/bash', args: ['-lc', 'node dist/apps/api/main.js'],
-      interpreter: 'none', env: { PORT: '3310', DEBUG: 'true' }, autorestart: true, treekill: true, time: true,
-      watch: ['dist/apps/api'], watch_delay: 1000,
+      name: 'demo-api',
+      namespace: 'demo',
+      cwd: basic,
+      script: '/bin/bash',
+      args: ['-lc', 'node dist/apps/api/main.js'],
+      interpreter: 'none',
+      env: { PORT: '3310', DEBUG: 'true' },
+      autorestart: true,
+      treekill: true,
+      time: true,
+      watch: ['dist/apps/api'],
+      watch_delay: 1000,
     });
     expect(api).not.toHaveProperty('ignore_watch');
     const worker = eco.apps.find((a) => a.name === 'demo-worker')!;
@@ -38,7 +51,11 @@ describe('buildEcosystem', () => {
     expect(api.cwd).toBe('/srv/demo');
     expect(api.env.PORT).toBe('4000');
     expect(api.args).toEqual(['-lc', `sh -c 'echo "$HOME" && node x.js'`]);
-    expect(ecosystemPath(m2.hosts.stand)).toBe('/srv/demo/.mcproc/.generated/ecosystem.json');
-    expect(appCwd(m2.hosts.stand, { ...m2.apps.api, cwd: 'apps/api' })).toBe('/srv/demo/apps/api');
+    expect(ecosystemPath(m2.hosts.stand)).toBe(
+      '/srv/demo/.mcproc/.generated/ecosystem.json'
+    );
+    expect(appCwd(m2.hosts.stand, { ...m2.apps.api, cwd: 'apps/api' })).toBe(
+      '/srv/demo/apps/api'
+    );
   });
 });

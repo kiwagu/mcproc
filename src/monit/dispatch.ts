@@ -9,9 +9,16 @@ import type { Frame } from './frame.js';
  * burst (`b`, then Home) makes the next scroll measure it again instead of trusting a frame painted before that key.
  */
 export function screenDispatch(io: {
-  get: () => MonitState; set: (s: MonitState) => void;
-  render: (s: MonitState) => Frame; show: (f: Frame) => void;
+  get: () => MonitState;
+  set: (s: MonitState) => void;
+  render: (s: MonitState) => Frame;
+  show: (f: Frame) => void;
   defer?: (cb: () => void) => void;
+  /** where a scroll of `delta` rows lands, measured on the pane as it is now (frame scrollTo); without it, whole entries */
+  scrollTo?: (
+    s: MonitState,
+    delta: number
+  ) => { entries: number; rows: number };
 }): { dispatch: (a: MonitAction) => void; paint: () => void } {
   let ceiling: number | undefined;
   const paint = () => {
@@ -21,7 +28,9 @@ export function screenDispatch(io: {
   };
   const schedule = coalesce(paint, io.defer);
   const dispatch = (a: MonitAction) => {
-    if (a.type === 'scroll') {
+    if (a.type === 'scroll' && io.scrollTo) {
+      io.set(reduce(io.get(), { ...a, to: io.scrollTo(io.get(), a.delta) }));
+    } else if (a.type === 'scroll') {
       ceiling ??= io.render(io.get()).maxScroll;
       io.set(reduce(io.get(), { ...a, max: ceiling }));
     } else {

@@ -1,9 +1,19 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { prepare, connect, clearResolutionCache, type Context } from '../../src/core/resolve.js';
+import {
+  prepare,
+  connect,
+  clearResolutionCache,
+  type Context,
+} from '../../src/core/resolve.js';
 import { Fleet, actOn } from '../../src/core/fleet.js';
-import { clearLogs, readStore, storePath, takeIncidents } from '../../src/core/incidents/store.js';
+import {
+  clearLogs,
+  readStore,
+  storePath,
+  takeIncidents,
+} from '../../src/core/incidents/store.js';
 
 const RUN = process.env.MCPROC_IT === '1';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -11,18 +21,35 @@ const BOOM = `console.log('starting'); setTimeout(() => { console.error(new Type
 const CRASHY = `console.log('up'); setTimeout(() => process.exit(1), 300);`;
 
 describe.skipIf(!RUN)('incidents against a real pm2', () => {
-  let base: string; let ctx: Context; let fleet: Fleet;
+  let base: string;
+  let ctx: Context;
+  let fleet: Fleet;
   beforeAll(async () => {
     base = fs.mkdtempSync('/tmp/mcproc-inc-');
     fs.mkdirSync(path.join(base, '.mcproc'));
     fs.writeFileSync(path.join(base, 'boom.js'), BOOM);
     fs.writeFileSync(path.join(base, 'crashy.js'), CRASHY);
-    fs.writeFileSync(path.join(base, '.mcproc', 'mcproc.yaml'), [
-      'version: 1', 'project: itinc', 'apps:',
-      '  boom:', '    description: logs a TypeError with a stack once', '    kind: worker', '    run: node boom.js',
-      '  crashy:', '    description: exits 1 after 300 ms, pm2 restarts it', '    kind: worker', '    run: node crashy.js', '    pm2: { restart_delay: 500 }',
-      'hosts:', '  local:', `    pm2_home: ${path.join(base, 'home')}`, '',
-    ].join('\n'));
+    fs.writeFileSync(
+      path.join(base, '.mcproc', 'mcproc.yaml'),
+      [
+        'version: 1',
+        'project: itinc',
+        'apps:',
+        '  boom:',
+        '    description: logs a TypeError with a stack once',
+        '    kind: worker',
+        '    run: node boom.js',
+        '  crashy:',
+        '    description: exits 1 after 300 ms, pm2 restarts it',
+        '    kind: worker',
+        '    run: node crashy.js',
+        '    pm2: { restart_delay: 500 }',
+        'hosts:',
+        '  local:',
+        `    pm2_home: ${path.join(base, 'home')}`,
+        '',
+      ].join('\n')
+    );
     clearResolutionCache();
     ctx = await connect(prepare({ project: base }));
     fleet = new Fleet(prepare({ project: base }).manifest, undefined);
@@ -30,7 +57,11 @@ describe.skipIf(!RUN)('incidents against a real pm2', () => {
     await sleep(2500);
   }, 60_000);
   afterAll(async () => {
-    try { await ctx.pm2.run(['kill']); } catch { /* already gone */ }
+    try {
+      await ctx.pm2.run(['kill']);
+    } catch {
+      /* already gone */
+    }
     fs.rmSync(base, { recursive: true, force: true });
   });
 
@@ -39,21 +70,34 @@ describe.skipIf(!RUN)('incidents against a real pm2', () => {
     const boom = first.answer.incidents.find((i) => i.app === 'boom')!;
     expect(boom.line).toContain('TypeError: x is undefined');
     expect(boom.after.some((l) => l.includes('    at '))).toBe(true);
-    expect(fs.existsSync(path.join(base, '.mcproc', 'incidents.json'))).toBe(true);
+    expect(fs.existsSync(path.join(base, '.mcproc', 'incidents.json'))).toBe(
+      true
+    );
     await sleep(2500);
     const peek = await takeIncidents(fleet, ['boom', 'crashy'], { peek: true });
     expect(peek.answer.incidents.filter((i) => i.app === 'boom')).toEqual([]);
-    const peeked = peek.answer.incidents.find((i) => i.app === 'crashy' && i.kind === 'restarted')?.count ?? 0;
+    const peeked =
+      peek.answer.incidents.find(
+        (i) => i.app === 'crashy' && i.kind === 'restarted'
+      )?.count ?? 0;
     expect(peeked).toBeGreaterThan(0);
     const second = await takeIncidents(fleet, ['boom', 'crashy']);
     expect(second.answer.incidents.filter((i) => i.app === 'boom')).toEqual([]);
-    expect(second.answer.incidents.find((i) => i.app === 'crashy' && i.kind === 'restarted')?.count).toBeGreaterThanOrEqual(peeked);
+    expect(
+      second.answer.incidents.find(
+        (i) => i.app === 'crashy' && i.kind === 'restarted'
+      )?.count
+    ).toBeGreaterThanOrEqual(peeked);
   }, 30_000);
 
   it('a clear empties the logs and records it: even with no pick-up point left, the old TypeError never comes back', async () => {
     const file = storePath(fleet.manifest.path);
     fs.rmSync(file);
-    expect((await takeIncidents(fleet, ['boom'], { peek: true })).answer.incidents.map((i) => i.app)).toEqual(['boom']); // a first call would find it again
+    expect(
+      (
+        await takeIncidents(fleet, ['boom'], { peek: true })
+      ).answer.incidents.map((i) => i.app)
+    ).toEqual(['boom']); // a first call would find it again
     const r = await clearLogs(fleet, ['boom']);
     expect(r).toMatchObject([{ app: 'boom', host: 'local' }]);
     expect(r[0].err_bytes).toBeGreaterThan(0);

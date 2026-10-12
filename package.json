@@ -1,13 +1,18 @@
 {
   "name": "mcproc",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "pm2 process control for agents over MCP: local and remote hosts, per-app ports, one manifest per project",
   "type": "module",
   "license": "MIT",
   "bin": {
     "mcproc": "dist/cli.js"
   },
-  "files": ["dist", "runtime/package.json", "runtime/package-lock.json", "README.md"],
+  "files": [
+    "dist",
+    "runtime/package.json",
+    "runtime/package-lock.json",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -17,6 +22,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:it": "MCPROC_IT=1 vitest run test/integration",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check .",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
@@ -28,6 +36,7 @@
     "zod": "^3.25"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
     "@types/node": "^26.6.5",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",

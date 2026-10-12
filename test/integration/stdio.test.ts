@@ -12,7 +12,11 @@ const cli = process.env.MCPROC_CLI ?? path.join(root, 'dist', 'cli.js');
 
 describe('mcproc mcp over stdio (built dist)', () => {
   it('lists tools and answers hosts', async () => {
-    const transport = new StdioClientTransport({ command: process.execPath, args: [cli, 'mcp'], env: { ...process.env, MCPROC_PROJECT: basic } as Record<string, string> });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [cli, 'mcp'],
+      env: { ...process.env, MCPROC_PROJECT: basic } as Record<string, string>,
+    });
     const client = new Client({ name: 'smoke', version: '0' });
     await client.connect(transport);
     const tools = await client.listTools();

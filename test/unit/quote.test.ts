@@ -9,12 +9,21 @@ describe('shq', () => {
     expect(shq('')).toBe("''");
   });
   it('round-trips hostile strings through /bin/sh', () => {
-    for (const s of [`a'b"c$d e&&f`, '$(touch /tmp/x)', 'back`tick`', 'new\nline', 'tab\tchar']) {
-      const out = execFileSync('/bin/sh', ['-c', `printf %s ${shq(s)}`]).toString();
+    for (const s of [
+      `a'b"c$d e&&f`,
+      '$(touch /tmp/x)',
+      'back`tick`',
+      'new\nline',
+      'tab\tchar',
+    ]) {
+      const out = execFileSync('/bin/sh', [
+        '-c',
+        `printf %s ${shq(s)}`,
+      ]).toString();
       expect(out).toBe(s);
     }
   });
   it('joins argv with one space', () => {
-    expect(shjoin(['ssh', 'host', "a b"])).toBe("'ssh' 'host' 'a b'");
+    expect(shjoin(['ssh', 'host', 'a b'])).toBe("'ssh' 'host' 'a b'");
   });
 });

@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { parsePlatform, nodeDistFile, nodeDistUrl, parseShasums, normalizeVersion, compareVersions } from '../../src/runtime/platform.js';
+import {
+  parsePlatform,
+  nodeDistFile,
+  nodeDistUrl,
+  parseShasums,
+  normalizeVersion,
+  compareVersions,
+} from '../../src/runtime/platform.js';
 
 describe('parsePlatform', () => {
   it('maps uname -sm and the musl probe to a nodejs.org platform', () => {
@@ -18,11 +25,17 @@ describe('parsePlatform', () => {
 
 describe('dist naming and checksums', () => {
   it('builds file names and URLs', () => {
-    expect(nodeDistFile('v24.21.0', 'linux-x64-musl')).toBe('node-v24.21.0-linux-x64-musl.tar.gz');
-    expect(nodeDistUrl('v24.21.0', 'SHASUMS256.txt')).toBe('https://nodejs.org/dist/v24.21.0/SHASUMS256.txt');
+    expect(nodeDistFile('v24.21.0', 'linux-x64-musl')).toBe(
+      'node-v24.21.0-linux-x64-musl.tar.gz'
+    );
+    expect(nodeDistUrl('v24.21.0', 'SHASUMS256.txt')).toBe(
+      'https://nodejs.org/dist/v24.21.0/SHASUMS256.txt'
+    );
   });
   it('parses SHASUMS256.txt', () => {
-    const m = parseShasums('aaa111  node-v24.21.0-linux-x64.tar.gz\nbbb222  node-v24.21.0-linux-x64.tar.xz\n\n');
+    const m = parseShasums(
+      'aaa111  node-v24.21.0-linux-x64.tar.gz\nbbb222  node-v24.21.0-linux-x64.tar.xz\n\n'
+    );
     expect(m.get('node-v24.21.0-linux-x64.tar.gz')).toBe('aaa111');
     expect(m.size).toBe(2);
   });
@@ -30,6 +43,8 @@ describe('dist naming and checksums', () => {
     expect(normalizeVersion('24.21.0')).toBe('v24.21.0');
     expect(normalizeVersion('v22.1.0')).toBe('v22.1.0');
     expect(() => normalizeVersion('latest')).toThrowError(/not a Node version/);
-    expect(['v22.1.0', 'v24.21.0', 'v24.3.0'].sort(compareVersions).reverse()).toEqual(['v24.21.0', 'v24.3.0', 'v22.1.0']);
+    expect(
+      ['v22.1.0', 'v24.21.0', 'v24.3.0'].sort(compareVersions).reverse()
+    ).toEqual(['v24.21.0', 'v24.3.0', 'v22.1.0']);
   });
 });
