@@ -58,9 +58,10 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
     const keys = '↑↓ scroll  f dashboard  o/e/b logs  h host  q quit';
     return { header, table: [], logs: p.rows, details: [], footer: cut(right ? `${right}  │ ${keys}` : keys, w), scroll: p.scroll, maxScroll: p.maxScroll };
   }
+  const multi = new Set(s.rows.map((r) => r.host)).size > 1; // apps of several hosts on one screen: say where each runs
   const tableLines = table([
-    ['', 'APP', 'STATUS', 'UP', 'MEM', 'CPU', 'PORTS', 'URL', 'RUNTIME'],
-    ...s.rows.map((r, i) => [i === s.selected ? '▶' : ' ', r.app, r.status, fmtUptime(r.uptime_ms), r.memory ? fmtBytes(r.memory) : '-', r.status === 'online' ? fmtCpu(r.cpu) : '-', cut(fmtPorts(r.ports), 22), cut(fmtUrl(r), 36), r.runtime ? cut(r.runtime, 40) : '-']),
+    ['', 'APP', ...(multi ? ['HOST'] : []), 'STATUS', 'UP', 'MEM', 'CPU', 'PORTS', 'URL', 'RUNTIME'],
+    ...s.rows.map((r, i) => [i === s.selected ? '▶' : ' ', r.app, ...(multi ? [r.host] : []), r.status, fmtUptime(r.uptime_ms), r.memory ? fmtBytes(r.memory) : '-', r.status === 'online' ? fmtCpu(r.cpu) : '-', cut(fmtPorts(r.ports), 22), cut(fmtUrl(r), 36), r.runtime ? cut(r.runtime, 40) : '-']),
   ]).split('\n').map((l) => cut(l.replace(/^(.)\s\s/, '$1'), w));
   const detailsH = 6;
   const logH = Math.max(3, size.height - 1 - tableLines.length - 3 - detailsH - 1); // 3: one title rule per pane, no frames
@@ -71,7 +72,7 @@ export function renderFrame(s: MonitState, size: { width: number; height: number
   const details = r && a ? [
     cut(`${r.app} [${r.kind}] ${a.description.split('\n')[0]}`, w),
     cut(`run: ${a.run}   cwd: ${a.cwd}`, w),
-    cut(`pm2: ${a.pm2Name}  pid ${r.pid ?? '-'}  restarts ${r.restarts}  procs ${r.procs ?? '?'}  mem ${r.memory ? fmtBytes(r.memory) : '-'} (RSS sum of the tree; pm2 root: ${fmtBytes(r.pm2_memory)})`, w),
+    cut(`pm2: ${a.pm2Name} on ${r.host}  pid ${r.pid ?? '-'}  restarts ${r.restarts}  procs ${r.procs ?? '?'}  mem ${r.memory ? fmtBytes(r.memory) : '-'} (RSS sum of the tree; pm2 root: ${fmtBytes(r.pm2_memory)})`, w),
     cut(`ports: ${portDetails(r)}`, w),
     cut(`url: ${fmtUrl(r)}`, w),
     cut(`logs: ${s.logPaths ? `${s.logPaths.out} | ${s.logPaths.err}` : '-'}`, w),

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseManifest, loadManifest, findManifestPath, defaultProject } from '../../src/core/manifest.js';
+import { parseManifest, loadManifest, findManifestPath, defaultProject, scopeManifest } from '../../src/core/manifest.js';
 import { McprocError } from '../../src/core/errors.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -92,5 +92,33 @@ describe('validation', () => {
     expect(parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n').apps.web.url).toBeNull();
     expect(() => parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n    url: localhost:3100\n')).toThrow(/url/);
     expect(() => parse('version: 1\napps:\n  web:\n    description: d\n    run: x\n    url: ftp://x/\n')).toThrow(/url/);
+  });
+});
+
+describe('host-bound apps', () => {
+  const base = 'version: 1\nhosts:\n  box: { ssh: box, cwd: /srv/p }\napps:\n';
+  it('host: binds an app to a declared host or to local; unbound apps carry null', () => {
+    const m = parse(base + '  a: { description: d, run: r, host: box }\n  b: { description: d, run: r, host: local }\n  c: { description: d, run: r }\n');
+    expect(m.apps.a.host).toBe('box');
+    expect(m.apps.b.host).toBe('local');
+    expect(m.apps.c.host).toBeNull();
+  });
+  it('rejects a host that the manifest does not declare', () => {
+    expectInvalid(base + '  a: { description: d, run: r, host: nowhere }\n', 'apps.a.host: unknown host "nowhere"');
+  });
+});
+
+describe('scopeManifest', () => {
+  const fleet = loadManifest(path.join(here, '..', 'fixtures', 'projects', 'fleet'));
+  it('keeps the apps that run on the host: bound to it, or unbound when it is the fallback', () => {
+    expect(Object.keys(scopeManifest(fleet, 'local', 'local').apps)).toEqual(['watch', 'tool']);
+    expect(Object.keys(scopeManifest(fleet, 'box', 'local').apps)).toEqual(['web']);
+    expect(Object.keys(scopeManifest(fleet, 'box', 'box').apps)).toEqual(['web', 'tool']);
+  });
+  it('drops dependencies and profile members that run elsewhere, so the view stays self-consistent', () => {
+    const box = scopeManifest(fleet, 'box', 'local');
+    expect(box.apps.web.depends_on).toEqual([]);
+    expect(box.profiles).toEqual({ dev: ['web'], builds: [] });
+    expect(fleet.apps.web.depends_on).toEqual(['watch']); // the full manifest is untouched
   });
 });

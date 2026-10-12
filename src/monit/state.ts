@@ -8,18 +8,24 @@ export type Stream = 'out' | 'err' | 'both';
 export type View = 'dashboard' | 'flat';
 export interface FlatLine { app: string; stream: 'out' | 'err'; text: string }
 export interface AppInfo { description: string; run: string; cwd: string; pm2Name: string }
+/** A buffered log line with its arrival number: hosts have their own clocks (and time zones), so across hosts arrival is the order. */
+export interface BufferedLine extends LogLine { seq: number }
 export interface MonitState {
   project: string; host: string; hosts: string[]; apps: Record<string, AppInfo>;
   rows: LsRow[]; selected: number; stream: Stream; view: View;
+  /** the user moved the selection in this view; until then it is the first row, whichever host answered first */
+  chosen: boolean;
   /** entries hidden below the log pane (0 = following the tail); the view stays put while new lines arrive */
   logScroll: number;
   /** one buffer per app, filled by every poll whichever view is active: the dashboard shows the selected app's, the flat view merges all */
-  logs: Record<string, LogLine[]>;
+  logs: Record<string, BufferedLine[]>;
+  /** the arrival number the next buffered line gets */
+  seq: number;
   maxLogs: number; logPaths: { out: string; err: string } | null;
   error: string | null; notice: string | null; busy: boolean; updatedAt: Date | null;
 }
 export type MonitAction =
-  | { type: 'rows'; rows: LsRow[]; at: Date }
+  | { type: 'rows'; rows: LsRow[]; at?: Date } // no `at`: nothing new was heard (a host failed), so the clock stays
   | { type: 'logs'; app: string; lines: LogLine[]; reset?: boolean; paths?: { out: string; err: string } | null }
   | { type: 'view'; view: View }
   | { type: 'scroll'; delta: number; max?: number } // + = older; ±Infinity = oldest / tail; max = the pane's ceiling (renderFrame().maxScroll)
@@ -36,9 +42,17 @@ export function appInfos(m: Manifest): Record<string, AppInfo> {
 export function hostNames(m: Manifest): string[] {
   return ['local', ...Object.keys(m.hosts).filter((h) => h !== 'local')];
 }
+/**
+ * The screen's views in `h` order, each the --host a command would take: with host-bound apps first "all" (undefined:
+ * every app at its own host), then each host; without any, just the hosts, as there is nothing else to tell apart.
+ */
+export function monitViews(m: Manifest): (string | undefined)[] {
+  return Object.values(m.apps).some((a) => a.host !== null) ? [undefined, ...hostNames(m)] : hostNames(m);
+}
+export const viewLabel = (requested: string | undefined): string => requested ?? 'all';
 
 export function initialState(p: { project: string; host: string; hosts: string[]; apps: Record<string, AppInfo>; maxLogs?: number }): MonitState {
-  return { project: p.project, host: p.host, hosts: p.hosts, apps: p.apps, rows: [], selected: 0, stream: 'both', view: 'dashboard', logScroll: 0, logs: {}, maxLogs: p.maxLogs ?? 2000, logPaths: null, error: null, notice: null, busy: false, updatedAt: null };
+  return { project: p.project, host: p.host, hosts: p.hosts, apps: p.apps, rows: [], selected: 0, chosen: false, stream: 'both', view: 'dashboard', logScroll: 0, logs: {}, seq: 0, maxLogs: p.maxLogs ?? 2000, logPaths: null, error: null, notice: null, busy: false, updatedAt: null };
 }
 
 const clamp = (i: number, n: number) => (n === 0 ? 0 : Math.min(Math.max(i, 0), n - 1));
@@ -48,20 +62,24 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
   switch (a.type) {
     case 'rows': {
       const name = s.rows[s.selected]?.app;
-      const idx = name ? a.rows.findIndex((r) => r.app === name) : -1;
-      return { ...s, rows: a.rows, selected: clamp(idx >= 0 ? idx : s.selected, a.rows.length), updatedAt: a.at, error: null };
+      const idx = s.chosen && name ? a.rows.findIndex((r) => r.app === name) : 0;
+      const selected = clamp(idx >= 0 ? idx : s.selected, a.rows.length);
+      const moved = a.rows[selected]?.app !== name; // another app is selected now: its log paths are not known yet
+      return { ...s, rows: a.rows, selected, ...(moved ? { logPaths: null, logScroll: 0 } : {}), updatedAt: a.at ?? s.updatedAt, error: null };
     }
     case 'logs': {
-      const buffer = (a.reset ? a.lines : [...(s.logs[a.app] ?? []), ...a.lines]).slice(-s.maxLogs);
+      // one poll's stdout and stderr merge by pm2's stamp (one app, one clock); then the batch is numbered in arrival order
+      const batch = sortByStamp(a.lines).map((l, i) => ({ ...l, seq: s.seq + i }));
+      const buffer = (a.reset ? batch : [...(s.logs[a.app] ?? []), ...batch]).slice(-s.maxLogs);
       const inView = s.view === 'flat' || a.app === selectedApp(s);
       // a scrolled view stays on the same lines while new ones arrive below it; a reset (rotation, flush) jumps to the tail
       const logScroll = !inView ? s.logScroll : a.reset ? 0 : s.logScroll > 0 ? s.logScroll + a.lines.length : 0;
       const logPaths = a.paths !== undefined && a.app === selectedApp(s) ? a.paths : s.logPaths;
-      return { ...s, logs: { ...s.logs, [a.app]: buffer }, logScroll, logPaths };
+      return { ...s, logs: { ...s.logs, [a.app]: buffer }, seq: s.seq + batch.length, logScroll, logPaths };
     }
     case 'select': {
       const selected = clamp(s.selected + a.delta, s.rows.length);
-      return selected === s.selected ? s : { ...s, selected, logPaths: null, logScroll: 0 }; // buffers are kept: the next selection shows its history at once
+      return selected === s.selected ? { ...s, chosen: true } : { ...s, selected, chosen: true, logPaths: null, logScroll: 0 }; // buffers are kept: the next selection shows its history at once
     }
     case 'view': return { ...s, view: a.view, logScroll: 0 };
     case 'scroll': {
@@ -73,7 +91,7 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
     case 'error': return { ...s, error: a.message };
     case 'notice': return { ...s, notice: a.message };
     case 'busy': return { ...s, busy: a.busy };
-    case 'host': return { ...s, host: a.host, rows: [], logs: {}, logScroll: 0, logPaths: null, selected: 0, error: null, notice: `host: ${a.host}` };
+    case 'host': return { ...s, host: a.host, rows: [], logs: {}, logScroll: 0, logPaths: null, selected: 0, chosen: false, error: null, notice: `host: ${a.host}` };
   }
 }
 
@@ -113,8 +131,16 @@ export function visibleLogs(s: MonitState): LogLine[] {
   return s.stream === 'both' ? sortByStamp(lines) : lines;
 }
 
-/** The flat stream: every app's buffer merged, ordered by pm2's stamp across apps (one host, one clock). */
+/**
+ * The flat stream: every app's buffer merged. Apps of one host are ordered by pm2's stamp (one clock); once the apps with
+ * lines run on more than one host, by arrival — another host's stamps may be in another time zone, or just drift.
+ */
 export function visibleFlat(s: MonitState): FlatLine[] {
-  const all = Object.entries(s.logs).flatMap(([app, lines]) => lines.map((l) => ({ app, stream: l.stream, text: l.text })));
-  return sortByStamp(s.stream === 'both' ? all : all.filter((l) => l.stream === s.stream));
+  const hostOf = new Map(s.rows.map((r) => [r.app, r.host]));
+  const entries = Object.entries(s.logs).filter(([, lines]) => lines.length > 0);
+  const oneClock = new Set(entries.map(([app]) => hostOf.get(app))).size <= 1;
+  const all = entries.flatMap(([app, lines]) => lines.map((l) => ({ app, stream: l.stream, text: l.text, seq: l.seq })));
+  const shown = s.stream === 'both' ? all : all.filter((l) => l.stream === s.stream);
+  const ordered = oneClock ? sortByStamp(shown) : shown.sort((a, b) => a.seq - b.seq);
+  return ordered.map(({ app, stream, text }) => ({ app, stream, text }));
 }

@@ -4,14 +4,14 @@ import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
 import { unpack, defaultUnpackDeps } from '../runtime/unpack.js';
 import type { WithNode } from '../runtime/decide.js';
-import { prepare, connect, assertApp, assertWritable, resolveProjectDir, type Context } from '../core/resolve.js';
-import { listApps, portsReport, hostsInfo, describeApp, describeProject } from '../core/list.js';
+import { prepare, connect, assertWritable, resolveProjectDir } from '../core/resolve.js';
+import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { flushLogs } from '../core/logs.js';
-import { streamLogs, defaultStreamDeps } from '../core/logstream.js';
+import { streamLogs, defaultStreamDeps, type LogSource } from '../core/logstream.js';
 import { doctor } from '../core/doctor.js';
 import { initProject } from '../core/init.js';
-import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '../core/actions.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderProject, renderUnpack, startNote } from '../mcp/render.js';
+import { Fleet, actOn, listFleet, assertWritableRuns, describeFleetApp, type Act } from '../core/fleet.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderProject, renderUnpack, startNote, hostsOf } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { installShortcut } from './install.js';
@@ -46,14 +46,14 @@ export function buildProgram(io: Io = defaultIo): Command {
       }
     };
   const ctxOf = (g: Globals) => connect(prepare({ project: g.project, host: g.host }));
-  const mutate = async (g: Globals, target: string, act: (ctx: Context) => Promise<Parameters<typeof renderLs>[0]>, note = false) => {
-    const p = prepare({ project: g.project, host: g.host });
-    resolveTargets(p.manifest, target);
-    assertWritable(p.host);
-    const ctx = await connect(p);
-    const rows = await act(ctx);
-    const n = note ? startNote(rows) : '';
-    emit(g, renderLs(rows, ctx.host.name) + (n ? `\n${n}` : ''), { host: ctx.host.name, rows });
+  // apps run at their own host (`host:` in the manifest); --host narrows a command to the apps that run there
+  const fleetOf = (g: Globals) => new Fleet(prepare({ project: g.project }).manifest, g.host);
+  const mutate = async (g: Globals, target: string, act: Act, opts: { reload?: boolean } = {}) => {
+    const fleet = fleetOf(g);
+    const rows = await actOn(fleet, target, act, opts);
+    const n = act === 'start' || act === 'restart' ? startNote(rows) : '';
+    emit(g, renderLs(rows, fleet.fallback) + (n ? `\n${n}` : ''), { ...hostsOf(rows, fleet.fallback), rows });
+    if (rows.some((r) => r.error)) process.exitCode = 1; // a host failed or was skipped: its rows say so, the exit code too
   };
 
   program.command('init').description('create .mcproc/ with a manifest draft discovered from the project').option('--force', 'overwrite an existing manifest')
@@ -62,16 +62,19 @@ export function buildProgram(io: Io = defaultIo): Command {
     .action(wrap(async (g) => { const { manifest } = prepare({ project: g.project }); const h = hostsInfo(manifest); emit(g, renderHosts(h), h); }));
   program.command('doctor').description('check hosts: reachability, node, pm2, tools, daemon')
     .action(wrap(async (g) => { const { manifest } = prepare({ project: g.project }); const r = await doctor(manifest, g.host); emit(g, renderDoctor(r), r); }));
-  program.command('ls [app]').description('apps with status, pid and real vs declared ports')
-    .action(wrap(async (g, _o, [app]) => { const p = prepare({ project: g.project, host: g.host }); if (app) assertApp(p.manifest, app); const ctx = await connect(p); const rows = await listApps(ctx, app); emit(g, renderLs(rows, ctx.host.name), rows); }));
+  program.command('ls [app]').description('apps with status, pid and real vs declared ports, each from the host it runs on')
+    .action(wrap(async (g, _o, [app]) => {
+      const fleet = fleetOf(g);
+      const { rows, errors } = await listFleet(fleet, fleet.select(app ? [app] : ['all']));
+      emit(g, renderLs(rows, fleet.fallback), rows);
+      if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
+    }));
   program.command('describe [app]').description('project summary, or one app in detail')
     .action(wrap(async (g, _o, [app]) => {
-      const p = prepare({ project: g.project, host: g.host });
-      if (!app) { const d = describeProject(p.manifest); emit(g, renderProject(d), d); return; }
-      assertApp(p.manifest, app);
-      const ctx = await connect(p);
-      const d = await describeApp(ctx, app);
-      emit(g, `${d.app.name} [${d.app.kind}]: ${d.app.description}\nrun: ${d.app.run}\ncwd: ${d.app.cwd}\n${renderLs([d.row], ctx.host.name)}\nlogs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`, d);
+      const fleet = fleetOf(g);
+      if (!app) { const d = describeProject(fleet.manifest); emit(g, renderProject(d), d); return; }
+      const d = await describeFleetApp(fleet, app);
+      emit(g, `${d.app.name} [${d.app.kind}]: ${d.app.description}\nrun: ${d.app.run}\ncwd: ${d.app.cwd}\n${renderLs([d.row], d.host)}\nlogs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`, d);
     }));
   program.command('logs [targets...]').description('logs of apps or profiles (default: all apps), one labeled line per entry like docker compose; -f keeps streaming')
     .option('-f, --follow', 'keep streaming until Ctrl-C')
@@ -81,9 +84,14 @@ export function buildProgram(io: Io = defaultIo): Command {
     .option('--no-color', 'plain labels (also when NO_COLOR is set or stdout is not a terminal)')
     .action(wrap(async (g, o, args) => {
       const targets = ((args[0] as unknown as string[] | undefined) ?? []);
-      const p = prepare({ project: g.project, host: g.host });
-      const apps = [...new Set((targets.length ? targets : ['all']).flatMap((t) => resolveTargets(p.manifest, t)))];
-      const ctx = await connect(p);
+      const fleet = fleetOf(g);
+      const apps = fleet.select(targets.length ? targets : ['all']);
+      // every host at once; one that cannot be reached becomes a note per app instead of ending the stream, and is
+      // connected again later while following (fleet.ctx keeps no failed connection)
+      const sources = await Promise.all(fleet.groups(apps).map(async (gr): Promise<LogSource> => {
+        const connect = () => fleet.ctx(gr.host);
+        try { return { ...gr, connect, ctx: await connect() }; } catch (e) { return { ...gr, connect, error: e }; }
+      }));
       const ac = new AbortController();
       const stop = () => ac.abort();
       process.once('SIGINT', stop);
@@ -91,7 +99,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
       process.stdout.on('error', (e: NodeJS.ErrnoException) => { if (e.code === 'EPIPE') ac.abort(); else throw e; });
       try {
-        await streamLogs(ctx, apps, {
+        await streamLogs(sources, {
           lines: Math.min(Math.max(1, Number(o.lines) || 100), 2000), follow: Boolean(o.follow), intervalMs: Math.max(200, Number(o.interval) || 1000),
           color: o.color !== false && !process.env.NO_COLOR && Boolean(process.stdout.isTTY), json: Boolean(g.json),
           stream: o.out ? 'out' : o.err ? 'err' : 'both', signal: ac.signal,
@@ -101,18 +109,21 @@ export function buildProgram(io: Io = defaultIo): Command {
   program.command('ports [port]').description('who listens on which port on the host')
     .action(wrap(async (g, _o, [port]) => { const ctx = await ctxOf(g); const r = await portsReport(ctx, port ? Number(port) : undefined); emit(g, renderPorts(r, ctx.host.name), r); }));
   program.command('start <target>').description('start an app or profile (dependencies first)').option('--reload', 'restart apps that are already online')
-    .action(wrap((g, o, [t]) => mutate(g, t, (ctx) => startApps(ctx, t, { reload: Boolean(o.reload) }), true)));
+    .action(wrap((g, o, [t]) => mutate(g, t, 'start', { reload: Boolean(o.reload) })));
   program.command('restart <target>').description('restart app(s) with the current manifest config')
-    .action(wrap((g, _o, [t]) => mutate(g, t, (ctx) => restartApps(ctx, t), true)));
+    .action(wrap((g, _o, [t]) => mutate(g, t, 'restart')));
   program.command('stop <target>').description('stop app(s)')
-    .action(wrap((g, _o, [t]) => mutate(g, t, (ctx) => stopApps(ctx, t))));
+    .action(wrap((g, _o, [t]) => mutate(g, t, 'stop')));
   program.command('delete <target>').description('remove app(s) from pm2')
-    .action(wrap((g, _o, [t]) => mutate(g, t, (ctx) => deleteApps(ctx, t))));
+    .action(wrap((g, _o, [t]) => mutate(g, t, 'delete')));
   program.command('flush [app]').description('truncate pm2 log files')
     .action(wrap(async (g, _o, [app]) => {
-      const p = prepare({ project: g.project, host: g.host }); if (app) assertApp(p.manifest, app); assertWritable(p.host);
-      const ctx = await connect(p); const r = await flushLogs(ctx, app);
-      emit(g, r.length ? r.map((x) => `${x.app}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush', r);
+      const fleet = fleetOf(g);
+      const groups = fleet.groups(fleet.select(app ? [app] : ['all']));
+      assertWritableRuns(fleet, groups);
+      const r = [];
+      for (const gr of groups) r.push(...(await flushLogs(await fleet.ctx(gr.host), gr.apps)).map((x) => ({ ...x, host: gr.host })));
+      emit(g, r.length ? r.map((x) => `${x.app}${groups.length > 1 ? ` (${x.host})` : ''}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush', r);
     }));
   program.command('monit').description('terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)')
     .option('--once', 'print one frame as text and exit')

@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { initialState, reduce, keyIntent, selectedRow, visibleLogs, visibleFlat, type MonitState } from '../../src/monit/state.js';
+import { initialState, reduce, keyIntent, selectedRow, visibleLogs, visibleFlat, monitViews, viewLabel, type MonitState } from '../../src/monit/state.js';
 import type { LsRow } from '../../src/core/list.js';
 
-const row = (app: string, status = 'online'): LsRow => ({ app, kind: 'server', description: `${app} desc`, status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0, procs: 1, runtime: null, pm2_cpu: 0, pm2_memory: 0, metrics_source: 'tree', url: null, url_status: 'unchecked', url_code: null, ports: { actual: [], declared: [], checks: [], undeclared: [] } });
+const row = (app: string, status = 'online'): LsRow => ({ app, host: 'local', kind: 'server', description: `${app} desc`, status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0, procs: 1, runtime: null, pm2_cpu: 0, pm2_memory: 0, metrics_source: 'tree', url: null, url_status: 'unchecked', url_code: null, ports: { actual: [], declared: [], checks: [], undeclared: [] } });
 const apps = { api: { description: 'd', run: 'r', cwd: '.', pm2Name: 'demo-api' }, web: { description: 'd', run: 'r', cwd: '.', pm2Name: 'demo-web' } };
 const s0 = (): MonitState => reduce(initialState({ project: 'demo', host: 'local', hosts: ['local', 'stand'], apps, maxLogs: 5 }), { type: 'rows', rows: [row('api'), row('web')], at: new Date(0) });
 
@@ -116,5 +116,47 @@ describe('visibleLogs', () => {
     expect(visibleLogs(s).map((l) => l.text)).toEqual(['2026-10-11T13:00:07: a', '2026-10-11T13:00:08: boom']);
     s = reduce(s, { type: 'stream', stream: 'out' });
     expect(visibleLogs(s).map((l) => l.text)).toEqual(['2026-10-11T13:00:07: a']);
+  });
+});
+
+describe('monitViews', () => {
+  it('with host-bound apps the screen opens on all of them, then h narrows to each host; without, it cycles the hosts as before', async () => {
+    const { loadManifest } = await import('../../src/core/manifest.js');
+    const path = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const fx = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'projects');
+    expect(monitViews(loadManifest(path.join(fx, 'fleet'))).map(viewLabel)).toEqual(['all', 'local', 'box', 'ro']);
+    expect(monitViews(loadManifest(path.join(fx, 'basic')))).toEqual(['local', 'stand', 'prod']);
+  });
+});
+
+describe('flat view across hosts', () => {
+  it('apps on different hosts merge by arrival (their clocks and time zones differ); apps of one host by pm2 stamp', () => {
+    let s = reduce(initialState({ project: 'demo', host: 'all', hosts: ['all', 'local', 'box'], apps }), { type: 'rows', rows: [row('api'), { ...row('web'), host: 'box' }], at: new Date(0) });
+    s = reduce(s, { type: 'view', view: 'flat' });
+    s = reduce(s, { type: 'logs', app: 'api', lines: [{ stream: 'out', text: '2026-10-12T12:00:05: local first' }] });
+    s = reduce(s, { type: 'logs', app: 'web', lines: [{ stream: 'out', text: '2026-10-12T09:00:06: utc second' }, { stream: 'err', text: '2026-10-12T09:00:01: utc err earlier' }] });
+    s = reduce(s, { type: 'logs', app: 'api', lines: [{ stream: 'out', text: '2026-10-12T12:00:07: local third' }] });
+    const texts = (x: MonitState) => visibleFlat(x).map((l) => l.text.slice(21));
+    expect(texts(s)).toEqual(['local first', 'utc err earlier', 'utc second', 'local third']); // one poll's out and err still merge by stamp
+    const oneHost = reduce(s, { type: 'rows', rows: [row('api'), row('web')], at: new Date(0) });
+    expect(texts(oneHost)).toEqual(['utc err earlier', 'utc second', 'local first', 'local third']);
+  });
+});
+
+describe('selection while hosts answer one by one', () => {
+  it('until the user moves it, the selection is the first app of the rows so far; after that it stays on the app the user chose', () => {
+    let s = initialState({ project: 'demo', host: 'all', hosts: ['all', 'local', 'box'], apps });
+    s = reduce(s, { type: 'rows', rows: [{ ...row('web'), host: 'box', status: 'unreachable' }] }); // the silent host fails first
+    expect(selectedRow(s)?.app).toBe('web');
+    s = reduce(s, { type: 'rows', rows: [row('api'), { ...row('web'), host: 'box', status: 'unreachable' }], at: new Date(1) });
+    expect(selectedRow(s)?.app).toBe('api');
+    expect(s.logPaths).toBeNull();
+    s = reduce(s, { type: 'select', delta: 1 });
+    s = reduce(s, { type: 'rows', rows: [row('api'), { ...row('web'), host: 'box' }], at: new Date(2) });
+    expect(selectedRow(s)?.app).toBe('web');
+    s = reduce(s, { type: 'host', host: 'local' });                // a new view starts unchosen again
+    s = reduce(s, { type: 'rows', rows: [row('web'), row('api')], at: new Date(3) });
+    expect(selectedRow(s)?.app).toBe('web');
   });
 });

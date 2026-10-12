@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { McprocError } from './errors.js';
-import { loadManifest, type Host, type Manifest } from './manifest.js';
+import { loadManifest, scopeManifest, type Host, type Manifest } from './manifest.js';
 import { Pm2Client, resolvePm2Bin, type Pm2Resolution } from './pm2.js';
 import { createTransport } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
@@ -40,13 +40,18 @@ export function prepare(opts: { project?: string; host?: string; roots?: string[
 const cache = new Map<string, Pm2Resolution>();
 export function clearResolutionCache(): void { cache.clear(); }
 
-export async function connect(prep: Prepared, opts: { spawner?: Spawner; fresh?: boolean } = {}): Promise<Context> {
+/**
+ * A context for one host. Its manifest is the host's view (scopeManifest): the apps bound to it plus the unbound ones
+ * when it is the fallback — by default the host itself, i.e. what `--host <it>` means; a whole-project command reaching
+ * a host it does not name passes `fallback` (local), so that host sees only its bound apps.
+ */
+export async function connect(prep: Prepared, opts: { spawner?: Spawner; fresh?: boolean; fallback?: string } = {}): Promise<Context> {
   const transport = createTransport(prep.host, opts.spawner);
   const key = `${prep.manifest.path}|${prep.host.name}`;
   let resolution = opts.fresh ? undefined : cache.get(key);
   if (!resolution) { resolution = await resolvePm2Bin(prep.host, transport); cache.set(key, resolution); }
   const pm2 = new Pm2Client(transport, prep.host, resolution.bin, prep.host.pm2_home);
-  return { ...prep, transport, pm2, resolution };
+  return { manifest: scopeManifest(prep.manifest, prep.host.name, opts.fallback ?? prep.host.name), host: prep.host, transport, pm2, resolution };
 }
 
 export function createContext(opts: { project?: string; host?: string; roots?: string[]; spawner?: Spawner; fresh?: boolean }): Promise<Context> {

@@ -7,6 +7,7 @@ import { buildProgram } from '../../src/cli/program.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
+const fleet = path.join(here, '..', 'fixtures', 'projects', 'fleet');
 
 function capture() {
   const out: string[] = [], err: string[] = [];
@@ -67,5 +68,30 @@ describe('cli', () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(['monit', '--once', '--project', fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'))], { from: 'user' });
     expect(c.err[0]).toContain('MANIFEST_NOT_FOUND');
+  });
+  it('host-bound apps: hosts and describe show where each app runs, without touching a host', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['hosts', '--project', fleet, '--json'], { from: 'user' });
+    expect(JSON.parse(c.out.join('')).map((h: { name: string; apps: string[] }) => `${h.name}:${h.apps.join(',')}`)).toEqual(['local:watch', 'box:web', 'ro:audit']);
+    const c2 = capture();
+    await buildProgram(c2.io).parseAsync(['describe', '--project', fleet], { from: 'user' });
+    expect(c2.out.join('\n')).toContain('web [server] on box');
+  });
+  it('host-bound apps: --host naming another host than the app\'s, or a readonly host in the way, is refused before connecting', async () => {
+    for (const argv of [['ls', 'web', '--host', 'local'], ['logs', 'watch', '--host', 'box'], ['describe', 'watch', '--host', 'box'], ['restart', 'web', '--host', 'local'], ['flush', 'web', '--host', 'local']]) {
+      const c = capture();
+      await buildProgram(c.io).parseAsync([...argv, '--project', fleet], { from: 'user' });
+      expect(c.err[0], argv.join(' ')).toContain('WRONG_HOST');
+    }
+    const cp = capture();
+    await buildProgram(cp.io).parseAsync(['describe', 'dev', '--project', fleet], { from: 'user' });
+    expect(cp.err[0]).toContain('UNKNOWN_APP'); // a profile is not an app: refused, never a stack trace
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['stop', 'all', '--project', fleet], { from: 'user' });
+    expect(c.err[0]).toContain('READONLY_HOST');
+    expect(c.err[0]).toContain('"audit"');
+    const c2 = capture();
+    await buildProgram(c2.io).parseAsync(['flush', '--project', fleet], { from: 'user' });
+    expect(c2.err[0]).toContain('READONLY_HOST');
   });
 });

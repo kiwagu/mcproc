@@ -2,8 +2,14 @@ import type { Context } from './resolve.js';
 import { snapshot as probeSnapshot, type Snapshot } from './list.js';
 import { findProcess } from './pm2.js';
 import { LogFollower, sortByStamp, type LogLine } from './logfollow.js';
+import { describeError } from './errors.js';
 
 export interface StreamLine { app: string; stream: 'out' | 'err'; text: string }
+/**
+ * The apps of one host: with the host's context, or with the error that kept it from connecting; `connect` lets a
+ * follow stream reach the host again later.
+ */
+export interface LogSource { host: string; apps: string[]; ctx?: Context; error?: unknown; connect?: () => Promise<Context> }
 export interface Follower { poll(): Promise<{ lines: LogLine[]; reset: boolean }> }
 export interface StreamDeps {
   snapshot(ctx: Context): Promise<Snapshot>;
@@ -35,8 +41,15 @@ export function defaultStreamDeps(): StreamDeps {
   };
 }
 
-/** Merged logs of several apps, compose style: history first (app order), then one poll per app per interval while following. */
-export async function streamLogs(ctx: Context, apps: string[], opts: StreamOptions, deps: StreamDeps): Promise<void> {
+/**
+ * Merged logs of several apps, possibly on several hosts, compose style: history first (app order), then, while
+ * following, one loop per host polling its apps every interval — a slow or silent host never holds the others back.
+ * A host that does not answer gets one note line per app per outage and is tried again: its followers resume at the
+ * byte offset they had, a host that was down at the start is connected on the re-probe ticks. If no host answers at
+ * the start, the first error is thrown instead.
+ */
+export async function streamLogs(sources: LogSource[], opts: StreamOptions, deps: StreamDeps): Promise<void> {
+  const apps = sources.flatMap((s) => s.apps);
   const width = Math.max(...apps.map((a) => a.length));
   const colors = new Map(apps.map((a, i) => [a, opts.color ? colorFor(i) : null]));
   let closed = false; // the reader went away (`| head`): stop quietly, no stack trace
@@ -46,16 +59,28 @@ export async function streamLogs(ctx: Context, apps: string[], opts: StreamOptio
     catch (e) { if ((e as { code?: string }).code === 'EPIPE') closed = true; else throw e; }
   };
   const followers = new Map<string, Follower>();
-  const attach = async () => {
-    const snap = await deps.snapshot(ctx);
-    for (const app of apps) {
-      if (followers.has(app)) continue;
-      const p = findProcess(snap.procs, ctx.manifest.project, app);
-      if (p) followers.set(app, deps.follower(ctx, { out: p.out_log, err: p.err_log }, opts.lines));
+  const down = new Map<LogSource, string>(); // hosts in an outage that was already announced
+  const announce = (s: LogSource, e: unknown) => {
+    if (down.has(s)) return;
+    down.set(s, describeError(e));
+    for (const app of s.apps) emit({ app, stream: 'out', text: `(host ${s.host} unreachable: ${describeError(e)})` });
+  };
+  /** connect when needed, probe once, and follow every app of the source that runs */
+  const attach = async (s: LogSource, reconnect: boolean) => {
+    if (!s.ctx) {
+      if (!reconnect || !s.connect) throw s.error ?? new Error(`host ${s.host} is not connected`);
+      s.ctx = await s.connect();
+    }
+    if (s.apps.every((a) => followers.has(a))) return;
+    const snap: Snapshot = await deps.snapshot(s.ctx);
+    for (const app of s.apps) {
+      const p = followers.has(app) ? undefined : findProcess(snap.procs, s.ctx.manifest.project, app);
+      if (p) followers.set(app, deps.follower(s.ctx, { out: p.out_log, err: p.err_log }, opts.lines));
     }
   };
-  const pollAll = async (first: boolean) => {
-    for (const app of apps) {
+  /** one poll of the source's apps in app order; on the first pass an app that does not run says so */
+  const poll = async (s: LogSource, first: boolean) => {
+    for (const app of s.apps) {
       if (closed) return;
       const f = followers.get(app);
       if (!f) { if (first) emit({ app, stream: 'out', text: '(not started)' }); continue; }
@@ -64,14 +89,30 @@ export async function streamLogs(ctx: Context, apps: string[], opts: StreamOptio
       for (const l of opts.stream === 'both' ? sortByStamp(got) : got) emit({ app, stream: l.stream, text: l.text });
     }
   };
-  await attach();
-  await pollAll(true);
+
+  // history: every host probed at once, then printed in app order
+  const failures = await Promise.all(sources.map((s) => attach(s, false).then(() => null, (e: unknown) => ({ e }))));
+  if (sources.length > 0 && failures.every((f) => f !== null)) throw failures[0]!.e;
+  for (const [i, s] of sources.entries()) {
+    const failed = failures[i];
+    if (failed) { announce(s, failed.e); continue; }
+    try { await poll(s, true); } catch (e) { announce(s, e); }
+    if (closed) return;
+  }
   if (!opts.follow || closed) return;
   const every = opts.resolveEvery ?? 10;
-  for (let tick = 1; !opts.signal?.aborted && !closed; tick++) {
-    await deps.sleep(opts.intervalMs);
-    if (opts.signal?.aborted) break;
-    if (followers.size < apps.length && tick % every === 0) await attach();
-    await pollAll(false);
-  }
+  await Promise.all(sources.map(async (s) => {
+    for (let tick = 1; !opts.signal?.aborted && !closed; tick++) {
+      await deps.sleep(opts.intervalMs);
+      if (opts.signal?.aborted || closed) break;
+      try {
+        // apps that were not running (or a host that was not reached) are looked for again every `every` ticks
+        if ((!s.ctx || s.apps.some((a) => !followers.has(a))) && tick % every === 0) await attach(s, true);
+        await poll(s, false);
+        down.delete(s);
+      } catch (e) {
+        announce(s, e);
+      }
+    }
+  }));
 }

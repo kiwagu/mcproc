@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
+import { loadManifest } from '../../src/core/manifest.js';
 import { listApps, portsReport, hostsInfo, describeApp, describeProject, snapshot, rowsFor } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -89,6 +90,11 @@ describe('portsReport', () => {
 });
 
 describe('hostsInfo / describe', () => {
+  it('a host lists the apps bound to it; describeProject names each app\'s host (null = wherever the command points)', () => {
+    const m = loadManifest(path.join(here, '..', 'fixtures', 'projects', 'fleet'));
+    expect(hostsInfo(m).map((h) => `${h.name}:${h.apps.join(',')}`)).toEqual(['local:watch', 'box:web', 'ro:audit']);
+    expect(describeProject(m).apps.map((a) => `${a.name}@${a.host}`)).toEqual(['watch@local', 'web@box', 'tool@null', 'audit@ro']);
+  });
   it('hostsInfo lists local first with transport descriptions', () => {
     const ctx = fakeCtx(basic, 'local', []);
     const info = hostsInfo(ctx.manifest);

@@ -8,6 +8,10 @@ import { unpack, defaultUnpackDeps } from '../../src/runtime/unpack.js';
 import { ensurePm2Bundle } from '../../src/runtime/bundle.js';
 import { startApps } from '../../src/core/actions.js';
 import { listApps } from '../../src/core/list.js';
+import { loadManifest } from '../../src/core/manifest.js';
+import { Fleet, actOn, listFleet } from '../../src/core/fleet.js';
+import { streamLogs, defaultStreamDeps } from '../../src/core/logstream.js';
+import { monitOnce } from '../../src/monit/once.js';
 
 const RUN = process.env.MCPROC_IT_DOCKER === '1';
 const SERVER = `require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, () => console.log('listening', process.env.PORT));`;
@@ -50,4 +54,37 @@ describe.skipIf(!RUN)('unpack into a bare alpine container (docker transport, ne
     expect(row.status).toBe('online');
     expect(row.ports.checks[0]).toEqual({ port: 38611, status: 'listening' });
   }, 600_000);
+
+  it('host-bound apps: one command starts a local app and the container app, ls/logs/monit show both from their hosts', async () => {
+    const home = path.join(proj, 'pm2'); // the local app gets its own daemon, never the user's ~/.pm2
+    fs.writeFileSync(path.join(proj, 'server.js'), SERVER);
+    fs.writeFileSync(path.join(proj, '.mcproc', 'mcproc.yaml'), [
+      'version: 1', 'project: itdk', 'apps:',
+      '  web:', '    description: http server inside alpine', '    run: /srv/p/.mcproc/runtime/bin/node server.js', '    env: { PORT: 38611 }', '    port: 38611', '    host: box',
+      '  side:', '    description: http server on this machine', '    run: node server.js', '    env: { PORT: 38612 }', '    port: 38612',
+      'hosts:', '  local:', `    pm2_home: ${home}`, '  box:', `    docker: { container: ${name} }`, '    cwd: /srv/p', '    shell: /bin/sh -c', '',
+    ].join('\n'));
+    clearResolutionCache();
+    const fleet = new Fleet(loadManifest(proj), undefined);
+    try {
+      await actOn(fleet, 'all', 'start');
+      await sleep(2500);
+      const { rows, errors } = await listFleet(fleet, fleet.select(['all']));
+      expect(errors).toEqual([]);
+      expect(rows.map((r) => `${r.app}@${r.host}:${r.status}:${r.ports.checks[0]?.status}`)).toEqual(['web@box:online:listening', 'side@local:online:listening']);
+      const out: string[] = [];
+      const sources = await Promise.all(fleet.groups(fleet.select(['all'])).map(async (g) => ({ ...g, ctx: await fleet.ctx(g.host) })));
+      await streamLogs(sources, { lines: 20, follow: false, intervalMs: 1000, color: false, json: false, stream: 'both' }, { ...defaultStreamDeps(), out: (l) => { out.push(l); } });
+      expect(out.some((l) => /^web  \| .*listening 38611/.test(l))).toBe(true);
+      expect(out.some((l) => /^side \| .*listening 38612/.test(l))).toBe(true);
+      const frame = await monitOnce({ project: proj, lines: 20, width: 160 });
+      expect(frame).toMatch(/mcproc · itdk · all/);
+      expect(frame).toMatch(/web\s+box\s+online/);
+      expect(frame).toMatch(/side\s+local\s+online/);
+      expect(frame).toContain('listening 38611'); // the selected app is web: its log is read inside the container
+    } finally {
+      await actOn(fleet, 'all', 'delete').catch(() => undefined);
+      await (await fleet.ctx('local')).pm2.run(['kill']).catch(() => undefined);
+    }
+  }, 120_000);
 });

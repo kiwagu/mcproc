@@ -1,26 +1,30 @@
 import blessed from '@pm2/blessed';
-import { prepare, connect } from '../core/resolve.js';
+import { prepare } from '../core/resolve.js';
+import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
-import { startApps, restartApps, stopApps } from '../core/actions.js';
+import { Fleet, actOn } from '../core/fleet.js';
 import { LogFollower } from '../core/logfollow.js';
-import { appInfos, hostNames, initialState, keyIntent, reduce, selectedRow, type MonitAction, type MonitState } from './state.js';
+import { appInfos, initialState, keyIntent, monitViews, reduce, selectedRow, viewLabel, type MonitAction, type MonitState } from './state.js';
 import { paneTitle, renderFrame, type Frame } from './frame.js';
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, type LoopDeps } from './loop.js';
 
-const deps = (project: string | undefined): LoopDeps => ({
-  connect: (host) => connect(prepare({ project, host })),
+const deps = (manifest: Manifest): LoopDeps => ({
+  fleet: (requested) => new Fleet(manifest, requested),
   snapshot,
-  rows: (ctx, snap) => rowsFor(ctx, snap, Object.keys(ctx.manifest.apps)),
+  rows: rowsFor,
   follower: (ctx, paths, lines) => new LogFollower(ctx, paths, lines),
-  command: (ctx, cmd, app) => (cmd === 'start' ? startApps(ctx, app) : cmd === 'restart' ? restartApps(ctx, app) : stopApps(ctx, app)),
+  command: (fleet, cmd, app) => actOn(fleet, app, cmd),
 });
 
 /** The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. */
 export async function runMonit(opts: { project?: string; host?: string; intervalMs: number; lines: number }): Promise<void> {
-  const prep = prepare({ project: opts.project, host: opts.host });
-  const ctx = await connect(prep);
-  let state: MonitState = initialState({ project: prep.manifest.project, host: ctx.host.name, hosts: hostNames(prep.manifest), apps: appInfos(prep.manifest) });
+  const { manifest } = prepare({ project: opts.project });
+  // apps bound to a host (`host:`) are shown from there: without --host the screen opens on every app at its own host
+  const views = monitViews(manifest);
+  const fleet = new Fleet(manifest, opts.host ?? views[0]);
+  fleet.select(['all']); // a --host that no app runs on is refused here, before the screen takes the terminal
+  let state: MonitState = initialState({ project: manifest.project, host: viewLabel(fleet.requested), hosts: views.map(viewLabel), apps: appInfos(manifest) });
 
   const screen = blessed.screen({ smartCSR: true, title: 'mcproc monit', fullUnicode: true });
   // No frames: every pane is a one-line title rule plus full-width content, so a terminal drag-selection copies text only
@@ -39,7 +43,7 @@ export async function runMonit(opts: { project?: string; host?: string; interval
 
   // labels get the same ANSI colors as `mcproc logs`; blessed renders SGR codes in content, and the log text itself is
   // already ANSI-stripped by the follower, so no tag syntax and no escaping are involved
-  const appColor = new Map(Object.keys(prep.manifest.apps).map((a, i) => [a, colorFor(i)]));
+  const appColor = new Map(Object.keys(manifest.apps).map((a, i) => [a, colorFor(i)]));
   const colorLabel = (line: string) => {
     const m = /^(\S+)(\s*)( [|!] )/.exec(line); // continuation rows start with spaces and keep no label
     const c = m && appColor.get(m[1]);
@@ -82,7 +86,7 @@ export async function runMonit(opts: { project?: string; host?: string; interval
     state = reduce(state, a.type === 'scroll' ? { ...a, max: frame?.maxScroll } : a); // the pane's real ceiling clamps the scroll
     paint();
   };
-  const loop = new MonitLoop(ctx, deps(opts.project), { lines: opts.lines }, () => state, dispatch);
+  const loop = new MonitLoop(fleet, deps(manifest), { lines: opts.lines }, () => state, dispatch);
 
   return new Promise<void>((resolve) => {
     const timer = setInterval(() => { void loop.refresh(); }, opts.intervalMs);
@@ -96,7 +100,7 @@ export async function runMonit(opts: { project?: string; host?: string; interval
         else { dispatch(intent.action); if (intent.action.type === 'view') void loop.refresh(); } // fill the new view at once
         return;
       }
-      if (intent.kind === 'host-next') return void loop.switchHost(state.hosts[(state.hosts.indexOf(state.host) + 1) % state.hosts.length]);
+      if (intent.kind === 'host-next') return void loop.nextView();
       void loop.runCommand(intent.cmd, intent.app);
     });
     screen.on('resize', paint);

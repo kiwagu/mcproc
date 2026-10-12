@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { startNote, renderLs, renderPorts, renderDoctor, renderUnpack, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
+import { startNote, renderLs, renderPorts, renderDoctor, renderUnpack, renderHosts, renderProject, fmtCpu, fmtUrl } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
 
 const row = (status: string, checks: PortCheck[]): LsRow => ({
-  app: 'web', kind: 'server', description: '', status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0,
+  app: 'web', host: 'local', kind: 'server', description: '', status, pm_id: 0, pid: 1, uptime_ms: 0, restarts: 0, cpu: 0, memory: 0,
   procs: 1, runtime: null, pm2_memory: 0, pm2_cpu: 0, metrics_source: 'tree', url: null, url_status: 'unchecked', url_code: null,
   ports: { actual: [], declared: checks.map((c) => c.port), checks, undeclared: [] },
 });
@@ -50,6 +50,26 @@ describe('renderLs with tree metrics', () => {
     const t = renderPorts({ port: null, listeners: [{ proto: 'tcp', addr: '0.0.0.0', port: 55321, pid: null, pids: [], command: null, container: 'supabase_kong_zero-memory', app: null }] }, 'local');
     expect(t).toMatch(/CONTAINER/);
     expect(t).toContain('supabase_kong_zero-memory');
+  });
+});
+
+describe('several hosts', () => {
+  const local = row('online', []);
+  const box = { ...row('unreachable', []), app: 'dev-all', host: 'box', pid: null, error: 'TRANSPORT_FAILED: ssh box: Connection refused' };
+  it('renderLs adds a HOST column and names every host only when the rows span more than one, plus one line per unreachable host', () => {
+    const t = renderLs([local, box], 'local');
+    expect(t.split('\n')[0]).toBe('hosts: local, box');
+    expect(t).toMatch(/APP\s+HOST\s+KIND\s+STATUS/);
+    expect(t).toMatch(/dev-all\s+box\s+server\s+unreachable/);
+    expect(t.split('\n').at(-1)).toBe('box: TRANSPORT_FAILED: ssh box: Connection refused');
+    expect(renderLs([local], 'local')).not.toContain('HOST');
+    expect(renderLs([local], 'local').split('\n')[0]).toBe('host: local');
+  });
+  it('renderHosts shows the apps bound to each host; renderProject marks a bound app with its host', () => {
+    expect(renderHosts([{ name: 'box', transport: 'ssh box', readonly: false, cwd: '/w', runtime: '/w/.mcproc/runtime', pm2: null, pm2_home: null, apps: ['web', 'api'] }])).toMatch(/box\s+ssh box\s+\/w\s+no\s+-\s+web, api/);
+    const d = { project: 'p', root: '/r', apps: [{ name: 'web', kind: 'server', description: 'd', ports: [], url: null, depends_on: [], host: 'box' }, { name: 'tool', kind: 'worker', description: 'd', ports: [], url: null, depends_on: [], host: null }], profiles: {}, hosts: [], readme: null };
+    expect(renderProject(d)).toContain('  web [server] on box: d');
+    expect(renderProject(d)).toContain('  tool [worker]: d');
   });
 });
 

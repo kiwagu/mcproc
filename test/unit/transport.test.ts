@@ -17,15 +17,19 @@ describe('buildArgv', () => {
   it('docker: docker exec -u user -i container shell flags cmd', () => {
     expect(buildArgv(docker, 'pm2 jlist')).toEqual(['docker', 'exec', '-u', 'node', '-i', 'app-1', '/bin/bash', '-lc', 'pm2 jlist']);
   });
-  it('ssh: BatchMode, ssh_args, destination, one quoted remote command', () => {
+  it('ssh: BatchMode, ssh_args, a connect timeout, destination, one quoted remote command', () => {
     expect(buildArgv(ssh, `echo 'hi there'`)).toEqual([
-      'ssh', '-o', 'BatchMode=yes', '-J', 'bastion', 'stand', `'/bin/bash' '-lc' 'echo '\\''hi there'\\'''`,
+      'ssh', '-o', 'BatchMode=yes', '-J', 'bastion', '-o', 'ConnectTimeout=10', 'stand', `'/bin/bash' '-lc' 'echo '\\''hi there'\\'''`,
     ]);
+  });
+  it('ssh: the connect timeout comes after ssh_args, so a ConnectTimeout there wins (ssh keeps the first value)', () => {
+    const argv = buildArgv({ ...ssh, ssh_args: ['-o', 'ConnectTimeout=3'] }, 'true');
+    expect(argv.indexOf('ConnectTimeout=3')).toBeLessThan(argv.indexOf('ConnectTimeout=10'));
   });
   it('ssh + docker composes', () => {
     const argv = buildArgv(both, 'pm2 jlist');
-    expect(argv.slice(0, 6)).toEqual(['ssh', '-o', 'BatchMode=yes', '-J', 'bastion', 'stand']);
-    expect(argv[6]).toBe(`'docker' 'exec' '-u' 'node' '-i' 'app-1' '/bin/bash' '-lc' 'pm2 jlist'`);
+    expect(argv.slice(0, 8)).toEqual(['ssh', '-o', 'BatchMode=yes', '-J', 'bastion', '-o', 'ConnectTimeout=10', 'stand']);
+    expect(argv[8]).toBe(`'docker' 'exec' '-u' 'node' '-i' 'app-1' '/bin/bash' '-lc' 'pm2 jlist'`);
   });
   it('withEnv prefixes exports', () => {
     expect(withEnv('pm2 jlist', { PM2_HOME: "/h/it's" })).toBe(`export PM2_HOME='/h/it'\\''s'; pm2 jlist`);

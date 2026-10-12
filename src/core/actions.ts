@@ -53,6 +53,10 @@ export function assertNoCollision(ctx: Context, procs: Pm2Process[], names: stri
   }
 }
 
+/** A target string resolves within the context's host (an app, a profile or "all"); a list is taken as already resolved and ordered. */
+export type Targets = string | string[];
+const namesOf = (ctx: Context, t: Targets) => (typeof t === 'string' ? resolveTargets(ctx.manifest, t) : t);
+
 export async function shipEcosystem(ctx: Context): Promise<string> {
   const eco = buildEcosystem(ctx.manifest, ctx.host);
   const file = ecosystemPath(ctx.host);
@@ -64,8 +68,8 @@ export async function shipEcosystem(ctx: Context): Promise<string> {
   return file;
 }
 
-export async function startApps(ctx: Context, target: string, opts: { reload?: boolean } = {}): Promise<LsRow[]> {
-  const names = orderWithDeps(ctx.manifest, resolveTargets(ctx.manifest, target));
+export async function startApps(ctx: Context, target: Targets, opts: { reload?: boolean } = {}): Promise<LsRow[]> {
+  const names = typeof target === 'string' ? orderWithDeps(ctx.manifest, namesOf(ctx, target)) : target;
   const file = await shipEcosystem(ctx);
   const before = await snapshot(ctx);
   assertNoCollision(ctx, before.procs, names);
@@ -77,16 +81,16 @@ export async function startApps(ctx: Context, target: string, opts: { reload?: b
   return rowsFor(ctx, await snapshot(ctx), names);
 }
 
-export async function restartApps(ctx: Context, target: string): Promise<LsRow[]> {
-  const names = resolveTargets(ctx.manifest, target);
+export async function restartApps(ctx: Context, target: Targets): Promise<LsRow[]> {
+  const names = namesOf(ctx, target);
   const file = await shipEcosystem(ctx);
   assertNoCollision(ctx, await ctx.pm2.jlist(), names);
   for (const n of names) await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));
   return rowsFor(ctx, await snapshot(ctx), names);
 }
 
-async function forEachProcess(ctx: Context, target: string, act: (id: number, status: string) => Promise<unknown>): Promise<LsRow[]> {
-  const names = resolveTargets(ctx.manifest, target);
+async function forEachProcess(ctx: Context, target: Targets, act: (id: number, status: string) => Promise<unknown>): Promise<LsRow[]> {
+  const names = namesOf(ctx, target);
   const snap = await snapshot(ctx);
   for (const n of names) {
     const p = findProcess(snap.procs, ctx.manifest.project, n);
@@ -95,10 +99,10 @@ async function forEachProcess(ctx: Context, target: string, act: (id: number, st
   return rowsFor(ctx, await snapshot(ctx), names);
 }
 
-export function stopApps(ctx: Context, target: string): Promise<LsRow[]> {
+export function stopApps(ctx: Context, target: Targets): Promise<LsRow[]> {
   return forEachProcess(ctx, target, (id, status) => (status === 'stopped' ? Promise.resolve() : ctx.pm2.stop(id)));
 }
 
-export function deleteApps(ctx: Context, target: string): Promise<LsRow[]> {
+export function deleteApps(ctx: Context, target: Targets): Promise<LsRow[]> {
   return forEachProcess(ctx, target, (id) => ctx.pm2.delete(id));
 }

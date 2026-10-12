@@ -1,26 +1,25 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, runTool, type ToolDeps } from '../common.js';
-import { prepare, connect, assertWritable, assertApp, resolveProjectDir, type Context } from '../../core/resolve.js';
-import { resolveTargets, startApps, restartApps, stopApps, deleteApps } from '../../core/actions.js';
+import { prepare, assertWritable, resolveProjectDir } from '../../core/resolve.js';
+import { Fleet, defaultConnector, actOn, assertWritableRuns, type Act } from '../../core/fleet.js';
 import { flushLogs } from '../../core/logs.js';
 import { initProject } from '../../core/init.js';
 import type { LsRow } from '../../core/list.js';
 import { createTransport } from '../../transport/index.js';
 import { unpack, defaultUnpackDeps } from '../../runtime/unpack.js';
-import { renderLs, renderUnpack, startNote } from '../render.js';
+import { renderLs, renderUnpack, startNote, hostsOf } from '../render.js';
 
 export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
-  const guarded = async (args: { project?: string; host?: string }, check: (p: ReturnType<typeof prepare>) => void): Promise<Context> => {
-    const p = prepare({ project: args.project, host: args.host, roots: await deps.roots() });
-    check(p);
-    assertWritable(p.host);
-    return connect(p, { spawner: deps.spawner });
-  };
+  // apps run at their own host (`host:` in the manifest); host narrows a call to the apps that run there. Targets and
+  // readonly hosts are checked before any host is contacted.
+  const fleetOf = async (args: { project?: string; host?: string }) => new Fleet(prepare({ project: args.project, roots: await deps.roots() }).manifest, args.host, defaultConnector(deps.spawner));
   const targetInput = { ...commonInput, target: z.string().describe('App name, profile name, or "all"') };
-  const done = (ctx: Context, rows: LsRow[], note = false) => {
-    const n = note ? startNote(rows) : '';
-    return { text: renderLs(rows, ctx.host.name) + (n ? `\n${n}` : ''), data: { host: ctx.host.name, rows } as Record<string, unknown> };
+  const act = async (args: { project?: string; host?: string; target: string; reload?: boolean }, what: Act) => {
+    const fleet = await fleetOf(args);
+    const rows: LsRow[] = await actOn(fleet, args.target, what, { reload: args.reload });
+    const n = what === 'start' || what === 'restart' ? startNote(rows) : '';
+    return { text: renderLs(rows, fleet.fallback) + (n ? `\n${n}` : ''), data: { ...hostsOf(rows, fleet.fallback), rows } as Record<string, unknown> };
   };
 
   server.registerTool('init', {
@@ -34,44 +33,44 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('start', {
-    title: 'Start', description: 'Start an app or profile via pm2 from the generated ecosystem, dependencies first. Apps already online are left alone unless reload is true.',
+    title: 'Start', description: 'Start an app or profile via pm2 from the generated ecosystem, each app on the host it runs on, dependencies first. Apps already online are left alone unless reload is true.',
     inputSchema: { ...targetInput, reload: z.boolean().optional() }, annotations: MUT(false, true),
   }, (args) => runTool(async () => {
-    const ctx = await guarded(args, (p) => resolveTargets(p.manifest, args.target));
-    return done(ctx, await startApps(ctx, args.target, { reload: args.reload }), true);
+    return act(args, 'start');
   }));
 
   server.registerTool('restart', {
     title: 'Restart', description: 'Restart the named app(s) with the current manifest config (command, env, watch).',
     inputSchema: targetInput, annotations: MUT(false, false),
   }, (args) => runTool(async () => {
-    const ctx = await guarded(args, (p) => resolveTargets(p.manifest, args.target));
-    return done(ctx, await restartApps(ctx, args.target), true);
+    return act(args, 'restart');
   }));
 
   server.registerTool('stop', {
     title: 'Stop', description: 'Stop the named app(s); pm2 keeps them listed as stopped.',
     inputSchema: targetInput, annotations: MUT(true, true),
   }, (args) => runTool(async () => {
-    const ctx = await guarded(args, (p) => resolveTargets(p.manifest, args.target));
-    return done(ctx, await stopApps(ctx, args.target));
+    return act(args, 'stop');
   }));
 
   server.registerTool('delete', {
     title: 'Delete', description: 'Remove the named app(s) from pm2 (stops them first).',
     inputSchema: targetInput, annotations: MUT(true, true),
   }, (args) => runTool(async () => {
-    const ctx = await guarded(args, (p) => resolveTargets(p.manifest, args.target));
-    return done(ctx, await deleteApps(ctx, args.target));
+    return act(args, 'delete');
   }));
 
   server.registerTool('flush', {
-    title: 'Flush logs', description: 'Truncate the pm2 log files of one app, or of every app of the project on that host.',
+    title: 'Flush logs', description: 'Truncate the pm2 log files of one app, or of every app of the project (each on the host it runs on; with host, the apps that run there).',
     inputSchema: { ...commonInput, app: z.string().optional() }, annotations: MUT(true, true),
   }, (args) => runTool(async () => {
-    const ctx = await guarded(args, (p) => { if (args.app) assertApp(p.manifest, args.app); });
-    const r = await flushLogs(ctx, args.app);
-    return { text: r.length ? r.map((x) => `${x.app}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush (no pm2 processes for this project here)', data: { host: ctx.host.name, flushed: r } };
+    const fleet = await fleetOf(args);
+    const groups = fleet.groups(fleet.select(args.app ? [args.app] : ['all']));
+    assertWritableRuns(fleet, groups);
+    const r = [];
+    for (const g of groups) r.push(...(await flushLogs(await fleet.ctx(g.host), g.apps)).map((x) => ({ ...x, host: g.host })));
+    const multi = groups.length > 1;
+    return { text: r.length ? r.map((x) => `${x.app}${multi ? ` (${x.host})` : ''}: freed ${x.out_bytes + x.err_bytes} bytes`).join('\n') : 'nothing to flush (no pm2 processes for this project there)', data: { hosts: groups.map((g) => g.host), flushed: r } };
   }));
 
   server.registerTool('unpack', {

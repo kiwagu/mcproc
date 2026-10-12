@@ -3,7 +3,7 @@ import { initialState, reduce } from '../../src/monit/state.js';
 import { renderFrame, frameToText, paneTitle, wrapText } from '../../src/monit/frame.js';
 import type { LsRow } from '../../src/core/list.js';
 
-const web: LsRow = { app: 'web', kind: 'server', description: 'dashboard (Next dev)', status: 'online', pm_id: 1, pid: 971175, uptime_ms: 22 * 60_000, restarts: 0, cpu: 84.4, memory: 2_200_000_000, procs: 3, runtime: 'next-server (v16.2.9) with a very long tail of arguments that must be cut', pm2_cpu: 0, pm2_memory: 9_000_000, metrics_source: 'tree', url: 'http://localhost:3100/', url_status: 'ok', url_code: 200,
+const web: LsRow = { app: 'web', host: 'local', kind: 'server', description: 'dashboard (Next dev)', status: 'online', pm_id: 1, pid: 971175, uptime_ms: 22 * 60_000, restarts: 0, cpu: 84.4, memory: 2_200_000_000, procs: 3, runtime: 'next-server (v16.2.9) with a very long tail of arguments that must be cut', pm2_cpu: 0, pm2_memory: 9_000_000, metrics_source: 'tree', url: 'http://localhost:3100/', url_status: 'ok', url_code: 200,
   ports: { actual: [{ proto: 'tcp', addr: '*', port: 3100, pid: 971200, pids: [971200], command: 'next-server', container: null }], declared: [3100], checks: [{ port: 3100, status: 'listening' }], undeclared: [] } };
 const docs: LsRow = { ...web, app: 'docs', pid: 1, url: 'http://localhost:3200/', url_status: 'unchecked', url_code: null, ports: { actual: [], declared: [3200], checks: [{ port: 3200, status: 'declared-not-listening', held_by: { pid: null, command: null, container: 'some-container' } }], undeclared: [] } };
 const base = () => reduce(initialState({ project: 'zero-memory', host: 'local', hosts: ['local'], apps: { web: { description: 'dashboard (Next dev)', run: 'bun run dev', cwd: 'apps/web', pm2Name: 'zero-memory-web' }, docs: { description: 'docs', run: 'bun run dev', cwd: 'apps/docs', pm2Name: 'zero-memory-docs' } } }), { type: 'rows', rows: [web, docs], at: new Date('2026-10-11T13:41:07') });
@@ -99,5 +99,14 @@ describe('renderFrame', () => {
     expect(paneTitle('apps', 20)).toBe('── apps ' + '─'.repeat(12));
     expect(paneTitle('logs · server · both', 10)).toHaveLength(10);
     expect(paneTitle('logs · server · both', 10)).toMatch(/^── logs/);
+  });
+  it('rows from more than one host get a HOST column; the details name the host the app runs on', () => {
+    const s = reduce(base(), { type: 'rows', rows: [web, { ...docs, host: 'box' }], at: new Date('2026-10-11T13:41:07') });
+    const f = renderFrame(s, { width: 160, height: 40 });
+    expect(f.table[0]).toMatch(/APP\s+HOST\s+STATUS/);
+    expect(f.table[1]).toMatch(/^▶web\s+local\s+online/);
+    expect(f.table[2]).toMatch(/^ docs\s+box\s+online/);
+    expect(f.details.join('\n')).toContain('zero-memory-web on local');
+    expect(renderFrame(base(), { width: 160, height: 40 }).table[0]).not.toContain('HOST');
   });
 });

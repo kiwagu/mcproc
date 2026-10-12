@@ -12,16 +12,18 @@ import { MARK, probeScript } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
 export interface LsRow {
-  app: string; kind: AppKind; description: string; status: string; pm_id: number | null; pid: number | null;
+  app: string; host: string; kind: AppKind; description: string; status: string; pm_id: number | null; pid: number | null;
   uptime_ms: number | null; restarts: number;
   cpu: number | null; memory: number; procs: number | null; runtime: string | null;
   pm2_cpu: number; pm2_memory: number; metrics_source: 'tree' | 'pm2-root';
   url: string | null; url_status: 'ok' | 'error' | 'down' | 'unchecked'; url_code: number | null;
   ports: AppPorts;
+  /** set when the app's host could not be reached; status is then "unreachable" */
+  error?: string;
 }
 export interface Snapshot { procs: Pm2Process[]; ports: Record<string, AppPorts>; listeners: Listener[]; tree: Map<number, number>; stats: ProcStats; metrics: Record<string, TreeMetrics | null>; sampledAt: number; urls: Map<string, number | null> }
 export interface SnapshotOptions { cpu?: 'inline' | 'none'; prev?: { sample: StatSample; at: number }; urls?: 'check' | 'none' }
-export interface HostInfo { name: string; transport: string; readonly: boolean; cwd: string; runtime: string; pm2: string | null; pm2_home: string | null }
+export interface HostInfo { name: string; transport: string; readonly: boolean; cwd: string; runtime: string; pm2: string | null; pm2_home: string | null; /** apps bound to this host (`host:` in the manifest) */ apps: string[] }
 
 /** 2xx/3xx = ok, 4xx/5xx = error (up but refusing), 000 = down; unchecked when not asked or when the host has neither curl nor wget. */
 function urlFields(url: string | null, urls: Map<string, number | null>): Pick<LsRow, 'url_status' | 'url_code'> {
@@ -57,7 +59,7 @@ export function rowsFor(ctx: Context, snap: Snapshot, names: string[]): LsRow[] 
     const p = findProcess(snap.procs, ctx.manifest.project, name);
     const m = snap.metrics[name];
     return {
-      app: name, kind: app.kind, description: app.description,
+      app: name, host: ctx.host.name, kind: app.kind, description: app.description,
       status: p?.status ?? 'not-started', pm_id: p?.pm_id ?? null, pid: p && p.pid > 0 ? p.pid : null,
       uptime_ms: p?.uptime_ms ?? null, restarts: p?.restarts ?? 0,
       cpu: m ? m.cpu : p?.cpu ?? 0, memory: m ? m.memory : p?.memory ?? 0, procs: m ? m.procs : null, runtime: m ? m.runtime : null,
@@ -66,6 +68,15 @@ export function rowsFor(ctx: Context, snap: Snapshot, names: string[]): LsRow[] 
       ports: snap.ports[name],
     };
   });
+}
+
+/** The row of an app whose host did not answer (or whose change failed or was skipped): what the manifest declares, no runtime facts, and why. */
+export function unreachableRow(app: App, host: string, error: string, status = 'unreachable'): LsRow {
+  return {
+    app: app.name, host, kind: app.kind, description: app.description, status, pm_id: null, pid: null, uptime_ms: null, restarts: 0,
+    cpu: null, memory: 0, procs: null, runtime: null, pm2_cpu: 0, pm2_memory: 0, metrics_source: 'pm2-root',
+    url: app.url, url_status: 'unchecked', url_code: null, ports: { actual: [], declared: app.ports, checks: [], undeclared: [] }, error,
+  };
 }
 
 export async function listApps(ctx: Context, app?: string): Promise<LsRow[]> {
@@ -88,7 +99,7 @@ export function hostsInfo(m: Manifest): HostInfo[] {
   const names = ['local', ...Object.keys(m.hosts).filter((n) => n !== 'local')];
   return names.map((n) => {
     const h = m.hosts[n];
-    return { name: n, transport: describeHost(h), readonly: h.readonly, cwd: h.cwd, runtime: runtimeDir(h), pm2: h.pm2 ?? null, pm2_home: h.pm2_home ?? null };
+    return { name: n, transport: describeHost(h), readonly: h.readonly, cwd: h.cwd, runtime: runtimeDir(h), pm2: h.pm2 ?? null, pm2_home: h.pm2_home ?? null, apps: Object.values(m.apps).filter((a) => a.host === n).map((a) => a.name) };
   });
 }
 
@@ -106,7 +117,7 @@ export function describeProject(m: Manifest) {
   const readme = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, 'utf8') : null;
   return {
     project: m.project, root: m.root, manifest_path: m.path,
-    apps: Object.values(m.apps).map((a) => ({ name: a.name, kind: a.kind, description: a.description, ports: a.ports, url: a.url, depends_on: a.depends_on })),
+    apps: Object.values(m.apps).map((a) => ({ name: a.name, kind: a.kind, description: a.description, ports: a.ports, url: a.url, depends_on: a.depends_on, host: a.host })),
     profiles: { ...m.profiles, all: Object.keys(m.apps) },
     hosts: hostsInfo(m), readme,
   };

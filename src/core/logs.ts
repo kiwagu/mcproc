@@ -41,9 +41,10 @@ export async function readLogs(ctx: Context, app: string, opts: { lines?: number
   return result;
 }
 
-export async function flushLogs(ctx: Context, app?: string): Promise<{ app: string; out_bytes: number; err_bytes: number }[]> {
+/** Truncate the log files of one app, of the listed apps, or of every app of the context's host. */
+export async function flushLogs(ctx: Context, app?: string | string[]): Promise<{ app: string; out_bytes: number; err_bytes: number }[]> {
   const procs = await ctx.pm2.jlist();
-  const names = app ? [app] : Object.keys(ctx.manifest.apps);
+  const names = app === undefined ? Object.keys(ctx.manifest.apps) : typeof app === 'string' ? [app] : app;
   const targets = names.flatMap((n) => { const p = findProcess(procs, ctx.manifest.project, n); return p ? [{ n, p }] : []; });
   if (targets.length === 0) return [];
   const cmd = targets

@@ -28,6 +28,7 @@ const appSchema = z.object({
   depends_on: z.array(z.string()).default([]),
   autorestart: z.boolean().default(true),
   pm2: z.record(z.unknown()).default({}),
+  host: name.optional(),
 }).strict();
 
 const hostSchema = z.object({
@@ -60,6 +61,8 @@ export interface App {
   env: Record<string, string>; ports: number[]; url: string | null;
   watch?: boolean | string[]; watch_delay?: number; ignore_watch?: string[];
   depends_on: string[]; autorestart: boolean; pm2: Record<string, unknown>;
+  /** the host this app always runs on; null = wherever the command points (--host, default local) */
+  host: string | null;
 }
 export interface Host {
   name: string; local: boolean; ssh?: string; ssh_args: string[];
@@ -136,7 +139,7 @@ export function parseManifest(text: string, root: string, manifestPath: string):
       name: n, description: a.description, kind: a.kind, run: a.run, cwd: a.cwd,
       env: stringifyEnv(a.env), ports: a.ports ?? (a.port !== undefined ? [a.port] : []), url: a.url ?? null,
       watch: a.watch, watch_delay: a.watch_delay ?? (a.watch ? 1000 : undefined), ignore_watch: a.ignore_watch,
-      depends_on: a.depends_on, autorestart: a.autorestart, pm2: a.pm2,
+      depends_on: a.depends_on, autorestart: a.autorestart, pm2: a.pm2, host: a.host ?? null,
     };
   }
   const cycle = findCycle(apps);
@@ -164,9 +167,29 @@ export function parseManifest(text: string, root: string, manifestPath: string):
     };
   }
   if (!hosts.local) hosts.local = { name: 'local', local: true, ssh_args: [], cwd: root, readonly: false, shell: parseShell(DEFAULT_SHELL), env: {} };
+  for (const a of Object.values(apps)) {
+    if (a.host !== null && !hosts[a.host]) problems.push(`apps.${a.name}.host: unknown host "${a.host}" (declared: ${Object.keys(hosts).join(', ')})`);
+  }
 
   if (problems.length) throw new McprocError('MANIFEST_INVALID', `Invalid manifest ${manifestPath}:\n  ${problems.join('\n  ')}`, { details: problems });
   return { root, path: manifestPath, project: m.project ?? defaultProject(root), apps, profiles: m.profiles, hosts };
+}
+
+/**
+ * The part of the manifest that runs on one host: apps bound to it, plus the unbound apps when it is the fallback host
+ * (the host the command names, local when it names none). Dependencies and profile members that run elsewhere are
+ * dropped, so everything that works on one manifest (ecosystem, ports, targets) works on this view unchanged.
+ */
+export function scopeManifest(m: Manifest, host: string, fallback: string): Manifest {
+  const apps = Object.fromEntries(Object.values(m.apps)
+    .filter((a) => (a.host ?? fallback) === host)
+    .map((a) => [a.name, a]));
+  for (const [n, a] of Object.entries(apps)) {
+    const deps = a.depends_on.filter((d) => d in apps);
+    if (deps.length !== a.depends_on.length) apps[n] = { ...a, depends_on: deps };
+  }
+  const profiles = Object.fromEntries(Object.entries(m.profiles).map(([p, list]) => [p, list.filter((a) => a in apps)]));
+  return { ...m, apps, profiles };
 }
 
 export function loadManifest(startDir: string): Manifest {

@@ -47,12 +47,22 @@ export function fmtUrl(r: LsRow): string {
   if (r.url_status === 'down') return `${r.url} ✗ down`;
   return r.url;
 }
+/** One table; a HOST column and the list of hosts only when the rows span more than one, then one line per host that did not answer. */
 export function renderLs(rows: LsRow[], host: string): string {
-  return `host: ${host}\n` + table([
-    ['APP', 'KIND', 'STATUS', 'PID', 'UPTIME', 'RESTARTS', 'MEM', 'CPU', 'PORTS', 'URL', 'RUNTIME', 'DESCRIPTION'],
-    ...rows.map((r) => [r.app, r.kind, r.status, r.pid === null ? '-' : String(r.pid), fmtUptime(r.uptime_ms), String(r.restarts),
+  const hosts = [...new Set(rows.map((r) => r.host))];
+  const multi = hosts.length > 1;
+  const head = multi ? `hosts: ${hosts.join(', ')}` : `host: ${hosts[0] ?? host}`;
+  const errors = [...new Map(rows.filter((r) => r.error).map((r) => [r.host, `${r.host}: ${r.error}`])).values()];
+  return [head, table([
+    ['APP', ...(multi ? ['HOST'] : []), 'KIND', 'STATUS', 'PID', 'UPTIME', 'RESTARTS', 'MEM', 'CPU', 'PORTS', 'URL', 'RUNTIME', 'DESCRIPTION'],
+    ...rows.map((r) => [r.app, ...(multi ? [r.host] : []), r.kind, r.status, r.pid === null ? '-' : String(r.pid), fmtUptime(r.uptime_ms), String(r.restarts),
       r.memory ? fmtBytes(r.memory) : '-', r.status === 'online' ? fmtCpu(r.cpu) : '-', fmtPorts(r.ports), fmtUrl(r), r.runtime ? cut(r.runtime, 32) : '-', cut(r.description.split('\n')[0], 40)]),
-  ]);
+  ]), ...errors].join('\n');
+}
+/** `host` when the rows come from one host (the shape results had before apps could run on several), `hosts` always. */
+export function hostsOf(rows: LsRow[], fallback: string): { host?: string; hosts: string[] } {
+  const hosts = rows.length ? [...new Set(rows.map((r) => r.host))] : [fallback];
+  return hosts.length === 1 ? { host: hosts[0], hosts } : { hosts };
 }
 /** A port sampled right after start may simply not be bound yet; say so instead of letting "✗" read as a failure. */
 export function startNote(rows: LsRow[]): string {
@@ -65,7 +75,7 @@ export function renderPorts(rep: { port: number | null; listeners: Array<Listene
   return `host: ${host}\n` + table([['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'], ...rep.listeners.map((l) => [l.proto, l.addr, String(l.port), l.pid === null ? '?' : String(l.pid), l.command ?? '?', l.app ?? '-', l.container ?? '-'])]);
 }
 export function renderHosts(info: HostInfo[]): string {
-  return table([['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME'], ...info.map((h) => [h.name, h.transport, h.cwd, h.readonly ? 'yes' : 'no', h.pm2_home ?? '-'])]);
+  return table([['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME', 'APPS'], ...info.map((h) => [h.name, h.transport, h.cwd, h.readonly ? 'yes' : 'no', h.pm2_home ?? '-', h.apps.length ? h.apps.join(', ') : '-'])]);
 }
 export function renderDoctor(reps: DoctorReport[]): string {
   return reps.map((r) => {
@@ -96,9 +106,9 @@ export function renderLogs(l: LogsResult): string {
   if (l.err !== undefined) parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
 }
-export function renderProject(d: { project: string; root: string; apps: { name: string; kind: string; description: string; ports: number[]; url: string | null; depends_on: string[] }[]; profiles: Record<string, string[]>; hosts: HostInfo[]; readme: string | null }): string {
+export function renderProject(d: { project: string; root: string; apps: { name: string; kind: string; description: string; ports: number[]; url: string | null; depends_on: string[]; host: string | null }[]; profiles: Record<string, string[]>; hosts: HostInfo[]; readme: string | null }): string {
   const L = [`project: ${d.project} (${d.root})`, 'apps:'];
-  for (const a of d.apps) L.push(`  ${a.name} [${a.kind}]${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`);
+  for (const a of d.apps) L.push(`  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`);
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles)) L.push(`  ${p}: ${apps.join(', ')}`);
   L.push('hosts:', renderHosts(d.hosts).split('\n').map((x) => '  ' + x).join('\n'));

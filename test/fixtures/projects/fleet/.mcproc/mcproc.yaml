@@ -1,0 +1,35 @@
+version: 1
+project: fleet
+apps:
+  watch:
+    description: build watcher on this machine
+    kind: build
+    run: npx tsc -w
+    host: local
+  web:
+    description: dev server inside the dev container
+    run: yarn dev
+    port: 3000
+    url: http://localhost:3000/
+    host: box
+    depends_on: [watch]
+  tool:
+    description: helper that runs wherever the command points
+    kind: worker
+    run: node tool.js
+  audit:
+    description: read-only audit job on the shared stand
+    kind: worker
+    run: node audit.js
+    host: ro
+profiles:
+  dev: [watch, web]
+  builds: [watch]
+hosts:
+  box:
+    ssh: box
+    cwd: /home/dev/fleet
+  ro:
+    ssh: ro
+    cwd: /srv/fleet
+    readonly: true

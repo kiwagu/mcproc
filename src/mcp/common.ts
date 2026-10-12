@@ -6,7 +6,7 @@ import type { UnpackDeps } from '../runtime/unpack.js';
 
 export const commonInput = {
   project: z.string().optional().describe('Project root. Default: MCPROC_PROJECT, then CLAUDE_PROJECT_DIR, then the client roots, then the server cwd; the manifest is searched upward from there.'),
-  host: z.string().optional().describe('Host name from the manifest hosts: section. Default: local.'),
+  host: z.string().optional().describe('Host name from the manifest hosts: section. Omitted: every app is reached on the host it runs on (its `host:` in the manifest, local for apps without one). Given: only the apps that run on that host (bound to it, or without a `host:`); naming an app bound elsewhere is refused.'),
 };
 export interface ToolDeps { roots: () => Promise<string[]>; spawner?: Spawner; unpack?: UnpackDeps }
 

@@ -24,9 +24,13 @@ function dockerArgv(host: Host, cmd: string): string[] {
   return ['docker', 'exec', ...(d.user ? ['-u', d.user] : []), '-i', d.container, ...shellArgv(host, cmd)];
 }
 
+export const SSH_CONNECT_TIMEOUT_S = 10;
+
 export function buildArgv(host: Host, cmd: string): string[] {
   const inner = host.docker ? dockerArgv(host, cmd) : shellArgv(host, cmd);
-  if (host.ssh) return ['ssh', '-o', 'BatchMode=yes', ...host.ssh_args, host.ssh, shjoin(inner)];
+  // a host that does not answer at all must fail in seconds, not hang a whole fleet of probes; after ssh_args, so a
+  // ConnectTimeout given there wins (ssh keeps the first value it sees)
+  if (host.ssh) return ['ssh', '-o', 'BatchMode=yes', ...host.ssh_args, '-o', `ConnectTimeout=${SSH_CONNECT_TIMEOUT_S}`, host.ssh, shjoin(inner)];
   return inner;
 }
 

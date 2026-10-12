@@ -1,14 +1,17 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, RO, runTool, type ToolDeps } from '../common.js';
-import { prepare, connect, assertApp } from '../../core/resolve.js';
-import { listApps, portsReport, hostsInfo, describeApp, describeProject } from '../../core/list.js';
+import { prepare, connect } from '../../core/resolve.js';
+import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
+import { Fleet, defaultConnector, listFleet, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
 import { doctor } from '../../core/doctor.js';
-import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject } from '../render.js';
+import { renderLs, renderPorts, renderHosts, renderDoctor, renderLogs, renderProject, hostsOf } from '../render.js';
 
 export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   const prep = async (args: { project?: string; host?: string }) => prepare({ project: args.project, host: args.host, roots: await deps.roots() });
+  // apps run at their own host (`host:` in the manifest); host narrows a call to the apps that run there
+  const fleetOf = async (args: { project?: string; host?: string }) => new Fleet(prepare({ project: args.project, roots: await deps.roots() }).manifest, args.host, defaultConnector(deps.spawner));
 
   server.registerTool('hosts', {
     title: 'Hosts', description: 'Hosts declared in the project manifest: transport, project cwd there, readonly flag. No network access.',
@@ -29,42 +32,37 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
   }));
 
   server.registerTool('ls', {
-    title: 'List apps', description: 'One row per manifest app: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open".',
+    title: 'List apps', description: 'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open".',
     inputSchema: { ...commonInput, app: z.string().optional().describe('Only this app') }, annotations: RO,
   }, (args) => runTool(async () => {
-    const p = await prep(args);
-    if (args.app) assertApp(p.manifest, args.app);
-    const ctx = await connect(p, { spawner: deps.spawner });
-    const rows = await listApps(ctx, args.app);
-    return { text: renderLs(rows, ctx.host.name), data: { host: ctx.host.name, project: ctx.manifest.project, rows } };
+    const fleet = await fleetOf(args);
+    const { rows, errors } = await listFleet(fleet, fleet.select(args.app ? [args.app] : ['all']));
+    return { text: renderLs(rows, fleet.fallback), data: { ...hostsOf(rows, fleet.fallback), project: fleet.manifest.project, rows, errors } };
   }));
 
   server.registerTool('describe', {
     title: 'Describe', description: 'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config.',
     inputSchema: { ...commonInput, app: z.string().optional() }, annotations: RO,
   }, (args) => runTool(async () => {
-    const p = await prep(args);
+    const fleet = await fleetOf(args);
     if (!args.app) {
-      const d = describeProject(p.manifest);
+      const d = describeProject(fleet.manifest);
       return { text: renderProject(d), data: d as unknown as Record<string, unknown> };
     }
-    assertApp(p.manifest, args.app);
-    const ctx = await connect(p, { spawner: deps.spawner });
-    const d = await describeApp(ctx, args.app);
+    const d = await describeFleetApp(fleet, args.app);
     const text = [`${d.app.name} [${d.app.kind}]: ${d.app.description}`, `run: ${d.app.run}`, `cwd: ${d.app.cwd}`, d.app.depends_on.length ? `depends_on: ${d.app.depends_on.join(', ')}` : '',
-      renderLs([d.row], ctx.host.name), `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`, `pm2: ${JSON.stringify(d.pm2)}`].filter(Boolean).join('\n');
+      renderLs([d.row], d.host), `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`, `pm2: ${JSON.stringify(d.pm2)}`].filter(Boolean).join('\n');
     return { text, data: d as unknown as Record<string, unknown> };
   }));
 
   server.registerTool('logs', {
-    title: 'Logs', description: 'Tail an app\'s pm2 logs (out, err or both), ANSI stripped. Default 100 lines, max 2000.',
+    title: 'Logs', description: 'Tail an app\'s pm2 logs (out, err or both) on the host it runs on, ANSI stripped. Default 100 lines, max 2000.',
     inputSchema: { ...commonInput, app: z.string(), lines: z.number().int().min(1).max(2000).optional(), stream: z.enum(['out', 'err', 'both']).optional() }, annotations: RO,
   }, (args) => runTool(async () => {
-    const p = await prep(args);
-    assertApp(p.manifest, args.app);
-    const ctx = await connect(p, { spawner: deps.spawner });
+    const fleet = await fleetOf(args);
+    const ctx = await fleet.ctx(fleet.one(args.app));
     const r = await readLogs(ctx, args.app, { lines: args.lines, stream: args.stream });
-    return { text: renderLogs(r), data: r as unknown as Record<string, unknown> };
+    return { text: renderLogs(r), data: { host: ctx.host.name, ...r } as unknown as Record<string, unknown> };
   }));
 
   server.registerTool('ports', {

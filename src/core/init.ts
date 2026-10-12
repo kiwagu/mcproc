@@ -181,7 +181,8 @@ export function renderDraft(root: string, project: string, d: Discovery): string
     '# port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its',
     '# build output changes); depends_on = start order; profiles = named groups of apps;',
     '# url = the address to open in a browser; ls/describe show it with the HTTP answer, monit shows it;',
-    '# hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container).',
+    '# hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container);',
+    '# host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.',
   ];
   for (const n of d.notes) L.push(`# note: ${n}`);
   L.push('version: 1', `project: ${project}`, 'apps:');

@@ -13,6 +13,7 @@ import type { UnpackDeps } from '../../src/runtime/unpack.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
+const fleet = path.join(here, '..', 'fixtures', 'projects', 'fleet');
 
 async function client(spawner?: Spawner, unpackDeps?: UnpackDeps) {
   const server = createServer({ spawner, unpack: unpackDeps });
@@ -78,6 +79,40 @@ describe('mcp server', () => {
     expect(r.structuredContent.rows).toHaveLength(3);
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
+  });
+  it('host-bound apps: a target on another host than --host, or on a readonly host, is refused before any transport call', async () => {
+    const cl = await client(neverSpawn);
+    for (const [name, args] of [['restart', { target: 'web', host: 'local' }], ['logs', { app: 'watch', host: 'box' }], ['ls', { app: 'web', host: 'local' }], ['describe', { app: 'watch', host: 'box' }], ['flush', { app: 'web', host: 'local' }]] as const) {
+      const r = await cl.callTool({ name, arguments: { project: fleet, ...args } });
+      expect(text(r), name).toContain('WRONG_HOST');
+    }
+    for (const name of ['logs', 'describe']) expect(text(await cl.callTool({ name, arguments: { project: fleet, app: 'dev' } })), name).toContain('UNKNOWN_APP');
+    const ro = await cl.callTool({ name: 'start', arguments: { project: fleet, target: 'all' } });
+    expect(text(ro)).toContain('READONLY_HOST');
+    expect(text(ro)).toContain('"audit"');
+    expect(text(await cl.callTool({ name: 'flush', arguments: { project: fleet } }))).toContain('READONLY_HOST');
+  });
+  it('host-bound apps: ls without host lists every app from its own host; a host that is down leaves unreachable rows', async () => {
+    const jlists: Record<string, string> = {
+      local: JSON.stringify([{ pid: 4242, name: 'fleet-watch', pm_id: 0, pm2_env: { status: 'online', namespace: 'fleet' } }]),
+      box: JSON.stringify([{ pid: 77, name: 'fleet-web', pm_id: 3, pm2_env: { status: 'online', namespace: 'fleet' } }]),
+    };
+    const spawner: Spawner = async (argv) => {
+      const host = argv[0] === 'ssh' ? argv[argv.length - 2] : 'local';
+      if (host === 'ro') return { code: 255, stdout: '', stderr: 'ssh: connect to host ro port 22: Connection refused' };
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes(MARK.JLIST)) return { code: 0, stdout: probeOut({ jlist: jlists[host] }), stderr: '' };
+      if (cmd.includes('bin/pm2')) return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected on ${host}` };
+    };
+    const cl = await client(spawner);
+    const r: any = await cl.callTool({ name: 'ls', arguments: { project: fleet } });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.rows.map((x: any) => `${x.app}@${x.host}:${x.status}`)).toEqual(['watch@local:online', 'web@box:online', 'tool@local:not-started', 'audit@ro:unreachable']);
+    expect(r.structuredContent.hosts).toEqual(['local', 'box', 'ro']);
+    expect(r.structuredContent.errors[0]).toMatchObject({ host: 'ro', apps: ['audit'] });
+    expect(text(r)).toMatch(/web\s+box\s+server\s+online\s+77/);
+    expect(text(r)).toMatch(/^ro: TRANSPORT_FAILED/m);
   });
   it('init creates the draft', async () => {
     const cl = await client(neverSpawn);

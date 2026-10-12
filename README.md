@@ -66,30 +66,71 @@ hosts:                         # "local" is implicit
     cwd: /home/node/demo
     readonly: true             # every mutating tool is refused here
 ```
-Other app fields: `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
+Other app fields: `host` (see below), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
 Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
 `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
 
 The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
 checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
 
+### Apps on several hosts
+
+When part of a dev stack runs elsewhere, say watch builds on your machine and the dev server inside a
+dev container, bind those apps to their host with `host:`:
+
+```yaml
+apps:
+  libs-watch:
+    description: watch build of the shared libraries
+    kind: build
+    run: npm run watch:libs
+    host: local
+  web:
+    description: dev server inside the dev container
+    run: npm run dev
+    host: devbox
+hosts:
+  devbox:
+    ssh: dev@devbox.local
+    ssh_args: ["-p", "2222"]
+    cwd: /home/dev/project
+```
+
+A bound app always runs on its host. An app without `host:` runs wherever the command points:
+`--host`, or local when there is none.
+
+- Without `--host`, every command reaches each app at its own host. `ls` prints one table with a HOST
+  column (one probe per host, in parallel). `start`/`stop`/`restart`/`delete` of a profile or `all` go to
+  each app's host in dependency order, and a dependency on another host starts first, on that host.
+  `logs -f` streams them all, and `monit` shows them all on one screen.
+- With `--host X`, a command reaches only the apps that run on X: the apps bound to X and the unbound
+  ones. Naming an app bound elsewhere is refused before anything runs.
+- A host that does not answer never holds the others back. `ls` shows its apps as `unreachable` rows
+  with the reason. `monit` keeps their last known rows and names the host in the footer. `logs -f` prints
+  one note per app and picks the stream up where it was once the host is back, and a host that was down
+  at the start gets connected later. A change that fails on one host keeps the rows of what already
+  happened (`start` skips what comes after the failure). A readonly host refuses the whole change before
+  any host is touched, and the error names the apps that run there, dependencies included.
+- ssh gives up connecting after 10 s (`-o ConnectTimeout=10`). A `ConnectTimeout` in `ssh_args` wins.
+
 ## Tools (MCP) and commands (CLI)
 
 | tool | what it does |
 |------|--------------|
 | `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
-| `ls [app]` | one row per app: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
+| `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
-| `logs <app>` | tail of the pm2 out/err logs, ANSI stripped (`lines`, `stream`) |
-| `hosts`, `doctor` | hosts from the manifest; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
+| `logs <app>` | tail of the pm2 out/err logs on the app's host, ANSI stripped (`lines`, `stream`) |
+| `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json`, `ecosystem.json`, `Procfile` |
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload` |
 | `restart`, `stop`, `delete <target>` | by app or profile |
 | `flush [app]` | truncate pm2 log files |
 | `unpack` | bring pm2 (assembled with npm from the lockfile mcproc ships), and Node when the host has none ≥ 18, into `<cwd>/.mcproc/runtime` on that host |
 
-Every tool takes `project` and `host`. Read-only tools are annotated as such; mutating tools refuse
-`readonly` hosts and unknown app names before touching the host.
+Every tool takes `project` and `host` (see *Apps on several hosts*: without `host`, each app is reached
+where it runs). Read-only tools are annotated as such; mutating tools refuse `readonly` hosts and
+unknown app names before touching any host.
 
 ## `mcproc monit`
 
@@ -99,7 +140,9 @@ with ✓/✗, the runtime command, a live log tail with history, and the selecte
 `j`/`k` (or Tab) select an app, `↑`/`↓`, PageUp/PageDown and the mouse wheel scroll the log pane (End
 returns to the tail), `r`/`s`/`x` restart/start/stop, `o`/`e`/`b` switch the log stream, `f` switches to the
 flat view (every app's logs merged into one labeled stream, `app | line`, `app ! line` for stderr, one
-color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. Long log lines
+color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. With host-bound
+apps the screen opens on every app at its own host, with a HOST column, and reads each app's logs where
+it runs. `h` then cycles from `all` to each host, narrowing the screen the way `--host` narrows a command. Long log lines
 wrap with indented continuations. `mcproc monit --once` prints one frame as text, which is what an
 agent or a script reads.
 
