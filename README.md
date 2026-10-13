@@ -76,26 +76,28 @@ Other app fields: `host` (see below), `watch_delay`, `ignore_watch`, `autorestar
 Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
 `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
 
+The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
+checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
+
 ### Kinds
 
-| kind | what it is | autorestart | `ls` shows after it exits |
+| kind | what it is | autorestart | `ls` shows after it exits (autorestart on: pm2's words; off: the words below) |
 |---|---|---|---|
 | `server` | a process that listens (default) | on | `stopped`, `errored` |
 | `worker` | a process without a port | on | `stopped`, `errored` |
 | `build` | a long-running watch build | on | `stopped`, `errored` |
 | `task` | runs once: a build, a migration, a seed | off | `done`, `failed (exit N)`, `stopped` |
 
-A task's exit code is pm2's `exit_code`: 0 is `done`, any other code `failed (exit N)`. A manual stop reads
-`stopped`: mcproc puts `trap 'exit 130' INT; trap 'exit 143' TERM;` in front of a one-shot app's command, because
-pm2 itself records exit code 0 for a process killed by a signal. Two edges: a `run` that starts with `exec …`
+Autorestart defaults to on for every kind except `task`, which defaults it off. `autorestart: false` on any kind
+gives the same behaviour as a task, and `autorestart: true` on a task is refused. For an app with autorestart off,
+the exit code is pm2's `exit_code`: 0 is `done`; no code, 130 or 143 (a stop) is `stopped`; any other code is
+`failed (exit N)`. So a task that itself exits 130 or 143 reads `stopped`. A manual stop reads `stopped` because
+mcproc puts `trap 'exit 130' INT; trap 'exit 143' TERM;` in front of the command of an app with autorestart off,
+since pm2 itself records exit code 0 for a process killed by a signal. Two edges: a `run` that starts with `exec …`
 replaces the shell and loses the trap, so a manual stop of it reads `done`; a task that ignores SIGINT until pm2's
-kill timeout (SIGKILL) also reads `done`. The host shell must be POSIX (`bash`, `sh`): the default and the
+kill timeout (SIGKILL) also reads `done`. The host shell must be POSIX (`bash` or `sh`): the default shell and the
 documented `/bin/sh -c` both are. pm2 keeps no exit time, so UPTIME stays `-`. `start` on a done or failed task runs
-it again; `autorestart: true` on a task is refused. `init` drafts `build`, `migrate`, `seed` and `once` scripts as
-tasks and watch-style commands as `build`.
-
-The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
-checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
+it again. `init` drafts `build`, `migrate`, `seed` and `once` scripts as tasks and watch-style commands as `build`.
 
 ### Apps on several hosts
 
@@ -145,19 +147,23 @@ instead of sleeping and polling:
 | `until` | met when |
 |---|---|
 | `listening` | every declared port is bound (needs `port`/`ports`) |
-| `url-ok` | the `url` answers 2xx/3xx (requested from the host, as `ls` does; needs `curl` or `wget` there, without either it runs to the timeout and reports `unchecked`) |
-| `exited` | the process left `online`; the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped` |
+| `url-ok` | the `url` answers 2xx/3xx (requested from the host, as `ls` does) |
+| `exited` | the process left `online`; with autorestart off the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped`, otherwise pm2's `stopped` or `errored` |
 | `log:<regex>` | a new line of its out or err log matches (ANSI stripped; history is not searched) |
-| `idle:<seconds>` | no log output for that long — a watcher settled |
+| `idle:<seconds>` | no log output for that long: a watcher settled |
 
-`log:` and `idle:` see only output written after the call begins; for "is it up" prefer `listening` or `url-ok`.
-`wait --until exited` succeeds (exit code 0) once the process has exited, whatever its exit code; scripts read
-`exit_code` in `--json` or the `(exit N)` in the line.
+`url-ok` needs `curl` or `wget` on the host: without either it runs to the timeout and reports `unchecked`.
+`log:` and `idle:` see only output written after the call begins, and notice a dead process only every 5 s; for
+"is it up" prefer `listening` or `url-ok`. `wait --until exited` succeeds (exit code 0) once the process has exited,
+whatever its exit code; scripts read `exit_code` in `--json` or the `(exit N)` in the line. A wait on an app that
+was never started is a `NOT_STARTED` error, not a result. `listening` needs a declared port and `url-ok` a declared
+url, else `BAD_ARGUMENT`. `exited` on an app that has already stopped answers at once.
 
 The answer is one line: `web: listening after 1.3 s (:3000 ✓)`, `libs: done after 12.4 s (exit 0)`. On timeout
-(default 60 s, max 600) or when the process dies meanwhile it says what was last seen (`web: listening not reached
-after 60.0 s (status online, :3000 ✗ nothing listens)`) and `ok` is false; it is a result, not an error, and the CLI
-exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. Claude
+(default 60 s, max 600) it says what was last seen (`web: listening not reached after 60.0 s (status online, :3000 ✗
+nothing listens)`), and `ok` is false. If the process dies meanwhile, the wait ends at once with its reason and
+status and no observation, for example `web: exited (stopped) after 3.2 s while waiting for listening` (`observed`
+is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. Claude
 Code does not cut a long MCP call, but moves one into the background after two minutes. A cancelled MCP `wait` (or
 `start`) call stops the polling at once.
 
@@ -171,11 +177,11 @@ depends_on:
 ```
 
 `completed` needs a `kind: task` dependency; `ready` one with a port or a url (ports are checked when declared, the
-url otherwise). `start` launches dependencies first, as before, and waits at each such edge — on the dependency's
+url otherwise). `start` launches dependencies first, as before, and waits at each such edge, on the dependency's
 host, also when the dependent runs elsewhere. A done task is run again, a running one is waited on. When a dependency
 fails, times out or dies, the dependent is not started: its row reads `skipped` with the reason, and so do the apps
-that depend on it; unrelated apps still start. The answer adds `waited 4.2 s for libs (completed)` and the CLI exits 1
-when anything was skipped. With `--host X`, dependencies that run elsewhere are neither started nor waited for.
+that depend on it; unrelated apps still start. The answer adds `waited 4.2 s for libs (completed)` for each wait that was met (a failed
+wait shows in the rows), `start`'s JSON carries the waits as `waits[]`, and the CLI exits 1 when anything was skipped. With `--host X`, dependencies that run elsewhere are neither started nor waited for.
 
 ## Tools (MCP) and commands (CLI)
 
@@ -316,7 +322,7 @@ Ports published by Docker containers show the container name instead of a pid.
 `tail`, `head`, `od`). pm2 comes from the host's login-shell PATH (Node 18 or newer)
 or from `unpack`. mcproc itself is only installed where the agent runs; locally it ships its own
 pm2. `doctor` tells you which pm2 a host would use and why, or why none is usable.
-`curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`).
+`curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`); `url-ok` waits and a `ready` dependency on a url need one of them too.
 
 ## Hosts without pm2: `unpack`
 
