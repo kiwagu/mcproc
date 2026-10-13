@@ -8,6 +8,8 @@ import {
   type SnapshotOptions,
 } from './list.js';
 import { createFollower, type LogFollower } from './logfollow.js';
+import { stripAnsi } from './logs.js';
+import type { App } from './manifest.js';
 import { fmtPorts } from '../mcp/render.js';
 
 export type Until =
@@ -50,6 +52,10 @@ const POLL_LOCAL_MS = 500;
 const POLL_REMOTE_MS = 1000;
 /** pm2 statuses of a process that is running, or about to be. */
 const LIVE = new Set(['online', 'launching']);
+/** The log: and idle: waits look at the follower at least this often (a file wake makes it sooner). */
+const LOG_TICK_MS = 1000;
+/** ...and ask pm2 about the process this often: each check is a login shell, so not every tick. */
+const STATUS_EVERY_MS = 5000;
 
 const bad = (msg: string) =>
   new McprocError('BAD_ARGUMENT', msg, {
@@ -115,9 +121,108 @@ const notStarted = (ctx: Context, app: string) =>
     { hint: `Run start ${app} first; ls shows the current state.` }
   );
 
-/** The log:/idle: waits sit on the follower; they arrive with the next task. */
-async function waitOnLogs(): Promise<WaitResult> {
-  throw new Error('log waits arrive in the next task');
+type Answer = (
+  part: Partial<WaitResult> & { ok: boolean; status: string }
+) => WaitResult;
+/** What waitFor hands the log waits: its clock bounds and the ways to end a result. */
+interface LogRun {
+  deps: WaitDeps;
+  deadline: number;
+  signal?: AbortSignal;
+  answer: Answer;
+  gone: (p: Pm2Process | undefined, observed?: string) => WaitResult;
+  giveUp: (
+    reason: 'timeout' | 'aborted',
+    p: Pm2Process | undefined,
+    observed?: string
+  ) => WaitResult;
+}
+
+/**
+ * log:/idle: sit on the log follower, which takes its position at the end of both files: nothing written before
+ * that is searched, and a quiet period counts from that moment (or from the last byte since). Lines read in a poll
+ * are judged before the process is looked at, so a last line still counts. The process is asked about every few
+ * seconds, and once more when the quiet period of idle: ends.
+ */
+async function waitOnLogs(
+  ctx: Context,
+  app: string,
+  a: App,
+  until: Extract<Until, { kind: 'log' | 'idle' }>,
+  run: LogRun
+): Promise<WaitResult> {
+  const { deps, signal } = run;
+  let p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+  if (!p) throw notStarted(ctx, app);
+  const f = deps.follower(ctx, { out: p.out_log, err: p.err_log });
+  // a file wake, or the signal, ends the sleep of the tick; a wake during a poll skips the next sleep
+  let tick: AbortController | null = null;
+  let woken = false;
+  const wake = () => {
+    woken = true;
+    tick?.abort();
+  };
+  const onAbort = () => tick?.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    await f.poll(); // takes the position at the end; no history is searched
+    f.watch(wake);
+    const quietMs = until.kind === 'idle' ? Math.ceil(until.seconds * 1000) : 0;
+    let lastCheck = deps.now();
+    let lastChange = lastCheck;
+    let lastLine: string | undefined;
+    let seen = { out: f.offsets.out, err: f.offsets.err };
+    for (;;) {
+      const { lines } = await f.poll();
+      const now = deps.now();
+      // any byte counts as activity, a line still unfinished too
+      if (f.offsets.out !== seen.out || f.offsets.err !== seen.err) {
+        lastChange = now;
+        seen = { out: f.offsets.out, err: f.offsets.err };
+      }
+      for (const l of lines) {
+        const text = stripAnsi(l.text);
+        lastLine = text;
+        if (until.kind === 'log' && until.re.test(text))
+          return run.answer({
+            ok: true,
+            status: statusWord(p, a),
+            matched_line: text,
+          });
+      }
+      const observed =
+        lastLine === undefined ? 'no new output' : `last line: ${lastLine}`;
+      if (until.kind === 'idle' && now - lastChange >= quietMs) {
+        p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+        return p && LIVE.has(p.status)
+          ? run.answer({ ok: true, status: statusWord(p, a), observed })
+          : run.gone(p, observed);
+      }
+      if (now - lastCheck >= STATUS_EVERY_MS) {
+        lastCheck = now;
+        p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+        if (!p || !LIVE.has(p.status)) return run.gone(p, observed);
+      }
+      if (now >= run.deadline) return run.giveUp('timeout', p, observed);
+      // the next tick, cut to the deadline, the next status check and the end of the quiet period
+      const sleeps = [
+        LOG_TICK_MS,
+        run.deadline - now,
+        lastCheck + STATUS_EVERY_MS - now,
+      ];
+      if (until.kind === 'idle') sleeps.push(lastChange + quietMs - now);
+      if (!woken && !signal?.aborted) {
+        tick = new AbortController();
+        await deps.sleep(Math.max(0, Math.min(...sleeps)), tick.signal);
+        tick = null;
+      }
+      woken = false;
+      if (signal?.aborted) return run.giveUp('aborted', p, observed);
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    f.close();
+  }
 }
 
 /**
@@ -143,7 +248,6 @@ export async function waitFor(
     throw bad(`"${app}" declares no port, so listening cannot be observed`);
   if (until.kind === 'url-ok' && !a.url)
     throw bad(`"${app}" declares no url, so url-ok cannot be observed`);
-  if (until.kind === 'log' || until.kind === 'idle') return waitOnLogs();
 
   const timeoutMs = Math.min(
     opts.timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS,
@@ -153,9 +257,11 @@ export async function waitFor(
   const deadline = start + timeoutMs;
   const interval = ctx.host.local ? POLL_LOCAL_MS : POLL_REMOTE_MS;
   const label = untilLabel(until);
-  const answer = (
-    part: Partial<WaitResult> & { ok: boolean; status: string }
-  ): WaitResult => ({ until: label, waited_ms: deps.now() - start, ...part });
+  const answer: Answer = (part) => ({
+    until: label,
+    waited_ms: deps.now() - start,
+    ...part,
+  });
   /** the process left online (or is gone) with the condition still unmet */
   const gone = (p: Pm2Process | undefined, observed?: string): WaitResult =>
     answer({
@@ -165,6 +271,13 @@ export async function waitFor(
       exit_code: p?.exit_code ?? null,
       observed,
     });
+  /** the wait ends with the condition unmet: the timeout passed or the signal aborted */
+  const giveUp = (
+    reason: 'timeout' | 'aborted',
+    p: Pm2Process | undefined,
+    observed?: string
+  ): WaitResult =>
+    answer({ ok: false, reason, status: statusWord(p, a), observed });
   /** sleeps until the next poll or the deadline, whichever is first; false when the wait was aborted */
   const pause = async (): Promise<boolean> => {
     await deps.sleep(
@@ -173,6 +286,15 @@ export async function waitFor(
     );
     return !opts.signal?.aborted;
   };
+  if (until.kind === 'log' || until.kind === 'idle')
+    return waitOnLogs(ctx, app, a, until, {
+      deps,
+      deadline,
+      signal: opts.signal,
+      answer,
+      gone,
+      giveUp,
+    });
 
   for (let first = true; ; first = false) {
     let p: Pm2Process | undefined;
@@ -218,19 +340,7 @@ export async function waitFor(
       if (met) return answer({ ok: true, status: statusWord(p, a), observed });
       if (!p || !LIVE.has(p.status)) return gone(p, observed);
     }
-    if (deps.now() >= deadline)
-      return answer({
-        ok: false,
-        reason: 'timeout',
-        status: statusWord(p, a),
-        observed,
-      });
-    if (!(await pause()))
-      return answer({
-        ok: false,
-        reason: 'aborted',
-        status: statusWord(p, a),
-        observed,
-      });
+    if (deps.now() >= deadline) return giveUp('timeout', p, observed);
+    if (!(await pause())) return giveUp('aborted', p, observed);
   }
 }

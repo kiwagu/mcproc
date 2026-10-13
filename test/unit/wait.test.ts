@@ -327,3 +327,171 @@ describe('waitFor: limits and the real sleep', () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(15);
   });
 });
+
+/** A scripted follower: each poll returns the next batch; `watch` keeps the wake so a test can fire it. */
+function fakeFollower(batches: { out?: string[]; err?: string[] }[]) {
+  const offsets = { out: 0 as number | null, err: 0 as number | null };
+  let i = 0;
+  let wake: (() => void) | null = null;
+  const f = {
+    offsets,
+    polls: 0,
+    closed: false,
+    async poll() {
+      f.polls++;
+      const b = batches[i++] ?? {};
+      const lines = [
+        ...(b.out ?? []).map((text) => ({ stream: 'out' as const, text })),
+        ...(b.err ?? []).map((text) => ({ stream: 'err' as const, text })),
+      ];
+      offsets.out = (offsets.out ?? 0) + (b.out ?? []).join('\n').length;
+      offsets.err = (offsets.err ?? 0) + (b.err ?? []).join('\n').length;
+      return { lines, reset: false };
+    },
+    watch(w: () => void) {
+      wake = w;
+    },
+    close() {
+      f.closed = true;
+    },
+    fire: () => wake?.(),
+  };
+  return f;
+}
+
+describe('waitFor: log: and idle:', () => {
+  const online = jl(proc('api', 'online'));
+  it('log: matches a new line (ANSI stripped) and returns it; history is never searched', async () => {
+    const f = fakeFollower([
+      { out: ['old listening on 3100'] },
+      {},
+      { out: ['\x1b[32mlistening on 3100\x1b[0m'] },
+    ]);
+    const h = harness([], [online]);
+    const deps = { ...h.deps, follower: () => f };
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:listening on \\d+'), {
+      deps,
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      matched_line: 'listening on 3100',
+      status: 'online',
+    });
+    expect(f.polls).toBe(3); // history read, one empty tick, the match
+    expect(f.closed).toBe(true);
+  });
+  it('log: a line that arrives in the same poll the process exits still counts', async () => {
+    const f = fakeFollower([{}, { out: ['build finished'] }]);
+    const h = harness(
+      [],
+      [online, jl(proc('api', 'stopped', { exit_code: 0 }))]
+    );
+    // the status check and the match fall in the same tick: lines are judged first
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:finished'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r.ok).toBe(true);
+  });
+  it('log: a process that exits without a match ends the wait, checked at most every 5 s', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness(
+      [],
+      [online, jl(proc('api', 'stopped', { exit_code: 1 }))]
+    );
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:never'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'exited',
+      status: 'stopped',
+      exit_code: 1,
+    });
+    expect(h.calls.jlists).toBe(2); // one at the start, one after 5 s of ticks
+    expect(r.waited_ms).toBe(5000);
+  });
+  it('log: times out with the last line seen', async () => {
+    const f = fakeFollower([{}, { err: ['warming up'] }]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:never'), {
+      deps: { ...h.deps, follower: () => f },
+      timeoutMs: 3000,
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', waited_ms: 3000 });
+    expect(r.observed).toBe('last line: warming up');
+  });
+  it('idle: ok once nothing arrived for the given seconds, counted from the last byte', async () => {
+    const f = fakeFollower([{}, { out: ['a'] }, { out: ['b'] }, {}, {}, {}]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('idle:2'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 3000 }); // bytes at 0 s and 1 s; quiet 2 s → 3 s
+  });
+  it('idle: a process that is no longer online when the quiet period ends is not settled', async () => {
+    const f = fakeFollower([{}, {}, {}]);
+    const h = harness(
+      [],
+      [online, jl(proc('api', 'errored', { exit_code: 1 }))]
+    );
+    const r = await waitFor(h.ctx, 'api', parseUntil('idle:1'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'crashed',
+      status: 'errored',
+    });
+  });
+  it('a wake polls at once instead of waiting for the tick', async () => {
+    const f = fakeFollower([{}, { out: ['ready'] }]);
+    const h = harness([], [online]);
+    const deps = {
+      ...h.deps,
+      follower: () => f,
+      sleep: async () => {
+        f.fire();
+        await h.deps.sleep(0);
+      },
+    };
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:ready'), { deps });
+    expect(r.ok).toBe(true);
+    expect(r.waited_ms).toBe(0);
+  });
+  it('a wake that arrives during a sleep ends that sleep (it would not end by itself here)', async () => {
+    const f = fakeFollower([{}, {}, { out: ['ready'] }]);
+    const h = harness([], [online]);
+    const deps = {
+      ...h.deps,
+      follower: () => f,
+      // a sleep that only ends when its signal aborts; the file wake comes while it waits
+      sleep: (_ms: number, signal?: AbortSignal) =>
+        new Promise<void>((resolve) => {
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+          queueMicrotask(f.fire);
+        }),
+    };
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:ready'), { deps });
+    expect(r).toMatchObject({ ok: true, matched_line: 'ready', waited_ms: 0 });
+  });
+  it('log: an aborted wait answers aborted with what it saw, and closes the follower', async () => {
+    const ac = new AbortController();
+    const f = fakeFollower([{}, { out: ['starting'] }]);
+    const h = harness([], [online]);
+    const deps = {
+      ...h.deps,
+      follower: () => f,
+      sleep: async (ms: number) => {
+        await h.deps.sleep(ms);
+        ac.abort();
+      },
+    };
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:never'), {
+      deps,
+      signal: ac.signal,
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'aborted', status: 'online' });
+    expect(r.observed).toBe('last line: starting');
+    expect(f.closed).toBe(true);
+  });
+});
