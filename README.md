@@ -166,7 +166,8 @@ nothing listens)`), and `ok` is false. If the process dies meanwhile, the wait e
 status and no observation, for example `web: exited (stopped) after 3.2 s while waiting for listening` (`observed`
 is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. A process that pm2 is
 restarting (a watch restart, a restart delay) is not dead: the wait goes on, bounded by the timeout. `listening` and
-`url-ok` count only while the process is `online`: a port or url that still answers after the process died is not ready. Claude
+`url-ok` count only while the process is online or launching; a restart in progress is waited out, and a port or url that
+still answers after the process died is not ready. Claude
 Code does not cut a long MCP call, but moves one into the background after two minutes. A cancelled MCP `wait` (or
 `start`) call stops the polling at once.
 
