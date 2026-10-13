@@ -511,7 +511,7 @@ describe('actOn start with conditions across hosts', () => {
       async (_m, host) => ctxs[host as 'local' | 'box']
     );
     const ac = new AbortController();
-    ac.abort();
+    setTimeout(() => ac.abort(), 50); // while the wait polls; the start was not cancelled before it began
     const rows = await actOn(f, 'web', 'start', { signal: ac.signal });
     expect(rows.find((r) => r.app === 'web')).toMatchObject({
       status: 'skipped',

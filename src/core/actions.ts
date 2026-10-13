@@ -181,6 +181,11 @@ export async function startApps(
     // running already: left alone, whatever happened to what it needs (it is neither waited for nor skipped)
     const p = findProcess(before, ctx.manifest.project, n);
     if (p && p.status === 'online' && !opts.reload) continue;
+    // the caller cancelled: nothing more is launched, unrelated apps included
+    if (opts.signal?.aborted) {
+      skip(n, 'start cancelled');
+      continue;
+    }
     if (failed.has(n)) {
       // decided before this run (a dependency on another host failed, timed out or was not started)
       skip(n, failed.get(n)!);

@@ -388,6 +388,43 @@ describe('startApps with depends_on conditions', () => {
     });
     expect(launchedOf(blocked)).toEqual([]);
   });
+  it('a cancelled start launches nothing more, unrelated apps included: each is skipped as cancelled', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const ac = new AbortController();
+    ac.abort();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', {
+      signal: ac.signal,
+      failed,
+      waitDep: async () => {
+        throw new Error('must not wait once the start is cancelled');
+      },
+    });
+    expect(rows.map((r) => [r.app, r.status, r.error])).toEqual([
+      ['libs', 'skipped', 'start cancelled'],
+      ['api', 'skipped', 'start cancelled'],
+      ['logger', 'skipped', 'start cancelled'],
+      ['web', 'skipped', 'start cancelled'],
+    ]);
+    expect(launchedOf(ctx)).toEqual([]);
+    expect([...failed.keys()]).toEqual(['libs', 'api', 'logger', 'web']);
+  });
+  it('a cancelled start leaves an app that is online as it is: it is not launched, so it is not skipped', async () => {
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([{ ...proc('logger', 'online'), pm_id: 4 }])
+    );
+    const ac = new AbortController();
+    ac.abort();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', { signal: ac.signal, failed });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.logger.status).toBe('online');
+    expect(by.libs.status).toBe('skipped');
+    expect(failed.has('logger')).toBe(false);
+    expect(launchedOf(ctx)).toEqual([]);
+  });
   it('an app already online is not skipped when what it needs was: it is left alone and not marked failed', async () => {
     // libs fails, api (not running) is skipped, web is up already: it stays as it is, with its row and no cascade
     const ctx = fakeCtx(
@@ -480,7 +517,7 @@ describe('startApps with depends_on conditions', () => {
     // libs is still running (a task not yet done): without the signal this wait would last its whole timeout
     const ctx = fakeCtx(readiness, 'local', rules([proc('libs', 'online')]));
     const ac = new AbortController();
-    ac.abort();
+    setTimeout(() => ac.abort(), 50); // while the wait polls; the start was not cancelled before it began
     const waits: WaitRecord[] = [];
     const rows = await startApps(ctx, 'api', { waits, signal: ac.signal });
     expect(waits).toMatchObject([
