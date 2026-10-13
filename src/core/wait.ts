@@ -174,7 +174,7 @@ async function waitOnLogs(
     let seen = { out: f.offsets.out, err: f.offsets.err };
     for (;;) {
       const { lines } = await f.poll();
-      const now = deps.now();
+      let now = deps.now();
       // any byte counts as activity, a line still unfinished too
       if (f.offsets.out !== seen.out || f.offsets.err !== seen.err) {
         lastChange = now;
@@ -202,6 +202,7 @@ async function waitOnLogs(
         lastCheck = now;
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
         if (!p || !LIVE.has(p.status)) return run.gone(p, observed);
+        now = deps.now(); // the check took a login shell, more over ssh: do not sleep from the time before it
       }
       if (now >= run.deadline) return run.giveUp('timeout', p, observed);
       // the next tick, cut to the deadline, the next status check and the end of the quiet period

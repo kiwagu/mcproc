@@ -380,17 +380,29 @@ describe('waitFor: log: and idle:', () => {
     expect(f.polls).toBe(3); // history read, one empty tick, the match
     expect(f.closed).toBe(true);
   });
-  it('log: a line that arrives in the same poll the process exits still counts', async () => {
-    const f = fakeFollower([{}, { out: ['build finished'] }]);
+  it('log: a line that arrives in the same tick the process exits still counts', async () => {
+    // the 5 s status check (a stopped process) falls in the tick that reads the line: lines are judged first
+    const f = fakeFollower([
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      { out: ['build finished'] },
+    ]);
     const h = harness(
       [],
       [online, jl(proc('api', 'stopped', { exit_code: 0 }))]
     );
-    // the status check and the match fall in the same tick: lines are judged first
     const r = await waitFor(h.ctx, 'api', parseUntil('log:finished'), {
       deps: { ...h.deps, follower: () => f },
     });
-    expect(r.ok).toBe(true);
+    expect(r).toMatchObject({
+      ok: true,
+      matched_line: 'build finished',
+      waited_ms: 5000,
+    });
   });
   it('log: a process that exits without a match ends the wait, checked at most every 5 s', async () => {
     const f = fakeFollower([{}]);
@@ -443,20 +455,27 @@ describe('waitFor: log: and idle:', () => {
       status: 'errored',
     });
   });
-  it('a wake polls at once instead of waiting for the tick', async () => {
-    const f = fakeFollower([{}, { out: ['ready'] }]);
+  it('a wake that arrives during a poll skips the next sleep', async () => {
+    const f = fakeFollower([{}, {}, { out: ['ready'] }]);
     const h = harness([], [online]);
+    // the file changes while the first loop poll runs (the watch is set by then)
+    const follower = {
+      ...f,
+      poll: async () => {
+        const r = await f.poll();
+        if (f.polls === 2) f.fire();
+        return r;
+      },
+    };
     const deps = {
       ...h.deps,
-      follower: () => f,
+      follower: () => follower,
       sleep: async () => {
-        f.fire();
-        await h.deps.sleep(0);
+        throw new Error('slept although a wake was pending');
       },
     };
     const r = await waitFor(h.ctx, 'api', parseUntil('log:ready'), { deps });
-    expect(r.ok).toBe(true);
-    expect(r.waited_ms).toBe(0);
+    expect(r).toMatchObject({ ok: true, matched_line: 'ready', waited_ms: 0 });
   });
   it('a wake that arrives during a sleep ends that sleep (it would not end by itself here)', async () => {
     const f = fakeFollower([{}, {}, { out: ['ready'] }]);
@@ -473,6 +492,25 @@ describe('waitFor: log: and idle:', () => {
     };
     const r = await waitFor(h.ctx, 'api', parseUntil('log:ready'), { deps });
     expect(r).toMatchObject({ ok: true, matched_line: 'ready', waited_ms: 0 });
+  });
+  it('log: the clock is read again after a status check, so its duration does not push the timeout out', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness([], [online]);
+    const deps = {
+      ...h.deps,
+      follower: () => f,
+      // every pm2 look takes 400 ms
+      jlist: async (c: Parameters<WaitDeps['jlist']>[0]) => {
+        await h.deps.sleep(400);
+        return h.deps.jlist(c);
+      },
+    };
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:never'), {
+      deps,
+      timeoutMs: 5600,
+    });
+    // the 5 s check starts at 5400 ms and ends at 5800 ms, past the deadline: answered then, not after another sleep
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', waited_ms: 5800 });
   });
   it('log: an aborted wait answers aborted with what it saw, and closes the follower', async () => {
     const ac = new AbortController();
