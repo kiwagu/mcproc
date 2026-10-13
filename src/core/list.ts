@@ -34,6 +34,8 @@ export interface LsRow {
   pid: number | null;
   uptime_ms: number | null;
   restarts: number;
+  /** the exit code of a stopped one-shot app; null when it has none (see statusWord) */
+  exit_code: number | null;
   cpu: number | null;
   memory: number;
   procs: number | null;
@@ -162,6 +164,23 @@ export async function snapshot(
   };
 }
 
+/** Exit codes bash reports for SIGINT and SIGTERM: the process was stopped, it did not fail. */
+const SIGNAL_EXITS = new Set([130, 143]);
+
+/**
+ * The word a process is shown with: pm2's status, except that a one-shot app (autorestart off, every kind: task) that
+ * exited reads done / failed (exit N) / stopped by its exit code — pm2 itself says only "stopped" and cannot tell a
+ * manual stop (exit_code null) from a natural exit.
+ */
+export function statusWord(p: Pm2Process | undefined, app: App): string {
+  if (!p) return 'not-started';
+  if (p.status !== 'stopped' || app.autorestart) return p.status;
+  const c = p.exit_code;
+  if (c === 0) return 'done';
+  if (c === null || SIGNAL_EXITS.has(c)) return 'stopped';
+  return `failed (exit ${c})`;
+}
+
 export function rowsFor(
   ctx: Context,
   snap: Snapshot,
@@ -176,11 +195,12 @@ export function rowsFor(
       host: ctx.host.name,
       kind: app.kind,
       description: app.description,
-      status: p?.status ?? 'not-started',
+      status: statusWord(p, app),
       pm_id: p?.pm_id ?? null,
       pid: p && p.pid > 0 ? p.pid : null,
       uptime_ms: p?.uptime_ms ?? null,
       restarts: p?.restarts ?? 0,
+      exit_code: p?.exit_code ?? null,
       cpu: m ? m.cpu : (p?.cpu ?? 0),
       memory: m ? m.memory : (p?.memory ?? 0),
       procs: m ? m.procs : null,
@@ -212,6 +232,7 @@ export function unreachableRow(
     pid: null,
     uptime_ms: null,
     restarts: 0,
+    exit_code: null,
     cpu: null,
     memory: 0,
     procs: null,

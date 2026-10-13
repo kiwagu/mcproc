@@ -27,6 +27,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   pid: 1,
   uptime_ms: 0,
   restarts: 0,
+  exit_code: null,
   cpu: 0,
   memory: 0,
   procs: 1,
@@ -409,5 +410,16 @@ describe('fmtDeps', () => {
       ])
     ).toBe('libs (completed), api (ready), logger');
     expect(fmtDeps([])).toBe('');
+  });
+});
+
+describe('ls shows the status word', () => {
+  it('a finished task reads done, a failed one reads failed (exit N)', () => {
+    expect(renderLs([{ ...row('done', []), kind: 'task' }], 'local')).toContain(
+      'done'
+    );
+    expect(renderLs([{ ...row('failed (exit 2)', []) }], 'local')).toContain(
+      'failed (exit 2)'
+    );
   });
 });

@@ -14,6 +14,7 @@ import {
   describeProject,
   snapshot,
   rowsFor,
+  statusWord,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -306,5 +307,52 @@ describe('hostsInfo / describe', () => {
       { app: 'api', condition: 'ready', timeout_s: 90 },
       { app: 'logger', condition: 'started', timeout_s: 60 },
     ]);
+  });
+});
+
+describe('statusWord', () => {
+  const m = loadManifest(
+    path.join(here, '..', 'fixtures', 'projects', 'readiness')
+  );
+  const proc = (status: string, exit_code: number | null) =>
+    ({
+      status,
+      exit_code,
+    }) as unknown as import('../../src/core/pm2.js').Pm2Process;
+  it('a task that exited reads done / failed (exit N) / stopped by its exit code', () => {
+    expect(statusWord(proc('stopped', 0), m.apps.libs)).toBe('done');
+    expect(statusWord(proc('stopped', 2), m.apps.libs)).toBe('failed (exit 2)');
+    expect(statusWord(proc('stopped', 1), m.apps.libs)).toBe('failed (exit 1)');
+    expect(statusWord(proc('stopped', null), m.apps.libs)).toBe('stopped');
+    expect(statusWord(proc('stopped', 130), m.apps.libs)).toBe('stopped');
+    expect(statusWord(proc('stopped', 143), m.apps.libs)).toBe('stopped');
+  });
+  it('a server keeps pm2 words whatever the exit code; online and errored pass through', () => {
+    expect(statusWord(proc('stopped', 0), m.apps.api)).toBe('stopped');
+    expect(statusWord(proc('stopped', 2), m.apps.api)).toBe('stopped');
+    expect(statusWord(proc('online', null), m.apps.libs)).toBe('online');
+    expect(statusWord(proc('errored', 1), m.apps.libs)).toBe('errored');
+    expect(statusWord(undefined, m.apps.libs)).toBe('not-started');
+  });
+  it('rowsFor shows the word and the exit code', async () => {
+    const list = JSON.stringify([
+      {
+        pid: 0,
+        name: 'ready-libs',
+        pm_id: 0,
+        pm2_env: { status: 'stopped', namespace: 'ready', exit_code: 0 },
+      },
+    ]);
+    const ctx = fakeCtx(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness'),
+      'local',
+      [{ match: MARK.JLIST, result: { stdout: probeOut({ jlist: list }) } }]
+    );
+    const rows = await listApps(ctx, 'libs');
+    expect(rows[0]).toMatchObject({
+      status: 'done',
+      exit_code: 0,
+      uptime_ms: null,
+    });
   });
 });
