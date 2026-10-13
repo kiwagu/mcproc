@@ -8,6 +8,7 @@ import {
   type SnapshotOptions,
 } from './list.js';
 import { createFollower, type LogFollower } from './logfollow.js';
+import { bodyOf, repeatsARepeat } from './incidents/detect.js';
 import { stripAnsi } from './logs.js';
 import type { App, Dep } from './manifest.js';
 import { fmtPorts } from '../mcp/render.js';
@@ -52,6 +53,11 @@ const POLL_LOCAL_MS = 500;
 const POLL_REMOTE_MS = 1000;
 /** pm2 statuses of a process that is running, or about to be. */
 const LIVE = new Set(['online', 'launching']);
+/** pm2 statuses of a process in the middle of a restart (a watch restart, a restart delay): it is not dead, so a wait goes on. */
+const TRANSIENT = new Set(['stopping', 'waiting restart']);
+/** Not dead: running, or on its way through a restart. The timeout bounds a restart that does not end. */
+const notDead = (status: string): boolean =>
+  LIVE.has(status) || TRANSIENT.has(status);
 /** The log: and idle: waits look at the follower at least this often (a file wake makes it sooner). */
 const LOG_TICK_MS = 1000;
 /** ...and ask pm2 about the process this often: each check is a login shell, so not every tick. */
@@ -67,13 +73,21 @@ export function parseUntil(s: string): Until {
   if (s.startsWith('log:')) {
     const source = s.slice(4);
     if (!source) throw bad('log: needs a regular expression after the colon');
+    let re: RegExp;
     try {
-      return { kind: 'log', re: new RegExp(source), source };
+      re = new RegExp(source);
     } catch (e) {
       throw bad(
         `log: invalid regular expression "${source}": ${(e as Error).message}`
       );
     }
+    if (repeatsARepeat(source))
+      throw new McprocError(
+        'BAD_ARGUMENT',
+        `log: pattern "${source}" repeats a group that ends in a repeat (like (a+)+), which can run for minutes on a log line that almost matches`,
+        { hint: 'Rewrite it without the nested repeat.' }
+      );
+    return { kind: 'log', re, source };
   }
   if (s.startsWith('idle:')) {
     const seconds = Number(s.slice(5));
@@ -189,7 +203,8 @@ async function waitOnLogs(
       for (const l of lines) {
         const text = stripAnsi(l.text);
         lastLine = text;
-        if (until.kind === 'log' && until.re.test(text))
+        // the pattern sees the line without pm2's stamp; the answer keeps the line as written
+        if (until.kind === 'log' && until.re.test(bodyOf(text)))
           return run.answer({
             ok: true,
             status: statusWord(p, a),
@@ -200,14 +215,16 @@ async function waitOnLogs(
         lastLine === undefined ? 'no new output' : `last line: ${lastLine}`;
       if (until.kind === 'idle' && now - lastChange >= quietMs) {
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
-        return p && LIVE.has(p.status)
-          ? run.answer({ ok: true, status: statusWord(p, a), observed })
-          : run.gone(p, observed);
+        if (p && LIVE.has(p.status))
+          return run.answer({ ok: true, status: statusWord(p, a), observed });
+        if (!p || !notDead(p.status)) return run.gone(p, observed);
+        // mid-restart: not settled yet and not dead; look again after a tick
+        lastCheck = now = deps.now();
       }
       if (now - lastCheck >= STATUS_EVERY_MS) {
         lastCheck = now;
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
-        if (!p || !LIVE.has(p.status)) return run.gone(p, observed);
+        if (!p || !notDead(p.status)) return run.gone(p, observed);
         now = deps.now(); // the check took a login shell, more over ssh: do not sleep from the time before it
       }
       if (now >= run.deadline) return run.giveUp('timeout', p, observed);
@@ -217,7 +234,9 @@ async function waitOnLogs(
         run.deadline - now,
         lastCheck + STATUS_EVERY_MS - now,
       ];
-      if (until.kind === 'idle') sleeps.push(lastChange + quietMs - now);
+      // (not once the quiet period is over: a process still restarting is looked at again after a tick, not in a spin)
+      if (until.kind === 'idle' && now - lastChange < quietMs)
+        sleeps.push(lastChange + quietMs - now);
       if (!woken && !signal?.aborted) {
         tick = new AbortController();
         await deps.sleep(Math.max(0, Math.min(...sleeps)), tick.signal);
@@ -341,7 +360,7 @@ export async function waitFor(
         observed = `${a.url} ${code === null ? 'unchecked' : code === 0 ? 'down' : code}`;
       }
       if (met) return answer({ ok: true, status: statusWord(p, a), observed });
-      if (!p || !LIVE.has(p.status)) return gone(p, observed);
+      if (!p || !notDead(p.status)) return gone(p, observed);
     }
     if (deps.now() >= deadline) return giveUp('timeout', p, observed);
     if (!(await pause())) return giveUp('aborted', p, observed);

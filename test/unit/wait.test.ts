@@ -109,6 +109,21 @@ describe('parseUntil', () => {
   });
 });
 
+describe('parseUntil: log: patterns', () => {
+  it('refuses a group that ends in a repeat, which can run for minutes on a line that almost matches', () => {
+    for (const re of ['(a+)+', '(\\w+\\s*)*', '(.*)+$'])
+      expect(() => parseUntil(`log:${re}`)).toThrowError(
+        expect.objectContaining({
+          code: 'BAD_ARGUMENT',
+          hint: expect.stringContaining('without the nested repeat'),
+        })
+      );
+  });
+  it('lets a repeated group through when its content ends in a literal', () => {
+    expect(parseUntil('log:(\\d+\\.)+ ready').kind).toBe('log');
+  });
+});
+
 describe('waitFor: listening / url-ok / exited', () => {
   it('listening: polls the light probe every 500 ms locally until every declared port listens', async () => {
     const h = harness([
@@ -535,6 +550,166 @@ describe('waitFor: log: and idle:', () => {
     expect(r).toMatchObject({ ok: false, reason: 'aborted', status: 'online' });
     expect(r.observed).toBe('last line: starting');
     expect(f.closed).toBe(true);
+  });
+});
+
+describe('waitFor: pm2 restarts the process meanwhile (stopping, waiting restart)', () => {
+  const online = jl(proc('api', 'online'));
+  it('listening: a stopping process in the middle of a watch restart does not end the wait', async () => {
+    const h = harness([
+      probe(proc('api', 'online')),
+      probe(proc('api', 'stopping')),
+      probe(proc('api', 'online'), ss(3100, 101)),
+    ]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 1000 });
+  });
+  it('listening: waiting restart is waited out too, and a restart that never ends is a timeout, not a death', async () => {
+    const h = harness([probe(proc('api', 'waiting restart'))]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', waited_ms: 1200 });
+    expect(r.observed).toContain('status waiting restart');
+  });
+  it('url-ok: a waiting restart in the middle does not end the wait', async () => {
+    const urls = (code: string) => `http://localhost:3200/\t${code}\n`;
+    const h = harness([
+      probeOut({ jlist: jl(proc('web', 'online')), ps: PS, urls: urls('000') }),
+      probeOut({
+        jlist: jl(proc('web', 'waiting restart')),
+        ps: PS,
+        urls: urls('000'),
+      }),
+      probeOut({ jlist: jl(proc('web', 'online')), ps: PS, urls: urls('200') }),
+    ]);
+    const r = await waitFor(h.ctx, 'web', { kind: 'url-ok' }, { deps: h.deps });
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 1000 });
+  });
+  it('log: a status check that finds the process stopping keeps waiting, and a later line matches', async () => {
+    // the 5 s check falls on the 7th poll; the line arrives at 7 s
+    const f = fakeFollower([
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      { out: ['ready'] },
+    ]);
+    const h = harness([], [online, jl(proc('api', 'stopping')), online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:ready'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      matched_line: 'ready',
+      waited_ms: 7000,
+    });
+  });
+  it('log: a status check that finds the process dead ends the wait even after a stopping one', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness(
+      [],
+      [
+        online,
+        jl(proc('api', 'waiting restart')),
+        jl(proc('api', 'stopped', { exit_code: 1 })),
+      ]
+    );
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:never'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'exited',
+      status: 'stopped',
+      waited_ms: 10_000,
+    });
+  });
+  it('idle: a quiet period that ends while the process is stopping keeps waiting until it is online', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness([], [online, jl(proc('api', 'stopping')), online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('idle:1'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 2000 });
+    expect(h.calls.slept.every((ms) => ms > 0)).toBe(true); // no busy loop while it waits for pm2
+  });
+  it('idle: a process that turns out dead after stopping is not settled', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness(
+      [],
+      [online, jl(proc('api', 'stopping')), jl(proc('api', 'stopped'))]
+    );
+    const r = await waitFor(h.ctx, 'api', parseUntil('idle:1'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'exited', status: 'stopped' });
+  });
+  it('exited: stopping is waited out, waiting restart counts as left online', async () => {
+    const h = harness(
+      [],
+      [
+        jl(proc('libs', 'online')),
+        jl(proc('libs', 'stopping')),
+        jl(proc('libs', 'waiting restart')),
+      ]
+    );
+    const r = await waitFor(
+      h.ctx,
+      'libs',
+      { kind: 'exited' },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({ ok: true, waited_ms: 1000 });
+    expect(r.status).toBe('waiting restart');
+  });
+});
+
+describe('waitFor: log: and pm2 stamps', () => {
+  const online = jl(proc('api', 'online'));
+  const stamped = (text: string) => `2026-10-13T20:00:00.123: ${text}`;
+  it('log: the pattern is tested against the line without the stamp, and the answer keeps the stamp', async () => {
+    const f = fakeFollower([
+      {},
+      { out: [stamped('\x1b[32mlistening on 3100')] },
+    ]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:^listening'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      matched_line: stamped('listening on 3100'),
+    });
+  });
+  it('log: a seconds-only stamp is stripped too', async () => {
+    const f = fakeFollower([{}, { err: ['2026-10-13T20:00:00: ready'] }]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:^ready$'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r.ok).toBe(true);
+  });
+  it('log: a pattern that could match only with the stamp does not', async () => {
+    const f = fakeFollower([{}, { out: [stamped('listening on 3100')] }]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('log:^2026-10-13'), {
+      deps: { ...h.deps, follower: () => f },
+      timeoutMs: 3000,
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
   });
 });
 
