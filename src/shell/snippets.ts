@@ -31,10 +31,11 @@ export const RSS_AWK = `awk '/^Pid:/{ p=$2 } /^VmRSS:/{ print p, $2 }'`;
 const urlCheck = (q: string) =>
   `printf '%s\\t' ${q}; if command -v curl >/dev/null 2>&1; then curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' ${q} 2>/dev/null; echo; elif command -v wget >/dev/null 2>&1; then if wget -q --no-check-certificate -T 2 -O /dev/null ${q} 2>/dev/null; then echo 200; else echo 000; fi; else echo -; fi`;
 
-/** One round trip: pm2 state, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP request per declared url. */
+/** One round trip: pm2 state, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP request per declared url.
+ * `metrics: false` is the light form for polling: pm2 state, tree, listeners and urls only, no /proc stat, RSS, args or docker passes. */
 export function probeScript(
   pm2Bin: string,
-  opts: { cpuSample?: boolean; urls?: string[] } = {}
+  opts: { cpuSample?: boolean; urls?: string[]; metrics?: boolean } = {}
 ): string {
   return [
     `echo ${MARK.JLIST}`,
@@ -49,24 +50,28 @@ export function probeScript(
     `if [ "$F" = 0 ] && U=$(ss -lunp 2>/dev/null); then printf '%s\\n' "$U"; else F=1; echo ${MARK.PROC}; cat /proc/net/udp /proc/net/udp6 2>/dev/null; fi`,
     `echo ${MARK.FD}`,
     `if [ "$F" = 1 ]; then ${FD_SCAN}; fi`,
-    `echo ${MARK.STAT}`,
-    `echo "CLK $(getconf CLK_TCK 2>/dev/null || echo 100)"`,
-    `cat /proc/[0-9]*/stat 2>/dev/null | ${STAT_AWK}`,
-    ...(opts.cpuSample
-      ? [
-          `sleep 0.5 2>/dev/null || sleep 1`,
-          `echo ${MARK.STAT2}`,
+    ...(opts.metrics === false
+      ? []
+      : [
+          `echo ${MARK.STAT}`,
           `echo "CLK $(getconf CLK_TCK 2>/dev/null || echo 100)"`,
           `cat /proc/[0-9]*/stat 2>/dev/null | ${STAT_AWK}`,
-        ]
-      : []),
-    `echo ${MARK.RSS}`,
-    `cat /proc/[0-9]*/status 2>/dev/null | ${RSS_AWK}`,
-    `echo ${MARK.ARGS}`,
-    `ps -eo pid=,args= 2>/dev/null || ps -o pid,args 2>/dev/null`,
-    `echo ${MARK.DOCKER}`,
-    // a wedged docker daemon must not stall the whole probe until the transport timeout
-    `if command -v docker >/dev/null 2>&1; then if command -v timeout >/dev/null 2>&1; then timeout 3 docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null; else docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null; fi; fi`,
+          ...(opts.cpuSample
+            ? [
+                `sleep 0.5 2>/dev/null || sleep 1`,
+                `echo ${MARK.STAT2}`,
+                `echo "CLK $(getconf CLK_TCK 2>/dev/null || echo 100)"`,
+                `cat /proc/[0-9]*/stat 2>/dev/null | ${STAT_AWK}`,
+              ]
+            : []),
+          `echo ${MARK.RSS}`,
+          `cat /proc/[0-9]*/status 2>/dev/null | ${RSS_AWK}`,
+          `echo ${MARK.ARGS}`,
+          `ps -eo pid=,args= 2>/dev/null || ps -o pid,args 2>/dev/null`,
+          `echo ${MARK.DOCKER}`,
+          // a wedged docker daemon must not stall the whole probe until the transport timeout
+          `if command -v docker >/dev/null 2>&1; then if command -v timeout >/dev/null 2>&1; then timeout 3 docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null; else docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null; fi; fi`,
+        ]),
     `echo ${MARK.URL}`,
     ...(opts.urls ?? []).map((u) => urlCheck(shq(u))),
   ].join('\n');

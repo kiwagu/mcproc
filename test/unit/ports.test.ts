@@ -263,6 +263,19 @@ describe('probe stats, shared sockets and docker ports', () => {
   });
 });
 
+describe('light probe', () => {
+  it('without metrics the script has no stat, rss, args or docker passes but still lists sockets and urls', () => {
+    const s = probeScript('pm2', { metrics: false, urls: ['http://x/'] });
+    expect(s).toContain('jlist');
+    expect(s).toContain('ss -ltnp');
+    expect(s).toContain(MARK.URL);
+    expect(s).not.toContain('/proc/[0-9]*/stat');
+    expect(s).not.toContain('/proc/[0-9]*/status');
+    expect(s).not.toContain('docker ps');
+    expect(s).not.toContain('pid=,args=');
+  });
+});
+
 describe('joinPorts', () => {
   const jlist = JSON.stringify([
     {

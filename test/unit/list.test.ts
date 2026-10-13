@@ -194,6 +194,27 @@ describe('listApps', () => {
     expect(snap.metrics.api?.cpu).toBeCloseTo(20, 0); // 40 ticks / 100 / ~2 s
     expect(snap.stats.samples).toHaveLength(1);
   });
+  it('snapshot with metrics none asks for the light probe and still joins ports', async () => {
+    const ctx = fakeCtx(basic, 'local', [
+      {
+        match: MARK.JLIST,
+        result: {
+          stdout: probeOut({ jlist, ps: fx('ps.txt'), tcp: fx('ss-tcp.txt') }),
+        },
+      },
+    ]);
+    const snap = await snapshot(ctx, {
+      cpu: 'none',
+      urls: 'none',
+      metrics: 'none',
+    });
+    expect(ctx.fake.calls[0].cmd).not.toContain('/proc/[0-9]*/stat');
+    expect(snap.ports.api.checks[0]).toEqual({
+      port: 3310,
+      status: 'listening',
+    });
+    expect(snap.metrics.api).toBeNull();
+  });
   it('filters by app and maps jlist exit 127 to PM2_NOT_FOUND', async () => {
     const ctx = fakeCtx(basic, 'local', [probeRule]);
     expect((await listApps(ctx, 'worker')).map((r) => r.app)).toEqual([

@@ -63,6 +63,8 @@ export interface Snapshot {
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
   cpu?: 'inline' | 'none';
+  /** 'none': the light probe (no /proc stat, RSS, args or docker); tree metrics stay null */
+  metrics?: 'tree' | 'none';
   prev?: { sample: StatSample; at: number };
   urls?: 'check' | 'none' | string[];
 }
@@ -95,7 +97,8 @@ export async function snapshot(
   ctx: Context,
   opts: SnapshotOptions = {}
 ): Promise<Snapshot> {
-  const cpuSample = (opts.cpu ?? 'inline') === 'inline';
+  const withMetrics = opts.metrics !== 'none';
+  const cpuSample = (opts.cpu ?? 'inline') === 'inline' && withMetrics;
   const which = opts.urls ?? 'check';
   const urls =
     which === 'none'
@@ -105,9 +108,12 @@ export async function snapshot(
           .map((a) => a.url)
           .filter((u): u is string => u !== null);
   const res = ensureOk(
-    await ctx.transport.exec(probeScript(ctx.pm2.bin, { cpuSample, urls }), {
-      env: ctx.pm2.env(),
-    }),
+    await ctx.transport.exec(
+      probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
+      {
+        env: ctx.pm2.env(),
+      }
+    ),
     ctx.host,
     'probe'
   );
