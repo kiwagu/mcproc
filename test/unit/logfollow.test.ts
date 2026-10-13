@@ -44,6 +44,19 @@ const resp = (
 ) => sec('out', out) + sec('err', err);
 
 describe('LogFollower', () => {
+  it('initialLines 0 takes the position of the history but returns none of its lines', async () => {
+    const ctx = scripted([
+      resp(
+        { size: 20, body: 'old-1\nold-2\n', reset: true, start: 8 },
+        { size: 0 }
+      ),
+      resp({ size: 26, body: 'new-1\n' }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    expect((await f.poll()).lines).toEqual([]);
+    expect(f.offsets.out).toBe(20);
+    expect((await f.poll()).lines.map((l) => l.text)).toEqual(['new-1']);
+  });
   it('first poll takes the history, later polls read only new bytes by offset', async () => {
     const ctx = scripted([
       resp(

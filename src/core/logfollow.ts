@@ -311,9 +311,13 @@ export class LogFollower {
     if (longLine) this.pending[s] = '';
     // escapes are cleaned per complete line: a color code cut by a read boundary waits in `pending` with its line
     const lines = complete.split('\n').slice(0, -1);
-    for (const line of kind === 'H' || kind === 'R'
-      ? lines.slice(-this.initialLines)
-      : lines) {
+    const shown =
+      kind === 'H' || kind === 'R'
+        ? this.initialLines > 0
+          ? lines.slice(-this.initialLines)
+          : []
+        : lines;
+    for (const line of shown) {
       const t = keepSgr(line);
       if (t.replace(SGR_RE, '').length) out.push({ stream: s, text: t });
     }
