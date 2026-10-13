@@ -456,6 +456,27 @@ describe('actOn start with conditions across hosts', () => {
       false
     );
   });
+  it('a signal given to actOn reaches the wait on the dependency host: aborted, and the dependent on the other host is skipped', async () => {
+    const ctxs = {
+      local: fakeCtx(dir, 'local', rules([proc('libs', 'online')]), 'local'),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(
+      m2,
+      undefined,
+      async (_m, host) => ctxs[host as 'local' | 'box']
+    );
+    const ac = new AbortController();
+    ac.abort();
+    const rows = await actOn(f, 'web', 'start', { signal: ac.signal });
+    expect(rows.find((r) => r.app === 'web')).toMatchObject({
+      status: 'skipped',
+      error: 'libs: wait aborted',
+    });
+    expect(ctxs.box.fake.calls.some((c) => /startOrRestart/.test(c.cmd))).toBe(
+      false
+    );
+  });
   it('with --host a conditional dependency elsewhere is left alone', async () => {
     const box = fakeCtx(dir, 'box', rules([]), 'box');
     const f = new Fleet(m2, 'box', async () => box);

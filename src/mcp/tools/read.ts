@@ -212,20 +212,26 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Wait',
       description:
-        'Block until an app is usable or finished. until: listening (every declared port is bound), url-ok (its url answers 2xx/3xx), exited (the process left online; the answer carries exit_code and done / failed (exit N) / stopped), log:<regex> (a new log line matches, ANSI stripped), idle:<seconds> (no log output for that long: a watcher settled). ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile — a result, not an error. Call it after start instead of sleeping or polling ls.',
+        'Block until an app is usable or finished. until: listening (every declared port is bound; the app must declare a port), url-ok (its url answers 2xx/3xx; the app must declare a url), exited (the process left online; the answer carries exit_code and done / failed (exit N) / stopped), log:<regex> (a new log line matches, ANSI stripped), idle:<seconds> (no log output for that long: a watcher settled). log: and idle: see only output written after the call begins, so call wait before the action that prints the line, or use a condition on state such as listening. listening or url-ok on an app without a declared port or url is refused with BAD_ARGUMENT. ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile — a result, not an error. Call it after start instead of sleeping or polling ls.',
       inputSchema: {
         ...commonInput,
-        app: z.string(),
+        app: z.string().describe('The app to wait for'),
         until: z
           .string()
           .describe(
             'listening | url-ok | exited | log:<regex> | idle:<seconds>'
           ),
-        timeout_s: z.number().int().min(1).max(600).optional(),
+        timeout_s: z
+          .number()
+          .int()
+          .min(1)
+          .max(600)
+          .optional()
+          .describe('Seconds to wait, default 60, max 600'),
       },
       annotations: RO,
     },
-    (args) =>
+    (args, extra) =>
       runTool(async () => {
         const until = parseUntil(args.until); // a bad request is refused before any host is touched
         const fleet = await fleetOf(args);
@@ -233,6 +239,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         const r = await waitFor(ctx, args.app, until, {
           timeoutMs:
             args.timeout_s === undefined ? undefined : args.timeout_s * 1000,
+          signal: extra.signal, // the client cancelled the call or went away: stop polling the host
         });
         return {
           text: renderWait(args.app, r),

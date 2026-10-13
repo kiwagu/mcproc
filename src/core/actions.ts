@@ -123,6 +123,8 @@ export interface StartOptions {
   waits?: WaitRecord[];
   /** apps that failed or were skipped so far (app -> why), shared across host runs by actOn */
   failed?: Map<string, string>;
+  /** ends the default dependency wait as `aborted` (a client that cancelled the call); a waitDep of the caller's own is not given it */
+  signal?: AbortSignal;
 }
 
 /**
@@ -139,7 +141,9 @@ export async function startApps(
     typeof target === 'string'
       ? orderWithDeps(ctx.manifest, namesOf(ctx, target))
       : target;
-  const waitDep = opts.waitDep ?? ((d: Dep) => waitDependency(ctx, d));
+  const waitDep =
+    opts.waitDep ??
+    ((d: Dep) => waitDependency(ctx, d, { signal: opts.signal }));
   const depsOf =
     opts.depsOf ?? ((n: string) => ctx.manifest.apps[n].depends_on);
   const failed = opts.failed ?? new Map<string, string>();

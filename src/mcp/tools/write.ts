@@ -38,13 +38,15 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
   };
   const act = async (
     args: { project?: string; host?: string; target: string; reload?: boolean },
-    what: Act
+    what: Act,
+    signal?: AbortSignal // the request's: aborted when the client cancels it or goes away
   ) => {
     const fleet = await fleetOf(args);
     const waits: WaitRecord[] = [];
     const rows: LsRow[] = await actOn(fleet, args.target, what, {
       reload: args.reload,
       waits,
+      signal,
     });
     const { text, failed } = renderMutation(rows, fleet.fallback, what, waits);
     return {
@@ -96,9 +98,9 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
       inputSchema: { ...targetInput, reload: z.boolean().optional() },
       annotations: MUT(false, true),
     },
-    (args) =>
+    (args, extra) =>
       runTool(async () => {
-        return act(args, 'start');
+        return act(args, 'start', extra.signal);
       })
   );
 

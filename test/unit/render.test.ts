@@ -515,6 +515,14 @@ describe('renderMutation', () => {
     expect(renderWait('libs', { ...exited, status: 'stopped' })).toBe(
       'libs: stopped after 3.1 s'
     );
+    expect(
+      renderWait('libs', {
+        ...exited,
+        waited_ms: 500,
+        status: 'stopped',
+        exit_code: 143,
+      })
+    ).toBe('libs: stopped after 0.5 s (exit 143)'); // a stop by signal: the code is news, the status does not carry it
   });
   it('a skipped dependent is a failed row', () => {
     const r = renderMutation(

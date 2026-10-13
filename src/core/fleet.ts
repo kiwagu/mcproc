@@ -227,7 +227,12 @@ export async function actOn(
   fleet: Fleet,
   target: string,
   act: Act,
-  opts: { reload?: boolean; waits?: WaitRecord[] } = {}
+  opts: {
+    reload?: boolean;
+    waits?: WaitRecord[];
+    /** ends the dependency waits of a start as `aborted`: the caller's request was cancelled */
+    signal?: AbortSignal;
+  } = {}
 ): Promise<LsRow[]> {
   const named = fleet.select([target]);
   const names =
@@ -251,7 +256,9 @@ export async function actOn(
     );
   /** a dependency is observed on the host it runs on, whatever run the dependent is in */
   const waitDep = async (d: Dep) =>
-    waitDependency(await fleet.ctx(fleet.hostOf(d.app)), d);
+    waitDependency(await fleet.ctx(fleet.hostOf(d.app)), d, {
+      signal: opts.signal,
+    });
   for (const r of runs) {
     if (failed && act === 'start') {
       rows.push(
@@ -276,6 +283,7 @@ export async function actOn(
               depsOf,
               waits: opts.waits,
               failed: notStarted,
+              signal: opts.signal,
             })
           : act === 'restart'
             ? restartApps(ctx, r.apps)

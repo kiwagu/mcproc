@@ -87,6 +87,17 @@ describe('mcp server', () => {
     expect(byName.unpack.description).not.toMatch(
       /bundled with mcproc|ships inside/
     );
+    // what an agent must know before it calls wait
+    expect(byName.wait.description).toMatch(
+      /log: and idle: see only output written after the call begins/
+    );
+    expect(byName.wait.description).toMatch(/BAD_ARGUMENT/);
+    const waitProps = byName.wait.inputSchema.properties as Record<
+      string,
+      { description?: string }
+    >;
+    expect(waitProps.app.description).toBeTruthy();
+    expect(waitProps.timeout_s.description).toMatch(/default 60, max 600/);
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -297,6 +308,73 @@ describe('mcp server', () => {
     const never = await run('[]');
     expect(never.isError).toBe(true);
     expect(text(never)).toMatch(/^NOT_STARTED/);
+  });
+  describe('a call the client cancels stops polling the host', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    /** Starts the call, cancels it after 200 ms (the client sends notifications/cancelled) and counts what the host was asked afterwards. */
+    const cancelAfter200ms = async (
+      jlist: string,
+      name: string,
+      args: Record<string, unknown>
+    ) => {
+      let calls = 0;
+      const spawner: Spawner = async (argv) => {
+        calls++;
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, ps: '4242 1\n', tcp: '' }),
+            stderr: '',
+          };
+        if (cmd.includes("'jlist'"))
+          return { code: 0, stdout: jlist, stderr: '' };
+        if (/cat >|startOrRestart/.test(cmd))
+          return { code: 0, stdout: '', stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+      const cl = await client(spawner);
+      const ac = new AbortController();
+      const call = cl
+        .callTool({ name, arguments: args }, undefined, { signal: ac.signal })
+        .then(
+          () => 'answered',
+          () => 'cancelled'
+        );
+      await sleep(200);
+      expect(calls, 'the wait had reached the host').toBeGreaterThan(0);
+      ac.abort();
+      expect(await call).toBe('cancelled');
+      await sleep(300);
+      const settled = calls;
+      await sleep(1200); // a poll every 500 ms would show up twice here
+      expect(calls).toBe(settled);
+    };
+    const proc = (name: string, status: string) =>
+      JSON.stringify([
+        {
+          pid: 4242,
+          name: `ready-${name}`,
+          pm_id: 1,
+          pm2_env: { status, namespace: 'ready', pm_cwd: readiness },
+        },
+      ]);
+    it('wait', async () => {
+      await cancelAfter200ms(proc('api', 'online'), 'wait', {
+        project: readiness,
+        app: 'api',
+        until: 'listening',
+        timeout_s: 5,
+      });
+    });
+    it('start, while it waits for a dependency (api needs libs to complete, and libs is still running)', async () => {
+      await cancelAfter200ms(proc('libs', 'online'), 'start', {
+        project: readiness,
+        target: 'api',
+      });
+    });
   });
   it('host-bound apps: a target on another host than --host, or on a readonly host, is refused before any transport call', async () => {
     const cl = await client(neverSpawn);

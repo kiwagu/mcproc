@@ -476,6 +476,21 @@ describe('startApps with depends_on conditions', () => {
     });
     expect(waited).toEqual([]);
   });
+  it('an aborted signal ends the default wait as aborted and the dependent is skipped with that reason', async () => {
+    // libs is still running (a task not yet done): without the signal this wait would last its whole timeout
+    const ctx = fakeCtx(readiness, 'local', rules([proc('libs', 'online')]));
+    const ac = new AbortController();
+    ac.abort();
+    const waits: WaitRecord[] = [];
+    const rows = await startApps(ctx, 'api', { waits, signal: ac.signal });
+    expect(waits).toMatchObject([
+      { app: 'api', dep: 'libs', ok: false, reason: 'aborted' },
+    ]);
+    const api = rows.find((r) => r.app === 'api')!;
+    expect(api.status).toBe('skipped');
+    expect(api.error).toBe('libs: wait aborted');
+    expect(launchedOf(ctx)).toEqual([]);
+  });
   it('by default the wait runs on this context (no fleet)', async () => {
     // libs is already done: the default waiter sees exit 0 at once
     const ctx = fakeCtx(
