@@ -425,6 +425,35 @@ describe('startApps with depends_on conditions', () => {
     expect(failed.has('logger')).toBe(false);
     expect(launchedOf(ctx)).toEqual([]);
   });
+  it('a cancel that arrives while a dependency wait is answered ok launches nothing after it: the dependent is skipped, a reload does not restart it', async () => {
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([{ ...proc('api', 'online'), pm_id: 2 }])
+    );
+    const ac = new AbortController();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'web', {
+      reload: true,
+      signal: ac.signal,
+      failed,
+      waitDep: async () => {
+        ac.abort(); // the client goes away during the probe that finds the condition met
+        return okWait();
+      },
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api).toMatchObject({
+      status: 'skipped',
+      error: 'start cancelled',
+    });
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'start cancelled',
+    });
+    expect(launchedOf(ctx)).toEqual(['ready-libs']); // libs came before anything was awaited
+    expect(failed.get('api')).toBe('start cancelled');
+  });
   it('an app already online is not skipped when what it needs was: it is left alone and not marked failed', async () => {
     // libs fails, api (not running) is skipped, web is up already: it stays as it is, with its row and no cascade
     const ctx = fakeCtx(

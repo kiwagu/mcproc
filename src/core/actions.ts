@@ -210,6 +210,11 @@ export async function startApps(
       skip(n, unmet);
       continue;
     }
+    // the client may have gone while the dependency waits ran (a probe that found the condition met still answers ok)
+    if (opts.signal?.aborted) {
+      skip(n, 'start cancelled');
+      continue;
+    }
     await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));
   }
   const live = names.filter((n) => !skipped.has(n));

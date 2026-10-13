@@ -193,10 +193,10 @@ async function waitOnLogs(
     let lastLine: string | undefined;
     let seen = { out: f.offsets.out, err: f.offsets.err };
     for (;;) {
-      const { lines } = await f.poll();
+      const { lines, reset } = await f.poll();
       let now = deps.now();
-      // any byte counts as activity, a line still unfinished too
-      if (f.offsets.out !== seen.out || f.offsets.err !== seen.err) {
+      // any byte counts as activity, a line still unfinished too, and so does a file replaced by one of the same size
+      if (reset || f.offsets.out !== seen.out || f.offsets.err !== seen.err) {
         lastChange = now;
         seen = { out: f.offsets.out, err: f.offsets.err };
       }
@@ -359,8 +359,14 @@ export async function waitFor(
         met = code !== null && code > 0 && code < 400;
         observed = `${a.url} ${code === null ? 'unchecked' : code === 0 ? 'down' : code}`;
       }
-      if (met) return answer({ ok: true, status: statusWord(p, a), observed });
+      // the process is judged before the condition: a port or url that answers while it is dead or gone (a proxy,
+      // another process) is not a ready app, and one that pm2 is restarting is not ready yet, whatever answers
       if (!p || !notDead(p.status)) return gone(p, observed);
+      if (met) {
+        if (LIVE.has(p.status))
+          return answer({ ok: true, status: statusWord(p, a), observed });
+        observed = `status ${p.status}, ${observed}`;
+      }
     }
     if (deps.now() >= deadline) return giveUp('timeout', p, observed);
     if (!(await pause())) return giveUp('aborted', p, observed);

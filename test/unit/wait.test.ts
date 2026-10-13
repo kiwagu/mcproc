@@ -348,7 +348,9 @@ describe('waitFor: limits and the real sleep', () => {
 });
 
 /** A scripted follower: each poll returns the next batch; `watch` keeps the wake so a test can fire it. */
-function fakeFollower(batches: { out?: string[]; err?: string[] }[]) {
+function fakeFollower(
+  batches: { out?: string[]; err?: string[]; reset?: boolean }[]
+) {
   const offsets = { out: 0 as number | null, err: 0 as number | null };
   let i = 0;
   let wake: (() => void) | null = null;
@@ -365,7 +367,7 @@ function fakeFollower(batches: { out?: string[]; err?: string[] }[]) {
       ];
       offsets.out = (offsets.out ?? 0) + (b.out ?? []).join('\n').length;
       offsets.err = (offsets.err ?? 0) + (b.err ?? []).join('\n').length;
-      return { lines, reset: false };
+      return { lines, reset: b.reset ?? false };
     },
     watch(w: () => void) {
       wake = w;
@@ -458,6 +460,15 @@ describe('waitFor: log: and idle:', () => {
       deps: { ...h.deps, follower: () => f },
     });
     expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 3000 }); // bytes at 0 s and 1 s; quiet 2 s → 3 s
+  });
+  it('idle: a log replaced by content of the same size counts as activity', async () => {
+    // offsets do not move, but the follower says the file was replaced at the third poll (1 s): quiet 2 s counts from there
+    const f = fakeFollower([{}, {}, { reset: true }, {}, {}, {}]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('idle:2'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 3000 });
   });
   it('idle: a process that is no longer online when the quiet period ends is not settled', async () => {
     const f = fakeFollower([{}, {}, {}]);
@@ -674,6 +685,76 @@ describe('waitFor: pm2 restarts the process meanwhile (stopping, waiting restart
     );
     expect(r).toMatchObject({ ok: true, waited_ms: 1000 });
     expect(r.status).toBe('waiting restart');
+  });
+});
+
+describe('waitFor: a process that is not running is not ready, whatever answers', () => {
+  const urls = (code: string) => `http://localhost:3200/\t${code}\n`;
+  const webProbe = (status: string, code = '200', list = true) =>
+    probeOut({
+      jlist: list ? jl(proc('web', status)) : '[]',
+      ps: PS,
+      urls: urls(code),
+    });
+  it('url-ok: a stopped process behind a url that still answers 200 is exited, not ready', async () => {
+    const h = harness([webProbe('stopped')]);
+    const r = await waitFor(h.ctx, 'web', { kind: 'url-ok' }, { deps: h.deps });
+    expect(r).toMatchObject({ ok: false, reason: 'exited', status: 'stopped' });
+    expect(r.observed).toBe('http://localhost:3200/ 200');
+  });
+  it('url-ok: an errored process behind a url that still answers is crashed', async () => {
+    const h = harness([webProbe('errored')]);
+    const r = await waitFor(h.ctx, 'web', { kind: 'url-ok' }, { deps: h.deps });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'crashed',
+      status: 'errored',
+    });
+  });
+  it('url-ok: a process deleted on a later sample while the url stays healthy is exited (not-started), not ok', async () => {
+    const h = harness([
+      webProbe('online', '000'),
+      webProbe('online', '200', false),
+    ]);
+    const r = await waitFor(h.ctx, 'web', { kind: 'url-ok' }, { deps: h.deps });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'exited',
+      status: 'not-started',
+    });
+  });
+  it('listening: ports bound while the process is stopping are not ready yet; the wait goes on and succeeds once it is online', async () => {
+    // a restarting process still has its pid, so the bound port is attributed to the app
+    const alive = (status: string) => ({ ...proc('api', status), pid: 100 });
+    const h = harness([
+      probe(alive('stopping'), ss(3100, 101)),
+      probe(alive('waiting restart'), ss(3100, 101)),
+      probe(alive('online'), ss(3100, 101)),
+    ]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({ ok: true, status: 'online', waited_ms: 1000 });
+  });
+  it('url-ok: an answering url while pm2 restarts the process is waited out too, and a restart that never ends times out', async () => {
+    const h = harness([webProbe('waiting restart')]);
+    const r = await waitFor(
+      h.ctx,
+      'web',
+      { kind: 'url-ok' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'waiting restart',
+    });
+    expect(r.observed).toBe(
+      'status waiting restart, http://localhost:3200/ 200'
+    );
   });
 });
 
