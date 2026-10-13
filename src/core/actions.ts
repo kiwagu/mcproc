@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { McprocError } from './errors.js';
+import { describeError, McprocError } from './errors.js';
 import type { Dep, DepCondition, Manifest } from './manifest.js';
 import {
   appCwd,
@@ -140,47 +140,62 @@ export async function startApps(
   const waitDep = opts.waitDep ?? ((d: Dep) => waitDependency(ctx, d));
   const failed = opts.failed ?? new Map<string, string>();
   const skipped = new Map<string, string>();
-  const file = await shipEcosystem(ctx);
-  const before = await ctx.pm2.jlist(); // pm2's own list: the URL checks of a full probe could time out the start before it began
-  assertNoCollision(ctx, before, names);
-  for (const n of names) {
-    const app = ctx.manifest.apps[n];
-    if (failed.has(n)) {
-      // decided before this run (a dependency on another host failed, timed out or was not started)
-      skipped.set(n, failed.get(n)!);
-      continue;
-    }
-    // a dependency of this host that did not start: the dependent cannot either
-    const blocked = app.depends_on.find((d) => failed.has(d.app));
-    if (blocked) {
-      const why = `skipped: ${blocked.app} was not started (${failed.get(blocked.app)})`;
-      skipped.set(n, why);
-      failed.set(n, why);
-      continue;
-    }
-    const p = findProcess(before, ctx.manifest.project, n);
-    if (p && p.status === 'online' && !opts.reload) continue;
-    let unmet: string | undefined;
-    for (const d of app.depends_on) {
-      if (d.condition === 'started') continue;
-      const t0 = Date.now();
-      const r = await waitDep(d, n);
+  /** an app that is not started, and the apps that need it must not be either */
+  const skip = (n: string, why: string) => {
+    skipped.set(n, why);
+    failed.set(n, why);
+  };
+  /** One dependency wait, recorded. Why it is unmet, or undefined when met; a wait that throws (a host that cannot be reached, say) is an unmet one, not a crash of the whole start. */
+  const unmetAfterWait = async (d: Dep, n: string) => {
+    const t0 = Date.now();
+    const record = (ok: boolean, reason?: string) =>
       opts.waits?.push({
         app: n,
         dep: d.app,
         condition: d.condition,
         ms: Date.now() - t0,
-        ok: r.ok,
-        ...(r.reason ? { reason: r.reason } : {}),
+        ok,
+        ...(reason ? { reason } : {}),
       });
-      if (!r.ok) {
-        unmet = depFailure(d, r);
-        break;
-      }
+    try {
+      const r = await waitDep(d, n);
+      record(r.ok, r.reason);
+      return r.ok ? undefined : depFailure(d, r);
+    } catch (e) {
+      record(false, 'error');
+      return `${d.app}: ${describeError(e)}`;
+    }
+  };
+  const file = await shipEcosystem(ctx);
+  const before = await ctx.pm2.jlist(); // pm2's own list: the URL checks of a full probe could time out the start before it began
+  assertNoCollision(ctx, before, names);
+  for (const n of names) {
+    const app = ctx.manifest.apps[n];
+    // running already: left alone, whatever happened to what it needs (it is neither waited for nor skipped)
+    const p = findProcess(before, ctx.manifest.project, n);
+    if (p && p.status === 'online' && !opts.reload) continue;
+    if (failed.has(n)) {
+      // decided before this run (a dependency on another host failed, timed out or was not started)
+      skip(n, failed.get(n)!);
+      continue;
+    }
+    // a dependency of this host that did not start: the dependent cannot either
+    const blocked = app.depends_on.find((d) => failed.has(d.app));
+    if (blocked) {
+      skip(
+        n,
+        `skipped: ${blocked.app} was not started (${failed.get(blocked.app)})`
+      );
+      continue;
+    }
+    let unmet: string | undefined;
+    for (const d of app.depends_on) {
+      if (d.condition === 'started') continue;
+      unmet = await unmetAfterWait(d, n);
+      if (unmet !== undefined) break;
     }
     if (unmet !== undefined) {
-      skipped.set(n, unmet);
-      failed.set(n, unmet);
+      skip(n, unmet);
       continue;
     }
     await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));

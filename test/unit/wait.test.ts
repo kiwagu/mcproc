@@ -574,6 +574,17 @@ describe('untilFor / waitDependency / depFailure', () => {
       depFailure({ app: 'libs', condition: 'completed', timeoutMs: 1000 }, r)
     ).toBe('libs failed (exit 2)');
   });
+  it('a dependency the manifest does not know is UNKNOWN_APP, before anything is looked at', async () => {
+    const h = harness([], [jl(proc('libs', 'stopped', { exit_code: 0 }))]);
+    await expect(
+      waitDependency(
+        h.ctx,
+        { app: 'nope', condition: 'ready', timeoutMs: 1000 },
+        { deps: h.deps }
+      )
+    ).rejects.toMatchObject({ code: 'UNKNOWN_APP' });
+    expect(h.calls.jlists + h.calls.probes).toBe(0);
+  });
   it('depFailure names timeouts, exits and crashes', () => {
     const d = { app: 'api', condition: 'ready' as const, timeoutMs: 90_000 };
     expect(
@@ -607,7 +618,7 @@ describe('untilFor / waitDependency / depFailure', () => {
     ).toBe('api crashed');
     expect(
       depFailure(
-        { ...d, condition: 'completed' },
+        { ...d, condition: 'completed', timeoutMs: 60_000 },
         {
           ok: false,
           reason: 'timeout',

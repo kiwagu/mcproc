@@ -114,6 +114,12 @@ export function defaultWaitDeps(): WaitDeps {
   };
 }
 
+const unknownApp = (ctx: Context, app: string) =>
+  new McprocError(
+    'UNKNOWN_APP',
+    `Unknown app "${app}" in ${ctx.manifest.path}`
+  );
+
 const notStarted = (ctx: Context, app: string) =>
   new McprocError(
     'NOT_STARTED',
@@ -240,11 +246,7 @@ export async function waitFor(
 ): Promise<WaitResult> {
   const deps = opts.deps ?? defaultWaitDeps();
   const a = ctx.manifest.apps[app];
-  if (!a)
-    throw new McprocError(
-      'UNKNOWN_APP',
-      `Unknown app "${app}" in ${ctx.manifest.path}`
-    );
+  if (!a) throw unknownApp(ctx, app);
   if (until.kind === 'listening' && a.ports.length === 0)
     throw bad(`"${app}" declares no port, so listening cannot be observed`);
   if (until.kind === 'url-ok' && !a.url)
@@ -359,6 +361,7 @@ export async function waitDependency(
   opts: { signal?: AbortSignal; deps?: WaitDeps } = {}
 ): Promise<WaitResult> {
   const depApp = ctx.manifest.apps[dep.app];
+  if (!depApp) throw unknownApp(ctx, dep.app);
   const r = await waitFor(ctx, dep.app, untilFor(dep, depApp), {
     timeoutMs: dep.timeoutMs,
     ...opts,
@@ -374,11 +377,8 @@ export function depFailure(dep: Dep, r: WaitResult): string {
   switch (r.reason) {
     case 'failed':
       return `${dep.app} ${r.status}`;
-    case 'timeout': {
-      // the declared timeout; a wait that ended earlier says how long it did wait (a probe may overshoot by a tick)
-      const secs = Math.min(dep.timeoutMs, r.waited_ms) / 1000;
-      return `${dep.app} not ${want} in ${secs} s (${r.observed ?? `status ${r.status}`})`;
-    }
+    case 'timeout':
+      return `${dep.app} not ${want} in ${dep.timeoutMs / 1000} s (${r.observed ?? `status ${r.status}`})`;
     case 'crashed':
       return `${dep.app} crashed`;
     case 'aborted':
