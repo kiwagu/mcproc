@@ -6,6 +6,7 @@ import {
   buildEcosystem,
   ecosystemPath,
   appCwd,
+  STOP_TRAP,
 } from '../../src/core/ecosystem.js';
 import { pm2Name } from '../../src/core/pm2.js';
 
@@ -73,5 +74,17 @@ describe('buildEcosystem for a task', () => {
     expect(eco.apps.find((a) => a.name === 'ready-api')!.autorestart).toBe(
       true
     );
+  });
+  it('a task command traps SIGINT and SIGTERM, a server command is passed as written', () => {
+    const m = loadManifest(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness')
+    );
+    const eco = buildEcosystem(m, m.hosts.local);
+    const last = (name: string) => {
+      const args = eco.apps.find((a) => a.name === name)!.args;
+      return args[args.length - 1];
+    };
+    expect(last('ready-libs')).toBe(`${STOP_TRAP}node build.js`);
+    expect(last('ready-api')).toBe('node api.js');
   });
 });

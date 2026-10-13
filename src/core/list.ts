@@ -34,7 +34,7 @@ export interface LsRow {
   pid: number | null;
   uptime_ms: number | null;
   restarts: number;
-  /** the exit code of a stopped one-shot app; null when it has none (see statusWord) */
+  /** pm2's last recorded exit code for the process, any app; null when none is recorded (see statusWord) */
   exit_code: number | null;
   cpu: number | null;
   memory: number;
@@ -170,7 +170,8 @@ const SIGNAL_EXITS = new Set([130, 143]);
 /**
  * The word a process is shown with: pm2's status, except that a one-shot app (autorestart off, every kind: task) that
  * exited reads done / failed (exit N) / stopped by its exit code — pm2 itself says only "stopped" and cannot tell a
- * manual stop (exit_code null) from a natural exit.
+ * manual stop from a natural exit. A manual stop reaches 130 / 143 through the trap the ecosystem puts in front of the
+ * command of every autorestart-off app; null and those codes read as stopped.
  */
 export function statusWord(p: Pm2Process | undefined, app: App): string {
   if (!p) return 'not-started';

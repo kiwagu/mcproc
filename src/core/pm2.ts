@@ -17,7 +17,7 @@ export interface Pm2Process {
   err_log: string;
   restarts: number;
   unstable_restarts: number;
-  /** the code of the last exit; null when pm2 recorded none (a stop by hand, or a process still running) */
+  /** pm2's last recorded exit code for the process, any app; null when pm2 has recorded none (it never exited, or the field is absent) */
   exit_code: number | null;
   uptime_ms: number | null;
   cpu: number;
