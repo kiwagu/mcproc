@@ -16,6 +16,7 @@ import {
   type WaitRecord,
 } from '../../src/core/actions.js';
 import { McprocError } from '../../src/core/errors.js';
+import { loadManifest } from '../../src/core/manifest.js';
 import type { WaitResult } from '../../src/core/wait.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -344,6 +345,48 @@ describe('startApps with depends_on conditions', () => {
     expect(failed.get('web')).toBe(
       'skipped: api was not started (libs failed (exit 2))'
     );
+  });
+  it('depsOf supplies the dependencies the host-scoped manifest dropped: they are waited for, and block the dependent when they were not started', async () => {
+    const fleetReady = path.join(
+      here,
+      '..',
+      'fixtures',
+      'projects',
+      'fleet-ready'
+    );
+    const full = loadManifest(fleetReady);
+    const depsOf = (n: string) => full.apps[n].depends_on;
+    const boxCtx = () => fakeCtx(fleetReady, 'box', rules([]), 'local');
+    const plain = boxCtx();
+    expect(plain.manifest.apps.web.depends_on).toEqual([]); // libs runs on local: invisible from box
+    const waited: string[] = [];
+    const waits: WaitRecord[] = [];
+    await startApps(plain, ['web'], {
+      depsOf,
+      waits,
+      waitDep: async (d, forApp) => {
+        waited.push(`${forApp}<-${d.app}:${d.condition}`);
+        return okWait();
+      },
+    });
+    expect(waited).toEqual(['web<-libs:completed']);
+    expect(waits.map((w) => [w.app, w.dep, w.ok])).toEqual([
+      ['web', 'libs', true],
+    ]);
+    expect(launchedOf(plain)).toEqual(['fr-web']);
+    const blocked = boxCtx();
+    const rows = await startApps(blocked, ['web'], {
+      depsOf,
+      failed: new Map([['libs', 'libs failed (exit 2)']]),
+      waitDep: async () => {
+        throw new Error('must not wait for a dependency that was not started');
+      },
+    });
+    expect(rows[0]).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: libs was not started (libs failed (exit 2))',
+    });
+    expect(launchedOf(blocked)).toEqual([]);
   });
   it('an app already online is not skipped when what it needs was: it is left alone and not marked failed', async () => {
     // libs fails, api (not running) is skipped, web is up already: it stays as it is, with its row and no cascade

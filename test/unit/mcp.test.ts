@@ -165,6 +165,27 @@ describe('mcp server', () => {
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
   });
+  it('start answers with the waits it made (none for an app without conditions)', async () => {
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes(MARK.JLIST))
+        return { code: 0, stdout: probeOut({ jlist: '[]' }), stderr: '' };
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (/pm2 'jlist'/.test(cmd) || cmd.includes('--version'))
+        return { code: 0, stdout: '[]', stderr: '' };
+      if (/cat >|startOrRestart/.test(cmd))
+        return { code: 0, stdout: '', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+    };
+    const cl = await client(spawner);
+    const r: any = await cl.callTool({
+      name: 'start',
+      arguments: { project: basic, target: 'worker' },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.waits).toEqual([]);
+  });
   it('host-bound apps: a target on another host than --host, or on a readonly host, is refused before any transport call', async () => {
     const cl = await client(neverSpawn);
     for (const [name, args] of [

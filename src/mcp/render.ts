@@ -4,6 +4,7 @@ import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
 import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
+import type { WaitRecord } from '../core/actions.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -332,19 +333,31 @@ export function renderFlushed(r: Cleared[], multi: boolean): string {
     .join('\n');
 }
 
-/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table and the start note. */
+/** `waited 4.2 s for libs (completed), 1.1 s for api (ready)`: the waits that were met; the failed ones are in the rows. */
+export function waitNote(waits: WaitRecord[]): string {
+  const ok = waits.filter((w) => w.ok);
+  return ok.length
+    ? `waited ${ok.map((w) => `${(w.ms / 1000).toFixed(1)} s for ${w.dep} (${w.condition})`).join(', ')}`
+    : '';
+}
+
+/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start note and the waits made. */
 export function renderMutation(
   rows: LsRow[],
   fallback: string,
-  act: string
+  act: string,
+  waits: WaitRecord[] = []
 ): { text: string; failed: boolean } {
   const bad = rows.filter((r) => r.error);
-  const note = act === 'start' || act === 'restart' ? startNote(rows) : '';
+  const notes = [
+    act === 'start' || act === 'restart' ? startNote(rows) : '',
+    waitNote(waits),
+  ].filter(Boolean);
   const head = bad.length
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`
     : '';
   return {
-    text: head + renderLs(rows, fallback) + (note ? `\n${note}` : ''),
+    text: head + renderLs(rows, fallback) + notes.map((n) => `\n${n}`).join(''),
     failed: bad.length > 0,
   };
 }

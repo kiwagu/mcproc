@@ -10,6 +10,7 @@ import {
   assertWritable,
   resolveProjectDir,
 } from '../core/resolve.js';
+import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
 import type { CursorState } from '../core/incidents/cursor.js';
@@ -104,9 +105,10 @@ export function buildProgram(io: Io = defaultIo): Command {
     opts: { reload?: boolean } = {}
   ) => {
     const fleet = fleetOf(g);
-    const rows = await actOn(fleet, target, act, opts);
-    const { text, failed } = renderMutation(rows, fleet.fallback, act);
-    emit(g, text, { ...hostsOf(rows, fleet.fallback), rows });
+    const waits: WaitRecord[] = [];
+    const rows = await actOn(fleet, target, act, { ...opts, waits });
+    const { text, failed } = renderMutation(rows, fleet.fallback, act, waits);
+    emit(g, text, { ...hostsOf(rows, fleet.fallback), rows, waits });
     if (failed) process.exitCode = 1; // a host failed or was skipped: the first line says so, the exit code too
   };
 

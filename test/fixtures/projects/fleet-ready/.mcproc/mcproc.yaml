@@ -1,0 +1,19 @@
+version: 1
+project: fr
+apps:
+  libs:
+    description: one-shot build on this machine
+    kind: task
+    run: node build.js
+    host: local
+  web:
+    description: dev server in the container, needs the build
+    run: node web.js
+    port: 3000
+    host: box
+    depends_on:
+      - { app: libs, condition: completed }
+hosts:
+  box:
+    ssh: box
+    cwd: /home/dev/fr

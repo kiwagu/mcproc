@@ -1,5 +1,5 @@
 import { McprocError, describeError } from './errors.js';
-import type { Manifest } from './manifest.js';
+import type { Dep, Manifest } from './manifest.js';
 import { assertApp, connect, pickHost, type Context } from './resolve.js';
 import {
   deleteApps,
@@ -8,7 +8,9 @@ import {
   restartApps,
   startApps,
   stopApps,
+  type WaitRecord,
 } from './actions.js';
+import { waitDependency } from './wait.js';
 import {
   describeApp,
   rowsFor,
@@ -225,7 +227,7 @@ export async function actOn(
   fleet: Fleet,
   target: string,
   act: Act,
-  opts: { reload?: boolean } = {}
+  opts: { reload?: boolean; waits?: WaitRecord[] } = {}
 ): Promise<LsRow[]> {
   const named = fleet.select([target]);
   const names =
@@ -240,6 +242,16 @@ export async function actOn(
   const rows: LsRow[] = [];
   let failed: { host: string; error: unknown } | null = null;
   let done = 0;
+  const notStarted = new Map<string, string>(); // app -> why it did not start; one map for every run
+  /** every dependency of an app from the full manifest; with --host X the ones that run elsewhere are left out (neither started nor waited for) */
+  const depsOf = (n: string): Dep[] =>
+    fleet.manifest.apps[n].depends_on.filter(
+      (d) =>
+        fleet.requested === undefined || fleet.hostOf(d.app) === fleet.requested
+    );
+  /** a dependency is observed on the host it runs on, whatever run the dependent is in */
+  const waitDep = async (d: Dep) =>
+    waitDependency(await fleet.ctx(fleet.hostOf(d.app)), d);
   for (const r of runs) {
     if (failed && act === 'start') {
       rows.push(
@@ -258,7 +270,13 @@ export async function actOn(
       const ctx = await fleet.ctx(r.host);
       rows.push(
         ...(await (act === 'start'
-          ? startApps(ctx, r.apps, opts)
+          ? startApps(ctx, r.apps, {
+              reload: opts.reload,
+              waitDep,
+              depsOf,
+              waits: opts.waits,
+              failed: notStarted,
+            })
           : act === 'restart'
             ? restartApps(ctx, r.apps)
             : act === 'stop'

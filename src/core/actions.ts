@@ -117,6 +117,8 @@ export interface StartOptions {
   reload?: boolean;
   /** waits for one dependency (default: on this context); actOn passes one that finds the dependency's host */
   waitDep?: (dep: Dep, forApp: string) => Promise<WaitResult>;
+  /** the dependencies of an app to wait for; default the context's (host-scoped) manifest entry, the fleet passes the full manifest's */
+  depsOf?: (app: string) => Dep[];
   /** every wait made, appended */
   waits?: WaitRecord[];
   /** apps that failed or were skipped so far (app -> why), shared across host runs by actOn */
@@ -138,6 +140,8 @@ export async function startApps(
       ? orderWithDeps(ctx.manifest, namesOf(ctx, target))
       : target;
   const waitDep = opts.waitDep ?? ((d: Dep) => waitDependency(ctx, d));
+  const depsOf =
+    opts.depsOf ?? ((n: string) => ctx.manifest.apps[n].depends_on);
   const failed = opts.failed ?? new Map<string, string>();
   const skipped = new Map<string, string>();
   /** an app that is not started, and the apps that need it must not be either */
@@ -170,7 +174,6 @@ export async function startApps(
   const before = await ctx.pm2.jlist(); // pm2's own list: the URL checks of a full probe could time out the start before it began
   assertNoCollision(ctx, before, names);
   for (const n of names) {
-    const app = ctx.manifest.apps[n];
     // running already: left alone, whatever happened to what it needs (it is neither waited for nor skipped)
     const p = findProcess(before, ctx.manifest.project, n);
     if (p && p.status === 'online' && !opts.reload) continue;
@@ -179,8 +182,8 @@ export async function startApps(
       skip(n, failed.get(n)!);
       continue;
     }
-    // a dependency of this host that did not start: the dependent cannot either
-    const blocked = app.depends_on.find((d) => failed.has(d.app));
+    // a dependency that did not start (on this host or another): the dependent cannot either
+    const blocked = depsOf(n).find((d) => failed.has(d.app));
     if (blocked) {
       skip(
         n,
@@ -189,7 +192,7 @@ export async function startApps(
       continue;
     }
     let unmet: string | undefined;
-    for (const d of app.depends_on) {
+    for (const d of depsOf(n)) {
       if (d.condition === 'started') continue;
       unmet = await unmetAfterWait(d, n);
       if (unmet !== undefined) break;

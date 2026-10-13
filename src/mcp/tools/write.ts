@@ -7,6 +7,7 @@ import {
   resolveProjectDir,
 } from '../../core/resolve.js';
 import { Fleet, defaultConnector, actOn, type Act } from '../../core/fleet.js';
+import type { WaitRecord } from '../../core/actions.js';
 import { clearLogs } from '../../core/incidents/store.js';
 import { initProject } from '../../core/init.js';
 import type { LsRow } from '../../core/list.js';
@@ -40,13 +41,15 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     what: Act
   ) => {
     const fleet = await fleetOf(args);
+    const waits: WaitRecord[] = [];
     const rows: LsRow[] = await actOn(fleet, args.target, what, {
       reload: args.reload,
+      waits,
     });
-    const { text, failed } = renderMutation(rows, fleet.fallback, what);
+    const { text, failed } = renderMutation(rows, fleet.fallback, what, waits);
     return {
       text,
-      data: { ...hostsOf(rows, fleet.fallback), rows } as Record<
+      data: { ...hostsOf(rows, fleet.fallback), rows, waits } as Record<
         string,
         unknown
       >,
@@ -89,7 +92,7 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Start',
       description:
-        'Start an app or profile via pm2 from the generated ecosystem, each app on the host it runs on, dependencies first. Apps already online are left alone unless reload is true.',
+        'Start an app or profile via pm2 from the generated ecosystem, each app on the host it runs on, dependencies first. A dependency declared with condition ready or completed is waited for (up to its timeout) before the dependent starts, and a dependent whose dependency failed or timed out is skipped with the reason. Apps already online are left alone unless reload is true.',
       inputSchema: { ...targetInput, reload: z.boolean().optional() },
       annotations: MUT(false, true),
     },

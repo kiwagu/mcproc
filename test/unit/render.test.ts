@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   startNote,
+  waitNote,
   renderLs,
   renderPorts,
   renderDoctor,
@@ -397,6 +398,49 @@ describe('renderMutation', () => {
       failed: false,
       text: expect.not.stringContaining('failed'),
     });
+  });
+  it('waitNote lists successful waits; renderMutation appends it', () => {
+    const waits = [
+      {
+        app: 'api',
+        dep: 'libs',
+        condition: 'completed' as const,
+        ms: 4210,
+        ok: true,
+      },
+      {
+        app: 'web',
+        dep: 'api',
+        condition: 'ready' as const,
+        ms: 1100,
+        ok: true,
+      },
+      {
+        app: 'x',
+        dep: 'y',
+        condition: 'ready' as const,
+        ms: 9,
+        ok: false,
+        reason: 'timeout',
+      },
+    ];
+    expect(waitNote(waits)).toBe(
+      'waited 4.2 s for libs (completed), 1.1 s for api (ready)'
+    );
+    expect(waitNote([])).toBe('');
+    const r = renderMutation([row('online', [])], 'local', 'start', waits);
+    expect(r.text).toContain('waited 4.2 s for libs (completed)');
+  });
+  it('a skipped dependent is a failed row', () => {
+    const r = renderMutation(
+      [{ ...row('skipped', []), error: 'libs failed (exit 2)' }],
+      'local',
+      'start'
+    );
+    expect(r.failed).toBe(true);
+    expect(r.text).toContain(
+      'start partly failed: web (local): libs failed (exit 2)'
+    );
   });
 });
 
