@@ -119,6 +119,15 @@ export function guessPort(cmd: string, dir: string): number | undefined {
   return undefined;
 }
 
+/** A one-shot job (build, task) declares no port, so none is guessed for it. */
+function portFor(
+  kind: AppKind | 'unknown',
+  cmd: string,
+  dir: string
+): number | undefined {
+  return kind === 'build' || kind === 'task' ? undefined : guessPort(cmd, dir);
+}
+
 function packageCandidates(
   root: string,
   pkgDir: string,
@@ -147,10 +156,7 @@ function packageCandidates(
       run: `${pm} ${n}`,
       cwd: rel,
       kind,
-      port:
-        kind === 'build' || kind === 'task'
-          ? undefined
-          : guessPort(cmd, pkgDir),
+      port: portFor(kind, cmd, pkgDir),
     });
   }
   return out;
@@ -290,15 +296,17 @@ export function discover(root: string): Discovery {
   if (fs.existsSync(procfile)) {
     for (const line of fs.readFileSync(procfile, 'utf8').split('\n')) {
       const m = /^\s*([A-Za-z0-9_-]+):\s*(.+)$/.exec(line);
-      if (m)
+      if (m) {
+        const kind = guessKind(m[1], m[2]);
         candidates.push({
           name: sanitizeName(m[1]),
           source: `Procfile:${m[1]}`,
           run: m[2].trim(),
           cwd: '.',
-          kind: guessKind(m[1], m[2]),
-          port: guessPort(m[2], root),
+          kind,
+          port: portFor(kind, m[2], root),
         });
+      }
     }
   }
 
