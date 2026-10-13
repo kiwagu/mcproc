@@ -28,26 +28,28 @@ function scripted(responses: string[]) {
     },
   ]);
 }
-/** One file's answer as the host sends it: size, where the read began, why (N new bytes, R replaced), then the raw bytes. */
-const sec = (
-  s: 'out' | 'err',
-  x: { size: number; body?: string; reset?: boolean; start?: number }
-) => {
+/** One file's answer as the host sends it: size, where the read began, why (N new bytes, R replaced, H history), then the raw bytes. */
+type Section = {
+  size: number;
+  body?: string;
+  reset?: boolean;
+  history?: boolean;
+  start?: number;
+};
+const sec = (s: 'out' | 'err', x: Section) => {
   const body = x.body ?? '';
   const start =
     x.start ?? (x.reset ? 0 : Math.max(0, x.size - Buffer.byteLength(body)));
-  return `__MCPROC_LF_${s}__\n${x.size} ${start} ${x.reset ? 'R' : 'N'}\n${body}`;
+  const kind = x.history ? 'H' : x.reset ? 'R' : 'N';
+  return `__MCPROC_LF_${s}__\n${x.size} ${start} ${kind}\n${body}`;
 };
-const resp = (
-  out: { size: number; body?: string; reset?: boolean; start?: number },
-  err: { size: number; body?: string; reset?: boolean; start?: number }
-) => sec('out', out) + sec('err', err);
+const resp = (out: Section, err: Section) => sec('out', out) + sec('err', err);
 
 describe('LogFollower', () => {
   it('initialLines 0 takes the position of the history but returns none of its lines', async () => {
     const ctx = scripted([
       resp(
-        { size: 20, body: 'old-1\nold-2\n', reset: true, start: 8 },
+        { size: 20, body: 'old-1\nold-2\n', history: true, start: 8 },
         { size: 0 }
       ),
       resp({ size: 26, body: 'new-1\n' }, { size: 0 }),
@@ -56,6 +58,29 @@ describe('LogFollower', () => {
     expect((await f.poll()).lines).toEqual([]);
     expect(f.offsets.out).toBe(20);
     expect((await f.poll()).lines.map((l) => l.text)).toEqual(['new-1']);
+  });
+  it('initialLines 0 keeps every line of a replaced file: all of it was written after the follower began', async () => {
+    const ctx = scripted([
+      resp({ size: 20, body: 'old-1\nold-2\n', history: true }, { size: 0 }),
+      // flushed or rotated: the file starts over and already holds two lines
+      resp({ size: 14, body: 'new-1\nnew-2\n', reset: true }, { size: 0 }),
+      resp({ size: 20, body: 'new-3\n' }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    await f.poll();
+    const second = await f.poll();
+    expect(second.reset).toBe(true);
+    expect(second.lines.map((l) => l.text)).toEqual(['new-1', 'new-2']);
+    expect((await f.poll()).lines.map((l) => l.text)).toEqual(['new-3']);
+  });
+  it('a replaced file still shows only its last initialLines when history is asked for', async () => {
+    const ctx = scripted([
+      resp({ size: 6, body: 'a\n', history: true, start: 4 }, { size: 0 }),
+      resp({ size: 12, body: 'n1\nn2\nn3\n', reset: true }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 2);
+    await f.poll();
+    expect((await f.poll()).lines.map((l) => l.text)).toEqual(['n2', 'n3']);
   });
   it('first poll takes the history, later polls read only new bytes by offset', async () => {
     const ctx = scripted([
