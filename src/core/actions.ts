@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { McprocError } from './errors.js';
-import type { Manifest } from './manifest.js';
+import type { Dep, DepCondition, Manifest } from './manifest.js';
 import {
   appCwd,
   buildEcosystem,
@@ -8,7 +8,8 @@ import {
   generatedDir,
 } from './ecosystem.js';
 import { findProcess, pm2Name, type Pm2Process } from './pm2.js';
-import { rowsFor, snapshot, type LsRow } from './list.js';
+import { rowsFor, snapshot, unreachableRow, type LsRow } from './list.js';
+import { depFailure, waitDependency, type WaitResult } from './wait.js';
 import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
@@ -103,24 +104,102 @@ export async function shipEcosystem(ctx: Context): Promise<string> {
   return file;
 }
 
+/** One wait made on behalf of an app before it started: how long, and how it ended. */
+export interface WaitRecord {
+  app: string;
+  dep: string;
+  condition: DepCondition;
+  ms: number;
+  ok: boolean;
+  reason?: string;
+}
+export interface StartOptions {
+  reload?: boolean;
+  /** waits for one dependency (default: on this context); actOn passes one that finds the dependency's host */
+  waitDep?: (dep: Dep, forApp: string) => Promise<WaitResult>;
+  /** every wait made, appended */
+  waits?: WaitRecord[];
+  /** apps that failed or were skipped so far (app -> why), shared across host runs by actOn */
+  failed?: Map<string, string>;
+}
+
+/**
+ * Starts the apps in dependency order. Before launching an app it waits, in the order declared, for each of its
+ * ready/completed dependencies; one that times out, fails or dies leaves the app (and everything that depends on
+ * it) unstarted: its row is `skipped` with the reason, while unrelated apps still start.
+ */
 export async function startApps(
   ctx: Context,
   target: Targets,
-  opts: { reload?: boolean } = {}
+  opts: StartOptions = {}
 ): Promise<LsRow[]> {
   const names =
     typeof target === 'string'
       ? orderWithDeps(ctx.manifest, namesOf(ctx, target))
       : target;
+  const waitDep = opts.waitDep ?? ((d: Dep) => waitDependency(ctx, d));
+  const failed = opts.failed ?? new Map<string, string>();
+  const skipped = new Map<string, string>();
   const file = await shipEcosystem(ctx);
   const before = await ctx.pm2.jlist(); // pm2's own list: the URL checks of a full probe could time out the start before it began
   assertNoCollision(ctx, before, names);
   for (const n of names) {
+    const app = ctx.manifest.apps[n];
+    if (failed.has(n)) {
+      // decided before this run (a dependency on another host failed, timed out or was not started)
+      skipped.set(n, failed.get(n)!);
+      continue;
+    }
+    // a dependency of this host that did not start: the dependent cannot either
+    const blocked = app.depends_on.find((d) => failed.has(d.app));
+    if (blocked) {
+      const why = `skipped: ${blocked.app} was not started (${failed.get(blocked.app)})`;
+      skipped.set(n, why);
+      failed.set(n, why);
+      continue;
+    }
     const p = findProcess(before, ctx.manifest.project, n);
     if (p && p.status === 'online' && !opts.reload) continue;
+    let unmet: string | undefined;
+    for (const d of app.depends_on) {
+      if (d.condition === 'started') continue;
+      const t0 = Date.now();
+      const r = await waitDep(d, n);
+      opts.waits?.push({
+        app: n,
+        dep: d.app,
+        condition: d.condition,
+        ms: Date.now() - t0,
+        ok: r.ok,
+        ...(r.reason ? { reason: r.reason } : {}),
+      });
+      if (!r.ok) {
+        unmet = depFailure(d, r);
+        break;
+      }
+    }
+    if (unmet !== undefined) {
+      skipped.set(n, unmet);
+      failed.set(n, unmet);
+      continue;
+    }
     await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));
   }
-  return rowsFor(ctx, await snapshot(ctx, { urls: names }), names);
+  const live = names.filter((n) => !skipped.has(n));
+  const rows = live.length
+    ? rowsFor(ctx, await snapshot(ctx, { urls: live }), live)
+    : [];
+  const byApp = new Map(rows.map((r) => [r.app, r]));
+  return names.map(
+    (n) =>
+      byApp.get(n) ??
+      unreachableRow(
+        ctx.manifest.apps[n],
+        ctx.host.name,
+        skipped.get(n)!,
+        'skipped'
+      )
+  );
 }
 
 export async function restartApps(

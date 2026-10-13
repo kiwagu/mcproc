@@ -9,7 +9,7 @@ import {
 } from './list.js';
 import { createFollower, type LogFollower } from './logfollow.js';
 import { stripAnsi } from './logs.js';
-import type { App } from './manifest.js';
+import type { App, Dep } from './manifest.js';
 import { fmtPorts } from '../mcp/render.js';
 
 export type Until =
@@ -343,5 +343,47 @@ export async function waitFor(
     }
     if (deps.now() >= deadline) return giveUp('timeout', p, observed);
     if (!(await pause())) return giveUp('aborted', p, observed);
+  }
+}
+
+/** What a dependency must show before its dependents start: ready is the declared ports (else the url), completed the exit. */
+export function untilFor(dep: Dep, depApp: App): Until {
+  if (dep.condition === 'completed') return { kind: 'exited' };
+  return depApp.ports.length > 0 ? { kind: 'listening' } : { kind: 'url-ok' };
+}
+
+/** A dependency's condition observed on its own context; `completed` also requires exit code 0. */
+export async function waitDependency(
+  ctx: Context,
+  dep: Dep,
+  opts: { signal?: AbortSignal; deps?: WaitDeps } = {}
+): Promise<WaitResult> {
+  const depApp = ctx.manifest.apps[dep.app];
+  const r = await waitFor(ctx, dep.app, untilFor(dep, depApp), {
+    timeoutMs: dep.timeoutMs,
+    ...opts,
+  });
+  if (dep.condition === 'completed' && r.ok && r.exit_code !== 0)
+    return { ...r, ok: false, reason: 'failed' };
+  return r;
+}
+
+/** Why a dependent was not started, as its row says it. */
+export function depFailure(dep: Dep, r: WaitResult): string {
+  const want = dep.condition === 'completed' ? 'completed' : 'ready';
+  switch (r.reason) {
+    case 'failed':
+      return `${dep.app} ${r.status}`;
+    case 'timeout': {
+      // the declared timeout; a wait that ended earlier says how long it did wait (a probe may overshoot by a tick)
+      const secs = Math.min(dep.timeoutMs, r.waited_ms) / 1000;
+      return `${dep.app} not ${want} in ${secs} s (${r.observed ?? `status ${r.status}`})`;
+    }
+    case 'crashed':
+      return `${dep.app} crashed`;
+    case 'aborted':
+      return `${dep.app}: wait aborted`;
+    default:
+      return `${dep.app} exited (${r.status})`;
   }
 }

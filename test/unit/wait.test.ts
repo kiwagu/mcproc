@@ -8,11 +8,15 @@ import {
   parseUntil,
   waitFor,
   untilLabel,
+  untilFor,
+  waitDependency,
+  depFailure,
   defaultWaitDeps,
   WAIT_TIMEOUT_MAX_MS,
   type WaitDeps,
 } from '../../src/core/wait.js';
 import { snapshot } from '../../src/core/list.js';
+import { loadManifest } from '../../src/core/manifest.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
@@ -531,5 +535,87 @@ describe('waitFor: log: and idle:', () => {
     expect(r).toMatchObject({ ok: false, reason: 'aborted', status: 'online' });
     expect(r.observed).toBe('last line: starting');
     expect(f.closed).toBe(true);
+  });
+});
+
+describe('untilFor / waitDependency / depFailure', () => {
+  const m = loadManifest(readiness);
+  it('ready prefers declared ports, falls back to the url; completed is exited', () => {
+    expect(
+      untilFor({ app: 'api', condition: 'ready', timeoutMs: 1 }, m.apps.api)
+    ).toEqual({ kind: 'listening' });
+    expect(
+      untilFor(
+        { app: 'web', condition: 'ready', timeoutMs: 1 },
+        { ...m.apps.web, ports: [] }
+      )
+    ).toEqual({ kind: 'url-ok' });
+    expect(
+      untilFor(
+        { app: 'libs', condition: 'completed', timeoutMs: 1 },
+        m.apps.libs
+      )
+    ).toEqual({ kind: 'exited' });
+  });
+  it('completed is ok only with exit 0', async () => {
+    const h = harness([], [jl(proc('libs', 'stopped', { exit_code: 2 }))]);
+    const r = await waitDependency(
+      h.ctx,
+      { app: 'libs', condition: 'completed', timeoutMs: 1000 },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'failed',
+      status: 'failed (exit 2)',
+      exit_code: 2,
+    });
+    expect(
+      depFailure({ app: 'libs', condition: 'completed', timeoutMs: 1000 }, r)
+    ).toBe('libs failed (exit 2)');
+  });
+  it('depFailure names timeouts, exits and crashes', () => {
+    const d = { app: 'api', condition: 'ready' as const, timeoutMs: 90_000 };
+    expect(
+      depFailure(d, {
+        ok: false,
+        reason: 'timeout',
+        until: 'listening',
+        waited_ms: 90_000,
+        status: 'online',
+        observed: 'status online, :3100 ✗ nothing listens',
+      })
+    ).toBe('api not ready in 90 s (status online, :3100 ✗ nothing listens)');
+    expect(
+      depFailure(d, {
+        ok: false,
+        reason: 'exited',
+        until: 'listening',
+        waited_ms: 5,
+        status: 'stopped',
+        exit_code: null,
+      })
+    ).toBe('api exited (stopped)');
+    expect(
+      depFailure(d, {
+        ok: false,
+        reason: 'crashed',
+        until: 'listening',
+        waited_ms: 5,
+        status: 'errored',
+      })
+    ).toBe('api crashed');
+    expect(
+      depFailure(
+        { ...d, condition: 'completed' },
+        {
+          ok: false,
+          reason: 'timeout',
+          until: 'exited',
+          waited_ms: 60_000,
+          status: 'online',
+        }
+      )
+    ).toBe('api not completed in 60 s (status online)');
   });
 });
