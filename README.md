@@ -41,9 +41,13 @@ mcproc doctor        # why a host cannot be driven, and what to do
 version: 1
 project: demo                  # pm2 namespace and process-name prefix; default: directory name
 apps:
+  libs:
+    description: one-shot build of the shared libraries into dist/
+    kind: task                 # runs once; ls shows done / failed (exit N)
+    run: npm run build:libs
   api-build:
     description: tsc watch build of the API into dist/
-    kind: build                # build | server | worker (default server)
+    kind: build                # build | server | worker | task (default server)
     run: npx tsc -w -p apps/api
   api:
     description: HTTP API serving /health
@@ -53,9 +57,11 @@ apps:
     port: 3310                 # declared listening port (or ports: [3310, 9230])
     url: http://localhost:3310/   # optional: the address to open; ls/describe show it with the HTTP answer, monit shows it
     watch: [dist/apps/api]     # pm2 restarts the server when the build output changes
-    depends_on: [api-build]    # start order
+    depends_on:
+      - { app: libs, condition: completed }   # wait for the build to exit 0
+      - api-build                              # plain name = started (start order only)
 profiles:
-  base: [api-build, api]       # "all" is built in
+  base: [libs, api-build, api]   # "all" is built in
 hosts:                         # "local" is implicit
   stand:
     ssh: stand                 # alias from ~/.ssh/config; no secrets live here
@@ -69,6 +75,24 @@ hosts:                         # "local" is implicit
 Other app fields: `host` (see below), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
 Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
 `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
+
+### Kinds
+
+| kind | what it is | autorestart | `ls` shows after it exits |
+|---|---|---|---|
+| `server` | a process that listens (default) | on | `stopped`, `errored` |
+| `worker` | a process without a port | on | `stopped`, `errored` |
+| `build` | a long-running watch build | on | `stopped`, `errored` |
+| `task` | runs once: a build, a migration, a seed | off | `done`, `failed (exit N)`, `stopped` |
+
+A task's exit code is pm2's `exit_code`: 0 is `done`, any other code `failed (exit N)`. A manual stop reads
+`stopped`: mcproc puts `trap 'exit 130' INT; trap 'exit 143' TERM;` in front of a one-shot app's command, because
+pm2 itself records exit code 0 for a process killed by a signal. Two edges: a `run` that starts with `exec …`
+replaces the shell and loses the trap, so a manual stop of it reads `done`; a task that ignores SIGINT until pm2's
+kill timeout (SIGKILL) also reads `done`. The host shell must be POSIX (`bash`, `sh`): the default and the
+documented `/bin/sh -c` both are. pm2 keeps no exit time, so UPTIME stays `-`. `start` on a done or failed task runs
+it again; `autorestart: true` on a task is refused. `init` drafts `build`, `migrate`, `seed` and `once` scripts as
+tasks and watch-style commands as `build`.
 
 The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
 checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
@@ -113,6 +137,46 @@ A bound app always runs on its host. An app without `host:` runs wherever the co
   any host is touched, and the error names the apps that run there, dependencies included.
 - ssh gives up connecting after 10 s (`-o ConnectTimeout=10`). A `ConnectTimeout` in `ssh_args` wins.
 
+## Readiness: `wait` and `depends_on` conditions
+
+`wait` (MCP tool, `mcproc wait <app> --until <cond> [-t 60]` on the CLI) blocks until an app is usable or finished,
+instead of sleeping and polling:
+
+| `until` | met when |
+|---|---|
+| `listening` | every declared port is bound (needs `port`/`ports`) |
+| `url-ok` | the `url` answers 2xx/3xx (requested from the host, as `ls` does; needs `curl` or `wget` there, without either it runs to the timeout and reports `unchecked`) |
+| `exited` | the process left `online`; the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped` |
+| `log:<regex>` | a new line of its out or err log matches (ANSI stripped; history is not searched) |
+| `idle:<seconds>` | no log output for that long — a watcher settled |
+
+`log:` and `idle:` see only output written after the call begins; for "is it up" prefer `listening` or `url-ok`.
+`wait --until exited` succeeds (exit code 0) once the process has exited, whatever its exit code; scripts read
+`exit_code` in `--json` or the `(exit N)` in the line.
+
+The answer is one line: `web: listening after 1.3 s (:3000 ✓)`, `libs: done after 12.4 s (exit 0)`. On timeout
+(default 60 s, max 600) or when the process dies meanwhile it says what was last seen (`web: listening not reached
+after 60.0 s (status online, :3000 ✗ nothing listens)`) and `ok` is false; it is a result, not an error, and the CLI
+exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. Claude
+Code does not cut a long MCP call, but moves one into the background after two minutes. A cancelled MCP `wait` (or
+`start`) call stops the polling at once.
+
+`depends_on` entries can name what they wait for:
+
+```yaml
+depends_on:
+  - logger                                        # a name: start order only
+  - { app: libs, condition: completed }           # the task exited with code 0
+  - { app: api,  condition: ready, timeout: 90 }  # ports listening, or the url answers; default 60 s, max 600
+```
+
+`completed` needs a `kind: task` dependency; `ready` one with a port or a url (ports are checked when declared, the
+url otherwise). `start` launches dependencies first, as before, and waits at each such edge — on the dependency's
+host, also when the dependent runs elsewhere. A done task is run again, a running one is waited on. When a dependency
+fails, times out or dies, the dependent is not started: its row reads `skipped` with the reason, and so do the apps
+that depend on it; unrelated apps still start. The answer adds `waited 4.2 s for libs (completed)` and the CLI exits 1
+when anything was skipped. With `--host X`, dependencies that run elsewhere are neither started nor waited for.
+
 ## Tools (MCP) and commands (CLI)
 
 | tool | what it does |
@@ -122,9 +186,10 @@ A bound app always runs on its host. An app without `host:` runs wherever the co
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs <app>` | tail of the pm2 out/err logs on the app's host, ANSI stripped (`lines`, `stream`) |
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
+| `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json`, `ecosystem.json`, `Procfile` |
-| `start <target>` | app or profile, dependencies first; online apps untouched unless `reload` |
+| `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason |
 | `restart`, `stop`, `delete <target>` | by app or profile |
 | `flush [app]` | truncate pm2 log files; incidents start over from there |
 | `unpack` | bring pm2 (assembled with npm from the lockfile mcproc ships), and Node when the host has none ≥ 18, into `<cwd>/.mcproc/runtime` on that host |
