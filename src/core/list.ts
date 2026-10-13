@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { McprocError } from './errors.js';
-import type { App, AppKind, Manifest } from './manifest.js';
+import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
   parseJlist,
@@ -320,6 +320,13 @@ export async function describeApp(
   return { app, row, logs: p ? { out: p.out_log, err: p.err_log } : null, pm2 };
 }
 
+/** A dependency as the describe answers show it (the manifest keeps the timeout in ms): one shape for the project and for one app. */
+export const depView = (d: Dep) => ({
+  app: d.app,
+  condition: d.condition,
+  timeout_s: d.timeoutMs / 1000,
+});
+
 export function describeProject(m: Manifest) {
   const readmePath = path.join(m.root, '.mcproc', 'README.md');
   const readme = fs.existsSync(readmePath)
@@ -335,11 +342,7 @@ export function describeProject(m: Manifest) {
       description: a.description,
       ports: a.ports,
       url: a.url,
-      depends_on: a.depends_on.map((d) => ({
-        app: d.app,
-        condition: d.condition,
-        timeout_s: d.timeoutMs / 1000,
-      })),
+      depends_on: a.depends_on.map(depView),
       host: a.host,
     })),
     profiles: { ...m.profiles, all: Object.keys(m.apps) },

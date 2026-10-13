@@ -8,6 +8,7 @@ import {
   listFleet,
   describeFleetApp,
 } from '../../src/core/fleet.js';
+import { describeProject } from '../../src/core/list.js';
 import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
@@ -298,8 +299,13 @@ describe('one app by name (describe, logs)', () => {
     const d = await describeFleetApp(h.fleet, 'web');
     expect(d.host).toBe('box');
     expect(d.app.depends_on).toEqual([
-      { app: 'watch', condition: 'started', timeoutMs: 60_000 },
+      { app: 'watch', condition: 'started', timeout_s: 60 },
     ]);
+    // the project summary says the same thing about the same dependency
+    expect(
+      describeProject(h.fleet.manifest).apps.find((a) => a.name === 'web')
+        ?.depends_on
+    ).toEqual(d.app.depends_on);
     expect(d.row).toMatchObject({ host: 'box', status: 'online' });
     expect(d.pm2.cwd).toBe('/home/dev/fleet');
     expect(h.connected).toEqual(['box']);
@@ -455,6 +461,44 @@ describe('actOn start with conditions across hosts', () => {
     expect(ctxs.box.fake.calls.some((c) => /startOrRestart/.test(c.cmd))).toBe(
       false
     );
+  });
+  it('a skip decided in one host run holds in the later runs: libs (local) fails, web (box) is skipped, site (local, after web) is skipped and never launched', async () => {
+    const ctxs = {
+      local: fakeCtx(
+        dir,
+        'local',
+        rules([proc('libs', 'stopped', { exit_code: 2 })]),
+        'local'
+      ),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(
+      m2,
+      undefined,
+      async (_m, host) => ctxs[host as 'local' | 'box']
+    );
+    expect(f.runs(['libs', 'web', 'site']).map((r) => r.host)).toEqual([
+      'local',
+      'box',
+      'local',
+    ]);
+    const rows = await actOn(f, 'site', 'start');
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'libs failed (exit 2)',
+    });
+    expect(by.site).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: web was not started (libs failed (exit 2))',
+    });
+    const launched = (c: (typeof ctxs)[keyof typeof ctxs]) =>
+      c.fake.calls
+        .filter((x) => /startOrRestart/.test(x.cmd))
+        .map((x) => x.cmd);
+    expect(launched(ctxs.local)).toHaveLength(1); // libs only
+    expect(launched(ctxs.local)[0]).toContain("'fr-libs'");
+    expect(launched(ctxs.box)).toEqual([]);
   });
   it('a signal given to actOn reaches the wait on the dependency host: aborted, and the dependent on the other host is skipped', async () => {
     const ctxs = {

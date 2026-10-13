@@ -13,6 +13,12 @@ apps:
     host: box
     depends_on:
       - { app: libs, condition: completed }
+  site:
+    description: public site on this machine, needs the dev server in the container
+    run: node site.js
+    host: local
+    depends_on:
+      - web
 hosts:
   box:
     ssh: box

@@ -12,6 +12,7 @@ import {
 } from './actions.js';
 import { waitDependency } from './wait.js';
 import {
+  depView,
   describeApp,
   rowsFor,
   snapshot,
@@ -360,9 +361,17 @@ export async function listFleet(
   };
 }
 
-/** One app in detail, read on its host. The manifest entry is the full one: the host's view drops dependencies that run elsewhere. */
+/**
+ * One app in detail, read on its host. The manifest entry is the full one (the host's view drops dependencies that run
+ * elsewhere), with its dependencies in the shape the project summary uses.
+ */
 export async function describeFleetApp(fleet: Fleet, app: string) {
   const host = fleet.one(app);
   const d = await describeApp(await fleet.ctx(host), app);
-  return { ...d, app: fleet.manifest.apps[app], host };
+  const full = fleet.manifest.apps[app];
+  return {
+    ...d,
+    app: { ...full, depends_on: full.depends_on.map(depView) },
+    host,
+  };
 }
