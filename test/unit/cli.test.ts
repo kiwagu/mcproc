@@ -8,6 +8,7 @@ import { buildProgram } from '../../src/cli/program.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
 const fleet = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
 
 function capture() {
   const out: string[] = [],
@@ -91,6 +92,7 @@ describe('cli', () => {
       'delete',
       'flush',
       'incidents',
+      'wait',
       'monit',
       'unpack',
       'install',
@@ -200,6 +202,50 @@ describe('cli', () => {
       await buildProgram(c.io).parseAsync([...argv], { from: 'user' });
       expect(c.err[0], argv.join(' ')).toContain(code);
     }
+  });
+  it('wait: a bad --until, an unknown app and an app bound elsewhere are refused before any host is touched', async () => {
+    for (const [argv, code] of [
+      [
+        ['wait', 'libs', '--until', 'nope', '--project', readiness],
+        'BAD_ARGUMENT',
+      ],
+      [
+        ['wait', 'libs', '--until', 'log:(', '--project', readiness],
+        'BAD_ARGUMENT',
+      ],
+      [
+        ['wait', 'nope', '--until', 'exited', '--project', readiness],
+        'UNKNOWN_APP',
+      ],
+      [
+        [
+          'wait',
+          'web',
+          '--until',
+          'exited',
+          '--host',
+          'local',
+          '--project',
+          fleet,
+        ],
+        'WRONG_HOST',
+      ],
+    ] as const) {
+      const c = capture();
+      process.exitCode = 0;
+      await buildProgram(c.io).parseAsync([...argv], { from: 'user' });
+      expect(c.err[0], argv.join(' ')).toContain(code);
+      expect(process.exitCode, argv.join(' ')).toBe(1);
+    }
+  });
+  it('wait needs --until and takes -t', () => {
+    const cmd = buildProgram(capture().io).commands.find(
+      (c) => c.name() === 'wait'
+    )!;
+    expect(cmd.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--until', '--timeout'])
+    );
+    expect(cmd.options.find((o) => o.long === '--until')!.mandatory).toBe(true);
   });
   it('incidents takes by default; --peek looks without taking, -f keeps watching', () => {
     const cmd = buildProgram(capture().io).commands.find(

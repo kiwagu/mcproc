@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   startNote,
   waitNote,
+  renderWait,
   renderLs,
   renderPorts,
   renderDoctor,
@@ -430,6 +431,90 @@ describe('renderMutation', () => {
     expect(waitNote([])).toBe('');
     const r = renderMutation([row('online', [])], 'local', 'start', waits);
     expect(r.text).toContain('waited 4.2 s for libs (completed)');
+  });
+  it('renderWait: one line per outcome', () => {
+    const base = { until: 'listening', waited_ms: 1300, status: 'online' };
+    expect(renderWait('web', { ...base, ok: true, observed: ':3000 ✓' })).toBe(
+      'web: listening after 1.3 s (:3000 ✓)'
+    );
+    expect(
+      renderWait('libs', {
+        until: 'exited',
+        waited_ms: 12_400,
+        ok: true,
+        status: 'done',
+        exit_code: 0,
+      })
+    ).toBe('libs: done after 12.4 s (exit 0)');
+    expect(
+      renderWait('api', {
+        until: 'log:listening',
+        waited_ms: 800,
+        ok: true,
+        status: 'online',
+        matched_line: '2026-10-13T20:00:00.123: listening on 3010',
+      })
+    ).toBe(
+      'api: log matched after 0.8 s: 2026-10-13T20:00:00.123: listening on 3010'
+    );
+    expect(
+      renderWait('libs', {
+        until: 'idle:5',
+        waited_ms: 20_100,
+        ok: true,
+        status: 'online',
+      })
+    ).toBe('libs: idle:5 after 20.1 s');
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'timeout',
+        waited_ms: 60_000,
+        observed: 'status online, :3000 ✗ nothing listens',
+      })
+    ).toBe(
+      'web: listening not reached after 60.0 s (status online, :3000 ✗ nothing listens)'
+    );
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'exited',
+        waited_ms: 3100,
+        status: 'failed (exit 2)',
+        exit_code: 2,
+      })
+    ).toBe(
+      'web: exited (failed (exit 2)) after 3.1 s while waiting for listening'
+    );
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'crashed',
+        status: 'errored',
+      })
+    ).toBe('web: crashed (errored) after 1.3 s while waiting for listening');
+    expect(renderWait('web', { ...base, ok: false, reason: 'aborted' })).toBe(
+      'web: aborted after 1.3 s while waiting for listening'
+    );
+  });
+  it('renderWait: an exited wait names the exit code once, and not at all when there is none', () => {
+    const exited = { until: 'exited', waited_ms: 3100, ok: true };
+    expect(
+      renderWait('libs', {
+        ...exited,
+        status: 'failed (exit 2)',
+        exit_code: 2,
+      })
+    ).toBe('libs: failed (exit 2) after 3.1 s');
+    expect(
+      renderWait('libs', { ...exited, status: 'stopped', exit_code: null })
+    ).toBe('libs: stopped after 3.1 s');
+    expect(renderWait('libs', { ...exited, status: 'stopped' })).toBe(
+      'libs: stopped after 3.1 s'
+    );
   });
   it('a skipped dependent is a failed row', () => {
     const r = renderMutation(

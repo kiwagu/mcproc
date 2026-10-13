@@ -5,6 +5,7 @@ import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
 import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
 import type { WaitRecord } from '../core/actions.js';
+import type { WaitResult } from '../core/wait.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -230,6 +231,29 @@ export function renderLogs(l: LogsResult): string {
   if (l.err !== undefined)
     parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
+}
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+/** One line: what was reached (or not) after how long, and what was seen. */
+export function renderWait(app: string, r: WaitResult): string {
+  const seen = r.observed ? ` (${r.observed})` : '';
+  if (r.ok) {
+    if (r.until === 'exited') {
+      // "failed (exit 2)" already names its code; a stop has none
+      const code =
+        typeof r.exit_code === 'number' && !r.status.includes('exit')
+          ? ` (exit ${r.exit_code})`
+          : '';
+      return `${app}: ${r.status} after ${secs(r.waited_ms)}${code}`;
+    }
+    if (r.until.startsWith('log:'))
+      return `${app}: log matched after ${secs(r.waited_ms)}: ${r.matched_line}`;
+    return `${app}: ${r.until} after ${secs(r.waited_ms)}${seen}`;
+  }
+  if (r.reason === 'timeout')
+    return `${app}: ${r.until} not reached after ${secs(r.waited_ms)}${seen}`;
+  if (r.reason === 'aborted')
+    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}`;
+  return `${app}: ${r.reason} (${r.status}) after ${secs(r.waited_ms)} while waiting for ${r.until}`;
 }
 /** `libs (completed), api (ready), logger`: a started dependency is its bare name. */
 export function fmtDeps(deps: { app: string; condition: string }[]): string {

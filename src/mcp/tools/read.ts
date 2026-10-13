@@ -12,6 +12,7 @@ import {
 import { readLogs } from '../../core/logs.js';
 import { doctor } from '../../core/doctor.js';
 import { takeIncidents } from '../../core/incidents/store.js';
+import { parseUntil, waitFor } from '../../core/wait.js';
 import {
   renderLs,
   renderPorts,
@@ -21,6 +22,7 @@ import {
   fmtDeps,
   renderProject,
   renderIncidents,
+  renderWait,
   hostsOf,
 } from '../render.js';
 
@@ -201,6 +203,40 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         return {
           text: renderPorts(r, ctx.host.name),
           data: { host: ctx.host.name, ...r },
+        };
+      })
+  );
+
+  server.registerTool(
+    'wait',
+    {
+      title: 'Wait',
+      description:
+        'Block until an app is usable or finished. until: listening (every declared port is bound), url-ok (its url answers 2xx/3xx), exited (the process left online; the answer carries exit_code and done / failed (exit N) / stopped), log:<regex> (a new log line matches, ANSI stripped), idle:<seconds> (no log output for that long: a watcher settled). ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile — a result, not an error. Call it after start instead of sleeping or polling ls.',
+      inputSchema: {
+        ...commonInput,
+        app: z.string(),
+        until: z
+          .string()
+          .describe(
+            'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+          ),
+        timeout_s: z.number().int().min(1).max(600).optional(),
+      },
+      annotations: RO,
+    },
+    (args) =>
+      runTool(async () => {
+        const until = parseUntil(args.until); // a bad request is refused before any host is touched
+        const fleet = await fleetOf(args);
+        const ctx = await fleet.ctx(fleet.one(args.app));
+        const r = await waitFor(ctx, args.app, until, {
+          timeoutMs:
+            args.timeout_s === undefined ? undefined : args.timeout_s * 1000,
+        });
+        return {
+          text: renderWait(args.app, r),
+          data: { app: args.app, host: ctx.host.name, ...r },
         };
       })
   );

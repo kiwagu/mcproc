@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +14,7 @@ import type { UnpackDeps } from '../../src/runtime/unpack.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
 const fleet = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
 
 async function client(
   spawner?: Spawner,
@@ -33,7 +34,7 @@ const neverSpawn: Spawner = async (argv) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 14 tools with annotations and short instructions', async () => {
+  it('registers the 15 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -52,13 +53,22 @@ describe('mcp server', () => {
       'start',
       'stop',
       'unpack',
+      'wait',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
     }); // taking writes the local pick-up point
-    for (const n of ['hosts', 'doctor', 'ls', 'describe', 'logs', 'ports'])
+    for (const n of [
+      'hosts',
+      'doctor',
+      'ls',
+      'describe',
+      'logs',
+      'ports',
+      'wait',
+    ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
     for (const n of ['stop', 'delete', 'flush', 'init'])
       expect(byName[n].annotations?.destructiveHint).toBe(true); // init with force replaces the owner's manifest
@@ -185,6 +195,108 @@ describe('mcp server', () => {
     });
     expect(r.isError).toBeFalsy();
     expect(r.structuredContent.waits).toEqual([]);
+  });
+  it('wait: a finished one-shot answers ok with its exit code; a bad until is refused before any transport call', async () => {
+    const jlist = JSON.stringify([
+      {
+        pid: 0,
+        name: 'ready-libs',
+        pm_id: 0,
+        pm2_env: { status: 'stopped', namespace: 'ready', exit_code: 0 },
+      },
+    ]);
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'"))
+        return { code: 0, stdout: jlist, stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+    };
+    vi.useFakeTimers({ toFake: ['Date'] }); // the clock stands still: the wait took exactly 0.0 s
+    try {
+      const cl = await client(spawner);
+      const r: any = await cl.callTool({
+        name: 'wait',
+        arguments: { project: readiness, app: 'libs', until: 'exited' },
+      });
+      expect(r.isError).toBeUndefined();
+      expect(text(r)).toBe('libs: done after 0.0 s (exit 0)');
+      expect(r.structuredContent).toMatchObject({
+        app: 'libs',
+        host: 'local',
+        ok: true,
+        until: 'exited',
+        status: 'done',
+        exit_code: 0,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    const cl = await client(neverSpawn);
+    const bad = await cl.callTool({
+      name: 'wait',
+      arguments: { project: readiness, app: 'libs', until: 'nope' },
+    });
+    expect(bad.isError).toBe(true);
+    expect(text(bad)).toMatch(/^BAD_ARGUMENT/);
+    expect(
+      text(
+        await cl.callTool({
+          name: 'wait',
+          arguments: { project: readiness, app: 'nope', until: 'exited' },
+        })
+      )
+    ).toContain('UNKNOWN_APP');
+  });
+  it('wait: not reaching the condition is an answer, not an error; an app that never started is an error', async () => {
+    const online = (extra: object) =>
+      JSON.stringify([
+        {
+          pid: 4242,
+          name: 'ready-api',
+          pm_id: 1,
+          pm2_env: { status: 'online', namespace: 'ready', ...extra },
+        },
+      ]);
+    const run = async (jlist: string) => {
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, ps: '4242 1\n', tcp: '' }),
+            stderr: '',
+          };
+        if (cmd.includes("'jlist'"))
+          return { code: 0, stdout: jlist, stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+      return (await client(spawner)).callTool({
+        name: 'wait',
+        arguments: {
+          project: readiness,
+          app: 'api',
+          until: 'listening',
+          timeout_s: 1,
+        },
+      }) as Promise<any>;
+    };
+    const late = await run(online({}));
+    expect(late.isError).toBeUndefined();
+    expect(late.structuredContent).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'online',
+    });
+    expect(text(late)).toMatch(
+      /^api: listening not reached after 1\.\d s \(status online, :3100 ✗ nothing listens\)$/
+    );
+    const never = await run('[]');
+    expect(never.isError).toBe(true);
+    expect(text(never)).toMatch(/^NOT_STARTED/);
   });
   it('host-bound apps: a target on another host than --host, or on a readonly host, is refused before any transport call', async () => {
     const cl = await client(neverSpawn);
