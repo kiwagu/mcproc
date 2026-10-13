@@ -297,4 +297,14 @@ describe('hostsInfo / describe', () => {
     expect(d.readme).toBeNull();
     expect(ctx.fake.calls).toHaveLength(0);
   });
+  it('describeProject reports each dependency with its condition and timeout in seconds', () => {
+    const m = loadManifest(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness')
+    );
+    const web = describeProject(m).apps.find((a) => a.name === 'web')!;
+    expect(web.depends_on).toEqual([
+      { app: 'api', condition: 'ready', timeout_s: 90 },
+      { app: 'logger', condition: 'started', timeout_s: 60 },
+    ]);
+  });
 });

@@ -296,7 +296,9 @@ describe('one app by name (describe, logs)', () => {
     });
     const d = await describeFleetApp(h.fleet, 'web');
     expect(d.host).toBe('box');
-    expect(d.app.depends_on).toEqual(['watch']);
+    expect(d.app.depends_on).toEqual([
+      { app: 'watch', condition: 'started', timeoutMs: 60_000 },
+    ]);
     expect(d.row).toMatchObject({ host: 'box', status: 'online' });
     expect(d.pm2.cwd).toBe('/home/dev/fleet');
     expect(h.connected).toEqual(['box']);
@@ -353,7 +355,13 @@ describe('actOn when a host fails or refuses', () => {
       ...ro,
       apps: {
         ...ro.apps,
-        web: { ...ro.apps.web, depends_on: ['watch', 'audit'] },
+        web: {
+          ...ro.apps.web,
+          depends_on: [
+            { app: 'watch', condition: 'started' as const, timeoutMs: 60_000 },
+            { app: 'audit', condition: 'started' as const, timeoutMs: 60_000 },
+          ],
+        },
       },
     };
     const f = new Fleet(mm, undefined, never);

@@ -60,3 +60,18 @@ describe('buildEcosystem', () => {
     );
   });
 });
+
+describe('buildEcosystem for a task', () => {
+  it('a task is generated with autorestart false', () => {
+    const m = loadManifest(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness')
+    );
+    const eco = buildEcosystem(m, m.hosts.local);
+    expect(eco.apps.find((a) => a.name === 'ready-libs')!.autorestart).toBe(
+      false
+    );
+    expect(eco.apps.find((a) => a.name === 'ready-api')!.autorestart).toBe(
+      true
+    );
+  });
+});

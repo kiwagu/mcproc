@@ -23,6 +23,34 @@ const name = z.string().regex(NAME_RE, 'must match ^[a-z0-9][a-z0-9._-]*$');
 const envValue = z.union([z.string(), z.number(), z.boolean()]);
 const portNo = z.number().int().min(1).max(65535);
 
+export type AppKind = 'build' | 'server' | 'worker' | 'task';
+export type DepCondition = 'started' | 'ready' | 'completed';
+/** One dependency: which app, what state of it the dependent waits for, and how long. */
+export interface Dep {
+  app: string;
+  condition: DepCondition;
+  timeoutMs: number;
+}
+export const DEP_TIMEOUT_DEFAULT_S = 60;
+export const DEP_TIMEOUT_MAX_S = 600;
+
+/** A bare name means `started`; the object form names the condition and how long to wait for it. */
+const depSchema = z.union([
+  z.string().min(1),
+  z
+    .object({
+      app: z.string().min(1),
+      condition: z.enum(['started', 'ready', 'completed']).default('started'),
+      timeout: z
+        .number()
+        .int()
+        .min(1)
+        .max(DEP_TIMEOUT_MAX_S)
+        .default(DEP_TIMEOUT_DEFAULT_S),
+    })
+    .strict(),
+]);
+
 const errorsSchema = z.union([
   z.literal(false),
   z
@@ -44,7 +72,7 @@ const errorsSchema = z.union([
 const appSchema = z
   .object({
     description: z.string().min(1),
-    kind: z.enum(['build', 'server', 'worker']).default('server'),
+    kind: z.enum(['build', 'server', 'worker', 'task']).default('server'),
     run: z.string().min(1),
     cwd: z.string().min(1).default('.'),
     env: z.record(envValue).default({}),
@@ -60,8 +88,8 @@ const appSchema = z
     watch: z.union([z.boolean(), z.array(z.string())]).optional(),
     watch_delay: z.number().int().min(0).optional(),
     ignore_watch: z.array(z.string()).optional(),
-    depends_on: z.array(z.string()).default([]),
-    autorestart: z.boolean().default(true),
+    depends_on: z.array(depSchema).default([]),
+    autorestart: z.boolean().optional(),
     pm2: z.record(z.unknown()).default({}),
     host: name.optional(),
     errors: errorsSchema.optional(),
@@ -103,7 +131,6 @@ export const manifestSchema = z
   })
   .strict();
 
-export type AppKind = 'build' | 'server' | 'worker';
 /** What counts as an error in an app's logs (the `incidents` tool); null when the app turned detection off. */
 export interface ErrorSettings {
   match: string[];
@@ -124,7 +151,7 @@ export interface App {
   watch?: boolean | string[];
   watch_delay?: number;
   ignore_watch?: string[];
-  depends_on: string[];
+  depends_on: Dep[];
   autorestart: boolean;
   pm2: Record<string, unknown>;
   /** the host this app always runs on; null = wherever the command points (--host, default local) */
@@ -200,7 +227,7 @@ function findCycle(apps: Record<string, App>): string[] | null {
     state.set(n, 1);
     stack.push(n);
     for (const d of apps[n]?.depends_on ?? []) {
-      const c = visit(d);
+      const c = visit(d.app);
       if (c) return c;
     }
     stack.pop();
@@ -212,6 +239,18 @@ function findCycle(apps: Record<string, App>): string[] | null {
     if (c) return c;
   }
   return null;
+}
+
+/**
+ * A union entry that fails gives zod one `invalid_union` issue on the entry whose real reasons sit in its branches:
+ * flatten them so the message names the field (`apps.w.depends_on.0.timeout`), not just the entry.
+ */
+function flattenIssues(issues: z.ZodIssue[]): z.ZodIssue[] {
+  return issues.flatMap((i) =>
+    i.code === 'invalid_union'
+      ? flattenIssues(i.unionErrors.flatMap((e) => e.issues))
+      : [i]
+  );
 }
 
 /** A name the manifest itself declares (never one every JavaScript object has, like `constructor`). */
@@ -233,7 +272,7 @@ export function parseManifest(
   }
   const res = manifestSchema.safeParse(raw);
   if (!res.success) {
-    const issues = res.error.issues.map(
+    const issues = flattenIssues(res.error.issues).map(
       (i) => `${i.path.join('.') || '(root)'}: ${i.message}`
     );
     throw new McprocError(
@@ -251,9 +290,39 @@ export function parseManifest(
   for (const [n, a] of Object.entries(m.apps)) {
     if (a.port !== undefined && a.ports !== undefined)
       problems.push(`apps.${n}: use either port or ports, not both`);
-    for (const d of a.depends_on)
-      if (!own(m.apps, d))
-        problems.push(`apps.${n}.depends_on: unknown app "${d}"`);
+    const deps: Dep[] = a.depends_on.map((d) =>
+      typeof d === 'string'
+        ? {
+            app: d,
+            condition: 'started',
+            timeoutMs: DEP_TIMEOUT_DEFAULT_S * 1000,
+          }
+        : { app: d.app, condition: d.condition, timeoutMs: d.timeout * 1000 }
+    );
+    for (const d of deps) {
+      if (!own(m.apps, d.app)) {
+        problems.push(`apps.${n}.depends_on: unknown app "${d.app}"`);
+        continue;
+      }
+      const dep = m.apps[d.app];
+      if (d.condition === 'completed' && dep.kind !== 'task')
+        problems.push(
+          `apps.${n}.depends_on: "${d.app}" must be kind: task for condition completed (it is ${dep.kind})`
+        );
+      if (
+        d.condition === 'ready' &&
+        dep.port === undefined &&
+        (dep.ports ?? []).length === 0 &&
+        dep.url === undefined
+      )
+        problems.push(
+          `apps.${n}.depends_on: "${d.app}" declares no port or url, so ready cannot be observed`
+        );
+    }
+    if (a.kind === 'task' && a.autorestart === true)
+      problems.push(
+        `apps.${n}.autorestart: a task runs once; drop autorestart or use kind: worker`
+      );
     // stop, delete, logs and ports act on one pm2 process per app: settings that start several would leave the rest running
     const instances = (a.pm2 as Record<string, unknown>).instances;
     if (instances !== undefined && instances !== 1)
@@ -308,8 +377,8 @@ export function parseManifest(
       watch: a.watch,
       watch_delay: a.watch_delay ?? (a.watch ? 1000 : undefined),
       ignore_watch: a.ignore_watch,
-      depends_on: a.depends_on,
-      autorestart: a.autorestart,
+      depends_on: deps,
+      autorestart: a.autorestart ?? a.kind !== 'task',
       pm2: a.pm2,
       host: a.host ?? null,
       errors,
@@ -420,7 +489,7 @@ export function scopeManifest(
       .map((a) => [a.name, a])
   );
   for (const [n, a] of Object.entries(apps)) {
-    const deps = a.depends_on.filter((d) => d in apps);
+    const deps = a.depends_on.filter((d) => d.app in apps);
     if (deps.length !== a.depends_on.length)
       apps[n] = { ...a, depends_on: deps };
   }

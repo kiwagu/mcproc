@@ -12,6 +12,7 @@ import {
   renderMutation,
   fmtCpu,
   fmtUrl,
+  fmtDeps,
 } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
@@ -395,5 +396,18 @@ describe('renderMutation', () => {
       failed: false,
       text: expect.not.stringContaining('failed'),
     });
+  });
+});
+
+describe('fmtDeps', () => {
+  it('names a started dependency bare and any other with its condition', () => {
+    expect(
+      fmtDeps([
+        { app: 'libs', condition: 'completed' },
+        { app: 'api', condition: 'ready' },
+        { app: 'logger', condition: 'started' },
+      ])
+    ).toBe('libs (completed), api (ready), logger');
+    expect(fmtDeps([])).toBe('');
   });
 });

@@ -18,6 +18,7 @@ import {
   renderHosts,
   renderDoctor,
   renderLogs,
+  fmtDeps,
   renderProject,
   renderIncidents,
   hostsOf,
@@ -137,7 +138,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           `run: ${d.app.run}`,
           `cwd: ${d.app.cwd}`,
           d.app.depends_on.length
-            ? `depends_on: ${d.app.depends_on.join(', ')}`
+            ? `depends_on: ${fmtDeps(d.app.depends_on)}`
             : '',
           renderLs([d.row], d.host),
           `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,

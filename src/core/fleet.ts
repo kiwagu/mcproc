@@ -194,10 +194,10 @@ function dependsOn(
   seen = new Set<string>()
 ): boolean {
   for (const d of m.apps[app]?.depends_on ?? []) {
-    if (d === dep) return true;
-    if (!seen.has(d)) {
-      seen.add(d);
-      if (dependsOn(m, d, dep, seen)) return true;
+    if (d.app === dep) return true;
+    if (!seen.has(d.app)) {
+      seen.add(d.app);
+      if (dependsOn(m, d.app, dep, seen)) return true;
     }
   }
   return false;

@@ -230,6 +230,15 @@ export function renderLogs(l: LogsResult): string {
     parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
 }
+/** `libs (completed), api (ready), logger`: a started dependency is its bare name. */
+export function fmtDeps(deps: { app: string; condition: string }[]): string {
+  return deps
+    .map((d) =>
+      d.condition === 'started' ? d.app : `${d.app} (${d.condition})`
+    )
+    .join(', ');
+}
+
 export function renderProject(d: {
   project: string;
   root: string;
@@ -239,7 +248,7 @@ export function renderProject(d: {
     description: string;
     ports: number[];
     url: string | null;
-    depends_on: string[];
+    depends_on: { app: string; condition: string }[];
     host: string | null;
   }[];
   profiles: Record<string, string[]>;
@@ -249,7 +258,7 @@ export function renderProject(d: {
   const L = [`project: ${d.project} (${d.root})`, 'apps:'];
   for (const a of d.apps)
     L.push(
-      `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`
+      `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${fmtDeps(a.depends_on)}` : ''}: ${a.description}`
     );
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles))

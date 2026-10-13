@@ -32,7 +32,7 @@ export function orderWithDeps(m: Manifest, names: string[]): string[] {
   const visit = (n: string) => {
     if (seen.has(n)) return;
     seen.add(n);
-    for (const d of m.apps[n].depends_on) visit(d);
+    for (const d of m.apps[n].depends_on) visit(d.app);
     out.push(n);
   };
   for (const n of names) visit(n);

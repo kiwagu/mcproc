@@ -307,7 +307,11 @@ export function describeProject(m: Manifest) {
       description: a.description,
       ports: a.ports,
       url: a.url,
-      depends_on: a.depends_on,
+      depends_on: a.depends_on.map((d) => ({
+        app: d.app,
+        condition: d.condition,
+        timeout_s: d.timeoutMs / 1000,
+      })),
       host: a.host,
     })),
     profiles: { ...m.profiles, all: Object.keys(m.apps) },

@@ -1,0 +1,32 @@
+version: 1
+project: ready
+apps:
+  libs:
+    description: one-shot build of the shared libraries
+    kind: task
+    run: node build.js
+  api:
+    description: HTTP API
+    run: node api.js
+    port: 3100
+    depends_on:
+      - { app: libs, condition: completed }
+  web:
+    description: web dev server, needs the API up
+    run: node web.js
+    port: 3200
+    url: http://localhost:3200/
+    depends_on:
+      - { app: api, condition: ready, timeout: 90 }
+      - logger
+  logger:
+    description: log shipper, fire and forget
+    kind: worker
+    run: node logger.js
+  cli:
+    description: a tool that only needs the libs to exist, whenever
+    kind: worker
+    run: node cli.js
+    depends_on: [libs]
+profiles:
+  stack: [libs, api, web, logger]
