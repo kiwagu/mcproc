@@ -94,8 +94,9 @@ the exit code is pm2's `exit_code`: 0 is `done`; no code, 130 or 143 (a stop) is
 `failed (exit N)`. So a task that itself exits 130 or 143 reads `stopped`. A manual stop reads `stopped` because
 mcproc puts `trap 'exit 130' INT; trap 'exit 143' TERM;` in front of the command of an app with autorestart off,
 since pm2 itself records exit code 0 for a process killed by a signal. Two edges: a `run` that starts with `exec …`
-replaces the shell and loses the trap, so a manual stop of it reads `done`; a task that ignores SIGINT until pm2's
-kill timeout (SIGKILL) also reads `done`. The host shell must be POSIX (`bash` or `sh`): the default shell and the
+replaces the shell and loses the trap, so a manual stop of it reads `done`; a task whose process tree takes longer
+than pm2's kill timeout (1.6 s by default) to exit after SIGINT, whether it ignores the signal or only cleans up
+slowly, is killed with SIGKILL and also reads `done`. The host shell must be POSIX (`bash` or `sh`): the default shell and the
 documented `/bin/sh -c` both are. pm2 keeps no exit time, so UPTIME stays `-`. `start` on a done or failed task runs
 it again. `init` drafts `build`, `migrate`, `seed` and `once` scripts as tasks and watch-style commands as `build`.
 
@@ -149,7 +150,7 @@ instead of sleeping and polling:
 | `listening` | every declared port is bound (needs `port`/`ports`) |
 | `url-ok` | the `url` answers 2xx/3xx (requested from the host, as `ls` does) |
 | `exited` | the process left `online`; with autorestart off the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped`, otherwise pm2's `stopped` or `errored` |
-| `log:<regex>` | a new line of its out or err log matches (ANSI stripped; history is not searched) |
+| `log:<regex>` | a new line of its out or err log matches (ANSI stripped, matched against the line without pm2's time stamp; the answer keeps the stamp; history is not searched) |
 | `idle:<seconds>` | no log output for that long: a watcher settled |
 
 `url-ok` needs `curl` or `wget` on the host: without either it runs to the timeout and reports `unchecked`.
@@ -163,7 +164,8 @@ The answer is one line: `web: listening after 1.3 s (:3000 ✓)`, `libs: done af
 (default 60 s, max 600) it says what was last seen (`web: listening not reached after 60.0 s (status online, :3000 ✗
 nothing listens)`), and `ok` is false. If the process dies meanwhile, the wait ends at once with its reason and
 status and no observation, for example `web: exited (stopped) after 3.2 s while waiting for listening` (`observed`
-is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. Claude
+is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. A process that pm2 is
+restarting (a watch restart, a restart delay) is not dead: the wait goes on, bounded by the timeout. Claude
 Code does not cut a long MCP call, but moves one into the background after two minutes. A cancelled MCP `wait` (or
 `start`) call stops the polling at once.
 
@@ -182,6 +184,8 @@ host, also when the dependent runs elsewhere. A done task is run again, a runnin
 fails, times out or dies, the dependent is not started: its row reads `skipped` with the reason, and so do the apps
 that depend on it; unrelated apps still start. The answer adds `waited 4.2 s for libs (completed)` for each wait that was met (a failed
 wait shows in the rows), `start`'s JSON carries the waits as `waits[]`, and the CLI exits 1 when anything was skipped. With `--host X`, dependencies that run elsewhere are neither started nor waited for.
+`restart` does not order apps by their dependencies or wait for conditions; `start` does, and `start --reload`
+restarts the apps that are already online the same way.
 
 ## Tools (MCP) and commands (CLI)
 

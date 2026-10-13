@@ -138,7 +138,7 @@ export function startNote(rows: LsRow[]): string {
       )
   );
   return booting.length
-    ? `note: ${booting.map((r) => r.app).join(', ')} not listening yet; ports are sampled right after start, call ls again if the app is still booting`
+    ? `note: ${booting.map((r) => r.app).join(', ')} not listening yet; ports are sampled right after start, call wait until listening instead of polling ls`
     : '';
 }
 

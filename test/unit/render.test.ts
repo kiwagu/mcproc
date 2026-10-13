@@ -49,12 +49,12 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
 });
 
 describe('startNote', () => {
-  it('tells the reader to look again when an online app does not listen on its declared port yet', () => {
+  it('points the reader at wait, not at polling ls, when an online app does not listen on its declared port yet', () => {
     expect(
       startNote([
         row('online', [{ port: 3000, status: 'declared-not-listening' }]),
       ])
-    ).toContain('call ls again');
+    ).toContain('call wait until listening instead of polling ls');
   });
   it('stays silent when every port listens, when someone else holds the port, or when the app is not online', () => {
     expect(

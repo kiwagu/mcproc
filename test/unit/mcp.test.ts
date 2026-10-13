@@ -88,10 +88,18 @@ describe('mcp server', () => {
       /bundled with mcproc|ships inside/
     );
     // what an agent must know before it calls wait
-    expect(byName.wait.description).toMatch(
-      /log: and idle: see only output written after the call begins/
+    const waitDesc = byName.wait.description as string;
+    expect(waitDesc).toMatch(
+      /log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
     );
-    expect(byName.wait.description).toMatch(/BAD_ARGUMENT/);
+    expect(waitDesc).not.toMatch(/before the action/); // a blocking call cannot precede the action it waits for
+    expect(waitDesc).toMatch(/BAD_ARGUMENT/);
+    expect(waitDesc).toMatch(/without pm2's time stamp.*keeps the stamp/);
+    expect(waitDesc).toMatch(
+      /autorestart off.*other app shows pm2's stopped or errored/
+    );
+    expect(waitDesc).not.toContain('—');
+    expect(waitDesc.length).toBeLessThan(1200);
     const waitProps = byName.wait.inputSchema.properties as Record<
       string,
       { description?: string }
