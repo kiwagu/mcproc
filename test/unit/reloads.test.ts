@@ -104,6 +104,21 @@ describe('detectReloads', () => {
       `${T('40')}[vite] (client) page reload /new.js`,
     ]);
   });
+  it('a stamp in whole seconds (pm2 logs from before millisecond stamps) is compared with the start at its own precision', () => {
+    const sec = (s: string) => `2026-10-14T12:00:${s}: `;
+    const r = detectReloads(
+      [
+        out(`${sec('04')}[tsx] change in old Restarting...`), // the second before the start: an earlier run
+        out(`${sec('05')}api listening on 3010`), // the boot, logged in the start's second
+        out(`${sec('30')}api listening on 3010`),
+      ],
+      rules,
+      { app: 'api', start: '2026-10-14T12:00:05.700', coversStart: true }
+    );
+    expect(r).toEqual([
+      expect.objectContaining({ time: '2026-10-14T12:00:30.000', lines: 1 }),
+    ]);
+  });
   it("out and err are merged by time; an unstamped line takes its own stream's previous stamp", () => {
     const r = detectReloads(
       [
@@ -203,6 +218,54 @@ describe('ReloadTracker', () => {
     ]);
     expect(t.flush()).toEqual([
       expect.objectContaining({ line: expect.stringContaining('/d.js') }),
+    ]);
+  });
+  it('a push that throws TIMEOUT leaves the tracker as it was', () => {
+    const slow = compileReloadRules(
+      { match: ['^(a|aa)+$'], ignore: [], defaults: true },
+      50
+    );
+    const t = new ReloadTracker(slow, opts);
+    expect(
+      t.push([out(`${T('10')}[vite] (client) page reload /a.js`)], 1_000)
+    ).toEqual([]);
+    expect(() =>
+      t.push([out(`${T('50')}${'a'.repeat(40)}b`)], 2_000)
+    ).toThrowError(expect.objectContaining({ code: 'TIMEOUT' }));
+    // an unstamped marker still takes out's stamp from before the failed push, so it joins the open burst
+    expect(t.push([out('[vite] (client) page reload /b.js')], 3_000)).toEqual(
+      []
+    );
+    expect(t.flush()).toEqual([
+      expect.objectContaining({
+        lines: 2,
+        time: '2026-10-14T12:00:10.000',
+        last_time: '2026-10-14T12:00:10.000',
+      }),
+    ]);
+  });
+  it('a marker pushed later with a much older stamp closes the open burst instead of joining it', () => {
+    const t = new ReloadTracker(rules, opts);
+    t.push([out(`${T('30')}[vite] (client) page reload /a.js`)], 1_000);
+    // a second older still joins: the other stream's line of the same rebuild
+    expect(
+      t.push(
+        [
+          {
+            stream: 'err',
+            text: `${T('29')}[vite] (client) page reload /b.js`,
+          },
+        ],
+        1_100
+      )
+    ).toEqual([]);
+    expect(
+      t.push([out(`${T('10')}[vite] (client) page reload /c.js`)], 1_200)
+    ).toEqual([
+      expect.objectContaining({ lines: 2, time: '2026-10-14T12:00:30.000' }),
+    ]);
+    expect(t.flush()).toEqual([
+      expect.objectContaining({ lines: 1, time: '2026-10-14T12:00:10.000' }),
     ]);
   });
   it('drops the boot burst when it covers the start, and ignores lines before the start', () => {

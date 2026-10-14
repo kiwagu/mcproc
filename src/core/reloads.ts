@@ -5,8 +5,9 @@ import {
   MATCH_BUDGET_MS,
   MAX_LINE,
   runOwnPatterns,
+  stampOf,
 } from './incidents/detect.js';
-import { stampMs } from './logsince.js';
+import { msStamp } from './logsince.js';
 import { stripAnsi } from './logs.js';
 import type { ReloadSettings } from './manifest.js';
 
@@ -92,6 +93,7 @@ export interface DetectOptions {
 type Kind = Pick<ReloadMarker, 'id' | 'kind'>;
 const CUSTOM: Kind = { id: 'custom', kind: 'rebuild' };
 type Stream = ReloadInput['stream'];
+/** Each stream's last stamp as pm2 wrote it (whole seconds or milliseconds), which its unstamped lines inherit. */
 type LastStamp = Record<Stream, string | null>;
 interface Hit {
   time: string | null;
@@ -115,6 +117,14 @@ interface Timed {
 }
 
 /**
+ * Whether a stamp is before the start. A stamp in whole seconds (a log written before millisecond stamps were set up)
+ * is compared with the start's second: read as `.000`, the boot line logged in the start's own second would fall
+ * before a start such as `…:05.700` and the next re-listen would be taken for the boot.
+ */
+const beforeStart = (stamp: string, start: string): boolean =>
+  stamp < (stamp.length > 19 ? start : start.slice(0, 19));
+
+/**
  * Each line's time: its stamp in milliseconds, or the previous stamp of its own stream (`last` carries it across
  * calls). With a start, lines before it and lines that cannot be placed are dropped. The rest are ordered by time,
  * out before err on equal time, file order within a stream; untimed lines go first. Times are host-local wall clock,
@@ -128,10 +138,11 @@ function timed(
   const lines: Timed[] = [];
   input.forEach((l, i) => {
     const plain = stripAnsi(l.text);
-    const own = stampMs(plain);
+    const own = stampOf(plain);
     if (own !== null) last[l.stream] = own;
-    const time = own ?? last[l.stream];
-    if (start !== null && (time === null || time < start)) return;
+    const stamp = own ?? last[l.stream];
+    if (start !== null && (stamp === null || beforeStart(stamp, start))) return;
+    const time = stamp === null ? null : msStamp(stamp);
     const ms = time === null ? null : Date.parse(`${time}Z`);
     lines.push({ time, ms, plain, stream: l.stream, i });
   });
@@ -197,9 +208,16 @@ function hits(
   return out;
 }
 
-/** A marker joins the open burst when it comes less than RELOAD_GAP_MS after the burst's last one. An untimed marker always joins; a timed one never joins an untimed burst, whose age is unknown. */
+/**
+ * A marker joins the open burst when it comes less than RELOAD_GAP_MS after the burst's last one, or no more than that
+ * before it (a marker pushed later with a much older stamp starts a burst of its own). An untimed marker always joins;
+ * a timed one never joins an untimed burst, whose age is unknown.
+ */
 const joins = (b: Burst, h: Hit): boolean =>
-  h.ms === null || (b.lastMs !== null && h.ms - b.lastMs < RELOAD_GAP_MS);
+  h.ms === null ||
+  (b.lastMs !== null &&
+    h.ms - b.lastMs < RELOAD_GAP_MS &&
+    b.lastMs - h.ms <= RELOAD_GAP_MS);
 const opened = (h: Hit): Burst => ({
   first: h,
   lastTime: h.time,
@@ -229,7 +247,7 @@ const reloadOf = (b: Burst): Reload => ({
  * log has no later stamp to compare with.
  */
 export class ReloadTracker {
-  private readonly last: LastStamp = { out: null, err: null };
+  private last: LastStamp = { out: null, err: null };
   private open: Burst | null = null;
   private openWall = 0; // when the open burst's last marker arrived
   private bootPending: boolean; // the first burst to close may still be the boot
@@ -241,10 +259,19 @@ export class ReloadTracker {
     this.bootPending = opts.coversStart;
   }
 
-  /** The reloads these lines completed. */
+  /**
+   * The reloads these lines completed. One call carries every stream's new lines, as the log follower delivers them:
+   * lines are put in time order within a call only, so a stream held back for a later call would bring older stamps,
+   * and a marker more than RELOAD_GAP_MS older than the open burst closes it rather than joining it. A call that throws
+   * (TIMEOUT on the app's own patterns) leaves the tracker as it was.
+   */
   push(input: ReloadInput[], nowMs: number): Reload[] {
+    // the streams' stamps advance on a copy, kept only once classification succeeded
+    const last = { ...this.last };
+    const found = hits(input, this.rules, this.opts, last);
+    this.last = last;
     const done: Reload[] = [];
-    for (const h of hits(input, this.rules, this.opts, this.last)) {
+    for (const h of found) {
       if (this.open && joins(this.open, h)) add(this.open, h);
       else {
         this.close(done);

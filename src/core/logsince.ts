@@ -137,10 +137,12 @@ export function cutoffFor(
   }
 }
 
+/** A pm2 stamp normalised to milliseconds: `…:ss` reads as `…:ss.000`. */
+export const msStamp = (t: string): string => (t.length > 19 ? t : `${t}.000`);
 /** pm2's stamp of a line, normalised to milliseconds (`…:ss` reads as `…:ss.000`); null for an unstamped line. */
 export function stampMs(line: string): string | null {
   const t = stampOf(line);
-  return t === null || t.length > 19 ? t : `${t}.000`;
+  return t === null ? null : msStamp(t);
 }
 
 export interface Stamped {
