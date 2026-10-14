@@ -20,7 +20,10 @@ export interface Skipped {
   reason: string;
 }
 
-/** Which undeclared ports each running app may take: not ephemeral, not declared by another app. */
+/**
+ * Which undeclared ports each running app may take: not ephemeral, not declared by another app. A port taken earlier in
+ * the same run counts as declared by the app that took it, so two apps never adopt one port.
+ */
 export function planAdoption(
   rows: LsRow[],
   m: Manifest
@@ -45,6 +48,7 @@ export function planAdoption(
         });
       else take.push(p);
     }
+    for (const p of take) declaredBy.set(p, r.app);
     if (take.length) adopted.push({ app: r.app, host: r.host, ports: take });
     if (eph.length)
       skipped.push({
@@ -66,40 +70,73 @@ const lineEnd = (t: string, at: number) => {
   const i = t.indexOf('\n', at);
   return i < 0 ? t.length : i;
 };
-/** A block collection's range runs past its closing newline, a scalar's or a flow collection's stops at its last character: step back to that character. */
+/** Step back to the last non-blank character: a block node's range runs past its closing newline. */
 const contentEnd = (t: string, at: number) => {
   let e = at;
   while (e > 0 && /\s/.test(t[e - 1])) e--;
   return e;
 };
 
+const NOT_EDITABLE = 'not editable in place (alias or unusual key)';
+const ALREADY_DECLARED = 'already declared in the file';
+
+export interface Splice {
+  text: string;
+  /** the apps whose ports were written in */
+  edited: string[];
+  /** the apps left as they were, and why */
+  unedited: { app: string; reason: string }[];
+}
+
 /**
  * The manifest text with the adopted ports written in. Edits are spliced at the YAML nodes' own byte offsets, from the
  * end of the text backwards, so every other byte (comments, spacing, key order) stays as it was; re-serialising the
- * document instead would move comments. A `port: N` becomes `ports: [N, …]` in place, a flow `ports` list is rewritten
- * between its brackets, a block `ports` list gets one `- N` line per new port under its last item. An app with no port
- * yet gets `port: N` (one port) or `ports: […]` as a new field after its last one: a line of its own in a block map,
- * `, field` before the closing brace of a flow map.
+ * document instead would move comments.
+ * - `port: N` becomes `ports: [N, …]` in place; a one-line flow `ports` list is rewritten, sorted, between its brackets;
+ *   a flow list over several lines (which may hold comments) gets `, N` after its last item.
+ * - A block `ports` list gets a `- N` line in front of the first larger item, or after the list and the commented-out
+ *   items that trail it.
+ * - An app with no port yet gets `port: N` (one port) or `ports: […]` as a new field after its last one: a line of its
+ *   own in a block map, after any commented-out entries that close the last field's block; `, field` before the
+ *   closing brace of a flow map.
+ * An app that is an alias, or whose ports are all in the text already, is left alone and listed in `unedited`.
  */
-export function spliceManifest(text: string, adopted: Adopted[]): string {
+export function spliceManifest(text: string, adopted: Adopted[]): Splice {
   const doc = parseDocument(text);
   // declared ports as the loader reads them, aliases resolved
   const js = doc.toJS() as {
     apps?: Record<string, { port?: number; ports?: number[] }>;
   };
+  const appsNode = doc.get('apps', true);
   const byApp = new Map<string, number[]>();
   for (const a of adopted)
     byApp.set(a.app, [...(byApp.get(a.app) ?? []), ...a.ports]);
   const edits: { start: number; end: number; insert: string }[] = [];
+  const insertAt = (at: number, insert: string) =>
+    edits.push({ start: at, end: at, insert });
+  const edited: string[] = [];
+  const unedited: Splice['unedited'] = [];
   for (const [name, ports] of byApp) {
-    const app = doc.getIn(['apps', name], true);
-    if (!isMap(app) || app.items.length === 0) continue;
+    // the loader names an app by its key read as a string, so `1:` is app "1" here too
+    const app = isMap(appsNode)
+      ? appsNode.items.find(
+          (p) => isScalar(p.key) && String(p.key.value) === name
+        )?.value
+      : undefined;
+    if (!isMap(app) || app.items.length === 0) {
+      unedited.push({ app: name, reason: NOT_EDITABLE });
+      continue;
+    }
     const own = js.apps?.[name] ?? {};
     const declared = own.ports ?? (own.port === undefined ? [] : [own.port]);
     const added = [...new Set(ports)]
       .filter((p) => !declared.includes(p))
       .sort((x, y) => x - y);
-    if (added.length === 0) continue;
+    if (added.length === 0) {
+      unedited.push({ app: name, reason: ALREADY_DECLARED });
+      continue;
+    }
+    edited.push(name);
     const all = [...declared, ...added].sort((x, y) => x - y);
     const list = `[${all.join(', ')}]`;
     const pairOf = (k: string) =>
@@ -108,14 +145,42 @@ export function spliceManifest(text: string, adopted: Adopted[]): string {
     if (target) {
       const kr = rangeOf(target.key)!;
       const v = target.value;
-      if (isSeq(v) && !v.flow && v.items.length > 0) {
-        const ir = rangeOf(v.items[v.items.length - 1])!;
-        const prefix = text.slice(lineStart(text, ir[0]), ir[0]); // "      - "
-        const at = lineEnd(text, contentEnd(text, ir[1]));
-        const lines = added.map((p) => `\n${prefix}${p}`).join('');
-        edits.push({ start: at, end: at, insert: lines });
+      const vr = rangeOf(v)!; // every value node has one, `ports: []` and a value on the next line included
+      if (isSeq(v) && v.items.length > 0 && !v.flow) {
+        const items = v.items.map((i) => ({
+          r: rangeOf(i)!,
+          n: isScalar(i) ? Number(i.value) : Number.NaN,
+        }));
+        const prefix = (r: Range) => text.slice(lineStart(text, r[0]), r[0]); // "      - "
+        const before = new Map<number, number[]>();
+        const after: number[] = [];
+        for (const p of added) {
+          const k = items.findIndex((i) => i.n > p);
+          if (k < 0) after.push(p);
+          else before.set(k, [...(before.get(k) ?? []), p]);
+        }
+        for (const [k, ps] of before) {
+          const r = items[k].r;
+          insertAt(
+            lineStart(text, r[0]),
+            ps.map((p) => `${prefix(r)}${p}\n`).join('')
+          );
+        }
+        if (after.length) {
+          const last = items[items.length - 1].r;
+          insertAt(
+            lineEnd(text, contentEnd(text, vr[2])),
+            after.map((p) => `\n${prefix(last)}${p}`).join('')
+          );
+        }
+      } else if (
+        isSeq(v) &&
+        v.items.length > 0 &&
+        text.slice(vr[0], vr[1]).includes('\n')
+      ) {
+        const last = rangeOf(v.items[v.items.length - 1])!;
+        insertAt(last[1], added.map((p) => `, ${p}`).join(''));
       } else {
-        const vr = rangeOf(v)!; // every value node has one, `ports: []` and a value on the next line included
         edits.push({ start: vr[0], end: vr[1], insert: list });
         if (isScalar(target.key) && target.key.value === 'port')
           edits.push({ start: kr[0], end: kr[1], insert: 'ports' });
@@ -127,27 +192,27 @@ export function spliceManifest(text: string, adopted: Adopted[]): string {
         ? `port: ${all[0]}`
         : `ports: ${list}`;
     const last = app.items[app.items.length - 1];
-    const end = contentEnd(
-      text,
-      (rangeOf(last.value) ?? rangeOf(last.key)!)[1]
-    );
+    const lr = rangeOf(last.value) ?? rangeOf(last.key)!;
     if (app.flow) {
-      edits.push({ start: end, end, insert: `, ${field}` });
+      // the value's own end: with what trails it, a flow map over several lines would put the field in a comment
+      insertAt(contentEnd(text, lr[1]), `, ${field}`);
       continue;
     }
     const kr = rangeOf(app.items[0].key)!;
     const indent = text.slice(lineStart(text, kr[0]), kr[0]);
-    // the end of the last field's line, past its trailing comment: the new line goes right under it
-    const at = lineEnd(text, end);
-    edits.push({ start: at, end: at, insert: `\n${indent}${field}` });
+    // past what trails the last value (its comment, the commented-out entries that close its block): the new line goes under them
+    insertAt(lineEnd(text, contentEnd(text, lr[2])), `\n${indent}${field}`);
   }
   let out = text;
   for (const e of edits.sort((x, y) => y.start - x.start))
     out = `${out.slice(0, e.start)}${e.insert}${out.slice(e.end)}`;
-  return out;
+  return { text: out, edited, unedited };
 }
 
-/** A line diff with one line of context on each side of a change, no hunk headers; [] when the texts are equal. */
+/**
+ * A line diff with one line of context on each side of a change and a `…` line between hunks that are not next to each
+ * other; [] when the texts are equal.
+ */
 export function lineDiff(before: string, after: string): string[] {
   const a = before.split('\n');
   const b = after.split('\n');
@@ -175,7 +240,15 @@ export function lineDiff(before: string, after: string): string[] {
     else ops.push(`+${b[j++]}`);
   }
   const changed = (k: number) => k >= 0 && k < ops.length && ops[k][0] !== ' ';
-  return ops.filter((_, k) => changed(k) || changed(k - 1) || changed(k + 1));
+  const out: string[] = [];
+  let prev = -1;
+  for (let k = 0; k < ops.length; k++) {
+    if (!changed(k) && !changed(k - 1) && !changed(k + 1)) continue;
+    if (out.length > 0 && k !== prev + 1) out.push('…');
+    out.push(ops[k]);
+    prev = k;
+  }
+  return out;
 }
 
 export interface AdoptResult {
@@ -189,8 +262,9 @@ export interface AdoptResult {
 
 /**
  * Write the ports `ls` reports as undeclared into the manifest: the hosts are probed like `ls` (an unreachable host is
- * an error entry; its apps are left alone), the plan is spliced into the text read before probing, and nothing is
- * written when the file changed meanwhile or when there is nothing to adopt.
+ * an error entry; its apps are left alone), the plan is made against the text read before probing and spliced into
+ * it, and nothing is written when the file changed meanwhile, when there is nothing to adopt, or when no app could be
+ * edited in place.
  */
 export async function adoptPorts(fleet: Fleet): Promise<AdoptResult> {
   const m = fleet.manifest;
@@ -203,29 +277,54 @@ export async function adoptPorts(fleet: Fleet): Promise<AdoptResult> {
       }
     );
   const before = fs.readFileSync(m.path, 'utf8');
+  // the text that will be edited, not the copy the fleet loaded earlier: a port declared in between is seen
+  const current = parseManifest(before, m.root, m.path);
   // ports come from the listener sections, which the light probe keeps: no CPU sample, tree metrics or URL checks
   const { rows, errors } = await listFleet(fleet, fleet.select(['all']), {
     cpu: 'none',
     metrics: 'none',
     urls: 'none',
   });
-  const plan = planAdoption(rows, m);
-  if (plan.adopted.length === 0)
-    return { path: m.path, written: false, ...plan, errors, diff: [] };
-  const after = spliceManifest(before, plan.adopted);
-  parseManifest(after, m.root, m.path); // never write a manifest the loader would refuse
+  const plan = planAdoption(rows, current);
+  const splice = spliceManifest(before, plan.adopted);
+  const why = new Map(splice.unedited.map((u) => [u.app, u.reason]));
+  const adopted = plan.adopted.filter((a) => !why.has(a.app));
+  const skipped = [
+    ...plan.skipped,
+    ...plan.adopted
+      .filter((a) => why.has(a.app))
+      .map((a) => ({ ...a, reason: why.get(a.app)! })),
+  ];
+  if (splice.text === before)
+    return { path: m.path, written: false, adopted, skipped, errors, diff: [] };
+  try {
+    parseManifest(splice.text, m.root, m.path); // never write a manifest the loader would refuse
+  } catch (e) {
+    const issues = (e as McprocError).details;
+    const reason = Array.isArray(issues)
+      ? issues.join('; ')
+      : (e as Error).message;
+    throw new McprocError(
+      'MANIFEST_INVALID',
+      `adopting the ports would make ${m.path} invalid, so nothing was written: ${reason}`,
+      {
+        hint: 'Add the ports by hand; ls lists them under ports.undeclared.',
+      }
+    );
+  }
   if (fs.readFileSync(m.path, 'utf8') !== before)
     throw new McprocError(
       'ALREADY_EXISTS',
       `${m.path} changed while the ports were being probed; nothing written`,
       { hint: 'Run init --adopt-ports again.' }
     );
-  fs.writeFileSync(m.path, after);
+  fs.writeFileSync(m.path, splice.text);
   return {
     path: m.path,
     written: true,
-    ...plan,
+    adopted,
+    skipped,
     errors,
-    diff: lineDiff(before, after),
+    diff: lineDiff(before, splice.text),
   };
 }
