@@ -8,6 +8,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer, INSTRUCTIONS } from '../../src/mcp/server.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { probeOut } from '../helpers/probe.js';
+import { S, answerReads } from '../helpers/incidents.js';
 import type { Spawner } from '../../src/transport/types.js';
 import type { UnpackDeps } from '../../src/runtime/unpack.js';
 
@@ -106,6 +107,10 @@ describe('mcp server', () => {
     >;
     expect(waitProps.app.description).toBeTruthy();
     expect(waitProps.timeout_s.description).toMatch(/default 60, max 600/);
+    const logsDesc = byName.logs.description as string;
+    expect(logsDesc).toContain('since');
+    expect(logsDesc).toContain('targets');
+    expect(INSTRUCTIONS).toContain('since');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -601,5 +606,165 @@ describe('mcp server', () => {
       arguments: { project: proj, app: 'api' },
     });
     expect(text(second)).toMatch(/^no new incidents since/);
+  });
+});
+
+describe('logs since', () => {
+  // the basic fixture's base profile, both apps started on local; the host's clock reads 11:00:40
+  const setup = () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-since-'));
+    fs.cpSync(basic, project, { recursive: true });
+    const p = (app: string, pm_id: number) => ({
+      pid: 10 + pm_id,
+      name: `demo-${app}`,
+      pm_id,
+      pm2_env: {
+        status: 'online',
+        namespace: 'demo',
+        restart_time: 0,
+        pm_out_log_path: `/l/${app}-out`,
+        pm_err_log_path: `/l/${app}-err`,
+      },
+    });
+    const jlist = JSON.stringify([p('api-build', 0), p('api', 1)]);
+    const files: Record<string, string> = {
+      '/l/api-build-out': `${S(20)}build old\n${S(31)}build done\n${S(35)}build watching\n`,
+      '/l/api-build-err': '',
+      '/l/api-out': `${S(25)}api old\n${S(32)}listening 3310\n`,
+      '/l/api-err': `${S(33)}warn slow\n`,
+    };
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'"))
+        return { code: 0, stdout: jlist, stderr: '' };
+      if (cmd.includes('__MCPROC_LS_CLOCK__'))
+        return {
+          code: 0,
+          stdout: `__MCPROC_LS_CLOCK__ 2026-10-12T11:00:40 +0000\n${answerReads(cmd, files)}`,
+          stderr: '',
+        };
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    return { project, files, spawner };
+  };
+  it('merged mode: the lines of a profile since a span, in stamp order across the apps', async () => {
+    const { project, spawner } = setup();
+    const r: any = await (await client(spawner)).callTool({
+      name: 'logs',
+      arguments: { project, targets: ['base'], since: '10s' },
+    });
+    expect(r.isError).toBeFalsy();
+    const t = text(r).split('\n');
+    expect(t[0]).toMatch(
+      /^since 2026-10-12T11:00:30\.000 \(local time\) · 2 apps on 1 host · /
+    );
+    expect(t.slice(1)).toEqual([
+      `api-build | ${S(31)}build done`,
+      `api       | ${S(32)}listening 3310`,
+      `api       ! ${S(33)}warn slow`,
+      `api-build | ${S(35)}build watching`,
+    ]);
+    expect(r.structuredContent.since).toEqual({
+      local: '2026-10-12T11:00:30.000',
+    });
+    expect(r.structuredContent.lines[0]).toEqual({
+      app: 'api-build',
+      host: 'local',
+      stream: 'out',
+      time: '2026-10-12T11:00:31.000',
+      text: `${S(31)}build done`,
+    });
+    expect(
+      r.structuredContent.lines.map((l: any) => [l.app, l.stream])
+    ).toEqual([
+      ['api-build', 'out'],
+      ['api', 'out'],
+      ['api', 'err'],
+      ['api-build', 'out'],
+    ]);
+  });
+  it('last: each call returns only what was written since the previous one of this session', async () => {
+    const { project, files, spawner } = setup();
+    const cl = await client(spawner);
+    const last = () =>
+      cl.callTool({
+        name: 'logs',
+        arguments: { project, targets: ['base'], since: 'last' },
+      });
+    const first: any = await last();
+    expect(first.structuredContent.mode).toBe('last');
+    expect(first.structuredContent.lines.map((l: any) => l.text)).toEqual([
+      `${S(20)}build old`,
+      `${S(25)}api old`,
+      `${S(31)}build done`,
+      `${S(32)}listening 3310`,
+      `${S(33)}warn slow`,
+      `${S(35)}build watching`,
+    ]);
+    files['/l/api-out'] += `${S(38)}GET /health 200\n`;
+    const second: any = await last();
+    expect(text(second)).toBe(
+      `since the previous logs call · 2 apps on 1 host · 1 line\napi | ${S(38)}GET /health 200`
+    );
+    expect(second.structuredContent.lines).toHaveLength(1);
+    expect(text(await last())).toBe(
+      'no new log lines since the previous logs call (2 apps on 1 host)'
+    );
+    // the marks belong to this server's session: another one starts over
+    const other: any = await (await client(spawner)).callTool({
+      name: 'logs',
+      arguments: { project, targets: ['base'], since: 'last' },
+    });
+    expect(other.structuredContent.lines).toHaveLength(7);
+  });
+  it('app with since reads that app alone, merged', async () => {
+    const { project, spawner } = setup();
+    const r: any = await (await client(spawner)).callTool({
+      name: 'logs',
+      arguments: { project, app: 'api', since: '10s' },
+    });
+    expect(text(r).split('\n')).toEqual([
+      'since 2026-10-12T11:00:30.000 (local time) · 1 app on 1 host · 2 lines',
+      `api | ${S(32)}listening 3310`,
+      `api ! ${S(33)}warn slow`,
+    ]);
+  });
+  it('targets without since: the latest lines across the apps', async () => {
+    const { project, spawner } = setup();
+    const r: any = await (await client(spawner)).callTool({
+      name: 'logs',
+      arguments: { project, targets: ['base'], lines: 1 },
+    });
+    expect(text(r).split('\n')).toEqual([
+      'latest lines · 2 apps on 1 host · 1 line',
+      `api-build | ${S(35)}build watching`,
+      'truncated 2 older lines', // the last line of each of the three files, capped at one
+    ]);
+    expect(r.structuredContent.mode).toBe('tail');
+  });
+  it('refuses app with targets, neither, and a bad since before touching a host', async () => {
+    const { project } = setup();
+    const cl = await client(neverSpawn);
+    const both: any = await cl.callTool({
+      name: 'logs',
+      arguments: { project, app: 'api', targets: ['base'] },
+    });
+    expect(both.isError).toBe(true);
+    expect(text(both)).toMatch(/^BAD_ARGUMENT/);
+    const none: any = await cl.callTool({
+      name: 'logs',
+      arguments: { project },
+    });
+    expect(none.isError).toBe(true);
+    expect(text(none)).toMatch(/^BAD_ARGUMENT/);
+    const bad: any = await cl.callTool({
+      name: 'logs',
+      arguments: { project, targets: ['api'], since: 'yesterday' },
+    });
+    expect(bad.isError).toBe(true);
+    expect(text(bad)).toMatch(/^BAD_ARGUMENT/);
+    expect(text(bad)).toContain('since is a span like');
   });
 });

@@ -15,9 +15,12 @@ import {
   fmtCpu,
   fmtUrl,
   fmtDeps,
+  renderLogsSince,
+  sinceNotes,
 } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
+import type { SinceAnswer } from '../../src/core/logsince.js';
 
 const row = (status: string, checks: PortCheck[]): LsRow => ({
   app: 'web',
@@ -557,6 +560,108 @@ describe('ls shows the status word', () => {
     );
     expect(renderLs([{ ...row('failed (exit 2)', []) }], 'local')).toContain(
       'failed (exit 2)'
+    );
+  });
+});
+
+describe('renderLogsSince', () => {
+  const a: SinceAnswer = {
+    mode: 'relative',
+    since: { local: '2026-10-14T09:28:30.000' },
+    apps: 2,
+    hosts: 1,
+    truncated: 3,
+    lines: [
+      {
+        app: 'api',
+        host: 'local',
+        stream: 'out',
+        time: '2026-10-14T09:28:30.000',
+        text: '2026-10-14T09:28:30.000: listening 3010',
+      },
+      {
+        app: 'web',
+        host: 'local',
+        stream: 'err',
+        time: '2026-10-14T09:28:31.000',
+        text: '2026-10-14T09:28:31.000: warn',
+      },
+    ],
+    skipped: [{ app: 'api', host: 'local', stream: 'out', bytes: 2048 }],
+    not_started: ['logger'],
+    errors: [
+      {
+        host: 'box',
+        apps: ['tool'],
+        message: 'TRANSPORT_FAILED: ssh box: Connection refused',
+      },
+    ],
+  };
+  it('header, compose lines, notes', () => {
+    const t = renderLogsSince(a);
+    expect(t.split('\n')[0]).toBe(
+      'since 2026-10-14T09:28:30.000 (local time) · 2 apps on 1 host · 2 lines'
+    );
+    expect(t).toContain('\napi | 2026-10-14T09:28:30.000: listening 3010\n');
+    expect(t).toContain('\nweb ! 2026-10-14T09:28:31.000: warn\n');
+    expect(sinceNotes(a)).toEqual([
+      'truncated 3 older lines',
+      'skipped 2K of api out on local (more than the 1 MB read before the window)',
+      'not started: logger',
+      'box unreachable (tool): TRANSPORT_FAILED: ssh box: Connection refused',
+    ]);
+    expect(t.endsWith(sinceNotes(a).join('\n'))).toBe(true);
+  });
+  it('a last read names the bytes it jumped over since the previous call', () => {
+    expect(
+      sinceNotes({ ...a, mode: 'last', since: { local: null } })
+    ).toContain(
+      'skipped 2K of api out on local (more than 1 MB new since the previous call; the most recent 1 MB was read)'
+    );
+  });
+  it('several hosts list each cutoff; last and tail have their own phrase', () => {
+    const two = renderLogsSince({
+      ...a,
+      since: {
+        local: '2026-10-14T09:28:30.000',
+        box: '2026-10-14T07:28:30.000',
+      },
+      hosts: 2,
+    });
+    expect(two.split('\n')[0]).toBe(
+      "since local 2026-10-14T09:28:30.000, box 2026-10-14T07:28:30.000 (each host's time) · 2 apps on 2 hosts · 2 lines"
+    );
+    expect(
+      renderLogsSince({ ...a, mode: 'last', since: { local: null } }).split(
+        '\n'
+      )[0]
+    ).toBe('since the previous logs call · 2 apps on 1 host · 2 lines');
+    expect(
+      renderLogsSince({ ...a, mode: 'tail', since: { local: null } }).split(
+        '\n'
+      )[0]
+    ).toBe('latest lines · 2 apps on 1 host · 2 lines');
+  });
+  it('nothing in the window is one line plus the notes', () => {
+    const empty = {
+      ...a,
+      lines: [],
+      truncated: 0,
+      skipped: [],
+      not_started: [],
+      errors: [],
+    };
+    expect(renderLogsSince(empty)).toBe(
+      'no log lines since 2026-10-14T09:28:30.000 (local time) (2 apps on 1 host)'
+    );
+    expect(
+      renderLogsSince({ ...empty, mode: 'last', since: { local: null } })
+    ).toBe('no new log lines since the previous logs call (2 apps on 1 host)');
+    expect(
+      renderLogsSince({ ...empty, mode: 'tail', since: { local: null } })
+    ).toBe('no log lines (2 apps on 1 host)');
+    expect(renderLogsSince({ ...empty, not_started: ['api', 'web'] })).toBe(
+      'no log lines since 2026-10-14T09:28:30.000 (local time) (2 apps on 1 host)\nnot started: api, web'
     );
   });
 });

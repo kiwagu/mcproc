@@ -6,6 +6,8 @@ import type { UnpackResult } from '../runtime/unpack.js';
 import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
 import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
+import type { SinceAnswer } from '../core/logsince.js';
+import { formatLine } from '../core/logstream.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -231,6 +233,58 @@ export function renderLogs(l: LogsResult): string {
   if (l.err !== undefined)
     parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
+}
+/** `since <cutoff> (<host> time)`; several hosts list each cutoff; a `last` or tail read has no cutoff. */
+function sinceWhen(a: SinceAnswer): string {
+  if (a.mode === 'last') return 'since the previous logs call';
+  if (a.mode === 'tail') return 'latest lines';
+  const hosts = Object.entries(a.since);
+  return hosts.length === 1
+    ? `since ${hosts[0][1]} (${hosts[0][0]} time)`
+    : `since ${hosts.map(([h, c]) => `${h} ${c}`).join(', ')} (each host's time)`;
+}
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+/** The notes after the lines: what was cut, what may be missing, who was not read; the CLI prints the same on stderr. */
+export function sinceNotes(a: SinceAnswer): string[] {
+  const notes: string[] = [];
+  if (a.truncated > 0)
+    notes.push(`truncated ${plural(a.truncated, 'older line')}`);
+  // a last read jumped over new bytes past its mark; a window read may miss lines between the cutoff and its 1 MB
+  const why =
+    a.mode === 'last'
+      ? 'more than 1 MB new since the previous call; the most recent 1 MB was read'
+      : 'more than the 1 MB read before the window';
+  for (const s of a.skipped)
+    notes.push(
+      `skipped ${fmtBytes(s.bytes)} of ${s.app} ${s.stream} on ${s.host} (${why})`
+    );
+  if (a.not_started.length)
+    notes.push(`not started: ${a.not_started.join(', ')}`);
+  for (const e of a.errors)
+    notes.push(`${e.host} unreachable (${e.apps.join(', ')}): ${e.message}`);
+  return notes;
+}
+/** Header, then compose lines (`app | text`, `app ! text` for stderr, no colors), then the notes. */
+export function renderLogsSince(a: SinceAnswer): string {
+  const who = `${plural(a.apps, 'app')} on ${plural(a.hosts, 'host')}`;
+  const notes = sinceNotes(a);
+  if (a.lines.length === 0) {
+    const none =
+      a.mode === 'last'
+        ? `no new log lines ${sinceWhen(a)}`
+        : a.mode === 'tail'
+          ? 'no log lines'
+          : `no log lines ${sinceWhen(a)}`;
+    return [`${none} (${who})`, ...notes].join('\n');
+  }
+  const width = Math.max(...a.lines.map((l) => l.app.length));
+  return [
+    `${sinceWhen(a)} · ${who} · ${plural(a.lines.length, 'line')}`,
+    ...a.lines.map((l) =>
+      formatLine({ app: l.app, stream: l.stream, text: l.text }, width, null)
+    ),
+    ...notes,
+  ].join('\n');
 }
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 /** One line: what was reached (or not) after how long, and what was seen. */
