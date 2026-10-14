@@ -11,22 +11,35 @@ export const fleetManifest = loadManifest(fleetDir);
 /** pm2's stamp for 2026-10-12T11:00:<sec>, with the separator pm2 writes after it. */
 export const S = (sec: number) =>
   `2026-10-12T11:00:${String(sec).padStart(2, '0')}: `;
-/** `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading). */
+/**
+ * `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading).
+ * `clocks`: one host's own `now` and `zone` in place of the shared ones (hosts in different time zones).
+ */
 export interface FakeState {
   files: Record<string, string>;
   procs: Record<string, object[]>;
   now?: string;
+  zone?: string;
+  clocks?: Record<string, { now?: string; zone?: string }>;
   unwritable?: string[];
   short?: string[];
 }
 
-/** Hosts whose log files live in memory: the read script is answered from `files` (and the host's clock from `now`), jlist from `procs`, a flush empties files. */
+/**
+ * Hosts whose log files live in memory: the read script is answered from `files` (and the host's clock from `now` and
+ * `zone`; a state without `now` answers a garbled clock line, a host whose `date` printed nothing), jlist from `procs`,
+ * a flush empties files.
+ */
 export function fakeHosts(
   state: FakeState,
   down: string[] = [],
   manifest = fleetManifest
 ) {
   const reads: string[] = [];
+  const clock = (host: string) => {
+    const c = { now: state.now, zone: state.zone, ...state.clocks?.[host] };
+    return `__MCPROC_LS_CLOCK__ ${c.now ?? ''} ${c.zone ?? '+0000'}\n`;
+  };
   const fleet = new Fleet(manifest, undefined, async (_m, host, fallback) => {
     if (down.includes(host))
       throw new McprocError(
@@ -49,9 +62,16 @@ export function fakeHosts(
               stdout:
                 (cmd.includes('__MCPROC_NOW__')
                   ? `__MCPROC_NOW__ ${state.now ?? ''}\n`
-                  : '') + answerReads(cmd, state.files, state.short ?? []),
+                  : '') +
+                (cmd.includes('__MCPROC_LS_CLOCK__') ? clock(host) : '') +
+                answerReads(cmd, state.files, state.short ?? []),
             };
           },
+        },
+        {
+          // a since script with no file to read (no app started there) asks only for the clock
+          match: '__MCPROC_LS_CLOCK__',
+          result: () => ({ stdout: clock(host) }),
         },
         {
           match: ': > ',
@@ -66,7 +86,7 @@ export function fakeHosts(
   return { fleet, reads };
 }
 /** Executes the read snippets against the in-memory files: same arithmetic as the shell. */
-function answerReads(
+export function answerReads(
   cmd: string,
   files: Record<string, string>,
   short: string[] = []

@@ -10,6 +10,13 @@ import {
   describeFleetApp,
 } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
+import {
+  LogMarks,
+  parseSince,
+  readSince,
+  type SinceSpec,
+} from '../../core/logsince.js';
+import { McprocError } from '../../core/errors.js';
 import { doctor } from '../../core/doctor.js';
 import { takeIncidents } from '../../core/incidents/store.js';
 import { parseUntil, waitFor } from '../../core/wait.js';
@@ -19,6 +26,7 @@ import {
   renderHosts,
   renderDoctor,
   renderLogs,
+  renderLogsSince,
   fmtDeps,
   renderProject,
   renderIncidents,
@@ -152,15 +160,34 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
       })
   );
 
+  const marks = new LogMarks(); // one per server process: the marks of this client session
+  const logsHint =
+    'logs {app: "api"} tails one app; logs {targets: ["stack"], since: "2m"} merges a profile since a time.';
   server.registerTool(
     'logs',
     {
       title: 'Logs',
       description:
-        "Tail an app's pm2 logs (out, err or both) on the host it runs on, ANSI stripped. Default 100 lines, max 2000.",
+        'Read pm2 logs. One app, last N lines (default 100, max 2000) as out/err sections: pass app. Several apps since a point in time: pass targets (apps, profiles or ["all"]) and since: a span like 2m, a time like 2026-10-14T07:30 (the host\'s local time; add Z or +02:00 for an absolute instant), or last (everything since your previous logs call over those apps in this session). Lines come merged across apps in time order, each labelled `app | line` (`app ! line` for stderr), ANSI stripped; lines then caps the merged output (most recent kept). targets without since: the latest lines across the apps. After a change, read since over the profile instead of tailing each app.',
       inputSchema: {
         ...commonInput,
-        app: z.string(),
+        app: z
+          .string()
+          .optional()
+          .describe(
+            'One app (the sectioned tail), or with since the same as targets: [app]'
+          ),
+        targets: z
+          .array(z.string())
+          .min(1)
+          .optional()
+          .describe('Apps and/or profiles, or ["all"]'),
+        since: z
+          .string()
+          .optional()
+          .describe(
+            '2m | 90s | 2h | 2026-10-14T07:30[:00[.000]][Z|+02:00] | last'
+          ),
         lines: z.number().int().min(1).max(2000).optional(),
         stream: z.enum(['out', 'err', 'both']).optional(),
       },
@@ -168,18 +195,53 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     },
     (args) =>
       runTool(async () => {
+        // presence, not truthiness: an empty app or since is still passed, and refused as such
+        const { app, targets } = args;
+        if (targets !== undefined && app !== undefined)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'pass either app or targets, not both',
+            { hint: logsHint }
+          );
+        // app alone is the sectioned tail, or with since the same as targets: [app]
+        const wanted = targets ?? (app === undefined ? null : [app]);
+        if (wanted === null)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'name an app, or targets (with since for a time window)',
+            { hint: logsHint }
+          );
+        if (app !== undefined && args.since === undefined) {
+          const fleet = await fleetOf(args);
+          const ctx = await fleet.ctx(fleet.one(app));
+          const r = await readLogs(ctx, app, {
+            lines: args.lines,
+            stream: args.stream,
+          });
+          return {
+            text: renderLogs(r),
+            data: { host: ctx.host.name, ...r } as unknown as Record<
+              string,
+              unknown
+            >,
+          };
+        }
+        // parsed before the fleet is built, so a bad since never reaches a host
+        const since: SinceSpec =
+          args.since !== undefined
+            ? parseSince(args.since)
+            : { kind: 'tail', n: args.lines ?? 100 };
         const fleet = await fleetOf(args);
-        const ctx = await fleet.ctx(fleet.one(args.app));
-        const r = await readLogs(ctx, args.app, {
+        const names = fleet.select(wanted);
+        const a = await readSince(fleet, names, {
+          since,
           lines: args.lines,
           stream: args.stream,
+          marks,
         });
         return {
-          text: renderLogs(r),
-          data: { host: ctx.host.name, ...r } as unknown as Record<
-            string,
-            unknown
-          >,
+          text: renderLogsSince(a),
+          data: a as unknown as Record<string, unknown>,
         };
       })
   );

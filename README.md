@@ -32,6 +32,7 @@ $EDITOR .mcproc/mcproc.yaml   # uncomment the apps you need, write a description
 mcproc start base    # or an app name, or "all"
 mcproc ls            # status, pid, uptime and real vs declared ports
 mcproc logs api -n 200
+mcproc logs base --since 2m    # every app of a profile, merged by time stamp
 mcproc doctor        # why a host cannot be driven, and what to do
 ```
 
@@ -189,6 +190,23 @@ wait shows in the rows), `start`'s JSON carries the waits as `waits[]`, and the 
 `restart` does not order apps by their dependencies or wait for conditions; `start` does, and `start --reload`
 restarts the apps that are already online the same way.
 
+## Logs since a point in time
+
+After a restart, "what happened since" is one call over a profile instead of a tail per app. The MCP `logs` tool takes
+`targets` (apps, profiles or `all`) and `since`: a span (`90s`, `2m`, `2h`, at most 24 h), a time
+(`2026-10-14T07:30[:00[.000]]`), or `last`, everything since your previous `logs` call over those apps in this MCP
+session (a first call gives the last 100 lines of each log file). A time without a zone is the host's local time; with
+`Z` or `+02:00` it is converted with each host's own zone. Lines are picked by pm2's stamps, which are in each host's
+local time, and ordered by the moment they were written: each host's UTC offset, read along with its clock, puts hosts
+in different zones on one timeline (a host whose zone cannot be read is placed by its raw stamps, and a note says so).
+Each host's clock may still drift: a host whose clock runs ahead or behind has its lines placed that much later or
+earlier. Each file is read at most 1 MB back: when the window reaches further, `skipped` names the bytes not read.
+`lines` caps the merged answer (the most recent kept) and `truncated` counts what was dropped; `targets` without
+`since` gives the latest `lines` (default 100) across the apps.
+On the command line, `mcproc logs base --since 2m` prints the merged lines and exits, and `-f --since 2m` then follows
+from exactly where that read ended; an app that was not running yet is shown from the same cutoff once it starts. `last`
+needs the session that keeps the marks, so the CLI refuses it.
+
 ## Tools (MCP) and commands (CLI)
 
 | tool | what it does |
@@ -196,7 +214,7 @@ restarts the apps that are already online the same way.
 | `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
 | `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
-| `logs <app>` | tail of the pm2 out/err logs on the app's host, ANSI stripped (`lines`, `stream`) |
+| `logs [app \| targets, since]` | tail of one app's out/err (ANSI stripped), or the merged, time-ordered lines of several apps: the latest lines, or since a span (`2m`), a host-local time, or `last` (since your previous `logs` call over those apps in this MCP session); `app \| line`, `app ! line` for stderr |
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
 | `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |

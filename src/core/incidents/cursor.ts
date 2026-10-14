@@ -20,6 +20,8 @@ export interface Anchor {
   hex: string;
 }
 const HEX = /^[0-9a-f]{0,64}$/;
+/** U+FFFD as UTF-8: what the decoding of the read's output put in place of bytes that were not valid UTF-8. */
+const REPLACEMENT = Buffer.from('\ufffd');
 
 export interface AppMark {
   out?: FileMark;
@@ -73,7 +75,11 @@ export function readSnippet(
   ].join('; ');
 }
 
-/** `short`: fewer bytes arrived than the read announced (the file changed between measuring and reading): do not analyse or move on. */
+/**
+ * `short`: fewer bytes arrived than the read announced (the file changed between measuring and reading): do not analyse
+ * or move on. `anchor` is taken at the measured size; `nextAnchor` at `nextOffset`, the end of the last complete line,
+ * which is where a reader that goes on from this read starts.
+ */
 export interface FileRead {
   size: number;
   start: number;
@@ -83,14 +89,21 @@ export interface FileRead {
   nextOffset: number;
   short: boolean;
   anchor: Anchor | null;
+  nextAnchor: Anchor | null;
 }
 
-/** One file's section of the read script's output: its lines (escapes removed), how many are context, where to go on. */
+/**
+ * One file's section of the read script's output: its lines, how many are context, where to go on. `clean` turns a raw
+ * line into the text kept: by default every escape is removed (incidents match plain text); a terminal reader passes
+ * keepSgr to keep the colors.
+ */
 export function parseRead(
   stdout: string,
   id: number,
-  offset: number | null
+  offset: number | null,
+  opts: { clean?: (line: string) => string } = {}
 ): FileRead | null {
+  const clean = opts.clean ?? stripAnsi;
   const mark = `__MCPROC_INC_${id}__\n`;
   const at = stdout.indexOf(mark);
   if (at < 0) return null;
@@ -117,22 +130,56 @@ export function parseRead(
     pos += Buffer.byteLength(raw, 'utf8') + 1;
     if (lineStart === 0 && ctxStart > 0) continue; // the read began mid-line: that head is only a fragment
     if (lineStart < ctxBytes) contextOnly++;
-    lines.push(stripAnsi(raw));
+    lines.push(clean(raw));
   }
   const skipped =
     offset !== null && offset >= 0 && size >= offset
       ? Math.max(0, start - offset)
       : 0;
+  const nextOffset = Math.max(start, size - partial);
+  const short = buf.length < size - ctxStart;
+  const anchor = hex && HEX.test(hex) ? { at: size, hex } : null;
   return {
     size,
     start,
     skipped,
     lines,
     contextOnly,
-    nextOffset: Math.max(start, size - partial),
-    short: buf.length < size - ctxStart,
-    anchor: hex && HEX.test(hex) ? { at: size, hex } : null,
+    nextOffset,
+    short,
+    anchor,
+    nextAnchor: anchorAt(buf, nextOffset, { size, ctxStart, short, anchor }),
   };
+}
+
+/**
+ * The anchor at `at` (the end of the last complete line, at or before the size) from the bytes a read holds: the hex of
+ * the up to 16 bytes before it, as hex16 gives it. Positions are counted back from the end of the read, which is the
+ * measured size; null unless every byte from there to the end is in the read and came through the UTF-8 decoding of
+ * the output unchanged (a replaced byte changes the length, so its position is no longer known), and the read's last
+ * bytes are the ones the anchor at the size was taken from.
+ */
+function anchorAt(
+  buf: Buffer,
+  at: number,
+  read: {
+    size: number;
+    ctxStart: number;
+    short: boolean;
+    anchor: Anchor | null;
+  }
+): Anchor | null {
+  const { size, ctxStart, short, anchor } = read;
+  if (at === size) return anchor;
+  const n = Math.min(16, at);
+  const end = buf.length - (size - at);
+  if (!anchor || short || n <= 0 || at - n < ctxStart || end - n < 0)
+    return null;
+  const tail = buf.subarray(end - n);
+  if (tail.includes(REPLACEMENT)) return null;
+  if (buf.subarray(-Math.min(16, size)).toString('hex') !== anchor.hex)
+    return null;
+  return { at, hex: buf.subarray(end - n, end).toString('hex') };
 }
 
 /**

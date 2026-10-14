@@ -12,6 +12,7 @@ import {
   windowStart,
   type CursorState,
 } from '../../src/core/incidents/cursor.js';
+import { keepSgr } from '../../src/core/logs.js';
 
 /** Runs the real read snippet with sh against a temp file: what the host would print. */
 function read(content: string | Buffer, offset: number | null) {
@@ -123,8 +124,53 @@ describe('read snippet + parseRead', () => {
     const r = read('\x1b[31mERROR: red\x1b[0m\n', 0);
     expect(r.lines).toEqual(['ERROR: red']);
   });
+  it('parseRead strips every escape by default and keeps colors with a clean option', () => {
+    const body = '\x1b[32mgreen\x1b[0m \x1b]0;title\x07x\n';
+    const out = `__MCPROC_INC_0__\n${Buffer.byteLength(body)} 0 0 ${'a'.repeat(32)}\n${body}`;
+    expect(parseRead(out, 0, null)!.lines).toEqual(['green x']);
+    expect(parseRead(out, 0, null, { clean: keepSgr })!.lines).toEqual([
+      '\x1b[32mgreen\x1b[0m x',
+    ]);
+  });
   it('an empty or missing file is no lines and no error', () => {
     expect(read('', 0)).toMatchObject({ lines: [], nextOffset: 0 });
+  });
+  const hexOf = (b: string | Buffer) => Buffer.from(b).toString('hex');
+  it('a read that ends mid-line anchors its next offset: the 16 bytes before the last complete line, fewer near the start', () => {
+    const r = read('old\npartial', null);
+    expect(r.nextOffset).toBe(4);
+    expect(r.nextAnchor).toEqual({ at: 4, hex: hexOf('old\n') });
+    expect(r.anchor).toEqual({ at: 11, hex: hexOf('old\npartial') }); // the anchor at the size stays as it was
+    const long = `${'x'.repeat(40)}\n${'y'.repeat(30)}\nhalf`;
+    expect(read(long, null).nextAnchor).toEqual({
+      at: 72,
+      hex: hexOf(long.slice(56, 72)),
+    });
+  });
+  it('a read that ends with a newline: the next anchor is the anchor', () => {
+    const r = read('one\ntwo\n', null);
+    expect(r.nextAnchor).toEqual({ at: 8, hex: hexOf('one\ntwo\n') });
+    expect(r.nextAnchor).toEqual(r.anchor);
+  });
+  it('an invalid UTF-8 byte among the bytes before the next offset gives no next anchor: decoded, its length is lost', () => {
+    const bad = Buffer.concat([
+      Buffer.from('line\nab'),
+      Buffer.from([0xff]),
+      Buffer.from('cd\npart'),
+    ]);
+    const r = read(bad, null);
+    expect(r.nextOffset).toBe(11);
+    expect(r.nextAnchor).toBeNull();
+  });
+  it('a character cut by the context start (decoded as U+FFFD) does not shift the bytes before the next offset', () => {
+    const old = `${'é'.repeat(3000)}\nlast old!\n`; // 6011 bytes: the context starts at 1915, inside an é
+    const content = Buffer.from(`${old}new\nhal`);
+    const r = read(content, Buffer.byteLength(old));
+    expect(r.nextOffset).toBe(6015);
+    expect(r.nextAnchor).toEqual({
+      at: 6015,
+      hex: hexOf(content.subarray(5999, 6015)),
+    });
   });
 });
 

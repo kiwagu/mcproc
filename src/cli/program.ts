@@ -18,8 +18,17 @@ import {
   streamLogs,
   defaultStreamDeps,
   resolveColor,
+  formatLine,
+  colorFor,
   type LogSource,
+  type StreamOptions,
 } from '../core/logstream.js';
+import {
+  parseSince,
+  readSince,
+  LogMarks,
+  type SinceSpec,
+} from '../core/logsince.js';
 import { doctor } from '../core/doctor.js';
 import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
@@ -42,6 +51,7 @@ import {
   renderMutation,
   renderWait,
   hostsOf,
+  sinceNotes,
 } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
@@ -59,6 +69,67 @@ const defaultIo: Io = {
   out: (s) => process.stdout.write(`${s}\n`),
   err: (s) => process.stderr.write(`${s}\n`),
 };
+
+/**
+ * The one-shot read of `logs --since`: the merged lines since the cutoff on stdout, labeled and colored as the follow
+ * labels them (the longest name, each app's index in host-group order), the notes on stderr, exit code 1 when a host
+ * was not read. Returns where each app's follow starts, or null when the reader of stdout went away.
+ */
+export async function printSince(
+  fleet: Fleet,
+  apps: string[],
+  since: SinceSpec,
+  how: { stream: 'out' | 'err' | 'both'; color: boolean; json: boolean },
+  io: Io,
+  signal?: AbortSignal
+): Promise<StreamOptions['startAt'] | null> {
+  const marks = new LogMarks();
+  const a = await readSince(fleet, apps, {
+    since,
+    stream: how.stream,
+    marks,
+    keepColors: how.color && !how.json,
+  });
+  const order = fleet.groups(apps).flatMap((gr) => gr.apps);
+  const width = Math.max(...apps.map((x) => x.length));
+  let closed = false; // `| head` read enough: stop printing, no stack trace
+  for (const l of a.lines) {
+    if (closed || signal?.aborted) break;
+    try {
+      io.out(
+        how.json
+          ? JSON.stringify(l)
+          : formatLine(
+              { app: l.app, stream: l.stream, text: l.text },
+              width,
+              how.color ? colorFor(order.indexOf(l.app)) : null
+            )
+      );
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'EPIPE') throw e;
+      closed = true;
+    }
+  }
+  for (const n of sinceNotes(a)) io.err(n);
+  if (a.errors.length) process.exitCode = 1; // a host was not read: the lines of the others are printed, the exit code says so
+  if (closed || signal?.aborted) return null;
+  // a stream the read left without a mark (its app not started yet, or its read cut short) starts at its host's cutoff,
+  // so what the app writes before its follower's first poll is still printed; an app on a host that was not read has
+  // no cutoff and is followed from the file's end
+  return Object.fromEntries(
+    apps.map((x) => {
+      const host = fleet.hostOf(x);
+      const cutoff = a.since[host];
+      return [
+        x,
+        {
+          ...marks.get(LogMarks.key(fleet.manifest.path, host, x)),
+          ...(typeof cutoff === 'string' ? { cutoff } : {}),
+        },
+      ];
+    })
+  );
+}
 
 export function buildProgram(io: Io = defaultIo): Command {
   const program = new Command()
@@ -201,11 +272,61 @@ export function buildProgram(io: Io = defaultIo): Command {
       '--no-color',
       'plain text (also when NO_COLOR is set or stdout is not a terminal)'
     )
+    .option(
+      '--since <time>',
+      'lines since a span (2m, 90s) or a host-local time (2026-10-14T07:30; add Z or +02:00 for an instant), merged across the targets; prints and exits, with -f then follows'
+    )
     .action(
       wrap(async (g, o, args) => {
         const targets = (args[0] as unknown as string[] | undefined) ?? [];
         const fleet = fleetOf(g);
         const apps = fleet.select(targets.length ? targets : ['all']);
+        const color = resolveColor(
+          o.color as boolean | undefined,
+          process.env,
+          Boolean(process.stdout.isTTY)
+        );
+        const stream = o.out ? 'out' : o.err ? 'err' : 'both';
+        let since: SinceSpec | undefined;
+        if (o.since !== undefined) {
+          if (o.lines !== undefined)
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              '-n and --since do not combine: --since decides what is printed first',
+              {
+                hint: 'Drop -n; with -f the follow continues from where the since read ended.',
+              }
+            );
+          since = parseSince(String(o.since));
+          if (since.kind === 'last')
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              'since last needs an MCP session, which keeps the marks',
+              {
+                hint: 'Use a time such as --since 2m, or --since 2026-10-14T07:30.',
+              }
+            );
+        }
+        const ac = new AbortController();
+        // a reader that closes early (`| head`) raises EPIPE asynchronously on stdout, possibly after the stream already returned:
+        // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
+        process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+          if (e.code === 'EPIPE') ac.abort();
+          else throw e;
+        });
+        let startAt: StreamOptions['startAt'];
+        if (since) {
+          const at = await printSince(
+            fleet,
+            apps,
+            since,
+            { stream, color, json: Boolean(g.json) },
+            io,
+            ac.signal
+          );
+          if (!o.follow || at === null) return;
+          startAt = at;
+        }
         // every host at once; one that cannot be reached becomes a note per app instead of ending the stream, and is
         // connected again later while following (fleet.ctx keeps no failed connection)
         const sources = await Promise.all(
@@ -218,30 +339,23 @@ export function buildProgram(io: Io = defaultIo): Command {
             }
           })
         );
-        const ac = new AbortController();
+        if (ac.signal.aborted) return; // the reader of the since lines went away meanwhile: nothing to follow for
         const stop = () => ac.abort();
         process.once('SIGINT', stop);
-        // a reader that closes early (`| head`) raises EPIPE asynchronously on stdout, possibly after the stream already returned:
-        // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
-        process.stdout.on('error', (e: NodeJS.ErrnoException) => {
-          if (e.code === 'EPIPE') ac.abort();
-          else throw e;
-        });
         try {
           await streamLogs(
             sources,
             {
-              lines: Math.min(Math.max(1, Number(o.lines) || 100), 2000),
+              lines: since
+                ? 0
+                : Math.min(Math.max(1, Number(o.lines) || 100), 2000),
               follow: Boolean(o.follow),
               intervalMs: Math.max(200, Number(o.interval) || 1000),
-              color: resolveColor(
-                o.color as boolean | undefined,
-                process.env,
-                Boolean(process.stdout.isTTY)
-              ),
+              color,
               json: Boolean(g.json),
-              stream: o.out ? 'out' : o.err ? 'err' : 'both',
+              stream,
               signal: ac.signal,
+              startAt,
             },
             defaultStreamDeps()
           );
