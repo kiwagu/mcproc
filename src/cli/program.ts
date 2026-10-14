@@ -32,6 +32,7 @@ import {
 import { doctor } from '../core/doctor.js';
 import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
+import { adoptPorts } from '../core/adopt.js';
 import {
   Fleet,
   actOn,
@@ -50,6 +51,7 @@ import {
   renderFlushed,
   renderMutation,
   renderWait,
+  renderAdopted,
   hostsOf,
   sinceNotes,
 } from '../mcp/render.js';
@@ -191,8 +193,19 @@ export function buildProgram(io: Io = defaultIo): Command {
       'create .mcproc/ with a manifest draft discovered from the project'
     )
     .option('--force', 'overwrite an existing manifest')
+    .option(
+      '--adopt-ports',
+      'write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and print the diff; needs that manifest, drafts nothing and ignores --force'
+    )
     .action(
       wrap(async (g, o) => {
+        if (o.adoptPorts) {
+          const r = await adoptPorts(fleetOf(g));
+          const { text, failed } = renderAdopted(r);
+          emit(g, text, r);
+          if (failed) process.exitCode = 1; // a host was not read: the line names it, the exit code says so
+          return;
+        }
         const r = initProject(resolveProjectDir(g.project), {
           force: Boolean(o.force),
         });

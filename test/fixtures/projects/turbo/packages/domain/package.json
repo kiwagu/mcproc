@@ -1,0 +1,1 @@
+{ "name": "@t/domain", "scripts": { "build": "tsc -p ." }, "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } } }

@@ -9,7 +9,7 @@ import { registerWriteTools } from './tools/write.js';
 
 export const INSTRUCTIONS = [
   'mcproc drives pm2 for the current project from its .mcproc/mcproc.yaml manifest (apps with descriptions, declared ports, profiles, hosts).',
-  'Loop: (1) no manifest → call init, then fill in a description per app in .mcproc/mcproc.yaml and verify with start + ls (ports) + logs.',
+  'Loop: (1) no manifest → call init, then fill in a description per app in .mcproc/mcproc.yaml and verify with start + ls (ports) + logs; a port ls reports as undeclared is adopted into the manifest with init adopt_ports.',
   '(2) manifest present → call describe first, then act by app or profile name: start, restart, stop, logs. ls answers "is it up and on which port"; ports answers "who holds port N".',
   "On long work with running apps, call incidents now and then (your client's loop or cron if it has one): it returns only new errors with context, each once, and is nearly free when nothing happened.",
   'After start, call wait (until listening, url-ok, exited, log:<regex> or idle:<seconds>) instead of sleeping or polling ls; a start whose manifest declares depends_on conditions waits by itself.',

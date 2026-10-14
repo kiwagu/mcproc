@@ -1,0 +1,1 @@
+{ "name": "@t/api", "scripts": { "dev": "tsx watch src/index.ts", "build": "tsc -p ." }, "dependencies": { "@t/contracts": "workspace:*" } }

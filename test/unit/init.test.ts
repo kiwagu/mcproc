@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   discover,
   guessKind,
@@ -9,8 +10,12 @@ import {
   renderDraft,
   initProject,
   sanitizeName,
+  LIVE_DESCRIPTION,
 } from '../../src/core/init.js';
-import { parseManifest } from '../../src/core/manifest.js';
+import { loadManifest, parseManifest } from '../../src/core/manifest.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const turbo = path.join(here, '..', 'fixtures', 'projects', 'turbo');
 
 function write(root: string, rel: string, content: string) {
   const p = path.join(root, rel);
@@ -164,6 +169,355 @@ describe('discover', () => {
     expect(byName['migrate-2'].port).toBeUndefined();
     expect(d.candidates.some((c) => c.name.startsWith('junk'))).toBe(false);
     expect(d.notes.some((n) => n.includes('ecosystem.config.cjs'))).toBe(true);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(d.candidates.every((c) => !c.live)).toBe(true);
+  });
+});
+
+describe('discover on a turbo repo', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  /** A throwaway copy of the turbo fixture, removed after the suite. */
+  const copy = () => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-init-'));
+    made.push(r);
+    fs.cpSync(turbo, r, { recursive: true });
+    return r;
+  };
+  const byName = (d: ReturnType<typeof discover>) =>
+    Object.fromEntries(d.candidates.map((c) => [c.name, c]));
+  it('drafts the persistent dev task live, folds dist libraries into libs/libs-watch, wires depends_on', () => {
+    const d = discover(turbo);
+    const c = byName(d);
+    expect(d.candidates.slice(0, 2).map((x) => x.name)).toEqual([
+      'libs',
+      'libs-watch',
+    ]);
+    expect(c.libs).toMatchObject({
+      live: true,
+      kind: 'task',
+      cwd: '.',
+      source: 'turbo.json:build',
+      run: 'bunx turbo run build --filter=@t/domain --ui=stream',
+    });
+    expect(c.libs.description).toContain('packages');
+    expect(c['libs-watch']).toMatchObject({
+      live: true,
+      kind: 'build',
+      run: 'bunx turbo watch build --filter=@t/domain --ui=stream',
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
+    });
+    expect(c.api).toMatchObject({
+      live: true,
+      source: 'apps/api/package.json:dev',
+      run: 'bun run dev',
+      cwd: 'apps/api',
+      kind: 'server',
+      port: 3020,
+      description: LIVE_DESCRIPTION,
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
+    });
+    expect(c.web).toMatchObject({
+      live: true,
+      cwd: 'apps/web',
+      kind: 'server',
+      port: 3002,
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
+    });
+    expect(c.contracts).toMatchObject({
+      live: true,
+      cwd: 'packages/contracts',
+      kind: 'build',
+      source: 'packages/contracts/package.json:dev',
+    });
+    expect(c.contracts.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeout: 600 },
+    ]); // contracts → domain
+    expect(c.contracts.port).toBeUndefined();
+    expect(c.api.note).toContain("contracts's first build is not awaited"); // api depends on the live library contracts
+    expect(c.web.note).toBeUndefined();
+    expect(c['domain-build']).toBeUndefined(); // folded into libs
+    expect(c['contracts-build']).toMatchObject({ kind: 'task' }); // a live library keeps its one-shot build, commented
+    expect(c['contracts-build'].live).toBeUndefined();
+    expect(c['web-start']).toMatchObject({ kind: 'server', port: 4173 });
+    expect(c['web-build']).toMatchObject({ kind: 'task' });
+    expect(c['api-build']).toMatchObject({ kind: 'task' });
+    expect(c.dev).toMatchObject({
+      source: 'package.json:dev',
+      run: 'bun run dev',
+      cwd: '.',
+    });
+    expect(c.dev.live).toBeUndefined();
+    expect(c.dev.note).toBe(
+      'the dev profile replaces this: turbo would start every package as one process'
+    );
+    expect(c.build).toMatchObject({ kind: 'task' });
+    expect(Object.keys(c).filter((n) => n.startsWith('turbo-'))).toEqual([]);
+    expect(d.profiles).toEqual([
+      {
+        name: 'dev',
+        apps: ['libs', 'libs-watch', 'api', 'web', 'contracts'],
+        live: true,
+      },
+      { name: 'start', apps: ['web-start'], live: false },
+    ]);
+    expect(d.libs).toEqual(['@t/domain']);
+    expect(d.notes).toContain(
+      '1 library built into dist/ is drafted as libs and libs-watch: @t/domain'
+    );
+    // workspace packages come in sorted directory order, whatever order readdir returns
+    expect([
+      ...new Set(d.candidates.filter((x) => x.cwd !== '.').map((x) => x.cwd)),
+    ]).toEqual(['apps/api', 'apps/web', 'packages/contracts']);
+    expect(d.notes.some((n) => n.includes('turbo.json'))).toBe(false);
+  });
+  it('a turbo repo without a persistent dev task drafts as before', () => {
+    const r = copy();
+    write(r, 'turbo.json', JSON.stringify({ tasks: { dev: {}, build: {} } }));
+    const d = discover(r);
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+    expect(byName(d)['web-dev']).toMatchObject({ kind: 'server', port: 3002 });
+    // only the bare task makes the live stack, not a package-scoped one
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({
+        tasks: {
+          'web#dev': { persistent: true },
+          '//#dev': { persistent: true },
+          build: {},
+        },
+      })
+    );
+    expect(discover(r).candidates.some((c) => c.live)).toBe(false);
+  });
+  it('turbo 1 pipeline: no --ui flag, no libs-watch (no turbo watch); npm, yarn and pnpm binaries', () => {
+    const r = copy();
+    fs.rmSync(path.join(r, 'bun.lock'));
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ pipeline: { dev: { persistent: true }, build: {} } })
+    );
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.libs.run).toBe('npx turbo run build --filter=@t/domain');
+    expect(c['libs-watch']).toBeUndefined();
+    expect(d.notes).toContain(
+      'turbo 1 has no turbo watch: libs-watch is not drafted; run libs again after changing a library, or move to turbo 2'
+    );
+    expect(c.api.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeout: 600 },
+    ]);
+    expect(d.profiles[0].apps).toEqual(['libs', 'api', 'web', 'contracts']);
+    expect(d.notes).toContain(
+      '1 library built into dist/ is drafted as libs: @t/domain'
+    );
+    write(r, 'yarn.lock', '');
+    expect(byName(discover(r)).libs.run).toBe(
+      'yarn turbo run build --filter=@t/domain'
+    );
+    fs.rmSync(path.join(r, 'yarn.lock'));
+    write(r, 'pnpm-lock.yaml', '');
+    expect(byName(discover(r)).libs.run).toBe(
+      'pnpm exec turbo run build --filter=@t/domain'
+    );
+  });
+  it('libraries share a folder filter when no live library sits in their folder, ./-prefixed patterns too', () => {
+    const r = copy();
+    const contracts = JSON.parse(
+      fs.readFileSync(
+        path.join(r, 'packages', 'contracts', 'package.json'),
+        'utf8'
+      )
+    );
+    delete contracts.scripts.dev;
+    write(r, 'packages/contracts/package.json', JSON.stringify(contracts));
+    const d = discover(r);
+    expect(byName(d).libs.run).toBe(
+      "bunx turbo run build --filter='./packages/*' --ui=stream"
+    );
+    expect(d.libs).toEqual(['@t/contracts', '@t/domain']);
+    expect(d.notes).toContain(
+      '2 libraries built into dist/ are drafted as libs and libs-watch: @t/contracts, @t/domain'
+    );
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ ...pkg, workspaces: ['./apps/*', './packages/*'] })
+    );
+    expect(byName(discover(r)).libs.run).toBe(
+      "bunx turbo run build --filter='./packages/*' --ui=stream"
+    );
+  });
+  it("a commented root script never takes a live app's name", () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.scripts.server = 'node server.js';
+    write(r, 'package.json', JSON.stringify(pkg));
+    write(
+      r,
+      'apps/server/package.json',
+      JSON.stringify({ name: '@t/server', scripts: { dev: 'node s.js' } })
+    );
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.server).toMatchObject({ live: true, cwd: 'apps/server' });
+    expect(c['server-2']).toMatchObject({ source: 'package.json:server' });
+    expect(c['server-2'].live).toBeUndefined();
+    expect(d.profiles[0].apps).toContain('server');
+    expect(c.dev.note).toBe(
+      'the dev profile replaces this: turbo would start every package as one process'
+    );
+  });
+  it('a folder that also holds an app or another package with a build script filters its libraries by name', () => {
+    const r = copy();
+    const contracts = JSON.parse(
+      fs.readFileSync(
+        path.join(r, 'packages', 'contracts', 'package.json'),
+        'utf8'
+      )
+    );
+    delete contracts.scripts.dev; // contracts and domain are both folded now
+    write(r, 'packages/contracts/package.json', JSON.stringify(contracts));
+    write(
+      r,
+      'packages/site/package.json',
+      JSON.stringify({
+        name: '@t/site',
+        scripts: { dev: 'next dev', build: 'next build' },
+      })
+    );
+    const d = discover(r);
+    expect(byName(d).site).toMatchObject({ live: true, port: 3000 });
+    expect(byName(d).libs.run).toBe(
+      'bunx turbo run build --filter=@t/contracts --filter=@t/domain --ui=stream'
+    );
+    expect(byName(d)['libs-watch'].run).toBe(
+      'bunx turbo watch build --filter=@t/contracts --filter=@t/domain --ui=stream'
+    );
+    // not live, not a library, but built by a folder filter all the same
+    fs.rmSync(path.join(r, 'packages', 'site'), { recursive: true });
+    write(
+      r,
+      'packages/tool/package.json',
+      JSON.stringify({ name: '@t/tool', scripts: { build: 'tsc -p .' } })
+    );
+    expect(byName(discover(r)).libs.run).toBe(
+      'bunx turbo run build --filter=@t/contracts --filter=@t/domain --ui=stream'
+    );
+  });
+  it('a persistent dev task no package implements drafts as before: no live apps, no profile, no root note', () => {
+    const r = copy();
+    for (const dir of ['apps/api', 'apps/web', 'packages/contracts']) {
+      const p = JSON.parse(
+        fs.readFileSync(path.join(r, dir, 'package.json'), 'utf8')
+      );
+      delete p.scripts.dev;
+      write(r, `${dir}/package.json`, JSON.stringify(p));
+    }
+    const d = discover(r);
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(byName(d).dev.note).toBeUndefined();
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+  });
+  it('a turbo task no script implements is drafted as turbo-<task>', () => {
+    const r = copy();
+    const t = JSON.parse(fs.readFileSync(path.join(r, 'turbo.json'), 'utf8'));
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ tasks: { ...t.tasks, watch: { cache: false } } })
+    );
+    expect(byName(discover(r))['turbo-watch']).toMatchObject({
+      source: 'turbo.json:watch',
+      run: 'npx turbo run watch',
+      cwd: '.',
+    });
+  });
+  it('an unparsable turbo.json is noted and drafted the old way; one without tasks is not noted', () => {
+    const r = copy();
+    write(
+      r,
+      'turbo.json',
+      '{\n  // turbo accepts comments\n  "tasks": { "dev": { "persistent": true }, "build": {} }\n}\n'
+    );
+    const d = discover(r);
+    expect(d.notes).toContain(
+      "turbo.json could not be parsed (comments are not read); drafted without turbo's tasks"
+    );
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ $schema: 'https://turbo.build/schema.json' })
+    );
+    expect(discover(r).notes.some((n) => n.includes('turbo.json'))).toBe(false);
+  });
+  it('no dist libraries: no libs apps, no depends_on, no note', () => {
+    const r = copy();
+    fs.rmSync(path.join(r, 'packages', 'domain'), { recursive: true });
+    fs.rmSync(path.join(r, 'packages', 'contracts'), { recursive: true });
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.libs).toBeUndefined();
+    expect(c.api.depends_on).toBeUndefined();
+    expect(d.profiles[0]).toEqual({
+      name: 'dev',
+      apps: ['api', 'web'],
+      live: true,
+    });
+    expect(d.libs).toEqual([]);
+    expect(d.notes.some((n) => n.includes('dist/'))).toBe(false);
+  });
+  it('a live app named dev makes the profile dev-apps; a package named libs is deduplicated', () => {
+    const r = copy();
+    write(
+      r,
+      'apps/dev/package.json',
+      JSON.stringify({ name: '@t/dev', scripts: { dev: 'node s.js' } })
+    );
+    write(
+      r,
+      'apps/libs/package.json',
+      JSON.stringify({ name: 'libs', scripts: { dev: 'node s.js' } })
+    );
+    const d = discover(r);
+    const c = byName(d);
+    // live apps are named first: the package keeps its name, the commented root script steps aside
+    expect(c.dev).toMatchObject({ live: true, cwd: 'apps/dev' });
+    expect(c['dev-2']).toMatchObject({ source: 'package.json:dev', cwd: '.' });
+    expect(c['dev-2'].live).toBeUndefined();
+    expect(c['dev-2'].note).toBe(
+      'the dev-apps profile replaces this: turbo would start every package as one process'
+    );
+    expect(c['libs-2']).toMatchObject({ live: true, cwd: 'apps/libs' }); // libs itself comes first
+    expect(c.libs.kind).toBe('task');
+    expect(d.profiles[0].name).toBe('dev-apps');
+    fs.rmSync(path.join(r, 'package.json'));
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ workspaces: ['apps/*', 'packages/*'] })
+    ); // no root scripts: the live app takes the name dev
+    const d2 = discover(r);
+    expect(byName(d2).dev).toMatchObject({ live: true, cwd: 'apps/dev' });
+    expect(d2.profiles[0].name).toBe('dev-apps');
   });
 });
 
@@ -241,8 +595,643 @@ describe('renderDraft / initProject', () => {
     expect(r.by_source['package.json']).toBe(6); // root dev + build:watch + build + migrate, workspace api dev + start:worker
     expect(r.next).toContain('uncomment');
     expect(() => initProject(root)).toThrowError(/already exists/);
+    // the hint names the options the way both the CLI and MCP clients can follow
+    expect(() => initProject(root)).toThrowError(
+      expect.objectContaining({
+        code: 'ALREADY_EXISTS',
+        hint: "Overwrite the draft with force (README and .gitignore are kept), or keep it and adopt the running apps' ports into it.",
+      })
+    );
     expect(initProject(root, { force: true }).created).toContain(
       path.join(root, '.mcproc', 'mcproc.yaml')
     );
+  });
+});
+
+describe('renderDraft on a turbo repo', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  /** A throwaway copy of the turbo fixture, removed after the suite. */
+  const copy = () => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-init-'));
+    made.push(r);
+    fs.cpSync(turbo, r, { recursive: true });
+    return r;
+  };
+  const draftOf = (r: string) => renderDraft(r, 'fx', discover(r));
+  /** No root scripts and a workspace app named dev: the live profile becomes dev-apps. */
+  const liveAppNamedDev = (r: string) => {
+    fs.rmSync(path.join(r, 'package.json'));
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ workspaces: ['apps/*', 'packages/*'] })
+    );
+    write(
+      r,
+      'apps/dev/package.json',
+      JSON.stringify({ name: '@t/dev', scripts: { dev: 'node s.js' } })
+    );
+  };
+  it('writes live apps uncommented, the divider, the dev profile and the start profile; the draft loads', () => {
+    const text = draftOf(turbo);
+    expect(text).toContain(
+      [
+        '#',
+        "# Live apps below come from turbo's persistent dev task and form the dev profile: start dev runs them.",
+        '# The other candidates are commented out. Uncomment the ones your dev stack needs,',
+        '# write a description for each app, then run start + ls to confirm the ports; fix; repeat.',
+        '',
+      ].join('\n')
+    );
+    expect(text).not.toContain('# Candidates below are commented out.');
+    expect(text).toMatch(
+      /^ {2}libs: {4}# source: turbo\.json:build; kind\? task\n {4}description: .*\n {4}kind: task\n {4}run: "bunx turbo run build --filter=@t\/domain --ui=stream"\n/m
+    );
+    expect(text).toContain(
+      '  libs-watch:    # source: turbo.json:build; kind? build\n'
+    );
+    expect(text).toContain(
+      '    run: "bunx turbo watch build --filter=@t/domain --ui=stream"\n'
+    );
+    expect(text).toContain(
+      '    depends_on: [{ app: libs, condition: completed, timeout: 600 }]\n'
+    );
+    expect(text).toMatch(
+      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed, timeout: 600 \}\]\n {4}# contracts's first build is not awaited; uncomment contracts-build and add \{ app: contracts-build, condition: completed \} to its depends_on to wait for it\n/m
+    );
+    expect(text).toContain('  # --- other scripts (commented out) ---\n');
+    expect(text).toContain(
+      [
+        '  # dev:    # source: package.json:dev; kind? server',
+        '  #   description: ""',
+        '  #   kind: server',
+        '  #   run: bun run dev',
+        '  #   # the dev profile replaces this: turbo would start every package as one process',
+        '',
+      ].join('\n')
+    );
+    expect(text).toContain(
+      'profiles:\n  dev: [libs, libs-watch, api, web, contracts]\n  # start: [web-start]\nhosts:\n'
+    );
+    expect(text).not.toContain('# base: [api-build, api]');
+    const m = parseManifest(
+      text,
+      turbo,
+      path.join(turbo, '.mcproc', 'mcproc.yaml')
+    );
+    expect(Object.keys(m.apps)).toEqual([
+      'libs',
+      'libs-watch',
+      'api',
+      'web',
+      'contracts',
+    ]);
+    expect(m.profiles.dev).toEqual([
+      'libs',
+      'libs-watch',
+      'api',
+      'web',
+      'contracts',
+    ]);
+    expect(m.apps.api.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeoutMs: 600_000 },
+    ]);
+    expect(m.apps['libs-watch'].depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeoutMs: 600_000 },
+    ]);
+    expect(m.apps.libs.kind).toBe('task');
+    expect(m.apps.contracts.kind).toBe('build');
+  });
+  it('every drafted variant loads', () => {
+    const variants: [
+      string,
+      (r: string) => void,
+      ((m: ReturnType<typeof parseManifest>) => void)?,
+    ][] = [
+      [
+        'no dist libraries',
+        (r) => {
+          fs.rmSync(path.join(r, 'packages', 'domain'), { recursive: true });
+          fs.rmSync(path.join(r, 'packages', 'contracts'), {
+            recursive: true,
+          });
+        },
+      ],
+      [
+        'turbo 1',
+        (r) =>
+          write(
+            r,
+            'turbo.json',
+            JSON.stringify({
+              pipeline: { dev: { persistent: true }, build: {} },
+            })
+          ),
+      ],
+      ['a live app named dev', liveAppNamedDev],
+      [
+        'a live app named all',
+        (r) =>
+          write(
+            r,
+            'apps/all/package.json',
+            JSON.stringify({ name: '@t/all', scripts: { dev: 'node s.js' } })
+          ),
+        // all is the built-in profile of every app
+        (m) => {
+          expect(m.apps.all).toBeUndefined();
+          expect(m.apps['all-2']).toMatchObject({ cwd: 'apps/all' });
+          expect(m.profiles.dev).toContain('all-2');
+        },
+      ],
+      [
+        'live apps named dev and dev-apps',
+        (r) => {
+          liveAppNamedDev(r);
+          write(
+            r,
+            'apps/dev-apps/package.json',
+            JSON.stringify({
+              name: '@t/dev-apps',
+              scripts: { dev: 'node s.js' },
+            })
+          );
+        },
+      ],
+    ];
+    for (const [label, mutate, check] of variants) {
+      const r = copy();
+      mutate(r);
+      const text = draftOf(r);
+      const m = parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml'));
+      // every wait on libs is drafted at the cap: a cold build of many libraries outlasts the default
+      const waits = Object.values(m.apps).flatMap((a) =>
+        a.depends_on.filter((d) => d.app === 'libs')
+      );
+      expect(waits.length > 0, label).toBe(label !== 'no dist libraries');
+      for (const w of waits)
+        expect(w, label).toEqual({
+          app: 'libs',
+          condition: 'completed',
+          timeoutMs: 600_000,
+        });
+      check?.(m);
+    }
+  });
+  it('the header names the live profile: dev-apps when a live app is named dev', () => {
+    const r = copy();
+    liveAppNamedDev(r);
+    const text = draftOf(r);
+    expect(text).toContain(
+      'form the dev-apps profile: start dev-apps runs them.'
+    );
+    expect(text).toContain('\n  dev-apps: [');
+  });
+  it('a commented profile steps aside from an app of the same name', () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.scripts.start = 'turbo run start';
+    write(r, 'package.json', JSON.stringify(pkg));
+    const text = draftOf(r);
+    expect(text).toContain('  # start:    # source: package.json:start;');
+    expect(text).toContain('  # start-apps: [web-start]\n');
+  });
+  it('a live cwd is quoted when YAML would cut it', () => {
+    const r = copy();
+    write(
+      r,
+      'apps/web #2/package.json',
+      JSON.stringify({ name: '@t/hash', scripts: { dev: 'node s.js' } })
+    );
+    const m = parseManifest(
+      draftOf(r),
+      r,
+      path.join(r, '.mcproc', 'mcproc.yaml')
+    );
+    expect(m.apps.hash.cwd).toBe('apps/web #2');
+  });
+  it('names YAML would read as a boolean, a number or null are quoted: the draft loads with them as strings', () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.workspaces = [...pkg.workspaces, '123'];
+    write(r, 'package.json', JSON.stringify(pkg));
+    // yes/on are booleans in YAML 1.1 only: the yaml library reads them as strings, so they stay bare
+    const names = ['true', '123', 'null', '1e3', '007', 'yes', 'on'];
+    for (const n of names)
+      write(
+        r,
+        `apps/p-${n}/package.json`,
+        JSON.stringify({ name: `@t/${n}`, scripts: { dev: 'node s.js' } })
+      );
+    // an exact workspace directory whose name reads as a number
+    write(
+      r,
+      '123/package.json',
+      JSON.stringify({ name: '@t/exact', scripts: { dev: 'node s.js' } })
+    );
+    // a commented candidate whose name reads as a number
+    write(r, 'Procfile', '0x1f: node w.js\n');
+    const text = renderDraft(r, '123', discover(r));
+    const m = parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml'));
+    expect(m.project).toBe('123');
+    for (const n of names)
+      expect(m.apps[n], n).toMatchObject({ cwd: `apps/p-${n}` });
+    expect(m.apps.exact.cwd).toBe('123');
+    expect(m.profiles.dev).toEqual(expect.arrayContaining([...names, 'exact']));
+    expect(text).toContain('project: "123"\n');
+    expect(text).toContain('\n  "true":    # source: apps/p-true/package.json');
+    expect(text).toContain('\n  "null":    # source: apps/p-null/package.json');
+    expect(text).toContain('\n  yes:    # source: apps/p-yes/package.json');
+    expect(text).toContain('\n    cwd: "123"\n');
+    expect(text).toContain('\n  # "0x1f":    # source: Procfile:0x1f;');
+    expect(text).toContain(
+      '\n  dev: [libs, libs-watch, api, "007", "123", "1e3", "null", on, "true", yes, web, contracts, exact]\n'
+    );
+  });
+  it('a plain repo renders as before: every app commented, the base example profile', () => {
+    const text = renderDraft(root, 'mono', discover(root)); // the non-turbo fixture of this file
+    expect(text).not.toContain('--- other scripts');
+    expect(text).toContain('profiles:\n  # base: [api-build, api]\n');
+    expect(text).not.toContain('persistent dev task');
+    // the first line carries the date and the temp path
+    expect(text.slice(text.indexOf('\n') + 1)).toMatchInlineSnapshot(`
+      "#
+      # Candidates below are commented out. Uncomment the ones your dev stack needs,
+      # write a description for each app, then run start + ls to confirm the ports; fix; repeat.
+      # Fields: kind build|server|worker|task (task = runs once, e.g. a build or a migration; ls shows done/failed); run = shell command; cwd relative to the project root;
+      # port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its
+      # build output changes); depends_on = start order; profiles = named groups of apps;
+      # url = the address to open in a browser; ls/describe show it with the HTTP answer, monit shows it;
+      # hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container);
+      # host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.
+      # note: ecosystem.config.cjs found: JavaScript ecosystem files are not executed by init; port its apps by hand
+      version: 1
+      project: mono
+      apps:
+        # dev:    # source: package.json:dev; kind? server; port? 7777
+        #   description: ""
+        #   kind: server
+        #   run: yarn dev
+        #   port: 7777
+        #   url: http://localhost:7777
+        # build-watch:    # source: package.json:build:watch; kind? build
+        #   description: ""
+        #   kind: build
+        #   run: "yarn build:watch"
+        # build:    # source: package.json:build; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: yarn build
+        # migrate:    # source: package.json:migrate; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: yarn migrate
+        # api-dev:    # source: packages/api/package.json:dev; kind? server; port? 4100
+        #   description: ""
+        #   kind: server
+        #   run: yarn dev
+        #   cwd: packages/api
+        #   port: 4100
+        #   url: http://localhost:4100
+        # api-start-worker:    # source: packages/api/package.json:start:worker; kind? worker; port? 4100
+        #   description: ""
+        #   kind: worker
+        #   run: "yarn start:worker"
+        #   cwd: packages/api
+        #   port: 4100
+        # web-serve:    # source: apps/web/project.json:serve; kind? server; port? 4200
+        #   description: ""
+        #   kind: server
+        #   run: "npx nx run web:serve"
+        #   port: 4200
+        #   url: http://localhost:4200
+        # web-build:    # source: apps/web/project.json:build; kind? build
+        #   description: ""
+        #   kind: build
+        #   run: "npx nx run web:build --watch"
+        # legacy:    # source: ecosystem.json:legacy; kind? server; port? 8080
+        #   description: ""
+        #   kind: server
+        #   run: node build.server.js
+        #   port: 8080
+        #   url: http://localhost:8080
+        # web:    # source: Procfile:web; kind? unknown; port? 5000
+        #   description: ""
+        #   run: node server.js --port 5000
+        #   port: 5000
+        #   url: http://localhost:5000
+        # migrate-2:    # source: Procfile:migrate; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: node migrate.js
+      profiles:
+        # base: [api-build, api]
+      hosts:
+        # stand: { ssh: my-alias, cwd: /srv/project }
+        # prod: { ssh: prod-alias, cwd: /srv/project, readonly: true }
+      "
+    `);
+  });
+  it('initProject reports live apps, profiles and libs, and points at start dev', () => {
+    const r = copy();
+    const res = initProject(r);
+    expect(res.live).toEqual(['libs', 'libs-watch', 'api', 'web', 'contracts']);
+    expect(res.profiles).toEqual(['dev']);
+    expect(res.libs).toEqual(['@t/domain']);
+    expect(res.next).toContain('start dev');
+    expect(res.next).toContain('replace each TODO description');
+    expect(() => loadManifest(r)).not.toThrow();
+  });
+});
+
+describe('guessPort: frameworks and source constants', () => {
+  const made: string[] = [];
+  const mk = (files: Record<string, string>) => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-port-'));
+    made.push(r);
+    for (const [f, t] of Object.entries(files)) write(r, f, t);
+    return r;
+  };
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  it('next dev/start default to 3000 unless a flag says otherwise', () => {
+    const r = mk({});
+    expect(guessPort('next dev', r)).toBe(3000);
+    expect(
+      guessPort('NODE_OPTIONS=--use-system-ca next dev --turbopack', r)
+    ).toBe(3000);
+    expect(guessPort('next start', r)).toBe(3000);
+    expect(guessPort('next dev -p 3001', r)).toBe(3001);
+    expect(guessPort('next build', r)).toBeUndefined();
+    // a PORT in .env wins over the framework default
+    expect(guessPort('next dev', mk({ '.env': 'PORT=4444\n' }))).toBe(4444);
+  });
+  it('vite reads server.port from its config, with env fallbacks and nested braces; defaults 5173 / 4173', () => {
+    expect(guessPort('vite', mk({}))).toBe(5173);
+    expect(guessPort('vite preview', mk({}))).toBe(4173);
+    expect(guessPort('vite build', mk({}))).toBeUndefined();
+    expect(guessPort('vitest --watch', mk({}))).toBeUndefined();
+    expect(guessPort('vite-node src/x.ts', mk({}))).toBeUndefined();
+    expect(
+      guessPort(
+        'vite',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.mts':
+            'export default defineConfig({ server: { host: true, port: Number(process.env.WEB_PORT ?? 3002) } })',
+        })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.js':
+            "export default { server: { port: process.env.P || '4100' } }",
+        })
+      )
+    ).toBe(4100);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            "export default defineConfig({ server: { proxy: { '/api': { target: 'http://localhost:3020', changeOrigin: true } }, port: 3002 } })",
+        })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite preview',
+        mk({
+          'vite.config.ts':
+            'export default { server: { port: 3002 }, preview: { port: 4300 } }',
+        })
+      )
+    ).toBe(4300);
+    expect(
+      guessPort(
+        'vite preview',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(4173);
+    expect(
+      guessPort(
+        'vite --port 3333',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(3333);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            'export default { server: { port: Number(process.env.WEB_PORT) || 3002 } }',
+        })
+      )
+    ).toBe(3002);
+    // the nested hmr port is not the server port
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            'export default { server: { hmr: { port: 24678 } } }',
+        })
+      )
+    ).toBe(5173);
+    // vitest's own `test.server` block comes first and holds no port
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            "export default defineConfig({ test: { server: { deps: { inline: ['x'] } } }, server: { port: 3002 } })",
+        })
+      )
+    ).toBe(3002);
+    expect(guessPort('vite build && vite preview', mk({}))).toBe(4173);
+    expect(guessPort('tsx vite.config.ts', mk({}))).toBeUndefined();
+  });
+  it('vite --config / -c names the config to read: no standard config then, and no guess when it cannot be read', () => {
+    const dev = 'export default { server: { port: 3400 } }';
+    const named = mk({ 'config/dev.ts': dev });
+    expect(guessPort('vite --config config/dev.ts', named)).toBe(3400);
+    expect(guessPort('vite --config=config/dev.ts', named)).toBe(3400);
+    expect(guessPort('vite -c config/dev.ts --host', named)).toBe(3400);
+    expect(guessPort("vite serve --config 'config/dev.ts'", named)).toBe(3400);
+    const both = mk({
+      'vite.config.ts': 'export default { server: { port: 3002 } }',
+      'config/dev.ts': dev,
+    });
+    expect(guessPort('vite --config config/dev.ts', both)).toBe(3400);
+    // without the flag the standard config is read
+    expect(guessPort('vite', both)).toBe(3002);
+    expect(guessPort('vite --configLoader runner', both)).toBe(3002);
+    // a named config with no port: Vite's default
+    expect(
+      guessPort(
+        'vite -c config/dev.ts',
+        mk({ 'config/dev.ts': 'export default {}' })
+      )
+    ).toBe(5173);
+    // a named config that cannot be read, or a path the shell computes: no guess, standard config or not
+    expect(guessPort('vite --config config/missing.ts', both)).toBeUndefined();
+    expect(
+      guessPort('vite --config config/missing.ts', mk({}))
+    ).toBeUndefined();
+    expect(guessPort('vite --config config', both)).toBeUndefined();
+    expect(guessPort('vite --config $VITE_CONFIG', both)).toBeUndefined();
+    // the flag belongs to its own call: the build's config is not the preview's
+    const split = mk({
+      'config/b.ts': 'export default { preview: { port: 4400 } }',
+    });
+    expect(guessPort('vite build -c config/b.ts && vite preview', split)).toBe(
+      4173
+    );
+    expect(guessPort('vite build && vite preview -c config/b.ts', split)).toBe(
+      4400
+    );
+  });
+  it('vite reads a port named by a constant of the config, the port shorthand, loadEnv and parseInt reads', () => {
+    const vite = (config: string, cmd = 'vite') =>
+      guessPort(cmd, mk({ 'vite.config.ts': config }));
+    // an identifier, resolved through a const of the same file
+    expect(
+      vite(
+        "import { defineConfig } from 'vite';\nconst DEV_PORT = Number(process.env.APP_DEV_PORT ?? 3002);\nexport default defineConfig({\n  server: { host: true, port: DEV_PORT },\n});\n"
+      )
+    ).toBe(3002);
+    expect(
+      vite(
+        'const PREVIEW_PORT: number = 4300;\nexport default { preview: { port: PREVIEW_PORT } };\n',
+        'vite preview'
+      )
+    ).toBe(4300);
+    expect(
+      vite('let devPort = 3011\nexport default { server: { port: devPort } }')
+    ).toBe(3011);
+    // the shorthand `port`, before another key or last
+    expect(
+      vite(
+        "const port = 3003;\nexport default defineConfig({ server: { port, host: '0.0.0.0' } });\n"
+      )
+    ).toBe(3003);
+    expect(
+      vite(
+        'const port = Number(process.env.APP_PORT) || 3004\nexport default { server: {\n  strictPort: true,\n  port\n} }'
+      )
+    ).toBe(3004);
+    // the loadEnv object, with || and ??
+    expect(
+      vite(
+        "export default defineConfig(({ mode }) => {\n  const env = loadEnv(mode, process.cwd(), '');\n  return { server: { port: Number(env.APP_PORT) || 3005 } };\n});\n"
+      )
+    ).toBe(3005);
+    expect(
+      vite(
+        "export default defineConfig(({ mode }) => {\n  const env = loadEnv(mode, process.cwd(), '');\n  const port = env.APP_PORT ?? '3006';\n  return { server: { port } };\n});\n"
+      )
+    ).toBe(3006);
+    // parseInt, with or without a radix, the fallback quoted or not
+    expect(
+      vite(
+        "export default { server: { port: parseInt(process.env.APP_PORT ?? '3007') } }"
+      )
+    ).toBe(3007);
+    expect(
+      vite(
+        'export default { server: { port: parseInt(process.env.APP_PORT || 3008, 10) } }'
+      )
+    ).toBe(3008);
+    expect(
+      vite(
+        "const APP_PORT = parseInt(env.APP_PORT ?? '3009', 10);\nexport default { server: { port: APP_PORT } }"
+      )
+    ).toBe(3009);
+    // a port the section names but init cannot read: no guess at all, not the default
+    expect(
+      vite('export default { server: { port: getPort() } }')
+    ).toBeUndefined();
+    expect(
+      vite('export default { server: { port: cfg.port } }')
+    ).toBeUndefined();
+    expect(
+      vite(
+        "import { DEV_PORT } from './ports';\nexport default { server: { port: DEV_PORT } }"
+      )
+    ).toBeUndefined();
+    expect(vite('export default { server: { port } }')).toBeUndefined(); // the shorthand with no const to read
+    expect(
+      vite('const port = getPort();\nexport default { server: { port } }')
+    ).toBeUndefined();
+    expect(
+      vite('export default { preview: { port: getPort() } }', 'vite preview')
+    ).toBeUndefined();
+    // no port key in the section, or no config: the defaults, as before
+    expect(vite('export default { server: { host: true } }')).toBe(5173);
+    expect(vite('export default { server: { strictPort: true } }')).toBe(5173);
+    expect(vite('export default {}', 'vite preview')).toBe(4173);
+  });
+  it('source constants: PORT = N, DEFAULT_PORT = N, process.env.PORT ?? N', () => {
+    expect(
+      guessPort(
+        'tsx watch src/index.ts',
+        mk({ 'src/index.ts': 'const DEFAULT_PORT = 3020;\n' })
+      )
+    ).toBe(3020);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'const PORT: number = 8081;\n' })
+      )
+    ).toBe(8081);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({
+          'src/main.js': 'const port = Number(process.env.PORT ?? 4010);\n',
+        })
+      )
+    ).toBe(4010);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'app.listen(process.env.PORT || 4020)\n' })
+      )
+    ).toBe(4020);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': "const port = process.env.PORT || '4030';\n" })
+      )
+    ).toBe(4030);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({
+          'src/main.js': 'const port = Number(process.env.PORT) || 4040;\n',
+        })
+      )
+    ).toBe(4040);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'const PORTAL = 12;\n' })
+      )
+    ).toBeUndefined();
   });
 });

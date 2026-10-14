@@ -78,6 +78,47 @@ describe('cli', () => {
     );
     expect(c2.err[0]).toContain('READONLY_HOST');
   });
+  it('init --adopt-ports needs a manifest, and refuses a readonly local host before connecting, force or not', async () => {
+    const init = buildProgram(capture().io).commands.find(
+      (x) => x.name() === 'init'
+    )!;
+    // commander wraps the help text at the terminal's width
+    expect(init.helpInformation().replace(/\s+/g, ' ')).toContain(
+      '--adopt-ports write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and print the diff; needs that manifest, drafts nothing and ignores --force'
+    );
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));
+    try {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(
+        ['init', '--adopt-ports', '--project', empty],
+        { from: 'user' }
+      );
+      expect(c.err[0]).toContain('MANIFEST_NOT_FOUND');
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(path.join(empty, '.mcproc'))).toBe(false); // nothing drafted
+      process.exitCode = 0;
+      // the fleet's other hosts are ssh aliases: a connection attempt would fail with another error
+      fs.cpSync(fleet, dir, { recursive: true });
+      const file = path.join(dir, '.mcproc', 'mcproc.yaml');
+      const text = fs
+        .readFileSync(file, 'utf8')
+        .replace('hosts:\n', 'hosts:\n  local: { readonly: true }\n');
+      fs.writeFileSync(file, text);
+      const c2 = capture();
+      await buildProgram(c2.io).parseAsync(
+        ['init', '--adopt-ports', '--force', '--project', dir],
+        { from: 'user' }
+      );
+      expect(c2.err[0]).toContain('READONLY_HOST');
+      expect(c2.err[0]).toContain('its ports are not adopted');
+      expect(process.exitCode).toBe(1);
+      expect(fs.readFileSync(file, 'utf8')).toBe(text);
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('lists every command in --help', () => {
     const help = buildProgram(capture().io).helpInformation();
     for (const cmd of [
