@@ -110,6 +110,7 @@ describe('mcp server', () => {
     const logsDesc = byName.logs.description as string;
     expect(logsDesc).toContain('since');
     expect(logsDesc).toContain('targets');
+    expect(logsDesc).not.toContain('—');
     expect(INSTRUCTIONS).toContain('since');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
@@ -744,27 +745,33 @@ describe('logs since', () => {
     ]);
     expect(r.structuredContent.mode).toBe('tail');
   });
-  it('refuses app with targets, neither, and a bad since before touching a host', async () => {
+  it('refuses app with targets, neither, empty strings, empty targets and a bad since before touching a host', async () => {
     const { project } = setup();
     const cl = await client(neverSpawn);
-    const both: any = await cl.callTool({
-      name: 'logs',
-      arguments: { project, app: 'api', targets: ['base'] },
-    });
-    expect(both.isError).toBe(true);
-    expect(text(both)).toMatch(/^BAD_ARGUMENT/);
-    const none: any = await cl.callTool({
-      name: 'logs',
-      arguments: { project },
-    });
-    expect(none.isError).toBe(true);
-    expect(text(none)).toMatch(/^BAD_ARGUMENT/);
-    const bad: any = await cl.callTool({
-      name: 'logs',
-      arguments: { project, targets: ['api'], since: 'yesterday' },
-    });
-    expect(bad.isError).toBe(true);
-    expect(text(bad)).toMatch(/^BAD_ARGUMENT/);
-    expect(text(bad)).toContain('since is a span like');
+    const call = (args: object): Promise<any> =>
+      cl.callTool({ name: 'logs', arguments: { project, ...args } });
+    for (const args of [
+      { app: 'api', targets: ['base'] },
+      { app: '', targets: ['base'] }, // an app was passed, empty or not
+      {},
+      { since: '2m' }, // since alone names nothing to read
+      { targets: ['base'], since: '' }, // an empty since is a bad since, not a tail
+      { app: 'api', since: '' },
+      { targets: ['api'], since: 'yesterday' },
+    ]) {
+      const r = await call(args);
+      expect(r.isError, JSON.stringify(args)).toBe(true);
+      expect(text(r), JSON.stringify(args)).toMatch(/^BAD_ARGUMENT/);
+    }
+    expect(
+      text(await call({ targets: ['api'], since: 'yesterday' }))
+    ).toContain('since is a span like');
+    expect(text(await call({ targets: ['base'], since: '' }))).toContain(
+      'since is a span like'
+    );
+    const empty = await call({ targets: [], since: '2m' });
+    expect(empty.isError).toBe(true);
+    expect(text(empty)).toContain('Input validation error');
+    expect(text(empty)).toContain('targets');
   });
 });

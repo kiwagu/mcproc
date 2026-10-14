@@ -168,7 +168,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Logs',
       description:
-        'Read pm2 logs. One app, last N lines (default 100, max 2000) as out/err sections: pass app. Several apps since a point in time: pass targets (apps, profiles or ["all"]) and since — a span like 2m, a time like 2026-10-14T07:30 (the host\'s local time; add Z or +02:00 for an absolute instant), or last (everything since your previous logs call in this session). Lines come merged across apps in stamp order, each labelled `app | line` (`app ! line` for stderr), ANSI stripped; lines then caps the merged output (most recent kept). targets without since: the latest lines across the apps. After a change, read since over the profile instead of tailing each app.',
+        'Read pm2 logs. One app, last N lines (default 100, max 2000) as out/err sections: pass app. Several apps since a point in time: pass targets (apps, profiles or ["all"]) and since: a span like 2m, a time like 2026-10-14T07:30 (the host\'s local time; add Z or +02:00 for an absolute instant), or last (everything since your previous logs call in this session). Lines come merged across apps in stamp order, each labelled `app | line` (`app ! line` for stderr), ANSI stripped; lines then caps the merged output (most recent kept). targets without since: the latest lines across the apps. After a change, read since over the profile instead of tailing each app.',
       inputSchema: {
         ...commonInput,
         app: z
@@ -179,6 +179,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           ),
         targets: z
           .array(z.string())
+          .min(1)
           .optional()
           .describe('Apps and/or profiles, or ["all"]'),
         since: z
@@ -194,22 +195,26 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     },
     (args) =>
       runTool(async () => {
-        if (args.targets && args.app)
+        // presence, not truthiness: an empty app or since is still passed, and refused as such
+        const { app, targets } = args;
+        if (targets !== undefined && app !== undefined)
           throw new McprocError(
             'BAD_ARGUMENT',
             'pass either app or targets, not both',
             { hint: logsHint }
           );
-        if (!args.targets && !args.since) {
-          if (!args.app)
-            throw new McprocError(
-              'BAD_ARGUMENT',
-              'name an app, or targets (with since for a time window)',
-              { hint: logsHint }
-            );
+        // app alone is the sectioned tail, or with since the same as targets: [app]
+        const wanted = targets ?? (app === undefined ? null : [app]);
+        if (wanted === null)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'name an app, or targets (with since for a time window)',
+            { hint: logsHint }
+          );
+        if (app !== undefined && args.since === undefined) {
           const fleet = await fleetOf(args);
-          const ctx = await fleet.ctx(fleet.one(args.app));
-          const r = await readLogs(ctx, args.app, {
+          const ctx = await fleet.ctx(fleet.one(app));
+          const r = await readLogs(ctx, app, {
             lines: args.lines,
             stream: args.stream,
           });
@@ -222,11 +227,12 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           };
         }
         // parsed before the fleet is built, so a bad since never reaches a host
-        const since: SinceSpec = args.since
-          ? parseSince(args.since)
-          : { kind: 'tail', n: args.lines ?? 100 };
+        const since: SinceSpec =
+          args.since !== undefined
+            ? parseSince(args.since)
+            : { kind: 'tail', n: args.lines ?? 100 };
         const fleet = await fleetOf(args);
-        const names = fleet.select(args.targets ?? [args.app as string]);
+        const names = fleet.select(wanted);
         const a = await readSince(fleet, names, {
           since,
           lines: args.lines,
