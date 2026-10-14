@@ -135,6 +135,10 @@ describe('parsers', () => {
     expect(parseProbe(probeOut({ clock: '' })).zone).toBeNull();
     expect(parseProbe(probeOut({ clock: 'CEST' })).zone).toBeNull();
     expect(parseProbe(probeOut({ clock: '+02:00' })).zone).toBeNull();
+    // the shape of a zone but no real offset: refused as logs since refuses it, so both read the host alike
+    expect(parseProbe(probeOut({ clock: '+9900' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: '-0260' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: '+1400' })).zone).toBe('+1400');
     // the output of a probe without the section (an older script): no zone, every other section as before
     const old = probeOut({ jlist: '[]', ps: fx('ps.txt') }).replace(
       `${MARK.CLOCK}\n+0000\n`,

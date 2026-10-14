@@ -90,9 +90,13 @@ function wallMs(stamp: string): number {
     : Number.NaN;
 }
 const HOST_NOW = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+/** A UTC offset as `date +%z` prints it: sign, hours 00..23, minutes 00..59. */
+const ZONE = /^([+-])([01]\d|2[0-3])([0-5]\d)$/;
+/** Whether a host's `date +%z` output is a real offset (`+0200`), not just its shape (`+9900`). */
+export const isZone = (zone: string): boolean => ZONE.test(zone);
 /** The host's `date +%z` (`+0200`) as milliseconds east of UTC; null when it is not one. */
 const zoneMs = (zone: string): number | null => {
-  const m = /^([+-])([01]\d|2[0-3])([0-5]\d)$/.exec(zone);
+  const m = ZONE.exec(zone);
   if (!m) return null;
   return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60_000;
 };

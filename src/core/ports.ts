@@ -1,6 +1,7 @@
 import type { App } from './manifest.js';
 import { findProcess, type Pm2Process } from './pm2.js';
 import { MARK } from '../shell/snippets.js';
+import { isZone } from './logsince.js';
 import {
   EMPTY_STATS,
   parseArgs,
@@ -164,6 +165,12 @@ function sections(stdout: string, marks: string[]): Record<string, string> {
   return out;
 }
 
+/** The clock section's `date +%z`; null when it is absent or not a real offset, as logs since reads a zone. */
+const zoneOf = (section: string | undefined): string | null => {
+  const z = (section ?? '').trim();
+  return isZone(z) ? z : null;
+};
+
 export function parseProbe(stdout: string): ProbeData {
   const sec = sections(stdout, [
     MARK.JLIST,
@@ -230,7 +237,7 @@ export function parseProbe(stdout: string): ProbeData {
     listeners,
     stats,
     urls: parseUrlChecks(sec[MARK.URL]),
-    zone: /^[+-]\d{4}$/.exec((sec[MARK.CLOCK] ?? '').trim())?.[0] ?? null,
+    zone: zoneOf(sec[MARK.CLOCK]),
   };
 }
 

@@ -7,6 +7,7 @@ import {
   mergeLines,
   hostClock,
   hostStamp,
+  isZone,
   MAX_RELATIVE_MS,
   LogMarks,
   readSince,
@@ -151,6 +152,13 @@ describe('hostStamp', () => {
     expect(hostStamp(at, '-0330')).toBe('2026-10-14T04:00:00.250');
     expect(hostStamp(at, '+0000')).toBe('2026-10-14T07:30:00.250');
     expect(hostStamp(at, 'garbage')).toBeNull();
+    expect(hostStamp(at, '+9900')).toBeNull();
+  });
+  it('isZone: a `date +%z` offset of 00..23 hours and 00..59 minutes', () => {
+    for (const z of ['+0000', '+0200', '-0330', '+1400', '-2359'])
+      expect(isZone(z)).toBe(true);
+    for (const z of ['+9900', '+2400', '-0260', '+02:00', '0200', 'CEST', ''])
+      expect(isZone(z)).toBe(false);
   });
 });
 

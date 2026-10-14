@@ -209,15 +209,16 @@ function hits(
 }
 
 /**
- * A marker joins the open burst when it comes less than RELOAD_GAP_MS after the burst's last one, or no more than that
- * before it (a marker pushed later with a much older stamp starts a burst of its own). An untimed marker always joins;
- * a timed one never joins an untimed burst, whose age is unknown.
+ * A marker joins the open burst when it comes less than RELOAD_GAP_MS after the burst's last one and less than that
+ * before its first one: a line flushed late from inside the burst's span still joins, while a marker pushed later
+ * with a much older stamp starts a burst of its own. An untimed marker always joins; a timed one never joins an
+ * untimed burst, whose age is unknown.
  */
 const joins = (b: Burst, h: Hit): boolean =>
   h.ms === null ||
   (b.lastMs !== null &&
     h.ms - b.lastMs < RELOAD_GAP_MS &&
-    b.lastMs - h.ms <= RELOAD_GAP_MS);
+    (b.first.ms === null || b.first.ms - h.ms < RELOAD_GAP_MS));
 const opened = (h: Hit): Burst => ({
   first: h,
   lastTime: h.time,
@@ -225,9 +226,11 @@ const opened = (h: Hit): Burst => ({
   lines: 1,
   relistenOnly: h.marker.kind === 'relisten',
 });
+/** A marker older than the burst's first line (pushed in a later call) becomes its first, as it would in one call. */
 function add(b: Burst, h: Hit): void {
   b.lines++;
   b.relistenOnly &&= h.marker.kind === 'relisten';
+  if (h.ms !== null && b.first.ms !== null && h.ms < b.first.ms) b.first = h;
   if (h.ms !== null && (b.lastMs === null || h.ms >= b.lastMs)) {
     b.lastMs = h.ms;
     b.lastTime = h.time;
@@ -243,8 +246,8 @@ const reloadOf = (b: Burst): Reload => ({
 
 /**
  * Reloads as lines arrive (a follower's pushes). A burst is reported once it is closed: by a marker RELOAD_GAP_MS or
- * more after it, or by `idle` once no marker has ARRIVED for that long. Arrival is wall time, not the stamps: a quiet
- * log has no later stamp to compare with.
+ * more after its last line, by one RELOAD_GAP_MS or more older than its first line, or by `idle` once no marker has
+ * ARRIVED for that long. Arrival is wall time, not the stamps: a quiet log has no later stamp to compare with.
  */
 export class ReloadTracker {
   private last: LastStamp = { out: null, err: null };
@@ -262,8 +265,8 @@ export class ReloadTracker {
   /**
    * The reloads these lines completed. One call carries every stream's new lines, as the log follower delivers them:
    * lines are put in time order within a call only, so a stream held back for a later call would bring older stamps,
-   * and a marker more than RELOAD_GAP_MS older than the open burst closes it rather than joining it. A call that throws
-   * (TIMEOUT on the app's own patterns) leaves the tracker as it was.
+   * and a marker RELOAD_GAP_MS or more older than the open burst's first line closes it rather than joining it. A call
+   * that throws (TIMEOUT on the app's own patterns) leaves the tracker as it was.
    */
   push(input: ReloadInput[], nowMs: number): Reload[] {
     // the streams' stamps advance on a copy, kept only once classification succeeded

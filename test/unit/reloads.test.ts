@@ -262,10 +262,64 @@ describe('ReloadTracker', () => {
     expect(
       t.push([out(`${T('10')}[vite] (client) page reload /c.js`)], 1_200)
     ).toEqual([
-      expect.objectContaining({ lines: 2, time: '2026-10-14T12:00:30.000' }),
+      expect.objectContaining({ lines: 2, time: '2026-10-14T12:00:29.000' }),
     ]);
     expect(t.flush()).toEqual([
       expect.objectContaining({ lines: 1, time: '2026-10-14T12:00:10.000' }),
+    ]);
+  });
+  it("a late marker inside the burst's span joins it however far it is from the burst's last line; one 2 s or more before its first line does not", () => {
+    const t = new ReloadTracker(rules, opts);
+    t.push(
+      [
+        out(`${T('30')}[vite] (client) page reload /a.js`),
+        out(`${T('31', 500)}[vite] (client) page reload /b.js`),
+        out(`${T('33')}[vite] (client) page reload /c.js`),
+      ],
+      1_000
+    );
+    // err flushed late: 2.5 s before the burst's last line, but after its first
+    expect(
+      t.push(
+        [
+          {
+            stream: 'err',
+            text: `${T('30', 500)}[vite] (client) page reload /d.js`,
+          },
+        ],
+        1_100
+      )
+    ).toEqual([]);
+    // exactly 2 s before the first line: not less than 2 s apart, so it closes the burst
+    expect(
+      t.push([out(`${T('28')}[vite] (client) page reload /e.js`)], 1_200)
+    ).toEqual([
+      expect.objectContaining({
+        lines: 4,
+        time: '2026-10-14T12:00:30.000',
+        last_time: '2026-10-14T12:00:33.000',
+      }),
+    ]);
+  });
+  it('an older marker that joins in a later push becomes the first line: the reload does not depend on how the lines were split between polls', () => {
+    const a = `${T('30', 400)}[vite] (client) page reload /a.js`;
+    const b = {
+      stream: 'err' as const,
+      text: `${T('30')}[vite] (client) page reload /b.js`,
+    };
+    const once = detectReloads([out(a), b], rules, opts);
+    const t = new ReloadTracker(rules, opts);
+    t.push([out(a)], 1_000);
+    t.push([b], 1_100);
+    const split = t.flush();
+    expect(split).toEqual(once);
+    expect(split).toEqual([
+      expect.objectContaining({
+        lines: 2,
+        time: '2026-10-14T12:00:30.000',
+        last_time: '2026-10-14T12:00:30.400',
+        line: expect.stringContaining('/b.js'),
+      }),
     ]);
   });
   it('drops the boot burst when it covers the start, and ignores lines before the start', () => {
