@@ -136,6 +136,27 @@ describe('detectReloads', () => {
     );
     expect(r.map((x) => x.lines)).toEqual([2, 1]);
   });
+  it('without a start (a wait), lines that carry no stamp still count, untimed: they make one burst with no time, and a stamped marker after them starts its own', () => {
+    const r = detectReloads(
+      [
+        out('[vite] (client) page reload /a.js'),
+        out('[vite] (client) page reload /b.js'),
+        { stream: 'err', text: `${T('10')}[vite] (client) page reload /c.js` },
+      ],
+      rules,
+      opts
+    );
+    expect(r).toEqual([
+      {
+        time: null,
+        last_time: null,
+        lines: 2,
+        line: '[vite] (client) page reload /a.js',
+        marker: 'vite',
+      },
+      expect.objectContaining({ time: '2026-10-14T12:00:10.000', lines: 1 }),
+    ]);
+  });
   it('the built-in markers', () => {
     const hit = (body: string) =>
       detectReloads([out(`${T('10')}${body}`)], rules, opts).length === 1;
@@ -182,6 +203,19 @@ describe('detectReloads', () => {
         opts
       )
     ).toEqual([]);
+  });
+  it("an app's own ignore beats its own match on the same line", () => {
+    const own = compileReloadRules({
+      match: ['^reloaded '],
+      ignore: ['^reloaded config'],
+      defaults: true,
+    });
+    expect(
+      detectReloads([out(`${T('10')}reloaded config`)], own, opts)
+    ).toEqual([]);
+    expect(
+      detectReloads([out(`${T('10')}reloaded routes`)], own, opts)
+    ).toEqual([expect.objectContaining({ marker: 'custom' })]);
   });
   it('an own pattern that runs past the budget throws TIMEOUT naming the reloads patterns', () => {
     const slow = compileReloadRules(

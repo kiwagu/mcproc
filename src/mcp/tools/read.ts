@@ -3,14 +3,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { prepare, connect } from '../../core/resolve.js';
 import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
-import {
-  Fleet,
-  defaultConnector,
-  listFleet,
-  describeFleetApp,
-} from '../../core/fleet.js';
+import { Fleet, defaultConnector, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
-import { countReloads } from '../../core/reloadcount.js';
+import { listWithReloads } from '../../core/reloadcount.js';
 import {
   LogMarks,
   parseSince,
@@ -114,18 +109,11 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     (args) =>
       runTool(async () => {
         const fleet = await fleetOf(args);
-        const listed = await listFleet(
+        const { rows, errors, unread } = await listWithReloads(
           fleet,
-          fleet.select(args.app ? [args.app] : ['all'])
+          fleet.select(args.app ? [args.app] : ['all']),
+          args.reloads ?? false
         );
-        let { rows, errors } = listed;
-        let unread: typeof errors = [];
-        if (args.reloads) {
-          const r = await countReloads(fleet, listed.probes, rows);
-          rows = r.rows;
-          unread = r.errors;
-          errors = [...errors, ...r.errors];
-        }
         return {
           text: renderLs(rows, fleet.fallback, unread),
           data: {

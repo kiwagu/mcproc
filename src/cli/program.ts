@@ -33,15 +33,8 @@ import { doctor } from '../core/doctor.js';
 import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
 import { adoptPorts } from '../core/adopt.js';
-import {
-  Fleet,
-  actOn,
-  listFleet,
-  describeFleetApp,
-  type Act,
-  type HostError,
-} from '../core/fleet.js';
-import { countReloads } from '../core/reloadcount.js';
+import { Fleet, actOn, describeFleetApp, type Act } from '../core/fleet.js';
+import { listWithReloads } from '../core/reloadcount.js';
 import {
   renderLs,
   renderPorts,
@@ -146,15 +139,11 @@ export async function printLs(
   how: { reloads: boolean; json: boolean },
   io: Io
 ): Promise<void> {
-  const listed = await listFleet(fleet, names);
-  let { rows, errors } = listed;
-  let unread: HostError[] = [];
-  if (how.reloads) {
-    const r = await countReloads(fleet, listed.probes, rows);
-    rows = r.rows;
-    unread = r.errors;
-    errors = [...errors, ...r.errors];
-  }
+  const { rows, errors, unread } = await listWithReloads(
+    fleet,
+    names,
+    how.reloads
+  );
   io.out(
     how.json
       ? JSON.stringify(rows, null, 2)
@@ -497,7 +486,7 @@ export function buildProgram(io: Io = defaultIo): Command {
     )
     .requiredOption(
       '--until <cond>',
-      'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded (the next in-process reload after the call: a tsx/nodemon restart, a Vite/Next rebuild, a repeated listening line; answered once its burst is quiet for 2 s; for a server whose reload restarts it, wait until: listening next)'
+      'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded (the next in-process reload after the call: a tsx/nodemon restart, a Vite/Next rebuild, a repeated listening line; answered once its burst is quiet for 2 s; for a server whose reload restarts it, wait --until listening next)'
     )
     .option(
       '-t, --timeout <s>',

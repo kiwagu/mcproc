@@ -1,5 +1,10 @@
 import { describeError, isMcprocError } from './errors.js';
-import type { Fleet, HostError, HostProbe } from './fleet.js';
+import {
+  listFleet,
+  type Fleet,
+  type HostError,
+  type HostProbe,
+} from './fleet.js';
 import type { LsRow } from './list.js';
 import { findProcess, isRunning } from './pm2.js';
 import {
@@ -121,5 +126,25 @@ export async function countReloads(
       return c ? { ...r, reloads: c } : r;
     }),
     errors: perHost.flat(),
+  };
+}
+
+/**
+ * What `ls` answers: the rows of the named apps from listFleet, and with `reloads` each running app's reloads counted
+ * on top (countReloads, one more read per host). `errors`: the hosts not probed, then the logs not read or counted;
+ * `unread`: those last ones alone, which the table names beside the rows. Without `reloads` it is listFleet as is.
+ */
+export async function listWithReloads(
+  fleet: Fleet,
+  names: string[],
+  reloads: boolean
+): Promise<{ rows: LsRow[]; errors: HostError[]; unread: HostError[] }> {
+  const listed = await listFleet(fleet, names);
+  if (!reloads) return { rows: listed.rows, errors: listed.errors, unread: [] };
+  const r = await countReloads(fleet, listed.probes, listed.rows);
+  return {
+    rows: r.rows,
+    errors: [...listed.errors, ...r.errors],
+    unread: r.errors,
   };
 }

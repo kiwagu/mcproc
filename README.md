@@ -294,9 +294,19 @@ Four places show them:
   the flat view. `monit --once` counts from the history it reads.
 
 Limits. A count marked `≥` (`0 (+≥7)`, `+≥7 reloads`) is a lower bound: the log was cleared since the process started,
-or the app wrote more than the last 1 MB that is read. A reload whose lines are split between two `incidents` calls is
-reported in both. The process start is pm2's start time read in the host's current time zone, so a daylight saving
-change since the start, or a pm2 daemon started under a different `TZ`, can shift it, and with it which lines count.
+or the app wrote more than the last 1 MB that is read. monit and `monit --once` count from the history they read, the
+last `--lines` lines of each log (200 by default), so an app that has run for a while often shows `+≥7` there where
+`ls --reloads` shows an exact `+7`. An err log whose first line came more than a minute after the start also marks
+monit's count `≥`: monit cannot tell where in the file its history began. A reload whose lines are split between two
+`incidents` calls is reported in both. With `include_reloads`, an app whose own `reloads` patterns run away also has
+its error incidents held back, and its point stays where it was, until the patterns are fixed. The process start is
+pm2's start time read in the host's current time zone, so a daylight saving change since the start, or a pm2 daemon
+started under a different `TZ`, can shift it, and with it which lines count.
+
+A process that runs several servers (a turbo or concurrently dev task, `docker compose up`) is one app, and only its
+first burst of `listening` lines is the boot: a later server whose first `listening` line comes more than 2 s after the
+one before it counts as a reload. Put that server's line in the app's `reloads.ignore`, for example
+`ignore: ['ws listening on']`.
 
 ## Tools (MCP) and commands (CLI)
 

@@ -138,7 +138,8 @@ export const bodyOf = (line: string): string => line.replace(PM2_STAMP, '');
 export const cut = (s: string): string =>
   s.length > MAX_LINE ? `${s.slice(0, MAX_LINE - 1)}…` : s;
 /** What patterns are matched against: the line without its stamp, as far as the output shows it (a huge line stays cheap). */
-const searched = (line: string): string => bodyOf(line).slice(0, MAX_LINE);
+export const searched = (line: string): string =>
+  bodyOf(line).slice(0, MAX_LINE);
 
 /**
  * A group repeated without bound whose content can end in an unbounded repeat — `(a+)+`, `(\w+\s*)*`, `(a+b?)+`, `(.*)+` —

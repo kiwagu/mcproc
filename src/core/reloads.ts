@@ -1,10 +1,9 @@
 import { McprocError } from './errors.js';
 import {
-  bodyOf,
   cut,
   MATCH_BUDGET_MS,
-  MAX_LINE,
   runOwnPatterns,
+  searched,
   stampOf,
 } from './incidents/detect.js';
 import { msStamp } from './logsince.js';
@@ -293,7 +292,7 @@ function hits(
 ): Hit[] {
   const lines = timed(input, opts.start, last);
   const kinds = classify(
-    lines.map((l) => bodyOf(l.plain).slice(0, MAX_LINE)),
+    lines.map((l) => searched(l.plain)),
     rules,
     opts.app
   );

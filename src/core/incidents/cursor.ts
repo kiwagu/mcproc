@@ -24,9 +24,10 @@ const HEX = /^[0-9a-f]{0,64}$/;
 const REPLACEMENT = Buffer.from('\ufffd');
 
 /**
- * Written only by a poll that looked for reloads: `start`, the run it looked at (pm2's start in the host's wall time,
- * pm2's stamp shape; null when the host's zone or pm2's start was unknown), and `boot`, true while that run's first
- * burst is still ahead of the point (a `listening`-only first burst is the boot, not a reload).
+ * Written by a poll that looked for reloads, and carried over as they were by a clear of the logs (clearLogs), which
+ * ends no run: `start`, the run it looked at (pm2's start in the host's wall time, pm2's stamp shape; null when the
+ * host's zone or pm2's start was unknown), and `boot`, true while that run's first burst is still ahead of the point
+ * (a `listening`-only first burst is the boot, not a reload).
  */
 export interface AppMark {
   out?: FileMark;

@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { listFleet } from '../../src/core/fleet.js';
+import { CONTEXT_BYTES, READ_CAP } from '../../src/core/incidents/cursor.js';
+import type { LsRow } from '../../src/core/list.js';
 import type { Manifest } from '../../src/core/manifest.js';
-import { countReloads } from '../../src/core/reloadcount.js';
+import { countReloads, listWithReloads } from '../../src/core/reloadcount.js';
 import {
   fakeHosts,
   fleetManifest,
@@ -94,6 +96,54 @@ describe('countReloads (ls --reloads)', () => {
     expect(r.row('web').reloads).toEqual({
       count: 2,
       last: '2026-10-12T11:00:50',
+      partial: true,
+    });
+  });
+  it('the read reaches byte 0 up to READ_CAP + CONTEXT_BYTES bytes: the boot is known and the count whole; one byte more and it is partial', async () => {
+    /** a log of exactly `size` bytes: the boot, traffic after it, one re-listen at the end */
+    const sized = (size: number) => {
+      const head = `${S(1)}listening on :3000\n`;
+      const tail = `${S(40)}listening on :3000\n`;
+      const line = `${S(3)}GET /api/items 200 ${'x'.repeat(59)}\n`; // 100 bytes
+      let fill = size - head.length - tail.length;
+      const lines = line.repeat(Math.floor(fill / line.length) - 1);
+      fill -= lines.length;
+      const last = `${S(3)}GET / 200 ${'y'.repeat(fill - 32)}\n`;
+      const log = head + lines + last + tail;
+      expect(Buffer.byteLength(log)).toBe(size);
+      return log;
+    };
+    const atCap = await lsReloads({
+      files: { '/l/web-out': sized(READ_CAP + CONTEXT_BYTES) },
+      procs: { box: [running('web', 3)] },
+    });
+    expect(atCap.row('web').reloads).toEqual({
+      count: 1,
+      last: '2026-10-12T11:00:40',
+      partial: false,
+    });
+    const past = await lsReloads({
+      files: { '/l/web-out': sized(READ_CAP + CONTEXT_BYTES + 1) },
+      procs: { box: [running('web', 3)] },
+    });
+    expect(past.row('web').reloads).toEqual({
+      count: 1,
+      last: '2026-10-12T11:00:40',
+      partial: true,
+    });
+  });
+  it("a short read (the file rotated while it was read) reaches nowhere: its lines are not counted and the count is partial; the other stream's still are", async () => {
+    const r = await lsReloads({
+      short: ['/l/web-out'],
+      files: {
+        '/l/web-out': thisRun,
+        '/l/web-err': `${S(20)}[vite] page reload src/x.ts\n`,
+      },
+      procs: { box: [running('web', 3)] },
+    });
+    expect(r.row('web').reloads).toEqual({
+      count: 1,
+      last: '2026-10-12T11:00:20',
       partial: true,
     });
   });
@@ -215,5 +265,59 @@ describe('countReloads (ls --reloads)', () => {
         ),
       },
     ]);
+  });
+});
+
+describe('listWithReloads (ls, with and without --reloads)', () => {
+  const state = (): FakeState => ({
+    failReads: ['box'],
+    files: {
+      '/l/watch-out': `${S(1)}Starting compilation in watch mode...\n${S(12)}File change detected. Starting incremental compilation...\n`,
+      '/l/web-out': thisRun,
+    },
+    procs: { local: [running('watch', 0)], box: [running('web', 3)] },
+  });
+  const all = (h: ReturnType<typeof fakeHosts>) => h.fleet.select(['all']);
+  /** how many commands each host was sent */
+  const sent = async (h: ReturnType<typeof fakeHosts>, hosts: string[]) =>
+    Promise.all(
+      hosts.map(
+        async (host) =>
+          ((await h.fleet.ctx(host)) as unknown as { fake: { calls: [] } }).fake
+            .calls.length
+      )
+    );
+  it("without reloads: listFleet's rows and errors as they are, nothing unread, one probe per host and no log read", async () => {
+    const plain = fakeHosts(state(), ['ro']);
+    const listed = await listFleet(plain.fleet, all(plain));
+    const h = fakeHosts(state(), ['ro']);
+    const r = await listWithReloads(h.fleet, all(h), false);
+    // uptime is measured against the clock of each call
+    const still = (rows: LsRow[]) => rows.map(({ uptime_ms, ...x }) => x);
+    expect({ ...r, rows: still(r.rows) }).toEqual({
+      rows: still(listed.rows),
+      errors: listed.errors,
+      unread: [],
+    });
+    expect(r.errors.map((e) => e.host)).toEqual(['ro']);
+    expect(h.reads).toEqual([]);
+    expect(await sent(h, ['local', 'box'])).toEqual([1, 1]);
+  });
+  it("with reloads: the counted rows; a host whose logs were not read is in unread and, after the probes' own, in errors", async () => {
+    const h = fakeHosts(state(), ['ro']);
+    const r = await listWithReloads(h.fleet, all(h), true);
+    expect(r.rows.find((x) => x.app === 'watch')!.reloads).toMatchObject({
+      count: 1,
+    });
+    expect(r.rows.find((x) => x.app === 'web')).not.toHaveProperty('reloads');
+    expect(r.unread).toEqual([
+      {
+        host: 'box',
+        apps: ['web'],
+        message: expect.stringMatching(/^reloads not counted/),
+      },
+    ]);
+    expect(r.errors.map((e) => e.host)).toEqual(['ro', 'box']);
+    expect(r.errors[1]).toBe(r.unread[0]);
   });
 });

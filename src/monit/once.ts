@@ -1,11 +1,10 @@
-import { prepare } from '../core/resolve.js';
+import { prepare, type Context } from '../core/resolve.js';
 import { describeError, isMcprocError } from '../core/errors.js';
 import { Fleet, listFleet } from '../core/fleet.js';
 import type { Manifest } from '../core/manifest.js';
 import { findProcess } from '../core/pm2.js';
 import { createFollower, type LogLine } from '../core/logfollow.js';
 import { historyReloads } from '../core/reloads.js';
-import type { Context } from '../core/resolve.js';
 import {
   appInfos,
   initialState,
