@@ -218,6 +218,67 @@ describe('mcp server', () => {
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
   });
+  it("ls reloads: true counts each running app's in-process reloads into its row and RESTARTS cell; without it ls reads no log", async () => {
+    const jlist = JSON.stringify([
+      {
+        pid: 4242,
+        name: 'demo-api',
+        pm_id: 1,
+        pm2_env: {
+          status: 'online',
+          namespace: 'demo',
+          restart_time: 1,
+          pm_uptime: Date.parse('2026-10-12T11:00:00Z'),
+          pm_out_log_path: '/l/api-out',
+          pm_err_log_path: '/l/api-err',
+        },
+      },
+    ]);
+    const files = {
+      '/l/api-out': `${S(1)}listening on 3310\n${S(10)}[tsx] change in ./dist/main.js Restarting...\n${S(11)}listening on 3310\n${S(30)}listening on 3310\n`,
+    };
+    // logs: false fails the call the moment a log read reaches the host
+    const spawner =
+      (logs: boolean): Spawner =>
+      async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, clock: '+0000' }),
+            stderr: '',
+          };
+        if (cmd.includes('__MCPROC_INC_')) {
+          if (!logs) throw new Error(`ls must not read logs: ${cmd}`);
+          return { code: 0, stdout: answerReads(cmd, files), stderr: '' };
+        }
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+    const r: any = await (await client(spawner(true))).callTool({
+      name: 'ls',
+      arguments: { project: basic, reloads: true },
+    });
+    expect(r.isError).toBeFalsy();
+    const rowOf = (res: any, app: string) =>
+      res.structuredContent.rows.find((x: any) => x.app === app);
+    expect(rowOf(r, 'api').reloads).toEqual({
+      count: 2,
+      last: '2026-10-12T11:00:30',
+      partial: false,
+    });
+    expect(rowOf(r, 'worker')).not.toHaveProperty('reloads'); // not running
+    expect(r.structuredContent.errors).toEqual([]);
+    expect(text(r)).toMatch(/api\s+server\s+online\s+4242\s+\S+\s+1 \(\+2\)\s/);
+    const plain: any = await (await client(spawner(false))).callTool({
+      name: 'ls',
+      arguments: { project: basic },
+    });
+    expect(plain.isError).toBeFalsy();
+    expect(rowOf(plain, 'api')).not.toHaveProperty('reloads');
+    expect(text(plain)).toMatch(/api\s+server\s+online\s+4242\s+\S+\s+1\s+-/);
+  });
   it('start answers with the waits it made (none for an app without conditions)', async () => {
     const spawner: Spawner = async (argv) => {
       const cmd = argv[argv.length - 1];

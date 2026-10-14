@@ -50,6 +50,12 @@ export interface LsRow {
   url_status: 'ok' | 'error' | 'down' | 'unchecked';
   url_code: number | null;
   ports: AppPorts;
+  /**
+   * only when asked (ls --reloads) and the app runs with reloads on and a known start: its in-process reloads since pm2
+   * started it, the last one's stamp as its log wrote it, and partial when the logs read did not reach back to the start
+   * (the count is then a lower bound)
+   */
+  reloads?: { count: number; last: string | null; partial: boolean };
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
 }

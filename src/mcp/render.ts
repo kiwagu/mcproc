@@ -1,4 +1,5 @@
 import type { LsRow, HostInfo } from '../core/list.js';
+import type { HostError } from '../core/fleet.js';
 import type { DoctorReport } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
@@ -73,14 +74,28 @@ export function fmtUrl(r: LsRow): string {
   if (r.url_status === 'down') return `${r.url} ✗ down`;
   return r.url;
 }
-/** One table; a HOST column and the list of hosts only when the rows span more than one, then one line per host that did not answer. */
-export function renderLs(rows: LsRow[], host: string): string {
+/** pm2's restarts, then the in-process reloads counted since the start when there are any: `0 (+3)`, `0 (+≥3)` when partial. */
+function fmtRestarts(r: LsRow): string {
+  const n = r.reloads;
+  return n && n.count > 0
+    ? `${r.restarts} (+${n.partial ? '≥' : ''}${n.count})`
+    : String(r.restarts);
+}
+/**
+ * One table; a HOST column and the list of hosts only when the rows span more than one, then one line per host that did
+ * not answer, then one per error of a later read of a host that did (`errors`, the reload count's).
+ */
+export function renderLs(
+  rows: LsRow[],
+  host: string,
+  errors: HostError[] = []
+): string {
   const hosts = [...new Set(rows.map((r) => r.host))];
   const multi = hosts.length > 1;
   const head = multi
     ? `hosts: ${hosts.join(', ')}`
     : `host: ${hosts[0] ?? host}`;
-  const errors = [
+  const unreachable = [
     ...new Map(
       rows.filter((r) => r.error).map((r) => [r.host, `${r.host}: ${r.error}`])
     ).values(),
@@ -110,7 +125,7 @@ export function renderLs(rows: LsRow[], host: string): string {
         r.status,
         r.pid === null ? '-' : String(r.pid),
         fmtUptime(r.uptime_ms),
-        String(r.restarts),
+        fmtRestarts(r),
         r.memory ? fmtBytes(r.memory) : '-',
         r.status === 'online' ? fmtCpu(r.cpu) : '-',
         fmtPorts(r.ports),
@@ -119,7 +134,8 @@ export function renderLs(rows: LsRow[], host: string): string {
         cut(r.description.split('\n')[0], 40),
       ]),
     ]),
-    ...errors,
+    ...unreachable,
+    ...errors.map((e) => `${e.host}: ${e.message}`),
   ].join('\n');
 }
 /** `host` when the rows come from one host (the shape results had before apps could run on several), `hosts` always. */

@@ -166,6 +166,47 @@ describe('renderLs with tree metrics', () => {
   });
 });
 
+describe('renderLs RESTARTS with reloads (ls --reloads)', () => {
+  const base = row('online', []);
+  const line = (r: Partial<LsRow>) =>
+    renderLs([{ ...base, ...r }], 'local').split('\n')[2];
+  const counted = (count: number, partial: boolean): LsRow['reloads'] => ({
+    count,
+    last: count ? '2026-10-12T11:00:30' : null,
+    partial,
+  });
+  it("adds the reloads since the start to pm2's restarts: (+N), (+≥N) when the logs read did not reach back to the start", () => {
+    expect(line({ reloads: counted(3, false) })).toMatch(/\s0 \(\+3\)\s/);
+    expect(line({ reloads: counted(3, true) })).toMatch(/\s0 \(\+≥3\)\s/);
+    expect(line({ restarts: 2, reloads: counted(7, false) })).toMatch(
+      /\s2 \(\+7\)\s/
+    );
+  });
+  it('shows nothing more when no reload was counted, partial or not, and nothing changes without the field', () => {
+    const plain = renderLs([base], 'local');
+    expect(plain).toMatch(/UPTIME\s+RESTARTS\s+MEM/);
+    expect(plain.split('\n')[2]).toMatch(/\s0s\s+0\s+-\s/);
+    expect(renderLs([{ ...base, reloads: counted(0, true) }], 'local')).toBe(
+      plain
+    );
+    expect(renderLs([{ ...base, reloads: counted(0, false) }], 'local')).toBe(
+      plain
+    );
+  });
+  it('a host whose logs could not be read for the count gets one line after the table', () => {
+    const t = renderLs([base], 'local', [
+      {
+        host: 'box',
+        apps: ['web'],
+        message: 'reloads not counted: TRANSPORT_FAILED: ssh to box failed',
+      },
+    ]);
+    expect(t.split('\n').at(-1)).toBe(
+      'box: reloads not counted: TRANSPORT_FAILED: ssh to box failed'
+    );
+  });
+});
+
 describe('several hosts', () => {
   const local = row('online', []);
   const box = {

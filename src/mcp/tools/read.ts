@@ -10,6 +10,7 @@ import {
   describeFleetApp,
 } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
+import { countReloads } from '../../core/reloadcount.js';
 import {
   LogMarks,
   parseSince,
@@ -97,22 +98,36 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'List apps',
       description:
-        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open".',
+        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open". reloads: true also counts each running app\'s in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2\'s restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.',
       inputSchema: {
         ...commonInput,
         app: z.string().optional().describe('Only this app'),
+        reloads: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also count each running app's in-process reloads since its pm2 start; costs one log read per host (default false)"
+          ),
       },
       annotations: RO,
     },
     (args) =>
       runTool(async () => {
         const fleet = await fleetOf(args);
-        const { rows, errors } = await listFleet(
+        const listed = await listFleet(
           fleet,
           fleet.select(args.app ? [args.app] : ['all'])
         );
+        let { rows, errors } = listed;
+        let unread: typeof errors = [];
+        if (args.reloads) {
+          const r = await countReloads(fleet, listed.probes, rows);
+          rows = r.rows;
+          unread = r.errors;
+          errors = [...errors, ...r.errors];
+        }
         return {
-          text: renderLs(rows, fleet.fallback),
+          text: renderLs(rows, fleet.fallback, unread),
           data: {
             ...hostsOf(rows, fleet.fallback),
             project: fleet.manifest.project,

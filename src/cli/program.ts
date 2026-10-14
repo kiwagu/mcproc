@@ -39,7 +39,9 @@ import {
   listFleet,
   describeFleetApp,
   type Act,
+  type HostError,
 } from '../core/fleet.js';
+import { countReloads } from '../core/reloadcount.js';
 import {
   renderLs,
   renderPorts,
@@ -131,6 +133,34 @@ export async function printSince(
       ];
     })
   );
+}
+
+/**
+ * `ls`: the rows of the named apps, each from its own host, as a table or JSON; with reloads, each running app's
+ * in-process reloads since its pm2 start, which reads the logs of each host once more. Exit code 1 when a host was not
+ * probed or its logs were not read.
+ */
+export async function printLs(
+  fleet: Fleet,
+  names: string[],
+  how: { reloads: boolean; json: boolean },
+  io: Io
+): Promise<void> {
+  const listed = await listFleet(fleet, names);
+  let { rows, errors } = listed;
+  let unread: HostError[] = [];
+  if (how.reloads) {
+    const r = await countReloads(fleet, listed.probes, rows);
+    rows = r.rows;
+    unread = r.errors;
+    errors = [...errors, ...r.errors];
+  }
+  io.out(
+    how.json
+      ? JSON.stringify(rows, null, 2)
+      : renderLs(rows, fleet.fallback, unread)
+  );
+  if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
 }
 
 export function buildProgram(io: Io = defaultIo): Command {
@@ -237,15 +267,19 @@ export function buildProgram(io: Io = defaultIo): Command {
     .description(
       'apps with status, pid and real vs declared ports, each from the host it runs on'
     )
+    .option(
+      '--reloads',
+      "also count each running app's in-process reloads since its pm2 start, shown as RESTARTS 0 (+3); reads each host's logs once more"
+    )
     .action(
-      wrap(async (g, _o, [app]) => {
+      wrap(async (g, o, [app]) => {
         const fleet = fleetOf(g);
-        const { rows, errors } = await listFleet(
+        await printLs(
           fleet,
-          fleet.select(app ? [app] : ['all'])
+          fleet.select(app ? [app] : ['all']),
+          { reloads: Boolean(o.reloads), json: Boolean(g.json) },
+          io
         );
-        emit(g, renderLs(rows, fleet.fallback), rows);
-        if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
       })
     );
   program

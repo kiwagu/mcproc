@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildProgram, printSince } from '../../src/cli/program.js';
+import { buildProgram, printLs, printSince } from '../../src/cli/program.js';
 import { parseSince } from '../../src/core/logsince.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
 
@@ -332,6 +332,94 @@ describe('cli', () => {
     const opt = cmd.options.find((o) => o.long === '--reloads');
     expect(opt?.description).toMatch(/reload/);
     expect(opt?.required || opt?.optional).toBeFalsy(); // a switch, no value
+  });
+});
+
+describe('printLs (ls)', () => {
+  const state = () => ({
+    files: {
+      '/l/web-out': `${S(1)}listening on :3000\n${S(20)}listening on :3000\n`,
+    },
+    procs: {
+      local: [proc('watch', 0)],
+      box: [proc('web', 2, { pm_uptime: Date.parse('2026-10-12T11:00:00Z') })],
+    },
+  });
+  it('the ls command takes --reloads as a switch', () => {
+    const cmd = buildProgram(capture().io).commands.find(
+      (c) => c.name() === 'ls'
+    )!;
+    const opt = cmd.options.find((o) => o.long === '--reloads');
+    expect(opt?.description).toMatch(/reload/);
+    expect(opt?.required || opt?.optional).toBeFalsy();
+  });
+  it('--reloads prints the reloads in the RESTARTS cell and the JSON rows carry them; without it no log is read', async () => {
+    const h = fakeHosts(state());
+    const c = capture();
+    await printLs(
+      h.fleet,
+      h.fleet.select(['all']),
+      { reloads: true, json: false },
+      c.io
+    );
+    expect(c.out.join('\n')).toMatch(
+      /web\s+box\s+server\s+online\s+102\s+\S+\s+0 \(\+1\)\s/
+    );
+    expect(h.reads).toEqual(['box']);
+    expect(process.exitCode).not.toBe(1);
+    const j = capture();
+    await printLs(
+      fakeHosts(state()).fleet,
+      ['web'],
+      { reloads: true, json: true },
+      j.io
+    );
+    expect(JSON.parse(j.out.join(''))[0].reloads).toEqual({
+      count: 1,
+      last: '2026-10-12T11:00:20',
+      partial: false,
+    });
+    const plain = fakeHosts(state());
+    const p = capture();
+    await printLs(
+      plain.fleet,
+      plain.fleet.select(['all']),
+      { reloads: false, json: false },
+      p.io
+    );
+    expect(plain.reads).toEqual([]);
+    expect(p.out.join('\n')).toMatch(/web\s+box\s+server\s+online\s+102\s/);
+    expect(p.out.join('\n')).not.toContain('(+');
+  });
+  it('a host whose logs could not be read: the other rows are counted, a line names the host, and the exit code is 1', async () => {
+    const h = fakeHosts({
+      ...state(),
+      failReads: ['box'],
+      files: {
+        '/l/watch-out': `${S(1)}Starting compilation in watch mode...\n${S(12)}File change detected. Starting incremental compilation...\n`,
+      },
+      procs: {
+        local: [
+          proc('watch', 0, { pm_uptime: Date.parse('2026-10-12T11:00:00Z') }),
+        ],
+        box: state().procs.box,
+      },
+    });
+    const c = capture();
+    await printLs(
+      h.fleet,
+      h.fleet.select(['all']),
+      { reloads: true, json: false },
+      c.io
+    );
+    const out = c.out.join('\n');
+    expect(out).toMatch(
+      /watch\s+local\s+build\s+online\s+100\s+\S+\s+0 \(\+1\)\s/
+    );
+    expect(out.split('\n').at(-1)).toMatch(
+      /^box: reloads not counted: TRANSPORT_FAILED/
+    );
+    expect(process.exitCode).toBe(1);
   });
 });
 
