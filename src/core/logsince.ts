@@ -175,18 +175,26 @@ export interface SinceLine {
   time: string | null;
   text: string;
 }
-/** Stable order by time (an unstamped line already carries its inherited time); the LAST `cap` lines are kept. */
+/**
+ * Stable order by the moment each line was written (an unstamped line already carries its inherited time), then the
+ * LAST `cap` lines are kept. pm2 stamps in its host's local time, so a stamp read as UTC minus its host's offset
+ * (`offsets`, ms east of UTC; a host without one counts as UTC) places hosts in different zones on one timeline. A
+ * line without a time sorts as the oldest.
+ */
 export function mergeLines(
   lines: SinceLine[],
-  cap: number
+  cap: number,
+  offsets: Record<string, number> = {}
 ): { lines: SinceLine[]; truncated: number } {
+  const moment = (l: SinceLine): number => {
+    const ms = l.time === null ? Number.NaN : Date.parse(`${l.time}Z`);
+    return Number.isNaN(ms)
+      ? Number.NEGATIVE_INFINITY
+      : ms - (offsets[l.host] ?? 0);
+  };
   const sorted = lines
-    .map((l, i) => ({ l, i }))
-    .sort((a, b) => {
-      const ta = a.l.time ?? '';
-      const tb = b.l.time ?? '';
-      return ta < tb ? -1 : ta > tb ? 1 : a.i - b.i;
-    })
+    .map((l, i) => ({ l, i, k: moment(l) }))
+    .sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : a.i - b.i))
     .map((x) => x.l);
   const truncated = Math.max(0, sorted.length - cap);
   return { lines: sorted.slice(truncated), truncated };
@@ -227,6 +235,8 @@ export interface SinceAnswer {
     bytes: number;
   }[];
   not_started: string[];
+  /** hosts whose UTC offset could not be read: their lines are placed by their raw stamps among the other hosts' */
+  unzoned: string[];
   errors: HostError[];
   apps: number;
   hosts: number;
@@ -236,6 +246,8 @@ const STREAMS = ['out', 'err'] as const;
 interface HostRead {
   host: string;
   cutoff: string | null;
+  /** the host's UTC offset in ms; null when its clock line or zone could not be read */
+  offset: number | null;
   lines: SinceLine[];
   skipped: SinceAnswer['skipped'];
   notStarted: string[];
@@ -312,7 +324,9 @@ export async function readSince(
           ctx.host,
           'read logs since'
         );
-        const cutoff = cutoffFor(spec, hostClock(res.stdout));
+        const clock = hostClock(res.stdout);
+        const cutoff = cutoffFor(spec, clock);
+        const offset = clock ? zoneMs(clock.zone) : null;
         const lines: SinceLine[] = [];
         const skipped: SinceAnswer['skipped'] = [];
         files.forEach((f, i) => {
@@ -363,7 +377,7 @@ export async function readSince(
               ...(r.anchor ? { at: r.anchor.at, anchor: r.anchor.hex } : {}),
             });
         });
-        return { host: g.host, cutoff, lines, skipped, notStarted };
+        return { host: g.host, cutoff, offset, lines, skipped, notStarted };
       } catch (e) {
         return {
           host: g.host,
@@ -377,14 +391,22 @@ export async function readSince(
   if (failed.length === perHost.length && failed.length > 0)
     throw failed[0].cause;
   const ok = perHost.filter((h): h is HostRead => !('error' in h));
-  // the reads come back grouped by host: equal stamps follow the order of the names, then out before err, then file order
+  // the reads come back grouped by host: equal moments follow the order of the names, then out before err, then file order
   const rank = new Map(names.map((n, i) => [n, i]));
   const byName = (a: string, b: string) =>
     (rank.get(a) ?? 0) - (rank.get(b) ?? 0);
+  // each host's stamps are its local time: its offset puts them on one timeline (a host without a zone stays as stamped)
   const merged = mergeLines(
     ok.flatMap((h) => h.lines).sort((a, b) => byName(a.app, b.app)),
-    cap
+    cap,
+    Object.fromEntries(ok.map((h) => [h.host, h.offset ?? 0]))
   );
+  // a host without a zone can only be misplaced against another host's lines
+  const withLines = ok.filter((h) => h.lines.length > 0);
+  const unzoned =
+    withLines.length > 1
+      ? withLines.filter((h) => h.offset === null).map((h) => h.host)
+      : [];
   return {
     mode: spec.kind,
     since: Object.fromEntries(ok.map((h) => [h.host, h.cutoff])),
@@ -392,6 +414,7 @@ export async function readSince(
     truncated: merged.truncated,
     skipped: ok.flatMap((h) => h.skipped),
     not_started: ok.flatMap((h) => h.notStarted).sort(byName),
+    unzoned,
     errors: failed.map((f) => f.error),
     apps: names.length,
     hosts: groups.length,

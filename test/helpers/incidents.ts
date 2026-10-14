@@ -11,12 +11,16 @@ export const fleetManifest = loadManifest(fleetDir);
 /** pm2's stamp for 2026-10-12T11:00:<sec>, with the separator pm2 writes after it. */
 export const S = (sec: number) =>
   `2026-10-12T11:00:${String(sec).padStart(2, '0')}: `;
-/** `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading). */
+/**
+ * `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading).
+ * `clocks`: one host's own `now` and `zone` in place of the shared ones (hosts in different time zones).
+ */
 export interface FakeState {
   files: Record<string, string>;
   procs: Record<string, object[]>;
   now?: string;
   zone?: string;
+  clocks?: Record<string, { now?: string; zone?: string }>;
   unwritable?: string[];
   short?: string[];
 }
@@ -32,8 +36,10 @@ export function fakeHosts(
   manifest = fleetManifest
 ) {
   const reads: string[] = [];
-  const clock = () =>
-    `__MCPROC_LS_CLOCK__ ${state.now ?? ''} ${state.zone ?? '+0000'}\n`;
+  const clock = (host: string) => {
+    const c = { now: state.now, zone: state.zone, ...state.clocks?.[host] };
+    return `__MCPROC_LS_CLOCK__ ${c.now ?? ''} ${c.zone ?? '+0000'}\n`;
+  };
   const fleet = new Fleet(manifest, undefined, async (_m, host, fallback) => {
     if (down.includes(host))
       throw new McprocError(
@@ -57,7 +63,7 @@ export function fakeHosts(
                 (cmd.includes('__MCPROC_NOW__')
                   ? `__MCPROC_NOW__ ${state.now ?? ''}\n`
                   : '') +
-                (cmd.includes('__MCPROC_LS_CLOCK__') ? clock() : '') +
+                (cmd.includes('__MCPROC_LS_CLOCK__') ? clock(host) : '') +
                 answerReads(cmd, state.files, state.short ?? []),
             };
           },
@@ -65,7 +71,7 @@ export function fakeHosts(
         {
           // a since script with no file to read (no app started there) asks only for the clock
           match: '__MCPROC_LS_CLOCK__',
-          result: () => ({ stdout: clock() }),
+          result: () => ({ stdout: clock(host) }),
         },
         {
           match: ': > ',

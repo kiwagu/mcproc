@@ -222,6 +222,53 @@ describe('mergeLines', () => {
     expect(c.lines.map((l) => l.text)).toEqual(['a1-cont', 'w1']);
     expect(c.truncated).toBe(3);
   });
+  it("with each host's UTC offset, hosts in different zones are ordered by the moment a line was written", () => {
+    const H = (host: string, time: string | null, text: string): SinceLine => ({
+      app: host === 'local' ? 'watch' : 'web',
+      host,
+      stream: 'out',
+      time,
+      text,
+    });
+    // local at +0300 writes at 11:00:32Z and :34Z; box at UTC at :31Z, :33Z and :35Z
+    const lines = [
+      H('local', '2026-10-12T14:00:32.000', 'local A'),
+      H('local', '2026-10-12T14:00:34.000', 'local B'),
+      H('box', '2026-10-12T11:00:31.000', 'box 1'),
+      H('box', '2026-10-12T11:00:33.000', 'box 2'),
+      H('box', '2026-10-12T11:00:35.000', 'box 3'),
+      H('box', null, 'unstamped'),
+    ];
+    const plus3 = 3 * 3_600_000;
+    const all = mergeLines(lines, 10, { local: plus3, box: 0 });
+    expect(all.lines.map((l) => l.text)).toEqual([
+      'unstamped', // no time: the oldest, as without offsets
+      'box 1',
+      'local A',
+      'box 2',
+      'local B',
+      'box 3',
+    ]);
+    expect(all.lines[2].time).toBe('2026-10-12T14:00:32.000'); // the time stays the host's own
+    const capped = mergeLines(lines, 3, { local: plus3 }); // a host without an offset counts as UTC
+    expect(capped.lines.map((l) => l.text)).toEqual([
+      'box 2',
+      'local B',
+      'box 3',
+    ]);
+    expect(capped.truncated).toBe(3);
+    // the same moment on two hosts keeps the order it came in
+    expect(
+      mergeLines(
+        [
+          H('local', '2026-10-12T14:00:31.000', 'l'),
+          H('box', '2026-10-12T11:00:31.000', 'b'),
+        ],
+        10,
+        { local: plus3 }
+      ).lines.map((l) => l.text)
+    ).toEqual(['l', 'b']);
+  });
 });
 
 describe('hostClock', () => {
@@ -579,6 +626,100 @@ describe('readSince', () => {
       marks,
     });
     expect(a.lines.map((l) => l.text)).toEqual(fresh);
+  });
+  describe('hosts in different time zones', () => {
+    const body = (l: SinceLine) => l.text.replace(/^\S+: /, '');
+    // the same real instants: watch on local (+0300) writes at 11:00:32Z and :34Z, web on box (UTC) at :31Z, :33Z, :35Z
+    const zoned = () => ({
+      procs: { local: [proc('watch', 0)], box: [proc('web', 2)] } as Record<
+        string,
+        object[]
+      >,
+      clocks: {
+        local: { now: '2026-10-12T14:00:40', zone: '+0300' },
+        box: { now: '2026-10-12T11:00:40', zone: '+0000' },
+      } as Record<string, { now?: string; zone?: string }>,
+      files: {
+        '/l/watch-out':
+          '2026-10-12T14:00:32.000: local A\n2026-10-12T14:00:34.000: local B\n',
+        '/l/watch-err': '',
+        '/l/web-out': `${S(31)}box 1\n${S(33)}box 2\n${S(35)}box 3\n`,
+        '/l/web-err': '',
+      } as Record<string, string>,
+    });
+    it('are interleaved by the actual moment, time and text stay host-local, and the cap keeps the true latest lines', async () => {
+      const { fleet } = fakeHosts(zoned());
+      const names = ['watch', 'web'];
+      const a = await readSince(fleet, names, { since: parseSince('1m') });
+      expect(a.since).toEqual({
+        local: '2026-10-12T13:59:40.000',
+        box: '2026-10-12T10:59:40.000',
+      });
+      expect(a.lines.map(body)).toEqual([
+        'box 1',
+        'local A',
+        'box 2',
+        'local B',
+        'box 3',
+      ]);
+      expect(a.lines[1]).toEqual({
+        app: 'watch',
+        host: 'local',
+        stream: 'out',
+        time: '2026-10-12T14:00:32.000',
+        text: '2026-10-12T14:00:32.000: local A',
+      });
+      expect(a.unzoned).toEqual([]);
+      const capped = await readSince(fleet, names, {
+        since: parseSince('1m'),
+        lines: 3,
+      });
+      expect(capped.lines.map(body)).toEqual(['box 2', 'local B', 'box 3']);
+      expect(capped.truncated).toBe(2);
+      const tail = await readSince(fleet, names, {
+        since: { kind: 'tail', n: 3 },
+      });
+      expect(tail.lines.map(body)).toEqual(['box 2', 'local B', 'box 3']);
+      expect(tail.truncated).toBe(2);
+    });
+    it("a host whose zone cannot be read is placed by its raw stamps and named in unzoned, when several hosts' lines merge", async () => {
+      const st = zoned();
+      delete st.clocks.box; // its clock line comes back garbled
+      const { fleet } = fakeHosts(st);
+      const names = ['watch', 'web'];
+      for (const since of [
+        { kind: 'tail', n: 3 } as const,
+        parseSince('2026-10-12T11:00:00'), // a host-local time needs no clock
+      ]) {
+        const a = await readSince(fleet, names, { since, lines: 10 });
+        expect(a.errors).toEqual([]);
+        // box's stamps read as UTC (which they happen to be here), local's through its zone
+        expect(a.lines.map(body)).toEqual([
+          'box 1',
+          'local A',
+          'box 2',
+          'local B',
+          'box 3',
+        ]);
+        expect(a.unzoned).toEqual(['box']);
+      }
+      // one host alone has nothing to be misplaced against
+      const alone = await readSince(fleet, ['web'], {
+        since: { kind: 'tail', n: 3 },
+      });
+      expect(alone.lines).toHaveLength(3);
+      expect(alone.unzoned).toEqual([]);
+      // a relative since needs the clock: box is not read, so it is an error, not a misplaced host
+      const rel = await readSince(fleet, names, { since: parseSince('1m') });
+      expect(rel.errors.map((e) => e.host)).toEqual(['box']);
+      expect(rel.unzoned).toEqual([]);
+      // a clock whose zone is not a real offset: the window is placed by the clock, the order by raw stamps
+      st.clocks.box = { now: '2026-10-12T11:00:40', zone: '+9900' };
+      const bad = await readSince(fleet, names, { since: parseSince('1m') });
+      expect(bad.since.box).toBe('2026-10-12T10:59:40.000');
+      expect(bad.lines).toHaveLength(5);
+      expect(bad.unzoned).toEqual(['box']);
+    });
   });
   it('an unreachable host leaves its marks alone: once it answers, its app reads like a first last', async () => {
     const st = state();

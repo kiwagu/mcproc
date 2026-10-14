@@ -589,6 +589,7 @@ describe('renderLogsSince', () => {
     ],
     skipped: [{ app: 'api', host: 'local', stream: 'out', bytes: 2048 }],
     not_started: ['logger'],
+    unzoned: [],
     errors: [
       {
         host: 'box',
@@ -611,6 +612,15 @@ describe('renderLogsSince', () => {
       'box unreachable (tool): TRANSPORT_FAILED: ssh box: Connection refused',
     ]);
     expect(t.endsWith(sinceNotes(a).join('\n'))).toBe(true);
+  });
+  it('hosts whose zone could not be read are one note: their lines may be out of place among the other hosts', () => {
+    expect(sinceNotes({ ...a, unzoned: ['box'] })).toContain(
+      "zone unknown on box: its lines are placed by their stamps as if in UTC, so they may be out of place among the other hosts' lines"
+    );
+    expect(sinceNotes({ ...a, unzoned: ['box', 'ro'] })).toContain(
+      "zone unknown on box, ro: their lines are placed by their stamps as if in UTC, so they may be out of place among the other hosts' lines"
+    );
+    expect(sinceNotes(a).some((n) => n.startsWith('zone unknown'))).toBe(false);
   });
   it('a last read names the bytes it jumped over since the previous call', () => {
     expect(

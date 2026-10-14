@@ -244,7 +244,7 @@ function sinceWhen(a: SinceAnswer): string {
     : `since ${hosts.map(([h, c]) => `${h} ${c}`).join(', ')} (each host's time)`;
 }
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
-/** The notes after the lines: what was cut, what may be missing, who was not read; the CLI prints the same on stderr. */
+/** The notes after the lines: what was cut, what may be missing or misplaced, who was not read; the CLI prints the same on stderr. */
 export function sinceNotes(a: SinceAnswer): string[] {
   const notes: string[] = [];
   if (a.truncated > 0)
@@ -260,6 +260,10 @@ export function sinceNotes(a: SinceAnswer): string[] {
     );
   if (a.not_started.length)
     notes.push(`not started: ${a.not_started.join(', ')}`);
+  if (a.unzoned.length)
+    notes.push(
+      `zone unknown on ${a.unzoned.join(', ')}: ${a.unzoned.length === 1 ? 'its' : 'their'} lines are placed by their stamps as if in UTC, so they may be out of place among the other hosts' lines`
+    );
   for (const e of a.errors)
     notes.push(`${e.host} unreachable (${e.apps.join(', ')}): ${e.message}`);
   return notes;
