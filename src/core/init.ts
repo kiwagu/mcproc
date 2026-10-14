@@ -92,16 +92,28 @@ export function guessKind(name: string, cmd: string): AppKind | 'unknown' {
 
 /** `next dev` / `next start` listen on 3000 unless a flag says otherwise. */
 const NEXT_RE = /\bnext\s+(dev|start)\b/;
-/** `vite` and its subcommand; the lookahead keeps `vitest` and `vite-node` out. */
-const VITE_RE = /(?:^|[\s&;])vite(?![\w-])(?:\s+(\w+))?/;
+/**
+ * `vite` and its subcommand; the lookahead keeps `vitest`, `vite-node` and a
+ * `vite.config.ts` argument out. Global: a script may chain
+ * `vite build && vite preview`, where the server is the second call.
+ */
+const VITE_RE = /(?:^|[\s&;])vite(?![\w.-])(?:\s+(\w+))?/g;
 const VITE_CONFIGS = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map(
   (e) => `vite.config.${e}`
 );
-/** A `port:` value: a literal, or the fallback of an env read (`?? N`, `|| 'N'`). */
+/**
+ * A `port:` value: a literal, or the fallback of an env read
+ * (`?? N`, `|| 'N'`, `Number(process.env.X) || N`).
+ */
 const PORT_VALUE =
-  /\bport\s*:\s*(?:Number\(\s*)?(?:process\.env\.[A-Za-z_0-9]+\s*(?:\?\?|\|\|)\s*)?["']?(\d{2,5})\b/;
+  /\bport\s*:\s*(?:Number\(\s*)?(?:process\.env\.[A-Za-z_0-9]+\s*\)?\s*(?:\?\?|\|\|)\s*)?["']?(\d{2,5})\b/;
 
-/** Vite's port from its config: the `server` or `preview` block's `port`, a literal or the fallback of an env read. */
+/**
+ * Vite's port from its config: the `server` or `preview` block's `port`, a
+ * literal or the fallback of an env read. Every `<section>: {` is tried in
+ * order, since a block of that name without a port can come first (vitest's
+ * `test: { server: { deps } }`).
+ */
 function vitePort(
   dir: string,
   section: 'server' | 'preview'
@@ -110,22 +122,26 @@ function vitePort(
     const p = path.join(dir, f);
     if (!fs.existsSync(p)) continue;
     const text = fs.readFileSync(p, 'utf8');
-    const at = text.search(new RegExp(`\\b${section}\\s*:\\s*\\{`));
-    if (at < 0) return undefined;
-    // the block's text up to its closing brace, nested braces (proxy maps) counted
-    let depth = 0;
-    let end = text.indexOf('{', at);
-    for (; end < text.length; end++) {
-      if (text[end] === '{') depth++;
-      else if (text[end] === '}' && --depth === 0) break;
+    for (const h of text.matchAll(
+      new RegExp(`\\b${section}\\s*:\\s*\\{`, 'g')
+    )) {
+      const at = h.index;
+      // the block's text up to its closing brace, nested braces (proxy maps) counted
+      let depth = 0;
+      let end = at + h[0].length - 1;
+      for (; end < text.length; end++) {
+        if (text[end] === '{') depth++;
+        else if (text[end] === '}' && --depth === 0) break;
+      }
+      // a `port:` of the block itself, not of a nested map such as `hmr: { port }`:
+      // one pass drops every brace pair with no brace inside (the block's own pair
+      // is never one: its closing brace is not in the slice); what deeper maps
+      // such as proxy entries leave behind holds no `port:` key in practice
+      const flat = text.slice(at, end).replace(/\{[^{}]*\}/g, '');
+      const m = PORT_VALUE.exec(flat);
+      if (m) return Number(m[1]);
     }
-    // a `port:` of the block itself, not of a nested map such as `hmr: { port }`:
-    // one pass drops every brace pair with no brace inside (the block's own pair
-    // is never one: its closing brace is not in the slice); what deeper maps
-    // such as proxy entries leave behind holds no `port:` key in practice
-    const flat = text.slice(at, end).replace(/\{[^{}]*\}/g, '');
-    const m = PORT_VALUE.exec(flat);
-    return m ? Number(m[1]) : undefined;
+    return undefined;
   }
   return undefined;
 }
@@ -140,8 +156,8 @@ export function guessPort(cmd: string, dir: string): number | undefined {
     if (e) return Number(e[1]);
   }
   if (NEXT_RE.test(cmd)) return 3000;
-  const vite = VITE_RE.exec(cmd);
-  if (vite && vite[1] !== 'build') {
+  const vite = [...cmd.matchAll(VITE_RE)].find((v) => v[1] !== 'build');
+  if (vite) {
     const section = vite[1] === 'preview' ? 'preview' : 'server';
     return vitePort(dir, section) ?? (section === 'server' ? 5173 : 4173);
   }
@@ -157,7 +173,7 @@ export function guessPort(cmd: string, dir: string): number | undefined {
         /\b(?:DEFAULT_)?PORT\b\s*(?::\s*number)?\s*=\s*(\d{2,5})\b/.exec(
           text
         ) ??
-        /\bPORT\s*(?:\?\?|\|\|)\s*(\d{2,5})\b/.exec(text);
+        /\bPORT\s*\)?\s*(?:\?\?|\|\|)\s*["']?(\d{2,5})\b/.exec(text);
       if (l) return Number(l[1]);
     }
   }

@@ -267,6 +267,8 @@ describe('guessPort: frameworks and source constants', () => {
     expect(guessPort('next start', r)).toBe(3000);
     expect(guessPort('next dev -p 3001', r)).toBe(3001);
     expect(guessPort('next build', r)).toBeUndefined();
+    // a PORT in .env wins over the framework default
+    expect(guessPort('next dev', mk({ '.env': 'PORT=4444\n' }))).toBe(4444);
   });
   it('vite reads server.port from its config, with env fallbacks and nested braces; defaults 5173 / 4173', () => {
     expect(guessPort('vite', mk({}))).toBe(5173);
@@ -328,6 +330,37 @@ describe('guessPort: frameworks and source constants', () => {
         mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
       )
     ).toBe(3333);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            'export default { server: { port: Number(process.env.WEB_PORT) || 3002 } }',
+        })
+      )
+    ).toBe(3002);
+    // the nested hmr port is not the server port
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            'export default { server: { hmr: { port: 24678 } } }',
+        })
+      )
+    ).toBe(5173);
+    // vitest's own `test.server` block comes first and holds no port
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            "export default defineConfig({ test: { server: { deps: { inline: ['x'] } } }, server: { port: 3002 } })",
+        })
+      )
+    ).toBe(3002);
+    expect(guessPort('vite build && vite preview', mk({}))).toBe(4173);
+    expect(guessPort('tsx vite.config.ts', mk({}))).toBeUndefined();
   });
   it('source constants: PORT = N, DEFAULT_PORT = N, process.env.PORT ?? N', () => {
     expect(
@@ -356,6 +389,20 @@ describe('guessPort: frameworks and source constants', () => {
         mk({ 'src/main.js': 'app.listen(process.env.PORT || 4020)\n' })
       )
     ).toBe(4020);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': "const port = process.env.PORT || '4030';\n" })
+      )
+    ).toBe(4030);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({
+          'src/main.js': 'const port = Number(process.env.PORT) || 4040;\n',
+        })
+      )
+    ).toBe(4040);
     expect(
       guessPort(
         'node src/main.js',
