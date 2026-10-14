@@ -22,6 +22,18 @@ export interface LogLine {
   text: string;
 }
 
+/**
+ * One poll: the new lines; `reset` when a file was replaced under the follower (its lines start over); `lost` when
+ * lines written since the last poll are missing from them: a burst too big for one read was skipped to its last part,
+ * a replaced file was read from its tail, or the host stream delivered more lines than a poll keeps. The follower
+ * always says; a stand-in for it may leave `lost` out.
+ */
+export interface FollowPoll {
+  lines: LogLine[];
+  reset: boolean;
+  lost?: boolean;
+}
+
 /** An unfinished line longer than this is shown cut. */
 const MAX_PENDING = 65536;
 /** Lines a host stream delivered that nobody polled yet are kept up to this many (the newest). */
@@ -203,6 +215,7 @@ export class LogFollower {
   /** what the host stream delivered since the last poll */
   private ready: LogLine[] = [];
   private readyReset = false;
+  private readyLost = false;
   constructor(
     private readonly ctx: Context,
     private readonly paths: { out: string; err: string },
@@ -285,9 +298,13 @@ export class LogFollower {
   offer(k: number, c: LogChunk): boolean {
     const s = k === 0 ? 'out' : 'err';
     if (!this.fits(s, c)) return false;
-    if (this.apply(s, c, this.ready)) this.readyReset = true;
-    if (this.ready.length > MAX_READY)
+    const kind = this.apply(s, c, this.ready);
+    if (kind === 'R') this.readyReset = true;
+    if (kind === 'R' || kind === 'S') this.readyLost = true;
+    if (this.ready.length > MAX_READY) {
       this.ready.splice(0, this.ready.length - MAX_READY);
+      this.readyLost = true;
+    }
     this.wake?.();
     return true;
   }
@@ -307,27 +324,40 @@ export class LogFollower {
     }
   };
 
-  async poll(): Promise<{ lines: LogLine[]; reset: boolean }> {
+  async poll(): Promise<FollowPoll> {
     if (!this.stream?.covers(this)) {
       const chunks = await this.read(this.requests());
       const out: LogLine[] = [];
       let reset = false;
+      let lost = false;
       (['out', 'err'] as const).forEach((s, i) => {
         // a read the stream overtook meanwhile is not applied twice
-        if (this.fits(s, chunks[i]) && this.apply(s, chunks[i], out))
-          reset = true;
+        if (!this.fits(s, chunks[i])) return;
+        const kind = this.apply(s, chunks[i], out);
+        reset ||= kind === 'R';
+        lost ||= kind === 'R' || kind === 'S';
       });
       this.ready.push(...out);
       this.readyReset ||= reset;
+      this.readyLost ||= lost;
     }
-    const r = { lines: this.ready, reset: this.readyReset };
+    const r = {
+      lines: this.ready,
+      reset: this.readyReset,
+      lost: this.readyLost,
+    };
     this.ready = [];
     this.readyReset = false;
+    this.readyLost = false;
     return r;
   }
 
-  /** Picks the lines of one read and moves the stream on by what arrived; true when the file was replaced. */
-  private apply(s: 'out' | 'err', c: LogChunk, out: LogLine[]): boolean {
+  /** Picks the lines of one read and moves the stream on by what arrived; returns the read's kind. */
+  private apply(
+    s: 'out' | 'err',
+    c: LogChunk,
+    out: LogLine[]
+  ): LogChunk['kind'] {
     const { size, start: st, kind, body } = c;
     const off = this.offsets[s];
     const fresh = kind !== 'N'; // history, a replaced file or a skipped burst: what came before is not continued
@@ -379,7 +409,7 @@ export class LogFollower {
     const whole = c.got >= size - st;
     this.offsets[s] = whole ? size : st + c.got;
     this.anchors[s] = whole && HEX.test(c.anchor) ? c.anchor : null; // known only for the measured size
-    return kind === 'R';
+    return kind;
   }
 }
 
