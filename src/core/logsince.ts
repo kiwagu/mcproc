@@ -13,7 +13,7 @@ export const FIRST_LAST_LINES = 100;
 
 const RELATIVE = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/;
 const ABSOLUTE =
-  /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/;
+  /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?$/;
 const UNIT: Record<string, number> = {
   ms: 1,
   s: 1000,
@@ -37,7 +37,7 @@ export function parseSince(s: string): SinceSpec {
   if (!abs) throw bad(s);
   const [, date, hh, mm, ss = '00', frac = '0', zone] = abs;
   const stamp = `${date}T${hh}:${mm}:${ss}.${frac.padEnd(3, '0')}`;
-  const wall = Date.parse(`${stamp}Z`);
+  const wall = wallMs(stamp);
   if (Number.isNaN(wall)) throw bad(s);
   if (!zone) return { kind: 'local', stamp };
   const offsetMin =
@@ -57,17 +57,29 @@ export interface HostClock {
 /** A wall-clock instant held as if it were UTC, in pm2's millisecond stamp shape. */
 const wallStamp = (ms: number): string =>
   new Date(ms).toISOString().slice(0, 23);
-const zoneMs = (zone: string): number => {
-  const m = /^([+-])(\d{2})(\d{2})$/.exec(zone);
-  if (!m) return 0;
+/**
+ * A wall-clock stamp read as if it were UTC; NaN when it names no real time. Date.parse rolls `02-30` or `24:00`
+ * over to the next day, so the stamp must come back unchanged.
+ */
+function wallMs(stamp: string): number {
+  const ms = Date.parse(`${stamp}Z`);
+  return !Number.isNaN(ms) && new Date(ms).toISOString().startsWith(stamp)
+    ? ms
+    : Number.NaN;
+}
+const HOST_NOW = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+/** The host's `date +%z` (`+0200`) as milliseconds east of UTC; null when it is not one. */
+const zoneMs = (zone: string): number | null => {
+  const m = /^([+-])([01]\d|2[0-3])([0-5]\d)$/.exec(zone);
+  if (!m) return null;
   return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60_000;
 };
 const noClock = () =>
   new McprocError(
     'TRANSPORT_FAILED',
-    'the host did not report its clock, so a relative since cannot be placed',
+    'the host did not report a readable clock and zone, so a relative time or a time with a zone cannot be placed there',
     {
-      hint: 'Pass an absolute time (2026-10-14T07:30) instead, or check that `date` works on that host.',
+      hint: "Pass a time without a zone (2026-10-14T07:30), read as the host's local time, or check that `date` works on that host.",
     }
   );
 
@@ -82,13 +94,19 @@ export function cutoffFor(
       return null;
     case 'local':
       return spec.stamp;
-    case 'relative':
-      if (!clock) throw noClock();
-      // the host's wall time read as if UTC: pure arithmetic on wall clocks, no zone involved
-      return wallStamp(Date.parse(`${clock.now}Z`) - spec.ms);
-    case 'instant':
-      if (!clock) throw noClock();
-      return wallStamp(spec.epochMs + zoneMs(clock.zone));
+    case 'relative': {
+      // the host's wall time read as if UTC: pure arithmetic on wall clocks, so only the clock is needed
+      const now =
+        clock && HOST_NOW.test(clock.now) ? wallMs(clock.now) : Number.NaN;
+      if (Number.isNaN(now)) throw noClock();
+      return wallStamp(now - spec.ms);
+    }
+    case 'instant': {
+      // an instant becomes the host's wall time through its zone alone
+      const zone = clock ? zoneMs(clock.zone) : null;
+      if (zone === null) throw noClock();
+      return wallStamp(spec.epochMs + zone);
+    }
   }
 }
 

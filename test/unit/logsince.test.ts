@@ -42,6 +42,21 @@ describe('parseSince', () => {
   it('last', () => {
     expect(parseSince('last')).toEqual({ kind: 'last' });
   });
+  it('refuses impossible times and offsets instead of rolling them over', () => {
+    for (const bad of [
+      '2026-02-29T07:30', // 2026 is not a leap year
+      '2026-02-30T07:30',
+      '2026-10-14T24:00',
+      '2026-10-14T07:30:00+99:99',
+    ])
+      expect(() => parseSince(bad)).toThrowError(
+        expect.objectContaining({ code: 'BAD_ARGUMENT' })
+      );
+    expect(parseSince('2028-02-29T07:30')).toEqual({
+      kind: 'local',
+      stamp: '2028-02-29T07:30:00.000',
+    });
+  });
   it('refuses the rest with BAD_ARGUMENT', () => {
     for (const bad of [
       '',
@@ -91,6 +106,36 @@ describe('cutoffFor', () => {
     expect(cutoffFor(parseSince('2026-10-14T07:30'), null)).toBe(
       '2026-10-14T07:30:00.000'
     ); // local needs no clock
+  });
+  it('a clock or zone that cannot be read is TRANSPORT_FAILED; each form checks only what it needs', () => {
+    const unread = expect.objectContaining({ code: 'TRANSPORT_FAILED' });
+    expect(() =>
+      cutoffFor(parseSince('2026-10-14T07:30:00Z'), null)
+    ).toThrowError(unread);
+    for (const now of [
+      '',
+      '09:30:00',
+      '2026-10-14 09:30:00',
+      '2026-02-30T09:30:00',
+      '2026-10-14T24:00:00',
+    ])
+      expect(() =>
+        cutoffFor(parseSince('5m'), { now, zone: '+0200' })
+      ).toThrowError(unread);
+    for (const zone of ['', 'CEST', '+02:00', '+2', '+9999'])
+      expect(() =>
+        cutoffFor(parseSince('2026-10-14T07:30:00Z'), { now: clock.now, zone })
+      ).toThrowError(unread);
+    // a relative since needs only the clock, an instant only the zone, a local time neither
+    expect(cutoffFor(parseSince('90s'), { now: clock.now, zone: 'CEST' })).toBe(
+      '2026-10-14T09:28:30.000'
+    );
+    expect(
+      cutoffFor(parseSince('2026-10-14T07:30:00Z'), { now: '', zone: '+0200' })
+    ).toBe('2026-10-14T09:30:00.000');
+    expect(
+      cutoffFor(parseSince('2026-10-14T07:30'), { now: '', zone: '' })
+    ).toBe('2026-10-14T07:30:00.000');
   });
 });
 
