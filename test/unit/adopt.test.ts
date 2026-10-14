@@ -877,6 +877,7 @@ describe('adoptPorts', () => {
     });
     await expect(adoptPorts(h.fleet)).rejects.toMatchObject({
       code: 'ALREADY_EXISTS',
+      hint: 'Run the adoption again.', // CLI and MCP clients alike
     });
     expect(fs.readFileSync(file, 'utf8')).toBe(
       `${MANIFEST}# edited meanwhile\n`

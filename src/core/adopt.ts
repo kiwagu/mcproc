@@ -436,7 +436,7 @@ export async function adoptPorts(fleet: Fleet): Promise<AdoptResult> {
     throw new McprocError(
       'ALREADY_EXISTS',
       `${m.path} changed while the ports were being probed; nothing written`,
-      { hint: 'Run init --adopt-ports again.' }
+      { hint: 'Run the adoption again.' }
     );
   fs.writeFileSync(m.path, splice.text);
   return {

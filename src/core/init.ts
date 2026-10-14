@@ -560,11 +560,6 @@ export function discover(root: string): Discovery {
   }
 
   candidates.push(...packageCandidates(root, root, pm));
-  if (liveTask)
-    for (const c of candidates)
-      if (c.source === 'package.json:dev')
-        c.note =
-          'the dev profile replaces this: turbo would start every package as one process';
   for (const dir of expanded.dirs) {
     const p = liveTask
       ? pkgs.find((x) => x.dir === path.relative(root, dir))
@@ -677,20 +672,28 @@ export function discover(root: string): Discovery {
     }
   }
 
-  // all is the loader's built-in profile of every app, so no app may take it
+  // all is the loader's built-in profile of every app, so no app may take it. The live apps are named first, so a
+  // commented candidate never takes a package's name; libs comes first among them, so it is never renamed and
+  // depends_on: libs holds
   const taken = new Set(['all']);
-  for (const c of candidates) {
+  for (const c of [
+    ...candidates.filter((x) => x.live),
+    ...candidates.filter((x) => !x.live),
+  ]) {
     let name = c.name;
     for (let i = 2; taken.has(name); i++) name = `${c.name}-${i}`;
     taken.add(name);
     c.name = name;
   }
-  // libs comes first, so the dedupe above never renames it and depends_on: libs holds
+  const profiles =
+    turbo && liveTask ? draftProfiles(candidates, turbo.persistent) : [];
+  for (const c of candidates)
+    if (liveTask && c.source === 'package.json:dev')
+      c.note = `the ${profiles[0].name} profile replaces this: turbo would start every package as one process`;
   return {
     candidates,
     notes,
-    profiles:
-      turbo && liveTask ? draftProfiles(candidates, turbo.persistent) : [],
+    profiles,
     libs: folded.map((p) => p.name),
   };
 }
@@ -815,7 +818,7 @@ export function initProject(
   const file = path.join(root, MANIFEST_REL);
   if (fs.existsSync(file) && !opts.force) {
     throw new McprocError('ALREADY_EXISTS', `${file} already exists`, {
-      hint: 'Pass force: true to overwrite the manifest draft (README and .gitignore are kept).',
+      hint: "Overwrite the draft with force (README and .gitignore are kept), or keep it and adopt the running apps' ports into it.",
     });
   }
   if (fs.existsSync(file) && localReadonly(fs.readFileSync(file, 'utf8'))) {

@@ -359,6 +359,28 @@ describe('discover on a turbo repo', () => {
       "bunx turbo run build --filter='./packages/*' --ui=stream"
     );
   });
+  it("a commented root script never takes a live app's name", () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.scripts.server = 'node server.js';
+    write(r, 'package.json', JSON.stringify(pkg));
+    write(
+      r,
+      'apps/server/package.json',
+      JSON.stringify({ name: '@t/server', scripts: { dev: 'node s.js' } })
+    );
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.server).toMatchObject({ live: true, cwd: 'apps/server' });
+    expect(c['server-2']).toMatchObject({ source: 'package.json:server' });
+    expect(c['server-2'].live).toBeUndefined();
+    expect(d.profiles[0].apps).toContain('server');
+    expect(c.dev.note).toBe(
+      'the dev profile replaces this: turbo would start every package as one process'
+    );
+  });
   it('a folder that also holds an app or another package with a build script filters its libraries by name', () => {
     const r = copy();
     const contracts = JSON.parse(
@@ -477,11 +499,16 @@ describe('discover on a turbo repo', () => {
     );
     const d = discover(r);
     const c = byName(d);
-    expect(c.dev.live).toBeUndefined(); // the root script keeps the bare name: it came first
-    expect(c['dev-2']).toMatchObject({ live: true, cwd: 'apps/dev' });
-    expect(c['libs-2']).toMatchObject({ live: true, cwd: 'apps/libs' });
+    // live apps are named first: the package keeps its name, the commented root script steps aside
+    expect(c.dev).toMatchObject({ live: true, cwd: 'apps/dev' });
+    expect(c['dev-2']).toMatchObject({ source: 'package.json:dev', cwd: '.' });
+    expect(c['dev-2'].live).toBeUndefined();
+    expect(c['dev-2'].note).toBe(
+      'the dev-apps profile replaces this: turbo would start every package as one process'
+    );
+    expect(c['libs-2']).toMatchObject({ live: true, cwd: 'apps/libs' }); // libs itself comes first
     expect(c.libs.kind).toBe('task');
-    expect(d.profiles[0].name).toBe('dev'); // no LIVE app is named dev
+    expect(d.profiles[0].name).toBe('dev-apps');
     fs.rmSync(path.join(r, 'package.json'));
     write(
       r,
@@ -568,6 +595,13 @@ describe('renderDraft / initProject', () => {
     expect(r.by_source['package.json']).toBe(6); // root dev + build:watch + build + migrate, workspace api dev + start:worker
     expect(r.next).toContain('uncomment');
     expect(() => initProject(root)).toThrowError(/already exists/);
+    // the hint names the options the way both the CLI and MCP clients can follow
+    expect(() => initProject(root)).toThrowError(
+      expect.objectContaining({
+        code: 'ALREADY_EXISTS',
+        hint: "Overwrite the draft with force (README and .gitignore are kept), or keep it and adopt the running apps' ports into it.",
+      })
+    );
     expect(initProject(root, { force: true }).created).toContain(
       path.join(root, '.mcproc', 'mcproc.yaml')
     );
@@ -672,7 +706,11 @@ describe('renderDraft on a turbo repo', () => {
     expect(m.apps.contracts.kind).toBe('build');
   });
   it('every drafted variant loads', () => {
-    const variants: [string, (r: string) => void][] = [
+    const variants: [
+      string,
+      (r: string) => void,
+      ((m: ReturnType<typeof parseManifest>) => void)?,
+    ][] = [
       [
         'no dist libraries',
         (r) => {
@@ -702,6 +740,12 @@ describe('renderDraft on a turbo repo', () => {
             'apps/all/package.json',
             JSON.stringify({ name: '@t/all', scripts: { dev: 'node s.js' } })
           ),
+        // all is the built-in profile of every app
+        (m) => {
+          expect(m.apps.all).toBeUndefined();
+          expect(m.apps['all-2']).toMatchObject({ cwd: 'apps/all' });
+          expect(m.profiles.dev).toContain('all-2');
+        },
       ],
       [
         'live apps named dev and dev-apps',
@@ -718,7 +762,7 @@ describe('renderDraft on a turbo repo', () => {
         },
       ],
     ];
-    for (const [label, mutate] of variants) {
+    for (const [label, mutate, check] of variants) {
       const r = copy();
       mutate(r);
       const text = draftOf(r);
@@ -734,6 +778,7 @@ describe('renderDraft on a turbo repo', () => {
           condition: 'completed',
           timeoutMs: 600_000,
         });
+      check?.(m);
     }
   });
   it('the header names the live profile: dev-apps when a live app is named dev', () => {
