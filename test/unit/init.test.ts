@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -244,5 +244,123 @@ describe('renderDraft / initProject', () => {
     expect(initProject(root, { force: true }).created).toContain(
       path.join(root, '.mcproc', 'mcproc.yaml')
     );
+  });
+});
+
+describe('guessPort: frameworks and source constants', () => {
+  const made: string[] = [];
+  const mk = (files: Record<string, string>) => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-port-'));
+    made.push(r);
+    for (const [f, t] of Object.entries(files)) write(r, f, t);
+    return r;
+  };
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  it('next dev/start default to 3000 unless a flag says otherwise', () => {
+    const r = mk({});
+    expect(guessPort('next dev', r)).toBe(3000);
+    expect(
+      guessPort('NODE_OPTIONS=--use-system-ca next dev --turbopack', r)
+    ).toBe(3000);
+    expect(guessPort('next start', r)).toBe(3000);
+    expect(guessPort('next dev -p 3001', r)).toBe(3001);
+    expect(guessPort('next build', r)).toBeUndefined();
+  });
+  it('vite reads server.port from its config, with env fallbacks and nested braces; defaults 5173 / 4173', () => {
+    expect(guessPort('vite', mk({}))).toBe(5173);
+    expect(guessPort('vite preview', mk({}))).toBe(4173);
+    expect(guessPort('vite build', mk({}))).toBeUndefined();
+    expect(guessPort('vitest --watch', mk({}))).toBeUndefined();
+    expect(guessPort('vite-node src/x.ts', mk({}))).toBeUndefined();
+    expect(
+      guessPort(
+        'vite',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.mts':
+            'export default defineConfig({ server: { host: true, port: Number(process.env.WEB_PORT ?? 3002) } })',
+        })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.js':
+            "export default { server: { port: process.env.P || '4100' } }",
+        })
+      )
+    ).toBe(4100);
+    expect(
+      guessPort(
+        'vite',
+        mk({
+          'vite.config.ts':
+            "export default defineConfig({ server: { proxy: { '/api': { target: 'http://localhost:3020', changeOrigin: true } }, port: 3002 } })",
+        })
+      )
+    ).toBe(3002);
+    expect(
+      guessPort(
+        'vite preview',
+        mk({
+          'vite.config.ts':
+            'export default { server: { port: 3002 }, preview: { port: 4300 } }',
+        })
+      )
+    ).toBe(4300);
+    expect(
+      guessPort(
+        'vite preview',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(4173);
+    expect(
+      guessPort(
+        'vite --port 3333',
+        mk({ 'vite.config.ts': 'export default { server: { port: 3002 } }' })
+      )
+    ).toBe(3333);
+  });
+  it('source constants: PORT = N, DEFAULT_PORT = N, process.env.PORT ?? N', () => {
+    expect(
+      guessPort(
+        'tsx watch src/index.ts',
+        mk({ 'src/index.ts': 'const DEFAULT_PORT = 3020;\n' })
+      )
+    ).toBe(3020);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'const PORT: number = 8081;\n' })
+      )
+    ).toBe(8081);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({
+          'src/main.js': 'const port = Number(process.env.PORT ?? 4010);\n',
+        })
+      )
+    ).toBe(4010);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'app.listen(process.env.PORT || 4020)\n' })
+      )
+    ).toBe(4020);
+    expect(
+      guessPort(
+        'node src/main.js',
+        mk({ 'src/main.js': 'const PORTAL = 12;\n' })
+      )
+    ).toBeUndefined();
   });
 });

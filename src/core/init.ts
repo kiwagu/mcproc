@@ -90,6 +90,46 @@ export function guessKind(name: string, cmd: string): AppKind | 'unknown' {
   return 'unknown';
 }
 
+/** `next dev` / `next start` listen on 3000 unless a flag says otherwise. */
+const NEXT_RE = /\bnext\s+(dev|start)\b/;
+/** `vite` and its subcommand; the lookahead keeps `vitest` and `vite-node` out. */
+const VITE_RE = /(?:^|[\s&;])vite(?![\w-])(?:\s+(\w+))?/;
+const VITE_CONFIGS = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map(
+  (e) => `vite.config.${e}`
+);
+/** A `port:` value: a literal, or the fallback of an env read (`?? N`, `|| 'N'`). */
+const PORT_VALUE =
+  /\bport\s*:\s*(?:Number\(\s*)?(?:process\.env\.[A-Za-z_0-9]+\s*(?:\?\?|\|\|)\s*)?["']?(\d{2,5})\b/;
+
+/** Vite's port from its config: the `server` or `preview` block's `port`, a literal or the fallback of an env read. */
+function vitePort(
+  dir: string,
+  section: 'server' | 'preview'
+): number | undefined {
+  for (const f of VITE_CONFIGS) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) continue;
+    const text = fs.readFileSync(p, 'utf8');
+    const at = text.search(new RegExp(`\\b${section}\\s*:\\s*\\{`));
+    if (at < 0) return undefined;
+    // the block's text up to its closing brace, nested braces (proxy maps) counted
+    let depth = 0;
+    let end = text.indexOf('{', at);
+    for (; end < text.length; end++) {
+      if (text[end] === '{') depth++;
+      else if (text[end] === '}' && --depth === 0) break;
+    }
+    // a `port:` of the block itself, not of a nested map such as `hmr: { port }`:
+    // one pass drops every brace pair with no brace inside (the block's own pair
+    // is never one: its closing brace is not in the slice); what deeper maps
+    // such as proxy entries leave behind holds no `port:` key in practice
+    const flat = text.slice(at, end).replace(/\{[^{}]*\}/g, '');
+    const m = PORT_VALUE.exec(flat);
+    return m ? Number(m[1]) : undefined;
+  }
+  return undefined;
+}
+
 export function guessPort(cmd: string, dir: string): number | undefined {
   const m = /(?:\bPORT=|--port[= ]|\s-p\s)(\d{2,5})\b/.exec(cmd);
   if (m) return Number(m[1]);
@@ -99,12 +139,25 @@ export function guessPort(cmd: string, dir: string): number | undefined {
     const e = /^\s*PORT=["']?(\d{2,5})/m.exec(fs.readFileSync(p, 'utf8'));
     if (e) return Number(e[1]);
   }
+  if (NEXT_RE.test(cmd)) return 3000;
+  const vite = VITE_RE.exec(cmd);
+  if (vite && vite[1] !== 'build') {
+    const section = vite[1] === 'preview' ? 'preview' : 'server';
+    return vitePort(dir, section) ?? (section === 'server' ? 5173 : 4173);
+  }
   const src = path.join(dir, 'src');
   if (fs.existsSync(src)) {
     for (const f of walk(src, 3)
       .filter((x) => /\.(ts|js|mjs|cjs|tsx|jsx)$/.test(x))
       .slice(0, 200)) {
-      const l = /\.listen\(\s*(\d{2,5})\b/.exec(fs.readFileSync(f, 'utf8'));
+      const text = fs.readFileSync(f, 'utf8');
+      // `PORT\b` keeps names such as PORTAL out
+      const l =
+        /\.listen\(\s*(\d{2,5})\b/.exec(text) ??
+        /\b(?:DEFAULT_)?PORT\b\s*(?::\s*number)?\s*=\s*(\d{2,5})\b/.exec(
+          text
+        ) ??
+        /\bPORT\s*(?:\?\?|\|\|)\s*(\d{2,5})\b/.exec(text);
       if (l) return Number(l[1]);
     }
   }
