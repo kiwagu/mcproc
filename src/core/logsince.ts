@@ -257,15 +257,15 @@ export async function readSince(
   opts: SinceOptions
 ): Promise<SinceAnswer> {
   const spec = opts.since;
-  const cap = Math.min(
-    Math.max(
-      1,
-      Math.trunc(
-        opts.lines ?? (spec.kind === 'tail' ? spec.n : MAX_MERGED_LINES)
-      )
-    ),
-    MAX_MERGED_LINES
+  const clampLines = (n: number) =>
+    Math.min(Math.max(1, Math.trunc(n)), MAX_MERGED_LINES);
+  const tailN = spec.kind === 'tail' ? clampLines(spec.n) : 0;
+  const cap = clampLines(
+    opts.lines ?? (spec.kind === 'tail' ? tailN : MAX_MERGED_LINES)
   );
+  const stream = opts.stream ?? 'both';
+  // only the requested streams are read, so the other stream's mark stays where its last read left it
+  const streams = STREAMS.filter((s) => stream === 'both' || s === stream);
   const clean = opts.keepColors ? keepSgr : stripAnsi;
   const groups = fleet.groups(names);
   const perHost = await Promise.all(
@@ -281,7 +281,7 @@ export async function readSince(
           (a) => !targets.some((t) => t.app === a)
         );
         const files = targets.flatMap((t) =>
-          STREAMS.map((stream) => {
+          streams.map((stream) => {
             const path = stream === 'out' ? t.p.out_log : t.p.err_log;
             const key = LogMarks.key(fleet.manifest.path, g.host, t.app);
             const mark =
@@ -317,14 +317,15 @@ export async function readSince(
         const skipped: SinceAnswer['skipped'] = [];
         files.forEach((f, i) => {
           const r = parseRead(res.stdout, i, f.offset, { clean });
-          if (!r) return;
+          // a read cut short (the file changed meanwhile) is not used: no lines, the old mark kept, read again next time
+          if (!r || r.short) return;
           // stamps are taken over every line read, so a slice that begins on a continuation line still knows its time
           const sel = selectSince(r.lines, cutoff);
           // a cutoff selects by time; without one (last, tail) every line is kept, in step with r.lines, and position
           // selects: past a mark only the part after it, else the last n of the file
           let kept = sel.kept;
           if (f.hadMark) kept = kept.slice(r.contextOnly);
-          else if (spec.kind === 'tail') kept = kept.slice(-spec.n);
+          else if (spec.kind === 'tail') kept = kept.slice(-tailN);
           else if (spec.kind === 'last') kept = kept.slice(-FIRST_LAST_LINES);
           // the 1 MB cap bit (the read began past byte 0) and nothing older than the cutoff was seen: lines between
           // the cutoff and the window start may be missing
@@ -355,8 +356,7 @@ export async function readSince(
               time: k.time,
               text: k.text,
             });
-          // a read cut short (the file changed meanwhile) keeps the old mark and is read again next time
-          if (opts.marks && !r.short)
+          if (opts.marks)
             opts.marks.set(f.key, f.stream, {
               path: f.path,
               offset: r.nextOffset,
@@ -377,15 +377,12 @@ export async function readSince(
   if (failed.length === perHost.length && failed.length > 0)
     throw failed[0].cause;
   const ok = perHost.filter((h): h is HostRead => !('error' in h));
-  const stream = opts.stream ?? 'both';
   // the reads come back grouped by host: equal stamps follow the order of the names, then out before err, then file order
   const rank = new Map(names.map((n, i) => [n, i]));
+  const byName = (a: string, b: string) =>
+    (rank.get(a) ?? 0) - (rank.get(b) ?? 0);
   const merged = mergeLines(
-    ok
-      .flatMap((h) =>
-        h.lines.filter((l) => stream === 'both' || l.stream === stream)
-      )
-      .sort((a, b) => (rank.get(a.app) ?? 0) - (rank.get(b.app) ?? 0)),
+    ok.flatMap((h) => h.lines).sort((a, b) => byName(a.app, b.app)),
     cap
   );
   return {
@@ -394,7 +391,7 @@ export async function readSince(
     lines: merged.lines,
     truncated: merged.truncated,
     skipped: ok.flatMap((h) => h.skipped),
-    not_started: ok.flatMap((h) => h.notStarted),
+    not_started: ok.flatMap((h) => h.notStarted).sort(byName),
     errors: failed.map((f) => f.error),
     apps: names.length,
     hosts: groups.length,

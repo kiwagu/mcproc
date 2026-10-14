@@ -504,4 +504,103 @@ describe('readSince', () => {
     ]);
     expect(a.skipped[0].bytes).toBeGreaterThan(300_000);
   });
+  it('a read cut short takes no lines and keeps its mark, so a later last returns them once', async () => {
+    const st: Parameters<typeof fakeHosts>[0] = state();
+    const { fleet } = fakeHosts(st);
+    const marks = new LogMarks();
+    await readSince(fleet, ['watch'], { since: parseSince('last'), marks });
+    const added = Array.from(
+      { length: 10 },
+      (_, i) => `${S(41 + i)}line ${41 + i}`
+    );
+    st.files['/l/watch-out'] += added.map((l) => `${l}\n`).join('');
+    st.short = ['/l/watch-out']; // the file changed between measuring and reading
+    const cut = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(cut.lines).toEqual([]);
+    st.short = [];
+    const again = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(again.lines.map((l) => l.text)).toEqual(added);
+  });
+  it("one stream read leaves the other stream's mark alone", async () => {
+    const st = state();
+    const { fleet } = fakeHosts(st);
+    const marks = new LogMarks();
+    await readSince(fleet, ['watch'], { since: parseSince('last'), marks });
+    st.files['/l/watch-err'] += `${S(41)}oops\n`;
+    const out = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+      stream: 'out',
+    });
+    expect(out.lines).toEqual([]);
+    const both = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(both.lines.map((l) => `${l.stream}:${l.text}`)).toEqual([
+      `err:${S(41)}oops`,
+    ]);
+  });
+  it('not_started follows the order of the names', async () => {
+    const st = state();
+    st.procs = { local: [], box: [] };
+    const { fleet } = fakeHosts(st);
+    const a = await readSince(fleet, ['watch', 'web', 'tool'], {
+      since: parseSince('10s'),
+    });
+    expect(a.not_started).toEqual(['watch', 'web', 'tool']);
+  });
+  it('a tail of n below 1 reads one line per file', async () => {
+    const { fleet } = fakeHosts(state());
+    const a = await readSince(fleet, ['watch'], {
+      since: { kind: 'tail', n: 0 },
+      lines: 10,
+    });
+    expect(a.lines.map((l) => l.text)).toEqual([`${S(36)}rebuilt`, '    at x']);
+  });
+  it("last after a file replaced by a longer one returns only the new file's lines", async () => {
+    const st = state();
+    const { fleet } = fakeHosts(st);
+    const marks = new LogMarks();
+    await readSince(fleet, ['watch'], { since: parseSince('last'), marks });
+    const fresh = [50, 51, 52, 53].map((s) => `${S(s)}fresh line ${s}`);
+    st.files['/l/watch-out'] = fresh.map((l) => `${l}\n`).join(''); // longer than the mark, other bytes before it
+    expect(st.files['/l/watch-out'].length).toBeGreaterThan(
+      `${S(10)}build ok\n${S(35)}change detected\n${S(36)}rebuilt\n`.length
+    );
+    const a = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(a.lines.map((l) => l.text)).toEqual(fresh);
+  });
+  it('an unreachable host leaves its marks alone: once it answers, its app reads like a first last', async () => {
+    const st = state();
+    const down = ['box'];
+    const { fleet } = fakeHosts(st, down);
+    const marks = new LogMarks();
+    const a1 = await readSince(fleet, ['watch', 'web'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(a1.errors.map((e) => e.host)).toEqual(['box']);
+    expect(
+      marks.get(LogMarks.key(fleet.manifest.path, 'box', 'web'))
+    ).toBeUndefined();
+    down.length = 0;
+    const a2 = await readSince(fleet, ['watch', 'web'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(a2.errors).toEqual([]);
+    expect(a2.lines.map((l) => `${l.app}:${l.text}`)).toEqual([
+      `web:${S(38)}listening 3000`,
+    ]);
+  });
 });
