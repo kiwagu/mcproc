@@ -133,27 +133,97 @@ const VITE_RE = /(?:^|[\s&;])vite(?![\w.-])(?:\s+(\w+))?/g;
 const VITE_CONFIGS = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map(
   (e) => `vite.config.${e}`
 );
-/**
- * A `port:` value: a literal, or the fallback of an env read
- * (`?? N`, `|| 'N'`, `Number(process.env.X) || N`).
- */
-const PORT_VALUE =
-  /\bport\s*:\s*(?:Number\(\s*)?(?:process\.env\.[A-Za-z_0-9]+\s*\)?\s*(?:\?\?|\|\|)\s*)?["']?(\d{2,5})\b/;
+/** A port literal, quoted or not. */
+const PORT_LITERAL = /^(["'`]?)(\d{2,5})\1$/;
+/** `process.env.X`, or `env.X` of the object Vite's loadEnv returns. */
+const ENV_READ = /^(?:process\.)?env\.[A-Za-z_$][\w$]*$/;
+/** The argument of `Number(…)` or `parseInt(…)` / `parseInt(…, 10)` around the whole expression; else the expression. */
+const unwrap = (e: string): string => {
+  const m = /^(?:Number|parseInt)\(([\s\S]*)\)$/.exec(e);
+  return m ? m[1].replace(/,\s*10\s*$/, '').trim() : e;
+};
 
 /**
- * Vite's port from its config: the `server` or `preview` block's `port`, a
- * literal or the fallback of an env read. Every `<section>: {` is tried in
- * order, since a block of that name without a port can come first (vitest's
- * `test: { server: { deps } }`).
+ * The port an expression gives when the environment sets nothing: a literal, or the fallback of an env read
+ * (`process.env.X ?? N`, `env.X || 'N'`), either one whole or the env read alone wrapped in `Number(…)` or
+ * `parseInt(…, 10)`. Anything else is not read.
+ */
+function portValue(expr: string): number | undefined {
+  const e = unwrap(expr.trim());
+  const lit = PORT_LITERAL.exec(e);
+  if (lit) return Number(lit[2]);
+  const fb = /^([\s\S]+?)\s*(?:\?\?|\|\|)\s*(\S+)$/.exec(e);
+  const n = fb && PORT_LITERAL.exec(fb[2]);
+  return n && ENV_READ.test(unwrap(fb[1].trim())) ? Number(n[2]) : undefined;
+}
+
+/**
+ * The expression that starts at `at`: up to the first `,`, `;` or line end outside brackets and quotes, or the bracket
+ * that closes an enclosing one.
+ */
+function exprAt(text: string, at: number): string {
+  let depth = 0;
+  let quote = '';
+  let i = at;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = '';
+    } else if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    else if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) {
+      if (depth-- === 0) break;
+    } else if (depth === 0 && ',;\n'.includes(ch)) break;
+  }
+  return text.slice(at, i).trim();
+}
+
+/**
+ * The value of the block's own `port` key: the expression after `port:`, or `port` for the shorthand
+ * (`{ port, host }`); undefined when the block has no such key.
+ */
+function portKey(block: string): string | undefined {
+  for (const m of block.matchAll(/(["']?)\bport(?![\w$])\1\s*(:)?/g)) {
+    // a key follows the block's brace or a comma
+    if (!/[{,]$/.test(block.slice(0, m.index).trimEnd())) continue;
+    const rest = m.index + m[0].length;
+    if (m[2]) return exprAt(block, rest);
+    if (/^\s*(?:[,}]|$)/.test(block.slice(rest))) return 'port';
+  }
+  return undefined;
+}
+
+/** A port expression read as `portValue` does; an identifier is first resolved through its `const`/`let`/`var` in `text`. */
+function readPort(expr: string, text: string): number | undefined {
+  if (!/^[A-Za-z_$][\w$]*$/.test(expr)) return portValue(expr);
+  const decl = new RegExp(
+    `\\b(?:const|let|var)\\s+${expr.replace(/\$/g, '\\$')}\\s*(?::[^=;]+)?=(?!=)`
+  ).exec(text);
+  return decl
+    ? portValue(exprAt(text, decl.index + decl[0].length))
+    : undefined;
+}
+
+/**
+ * Vite's port from its config: the `server` or `preview` block's `port`, as `readPort` reads it. Every
+ * `<section>: {` is tried in order, since a block of that name without a port can come first (vitest's
+ * `test: { server: { deps } }`). null when the block has a `port` that cannot be read: the default would then be a
+ * confident wrong guess. undefined when no block has a port, or there is no config.
  */
 function vitePort(
   dir: string,
   section: 'server' | 'preview'
-): number | undefined {
+): number | null | undefined {
   for (const f of VITE_CONFIGS) {
     const p = path.join(dir, f);
     if (!fs.existsSync(p)) continue;
-    const text = fs.readFileSync(p, 'utf8');
+    // comments out, so a word "port" in one is no key; only those after a blank or at a line start, which keeps
+    // `http://…` and `src/**/*` in strings
+    const text = fs
+      .readFileSync(p, 'utf8')
+      .replace(/(^|\s)\/\*[\s\S]*?\*\//g, '$1')
+      .replace(/(^|\s)\/\/[^\n]*/g, '$1');
     for (const h of text.matchAll(
       new RegExp(`\\b${section}\\s*:\\s*\\{`, 'g')
     )) {
@@ -165,13 +235,12 @@ function vitePort(
         if (text[end] === '{') depth++;
         else if (text[end] === '}' && --depth === 0) break;
       }
-      // a `port:` of the block itself, not of a nested map such as `hmr: { port }`:
+      // a `port` of the block itself, not of a nested map such as `hmr: { port }`:
       // one pass drops every brace pair with no brace inside (the block's own pair
       // is never one: its closing brace is not in the slice); what deeper maps
-      // such as proxy entries leave behind holds no `port:` key in practice
-      const flat = text.slice(at, end).replace(/\{[^{}]*\}/g, '');
-      const m = PORT_VALUE.exec(flat);
-      if (m) return Number(m[1]);
+      // such as proxy entries leave behind holds no `port` key in practice
+      const value = portKey(text.slice(at, end).replace(/\{[^{}]*\}/g, ''));
+      if (value !== undefined) return readPort(value, text) ?? null;
     }
     return undefined;
   }
@@ -191,7 +260,9 @@ export function guessPort(cmd: string, dir: string): number | undefined {
   const vite = [...cmd.matchAll(VITE_RE)].find((v) => v[1] !== 'build');
   if (vite) {
     const section = vite[1] === 'preview' ? 'preview' : 'server';
-    return vitePort(dir, section) ?? (section === 'server' ? 5173 : 4173);
+    const p = vitePort(dir, section);
+    // the defaults only when the config names no port: one it names but cannot be read gets no guess
+    return p === null ? undefined : (p ?? (section === 'server' ? 5173 : 4173));
   }
   const src = path.join(dir, 'src');
   if (fs.existsSync(src)) {

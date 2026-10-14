@@ -116,10 +116,11 @@ replace it. The root `dev` script, other persistent tasks (under a commented pro
 - A library live through its own `dev` watch is drafted as a `build` app and left out of `libs`, so its first build is not
   awaited: the draft leaves a note on each app that uses it saying how to wait for it.
 - Ports are also guessed for Next (3000), Vite (`server.port` in `vite.config.*`, or `preview.port` for `vite preview`,
-  as a literal or an env read's fallback; else 5173 or 4173) and, in `src/`, `PORT = N`, `DEFAULT_PORT = N`, `PORT ?? N`,
-  `PORT || N` or `.listen(N)`. The guess shows as `port?` in each candidate's `# source:` trailer; a live app also declares
-  it as `port:` (and `url:`), so check it with `ls` (a wrong guess shows ✗) and correct it by hand: `--adopt-ports` adds
-  the real port but leaves the guess in place.
+  as a literal or an env read's fallback, `process.env` or loadEnv's `env`, directly or through a constant of the config;
+  5173 or 4173 when the section sets no port, no guess when it sets one `init` cannot read) and, in `src/`, `PORT = N`,
+  `DEFAULT_PORT = N`, `PORT ?? N`, `PORT || N` or `.listen(N)`. The guess shows as `port?` in each candidate's
+  `# source:` trailer; a live app also declares it as `port:` (and `url:`), so check it with `ls` (a wrong guess shows
+  ✗) and correct it by hand: `--adopt-ports` adds the real port but leaves the guess in place.
 - `init --adopt-ports` (MCP: `adopt_ports`) drafts nothing and ignores `--force`: it needs an existing manifest and writes
   the ports `ls` reports as undeclared for the running apps into it, comments and layout kept, then prints the diff. Ports
   from 32768 up (the ephemeral range, almost always transient) and ports another app declares are reported, not adopted.

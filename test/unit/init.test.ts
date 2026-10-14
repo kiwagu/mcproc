@@ -931,6 +931,86 @@ describe('guessPort: frameworks and source constants', () => {
     expect(guessPort('vite build && vite preview', mk({}))).toBe(4173);
     expect(guessPort('tsx vite.config.ts', mk({}))).toBeUndefined();
   });
+  it('vite reads a port named by a constant of the config, the port shorthand, loadEnv and parseInt reads', () => {
+    const vite = (config: string, cmd = 'vite') =>
+      guessPort(cmd, mk({ 'vite.config.ts': config }));
+    // an identifier, resolved through a const of the same file
+    expect(
+      vite(
+        "import { defineConfig } from 'vite';\nconst DEV_PORT = Number(process.env.APP_DEV_PORT ?? 3002);\nexport default defineConfig({\n  server: { host: true, port: DEV_PORT },\n});\n"
+      )
+    ).toBe(3002);
+    expect(
+      vite(
+        'const PREVIEW_PORT: number = 4300;\nexport default { preview: { port: PREVIEW_PORT } };\n',
+        'vite preview'
+      )
+    ).toBe(4300);
+    expect(
+      vite('let devPort = 3011\nexport default { server: { port: devPort } }')
+    ).toBe(3011);
+    // the shorthand `port`, before another key or last
+    expect(
+      vite(
+        "const port = 3003;\nexport default defineConfig({ server: { port, host: '0.0.0.0' } });\n"
+      )
+    ).toBe(3003);
+    expect(
+      vite(
+        'const port = Number(process.env.APP_PORT) || 3004\nexport default { server: {\n  strictPort: true,\n  port\n} }'
+      )
+    ).toBe(3004);
+    // the loadEnv object, with || and ??
+    expect(
+      vite(
+        "export default defineConfig(({ mode }) => {\n  const env = loadEnv(mode, process.cwd(), '');\n  return { server: { port: Number(env.APP_PORT) || 3005 } };\n});\n"
+      )
+    ).toBe(3005);
+    expect(
+      vite(
+        "export default defineConfig(({ mode }) => {\n  const env = loadEnv(mode, process.cwd(), '');\n  const port = env.APP_PORT ?? '3006';\n  return { server: { port } };\n});\n"
+      )
+    ).toBe(3006);
+    // parseInt, with or without a radix, the fallback quoted or not
+    expect(
+      vite(
+        "export default { server: { port: parseInt(process.env.APP_PORT ?? '3007') } }"
+      )
+    ).toBe(3007);
+    expect(
+      vite(
+        'export default { server: { port: parseInt(process.env.APP_PORT || 3008, 10) } }'
+      )
+    ).toBe(3008);
+    expect(
+      vite(
+        "const APP_PORT = parseInt(env.APP_PORT ?? '3009', 10);\nexport default { server: { port: APP_PORT } }"
+      )
+    ).toBe(3009);
+    // a port the section names but init cannot read: no guess at all, not the default
+    expect(
+      vite('export default { server: { port: getPort() } }')
+    ).toBeUndefined();
+    expect(
+      vite('export default { server: { port: cfg.port } }')
+    ).toBeUndefined();
+    expect(
+      vite(
+        "import { DEV_PORT } from './ports';\nexport default { server: { port: DEV_PORT } }"
+      )
+    ).toBeUndefined();
+    expect(vite('export default { server: { port } }')).toBeUndefined(); // the shorthand with no const to read
+    expect(
+      vite('const port = getPort();\nexport default { server: { port } }')
+    ).toBeUndefined();
+    expect(
+      vite('export default { preview: { port: getPort() } }', 'vite preview')
+    ).toBeUndefined();
+    // no port key in the section, or no config: the defaults, as before
+    expect(vite('export default { server: { host: true } }')).toBe(5173);
+    expect(vite('export default { server: { strictPort: true } }')).toBe(5173);
+    expect(vite('export default {}', 'vite preview')).toBe(4173);
+  });
   it('source constants: PORT = N, DEFAULT_PORT = N, process.env.PORT ?? N', () => {
     expect(
       guessPort(
