@@ -3,8 +3,11 @@ import type { ErrorSettings } from '../manifest.js';
 import { McprocError } from '../errors.js';
 
 export type Stream = 'out' | 'err';
-export type IncidentKind = 'error' | 'crashed' | 'restarted';
-/** One error occurrence with its context, or a process event; `count` > 1 when the same error repeated within one poll. */
+export type IncidentKind = 'error' | 'crashed' | 'restarted' | 'reloaded';
+/**
+ * One error occurrence with its context, a process event, or an app's in-process reloads of one poll; `count` > 1 when
+ * the same error repeated within one poll (for `reloaded`, how many reloads).
+ */
 export interface Incident {
   app: string;
   host: string;

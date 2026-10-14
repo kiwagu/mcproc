@@ -761,6 +761,77 @@ describe('mcp server', () => {
     });
     expect(text(second)).toMatch(/^no new incidents since/);
   });
+  it('incidents include_reloads: the reloads of each app since the last call as one incident beside its errors; off by default', async () => {
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-inc-'));
+    fs.cpSync(basic, proj, { recursive: true });
+    const jlist = JSON.stringify([
+      {
+        pid: 10,
+        name: 'demo-api',
+        pm_id: 0,
+        pm2_env: {
+          status: 'online',
+          namespace: 'demo',
+          restart_time: 0,
+          pm_uptime: Date.parse('2026-10-12T11:00:00Z'),
+          pm_out_log_path: '/l/api-out',
+          pm_err_log_path: '/l/api-err',
+        },
+      },
+    ]);
+    // the boot's listening line, then a tsx restart that listens again, then an error
+    const files = {
+      '/l/api-out': `${S(2)}listening on 3310\n${S(5)}[tsx] change in ./src/a.ts Restarting...\n${S(6)}listening on 3310\n${S(8)}TypeError: boom\n`,
+      '/l/api-err': '',
+    };
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'"))
+        return { code: 0, stdout: jlist, stderr: '' };
+      if (cmd.includes('__MCPROC_INC_'))
+        return {
+          code: 0,
+          stdout: `__MCPROC_NOW__ 2026-10-12T11:01:00\n${cmd.includes('__MCPROC_LS_CLOCK__') ? '__MCPROC_LS_CLOCK__ 2026-10-12T11:01:00 +0000\n' : ''}${answerReads(cmd, files)}`,
+          stderr: '',
+        };
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    const cl = await client(spawner);
+    const tools = await cl.listTools();
+    const inc = tools.tools.find((t) => t.name === 'incidents')!;
+    expect(inc.description).toContain('include_reloads');
+    expect(
+      (inc.inputSchema.properties as Record<string, { description?: string }>)
+        .include_reloads.description
+    ).toBeTruthy();
+    const plain: any = await cl.callTool({
+      name: 'incidents',
+      arguments: { project: proj, app: 'api', peek: true },
+    });
+    expect(
+      plain.structuredContent.incidents.map((i: { kind: string }) => i.kind)
+    ).toEqual(['error']);
+    const r: any = await cl.callTool({
+      name: 'incidents',
+      arguments: { project: proj, app: 'api', include_reloads: true },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.incidents).toMatchObject([
+      { kind: 'error', app: 'api' },
+      {
+        kind: 'reloaded',
+        app: 'api',
+        count: 1,
+        time: '2026-10-12T11:00:05.000',
+        line: `${S(5)}[tsx] change in ./src/a.ts Restarting...`,
+      },
+    ]);
+    expect(text(r)).toContain(
+      `api@local 2026-10-12T11:00:05.000 reloaded: ${S(5)}[tsx] change in ./src/a.ts Restarting...`
+    );
+  });
 });
 
 describe('logs since', () => {

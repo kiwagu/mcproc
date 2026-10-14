@@ -2,6 +2,13 @@ import { describeError, isMcprocError } from '../errors.js';
 import { findProcess, type Pm2Process } from '../pm2.js';
 import type { Fleet, HostError } from '../fleet.js';
 import { ensureOk } from '../../transport/index.js';
+import { CLOCK_SNIPPET, hostClock, hostStamp } from '../logsince.js';
+import {
+  compileReloadRules,
+  detectReloads,
+  type Reload,
+  type ReloadInput,
+} from '../reloads.js';
 import {
   collapse,
   compileRules,
@@ -31,13 +38,17 @@ export interface IncidentsAnswer {
   hosts: number;
   latest: string | null;
 }
-/** `budgetMs`: how long an app's own patterns may take on one file (default MATCH_BUDGET_MS). */
+/**
+ * `budgetMs`: how long an app's own patterns may take on one file (default MATCH_BUDGET_MS). `includeReloads`: also
+ * report each app's in-process reloads since the last poll, as one `reloaded` incident per app (apps with `reloads`).
+ */
 export interface PollOptions {
   cursor?: CursorState;
   sinceMin?: number;
   max?: number;
   context?: [number, number];
   budgetMs?: number;
+  includeReloads?: boolean;
 }
 
 const EVENT_TAIL = 10;
@@ -60,13 +71,17 @@ export async function pollIncidents(
         const procs = await ctx.pm2.jlist();
         const targets = g.apps.flatMap((app) => {
           const settings = fleet.manifest.apps[app].errors;
+          const reloads = opts.includeReloads
+            ? fleet.manifest.apps[app].reloads
+            : null; // an app takes part for its errors, its reloads, or both
           const p = findProcess(procs, fleet.manifest.project, app);
-          return p && settings
+          return p && (settings || reloads)
             ? [
                 {
                   app,
                   p,
                   settings,
+                  reloads,
                   prev: opts.cursor?.apps[markKey(g.host, app)],
                 },
               ]
@@ -100,6 +115,7 @@ export async function pollIncidents(
           await ctx.transport.exec(
             [
               NOW_SNIPPET,
+              ...(opts.includeReloads ? [CLOCK_SNIPPET] : []), // the host's zone puts pm2's start in the stamps' wall time
               ...files.map((f, i) =>
                 readSnippet(i, f.path, f.offset, f.anchor)
               ),
@@ -109,15 +125,22 @@ export async function pollIncidents(
           'read logs for incidents'
         );
         const now = hostNow(res.stdout); // one cutoff for every file of this host: a first call looks back from the host's clock
+        const zone = opts.includeReloads
+          ? (hostClock(res.stdout)?.zone ?? null)
+          : null;
         const incidents: Incident[] = [];
         let latest: string | null = null;
-        const perApp = new Map<string, { mark: AppMark; errLines: string[] }>();
+        const perApp = new Map<
+          string,
+          { mark: AppMark; errLines: string[]; newLines: ReloadInput[] }
+        >();
         const stalled = new Map<string, string>();
         files.forEach((f, i) => {
           const r = parseRead(res.stdout, i, f.offset);
           const entry = perApp.get(f.t.app) ?? {
             mark: { restarts: f.t.p.restarts, status: f.t.p.status },
             errLines: [],
+            newLines: [],
           };
           perApp.set(f.t.app, entry);
           if (!r) return;
@@ -150,6 +173,10 @@ export async function pollIncidents(
           const contextOnly = from
             ? Math.max(r.contextOnly, insideFrom(r.lines, from))
             : r.contextOnly;
+          if (f.t.reloads)
+            for (const text of r.lines.slice(contextOnly))
+              entry.newLines.push({ stream: f.stream, text });
+          if (!f.t.settings) return; // errors: false, here for its reloads only
           try {
             incidents.push(
               ...detect(
@@ -164,12 +191,35 @@ export async function pollIncidents(
           }
         });
         for (const t of targets) {
-          if (stalled.has(t.app)) continue; // not analysed: its point stays, the next poll reads the same lines again
           const entry = perApp.get(t.app)!;
+          if (t.reloads && !stalled.has(t.app)) {
+            const start =
+              t.p.started_at !== null && zone
+                ? hostStamp(t.p.started_at, zone)
+                : null;
+            try {
+              const found = detectReloads(
+                entry.newLines,
+                compileReloadRules(t.reloads, opts.budgetMs),
+                {
+                  app: t.app,
+                  start,
+                  coversStart: !t.prev || t.prev.start !== start, // a first poll, or a new run, may begin with the boot
+                }
+              );
+              entry.mark.start = start;
+              if (found.length) incidents.push(reloaded(t.app, g.host, found));
+            } catch (e) {
+              if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
+              stalled.set(t.app, describeError(e));
+            }
+          }
+          if (stalled.has(t.app)) continue; // not analysed: its point stays, the next poll reads the same lines again
           next.apps[markKey(g.host, t.app)] = entry.mark;
-          incidents.push(
-            ...processEvents(t.app, g.host, t.p, t.prev, entry.errLines)
-          );
+          if (t.settings)
+            incidents.push(
+              ...processEvents(t.app, g.host, t.p, t.prev, entry.errLines)
+            );
         }
         return {
           incidents: incidents.filter((i) => !stalled.has(i.app)),
@@ -235,6 +285,21 @@ function insideFrom(lines: string[], from: string): number {
   }
   return lines.length;
 }
+
+/** An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's first marker line. */
+const reloaded = (app: string, host: string, rs: Reload[]): Incident => ({
+  app,
+  host,
+  kind: 'reloaded',
+  stream: 'out',
+  time: rs[rs.length - 1].time,
+  first_time: rs[0].time,
+  count: rs.length,
+  line: rs[rs.length - 1].line,
+  before: [],
+  after: [],
+  fingerprint: 'reloaded',
+});
 
 /** pm2's view of an app since the last poll: gave up (errored, reported once) or restarted (with how many times). */
 function processEvents(

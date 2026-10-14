@@ -325,6 +325,14 @@ describe('cli', () => {
       ])
     );
   });
+  it('incidents --reloads adds the reloads of each app since the last call', () => {
+    const cmd = buildProgram(capture().io).commands.find(
+      (c) => c.name() === 'incidents'
+    )!;
+    const opt = cmd.options.find((o) => o.long === '--reloads');
+    expect(opt?.description).toMatch(/reload/);
+    expect(opt?.required || opt?.optional).toBeFalsy(); // a switch, no value
+  });
 });
 
 describe('printSince (logs --since, one shot)', () => {

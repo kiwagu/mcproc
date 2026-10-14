@@ -23,11 +23,16 @@ const HEX = /^[0-9a-f]{0,64}$/;
 /** U+FFFD as UTF-8: what the decoding of the read's output put in place of bytes that were not valid UTF-8. */
 const REPLACEMENT = Buffer.from('\ufffd');
 
+/**
+ * `start`: the process start (the host's wall time, pm2's stamp shape) a poll that looked for reloads saw; while it stays
+ * the same, the run's boot is behind the point. Null when the host's zone or pm2's start was unknown.
+ */
 export interface AppMark {
   out?: FileMark;
   err?: FileMark;
   restarts: number;
   status: string;
+  start?: string | null;
 }
 /** Where the previous poll stopped: per `host/app` the read offset of each log file, pm2's restart count and status. */
 export interface CursorState {

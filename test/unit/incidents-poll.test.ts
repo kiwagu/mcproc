@@ -234,3 +234,206 @@ describe('pollIncidents', () => {
     expect(h.reads).toEqual(['local']);
   });
 });
+
+describe('pollIncidents with includeReloads', () => {
+  // the hosts run at +0200: pm2's start (epoch ms) becomes their wall time, the time of the stamps in the logs
+  const startedAt = (wall: string) => Date.parse(`${wall}Z`) - 2 * 3600_000;
+  const vite = () => ({
+    now: '2026-10-12T11:01:00',
+    zone: '+0200',
+    files: {
+      '/l/web-out': `${S(1)}[vite] page reload src/a.ts\n${S(1)}[vite] page reload src/b.ts\n${S(6)}[vite] hmr update /src/c.ts\n${S(8)}TypeError: boom\n`,
+    },
+    procs: {
+      box: [proc('web', 3, { pm_uptime: startedAt('2026-10-12T10:59:30') })],
+    } as Record<string, object[]>,
+  });
+  const web = (i: { kind: string; app: string }) =>
+    i.kind === 'reloaded' && i.app === 'web';
+
+  it("adds one reloaded incident per app beside its errors: the reloads of this poll counted, the first and the last one's time, the last one's line", async () => {
+    const h = fakeHosts(vite());
+    const r = await pollIncidents(h.fleet, ['web'], { includeReloads: true });
+    expect(r.answer.incidents).toEqual([
+      expect.objectContaining({
+        kind: 'error',
+        app: 'web',
+        line: `${S(8)}TypeError: boom`,
+      }),
+      {
+        app: 'web',
+        host: 'box',
+        kind: 'reloaded',
+        stream: 'out',
+        time: '2026-10-12T11:00:06.000',
+        first_time: '2026-10-12T11:00:01.000',
+        count: 2,
+        line: `${S(6)}[vite] hmr update /src/c.ts`,
+        before: [],
+        after: [],
+        fingerprint: 'reloaded',
+      },
+    ]);
+    expect(h.scripts[0]).toContain('__MCPROC_LS_CLOCK__');
+    expect(r.next.apps['box/web'].start).toBe('2026-10-12T10:59:30.000'); // the start in the host's wall time
+  });
+  it('without the flag the same lines give only the error, the read script asks for no clock and the point records no start', async () => {
+    const h = fakeHosts(vite());
+    const r = await pollIncidents(h.fleet, ['web']);
+    expect(r.answer.incidents.map((i) => `${i.kind}:${i.line}`)).toEqual([
+      `error:${S(8)}TypeError: boom`,
+    ]);
+    expect(h.scripts).toHaveLength(1);
+    expect(h.scripts[0]).not.toContain('__MCPROC_LS_CLOCK__');
+    expect(r.next.apps['box/web']).not.toHaveProperty('start');
+  });
+  it("the first burst after the start, listening lines only, is the boot; a later poll of the same run counts its first re-listen; lines of an earlier run don't count", async () => {
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `2026-10-12T10:59:50: listening on :3000\n${S(2)}listening on :3000\n${S(9)}listening on :3000\n`,
+      },
+      procs: {
+        box: [proc('web', 3, { pm_uptime: startedAt('2026-10-12T11:00:00') })],
+      } as Record<string, object[]>,
+    };
+    const h = fakeHosts(state);
+    const first = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+    });
+    expect(first.answer.incidents).toMatchObject([
+      {
+        kind: 'reloaded',
+        count: 1,
+        time: '2026-10-12T11:00:09.000',
+        first_time: '2026-10-12T11:00:09.000',
+        line: `${S(9)}listening on :3000`,
+      },
+    ]);
+    state.files['/l/web-out'] += `${S(30)}listening on :3000\n`;
+    const second = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+      cursor: first.next,
+    });
+    expect(second.answer.incidents).toMatchObject([
+      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:30.000' },
+    ]); // not taken for a boot: this run's boot was seen by the first poll
+  });
+  it("after a pm2 restart between polls the new run's boot is not a reload", async () => {
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `${S(2)}listening on :3000\n${S(9)}listening on :3000\n`,
+      },
+      procs: {
+        box: [proc('web', 3, { pm_uptime: startedAt('2026-10-12T11:00:00') })],
+      } as Record<string, object[]>,
+    };
+    const h = fakeHosts(state);
+    const first = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+    });
+    expect(first.answer.incidents.filter(web)).toHaveLength(1);
+    state.procs.box = [
+      proc('web', 3, {
+        pm_uptime: startedAt('2026-10-12T11:00:40'),
+        restart_time: 1,
+      }),
+    ];
+    state.files['/l/web-out'] += `${S(41)}listening on :3000\n`;
+    const second = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+      cursor: first.next,
+    });
+    expect(second.answer.incidents.map((i) => i.kind)).toEqual(['restarted']);
+    expect(second.next.apps['box/web'].start).toBe('2026-10-12T11:00:40.000');
+  });
+  it('an app with errors: false takes part only for its reloads: no errors, no crashes or restarts; without the flag it is not read at all', async () => {
+    const m = structuredClone(fleetManifest);
+    m.apps.watch.errors = null;
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/watch-out': `${S(1)}TypeError: not an incident here\n${S(3)}File change detected. Starting incremental compilation...\n`,
+      },
+      procs: {
+        local: [
+          proc('watch', 0, { pm_uptime: startedAt('2026-10-12T10:00:00') }),
+        ],
+      } as Record<string, object[]>,
+    };
+    const off = fakeHosts(state, [], m);
+    expect(
+      (await pollIncidents(off.fleet, ['watch'])).answer.incidents
+    ).toEqual([]);
+    expect(off.reads).toEqual([]);
+    const h = fakeHosts(state, [], m);
+    const first = await pollIncidents(h.fleet, ['watch'], {
+      includeReloads: true,
+    });
+    expect(first.answer.incidents).toMatchObject([
+      {
+        app: 'watch',
+        kind: 'reloaded',
+        count: 1,
+        line: `${S(3)}File change detected. Starting incremental compilation...`,
+      },
+    ]);
+    state.procs.local = [
+      proc('watch', 0, {
+        pm_uptime: startedAt('2026-10-12T10:00:00'),
+        restart_time: 2,
+        status: 'errored',
+      }),
+    ];
+    const second = await pollIncidents(h.fleet, ['watch'], {
+      includeReloads: true,
+      cursor: first.next,
+    });
+    expect(second.answer.incidents).toEqual([]);
+  });
+  it('an app with reloads: false gets no reloaded incident even with the flag', async () => {
+    const m = structuredClone(fleetManifest);
+    m.apps.web.reloads = null;
+    const r = await pollIncidents(fakeHosts(vite(), [], m).fleet, ['web'], {
+      includeReloads: true,
+    });
+    expect(r.answer.incidents.map((i) => i.kind)).toEqual(['error']);
+    expect(r.next.apps['box/web']).not.toHaveProperty('start');
+  });
+  it('an app whose reloads patterns run away is reported and keeps its point, its errors held back with it; the other apps still answer', async () => {
+    const m = structuredClone(fleetManifest);
+    m.apps.web.reloads = {
+      match: ['^(a|a)*$'],
+      ignore: [],
+      defaults: true,
+    };
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `${S(1)}${'a'.repeat(30)}!\n${S(2)}TypeError: web\n`,
+        '/l/watch-out': `${S(3)}TypeError: watch\n`,
+      },
+      procs: { local: [proc('watch', 0)], box: [proc('web', 3)] },
+    };
+    const r = await pollIncidents(
+      fakeHosts(state, [], m).fleet,
+      ['watch', 'web'],
+      { includeReloads: true, budgetMs: 200 }
+    );
+    expect(r.answer.incidents.map((i) => i.app)).toEqual(['watch']);
+    expect(r.answer.errors).toMatchObject([
+      {
+        host: 'box',
+        apps: ['web'],
+        message: expect.stringContaining('TIMEOUT'),
+      },
+    ]);
+    expect(r.next.apps['box/web']).toBeUndefined(); // not analysed: the next poll reads the same lines again
+    expect(r.next.apps['local/watch']).toBeDefined();
+  });
+});

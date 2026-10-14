@@ -393,6 +393,10 @@ export function buildProgram(io: Io = defaultIo): Command {
       '--context <before,after>',
       'lines of context (default per app, 3,5)'
     )
+    .option(
+      '--reloads',
+      "also each app's in-process reloads since the last poll (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), one line per app"
+    )
     .option('-f, --follow', 'keep polling and print each new incident')
     .option('--interval <s>', 'seconds between polls while following', '10')
     .option('--color', 'colors even when stdout is not a terminal')
@@ -426,6 +430,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             sinceMin: Number(o.since) || 15,
             max: Number(o.max) || 20,
             context,
+            includeReloads: Boolean(o.reloads),
           });
           if (peek) cursor = r.next;
           return r.answer;

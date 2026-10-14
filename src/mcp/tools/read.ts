@@ -315,7 +315,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Incidents',
       description:
-        "Only the errors that are NEW since they were last taken, each with lines of context before and after (a folded stack trace included), plus crashes and restarts. A call takes what it returns: the pick-up point, kept in .mcproc/incidents.json and shared by every session, agent and CLI call, moves past them, so nobody gets them twice; peek: true looks without taking. A log clear (flush, or c in monit) starts incidents over from there. Cheap to poll: nothing new is one short line. During long work on running apps call it periodically, with your client's own loop/cron/monitor if it has one; read logs only for an incident worth a closer look.",
+        "Only the errors that are NEW since they were last taken, each with lines of context before and after (a folded stack trace included), plus crashes and restarts. A call takes what it returns: the pick-up point, kept in .mcproc/incidents.json and shared by every session, agent and CLI call, moves past them, so nobody gets them twice; peek: true looks without taking. A log clear (flush, or c in monit) starts incidents over from there. Cheap to poll: nothing new is one short line. During long work on running apps call it periodically, with your client's own loop/cron/monitor if it has one; read logs only for an incident worth a closer look. include_reloads: true adds each app's in-process reloads since the last call (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line) as one reloaded incident per app with how many and when.",
       inputSchema: {
         ...commonInput,
         app: z
@@ -351,6 +351,12 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           ])
           .optional()
           .describe('[lines before, lines after] (default per app, 3 and 5)'),
+        include_reloads: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also report each app's in-process reloads since the last call, one reloaded incident per app (default false)"
+          ),
       },
       annotations: MUT(false, false), // taking writes the local pick-up point; nothing changes on the hosts
     },
@@ -363,6 +369,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           sinceMin: args.since,
           max: args.max,
           context: args.context,
+          includeReloads: args.include_reloads,
         });
         return {
           text: renderIncidents(answer),

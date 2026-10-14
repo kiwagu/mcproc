@@ -28,7 +28,7 @@ export interface FakeState {
 /**
  * Hosts whose log files live in memory: the read script is answered from `files` (and the host's clock from `now` and
  * `zone`; a state without `now` answers a garbled clock line, a host whose `date` printed nothing), jlist from `procs`,
- * a flush empties files.
+ * a flush empties files. `reads` names the host of each read script, `scripts` keeps the scripts themselves.
  */
 export function fakeHosts(
   state: FakeState,
@@ -36,6 +36,7 @@ export function fakeHosts(
   manifest = fleetManifest
 ) {
   const reads: string[] = [];
+  const scripts: string[] = [];
   const clock = (host: string) => {
     const c = { now: state.now, zone: state.zone, ...state.clocks?.[host] };
     return `__MCPROC_LS_CLOCK__ ${c.now ?? ''} ${c.zone ?? '+0000'}\n`;
@@ -58,6 +59,7 @@ export function fakeHosts(
           match: '__MCPROC_INC_',
           result: (cmd: string) => {
             reads.push(host);
+            scripts.push(cmd);
             return {
               stdout:
                 (cmd.includes('__MCPROC_NOW__')
@@ -83,7 +85,7 @@ export function fakeHosts(
       fallback
     );
   });
-  return { fleet, reads };
+  return { fleet, reads, scripts };
 }
 /** Executes the read snippets against the in-memory files: same arithmetic as the shell. */
 export function answerReads(

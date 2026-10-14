@@ -362,6 +362,34 @@ describe('renderIncidents', () => {
       renderIncidents({ ...base, incidents: [inc] }, { color: true })
     ).toContain('\x1b[31m');
   });
+  it("a reloaded incident is one line: how many reloads, the first one when several, the last one's line; not colored as an error", () => {
+    const reloaded = {
+      ...inc,
+      kind: 'reloaded' as const,
+      time: '2026-10-12T11:24:50.120',
+      first_time: '2026-10-12T11:20:01.000',
+      count: 2,
+      line: '2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts',
+      before: [],
+      after: [],
+      fingerprint: 'reloaded',
+    };
+    const t = renderIncidents(
+      { ...base, incidents: [inc, reloaded] },
+      { color: true }
+    );
+    expect(t.split('\n')).toContain(
+      'web@local 2026-10-12T11:24:50.120 reloaded ×2 (first 2026-10-12T11:20:01.000): 2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts'
+    );
+    expect(
+      renderIncidents({
+        ...base,
+        incidents: [{ ...reloaded, count: 1, first_time: reloaded.time }],
+      }).split('\n')[0]
+    ).toBe(
+      'web@local 2026-10-12T11:24:50.120 reloaded: 2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts'
+    );
+  });
 });
 
 describe('renderFlushed', () => {

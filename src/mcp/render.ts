@@ -366,7 +366,10 @@ export function renderProject(d: {
   return L.join('\n');
 }
 
-/** Incidents newest first: a header, context lines `│`, the error line `▶`; then how to go on. Nothing new is one short line. */
+/**
+ * Incidents newest first: a header, context lines `│`, the error line `▶`; an app's reloads are one line with the last
+ * reload's line; then how to go on. Nothing new is one short line.
+ */
 export function renderIncidents(
   a: TakenAnswer,
   opts: { color?: boolean } = {}
@@ -396,10 +399,16 @@ export function renderIncidents(
     const count = i.count > 1 ? ` ×${i.count}` : '';
     const first =
       i.count > 1 && i.first_time && i.first_time !== i.time
-        ? `first ${i.first_time}, `
-        : '';
+        ? i.first_time
+        : null;
+    if (i.kind === 'reloaded') {
+      L.push(
+        `${i.app}@${i.host} ${i.time ?? '-'} reloaded${count}${first ? ` (first ${first})` : ''}: ${i.line}`
+      ); // both streams and no context, and not an error: one plain line
+      continue;
+    }
     L.push(
-      `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first}${i.stream})`
+      `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first ? `first ${first}, ` : ''}${i.stream})`
     );
     for (const b of i.before) L.push(`  │ ${b}`);
     L.push(red(`  ▶ ${i.line}`));
