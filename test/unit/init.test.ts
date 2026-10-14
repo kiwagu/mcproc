@@ -815,6 +815,46 @@ describe('renderDraft on a turbo repo', () => {
     );
     expect(m.apps.hash.cwd).toBe('apps/web #2');
   });
+  it('names YAML would read as a boolean, a number or null are quoted: the draft loads with them as strings', () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.workspaces = [...pkg.workspaces, '123'];
+    write(r, 'package.json', JSON.stringify(pkg));
+    // yes/on are booleans in YAML 1.1 only: the yaml library reads them as strings, so they stay bare
+    const names = ['true', '123', 'null', '1e3', '007', 'yes', 'on'];
+    for (const n of names)
+      write(
+        r,
+        `apps/p-${n}/package.json`,
+        JSON.stringify({ name: `@t/${n}`, scripts: { dev: 'node s.js' } })
+      );
+    // an exact workspace directory whose name reads as a number
+    write(
+      r,
+      '123/package.json',
+      JSON.stringify({ name: '@t/exact', scripts: { dev: 'node s.js' } })
+    );
+    // a commented candidate whose name reads as a number
+    write(r, 'Procfile', '0x1f: node w.js\n');
+    const text = renderDraft(r, '123', discover(r));
+    const m = parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml'));
+    expect(m.project).toBe('123');
+    for (const n of names)
+      expect(m.apps[n], n).toMatchObject({ cwd: `apps/p-${n}` });
+    expect(m.apps.exact.cwd).toBe('123');
+    expect(m.profiles.dev).toEqual(expect.arrayContaining([...names, 'exact']));
+    expect(text).toContain('project: "123"\n');
+    expect(text).toContain('\n  "true":    # source: apps/p-true/package.json');
+    expect(text).toContain('\n  "null":    # source: apps/p-null/package.json');
+    expect(text).toContain('\n  yes:    # source: apps/p-yes/package.json');
+    expect(text).toContain('\n    cwd: "123"\n');
+    expect(text).toContain('\n  # "0x1f":    # source: Procfile:0x1f;');
+    expect(text).toContain(
+      '\n  dev: [libs, libs-watch, api, "007", "123", "1e3", "null", on, "true", yes, web, contracts, exact]\n'
+    );
+  });
   it('a plain repo renders as before: every app commented, the base example profile', () => {
     const text = renderDraft(root, 'mono', discover(root)); // the non-turbo fixture of this file
     expect(text).not.toContain('--- other scripts');

@@ -698,10 +698,19 @@ export function discover(root: string): Discovery {
   };
 }
 
+/**
+ * A scalar of the draft as YAML text: bare only when it holds no YAML punctuation and the yaml library reads it back
+ * as the same string, so `true`, `123`, `1e3`, `null` or `~` (a boolean, numbers, null) are double-quoted; JSON's
+ * escapes are valid in a YAML double-quoted string.
+ */
 function yamlStr(s: string): string {
-  return /[:#'"{}[\],&*?|<>=!%@`]/.test(s) || /^\s|\s$/.test(s)
-    ? JSON.stringify(s)
-    : s;
+  if (!/[:#'"{}[\],&*?|<>=!%@`]/.test(s) && !/^\s|\s$/.test(s))
+    try {
+      if ((parseYaml(`k: ${s}`) as { k?: unknown } | null)?.k === s) return s;
+    } catch {
+      /* not a plain scalar: quoted below */
+    }
+  return JSON.stringify(s);
 }
 
 export function renderDraft(
@@ -732,7 +741,7 @@ export function renderDraft(
     '# host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.',
   ];
   for (const n of d.notes) L.push(`# note: ${n}`);
-  L.push('version: 1', `project: ${project}`, 'apps:');
+  L.push('version: 1', `project: ${yamlStr(project)}`, 'apps:');
   if (d.candidates.length === 0)
     L.push(
       '  # no launch candidates found; add apps by hand, e.g.',
@@ -746,9 +755,7 @@ export function renderDraft(
   /** The field lines of a candidate under prefix p; its note goes last, as a comment. */
   const body = (c: Candidate, p: string): string[] => {
     // an empty description still has to read as a YAML string once uncommented
-    const out = [
-      `${p}description: ${c.description ? yamlStr(c.description) : '""'}`,
-    ];
+    const out = [`${p}description: ${yamlStr(c.description ?? '')}`];
     if (c.kind !== 'unknown') out.push(`${p}kind: ${c.kind}`);
     out.push(`${p}run: ${yamlStr(c.run)}`);
     if (c.cwd !== '.') out.push(`${p}cwd: ${yamlStr(c.cwd)}`);
@@ -757,24 +764,26 @@ export function renderDraft(
       out.push(`${p}url: http://localhost:${c.port}`);
     if (c.depends_on?.length)
       out.push(
-        `${p}depends_on: [${c.depends_on.map((x) => `{ app: ${x.app}, condition: ${x.condition}, timeout: ${x.timeout} }`).join(', ')}]`
+        `${p}depends_on: [${c.depends_on.map((x) => `{ app: ${yamlStr(x.app)}, condition: ${x.condition}, timeout: ${x.timeout} }`).join(', ')}]`
       );
     if (c.note) out.push(`${p}# ${c.note}`);
     return out;
   };
   for (const c of live)
-    L.push(`  ${c.name}:    ${trailer(c)}`, ...body(c, '    '));
+    L.push(`  ${yamlStr(c.name)}:    ${trailer(c)}`, ...body(c, '    '));
   if (live.length && rest.length)
     L.push('  # --- other scripts (commented out) ---');
   // a commented candidate's description is left for the human to write
   for (const c of rest)
     L.push(
-      `  # ${c.name}:    ${trailer(c)}`,
+      `  # ${yamlStr(c.name)}:    ${trailer(c)}`,
       ...body({ ...c, description: '' }, '  #   ')
     );
   L.push('profiles:');
   for (const p of d.profiles)
-    L.push(`  ${p.live ? '' : '# '}${p.name}: [${p.apps.join(', ')}]`);
+    L.push(
+      `  ${p.live ? '' : '# '}${yamlStr(p.name)}: [${p.apps.map(yamlStr).join(', ')}]`
+    );
   if (!liveProfile) L.push('  # base: [api-build, api]');
   L.push(
     'hosts:',
