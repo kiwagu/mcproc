@@ -48,6 +48,12 @@ export interface InitResult {
   created: string[];
   candidates: number;
   by_source: Record<string, number>;
+  /** The apps written uncommented. */
+  live: string[];
+  /** The live profiles, e.g. dev. */
+  profiles: string[];
+  /** The packages folded into the libs builders. */
+  libs: string[];
   next: string;
 }
 
@@ -610,6 +616,14 @@ export function renderDraft(
     '# hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container);',
     '# host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.',
   ];
+  const live = d.candidates.filter((c) => c.live);
+  const rest = d.candidates.filter((c) => !c.live);
+  // the profile is dev-apps when a live app took the name dev
+  const liveProfile = d.profiles.find((p) => p.live);
+  if (liveProfile)
+    L.push(
+      `# Apps found through turbo's persistent dev task are live and grouped in the ${liveProfile.name} profile; everything else is commented out.`
+    );
   for (const n of d.notes) L.push(`# note: ${n}`);
   L.push('version: 1', `project: ${project}`, 'apps:');
   if (d.candidates.length === 0)
@@ -620,21 +634,42 @@ export function renderDraft(
       '  #   run: npm run dev',
       '  #   port: 3000'
     );
-  for (const c of d.candidates) {
-    L.push(
-      `  # ${c.name}:    # source: ${c.source}; kind? ${c.kind}${c.port ? `; port? ${c.port}` : ''}`
-    );
-    L.push('  #   description: ""');
-    if (c.kind !== 'unknown') L.push(`  #   kind: ${c.kind}`);
-    L.push(`  #   run: ${yamlStr(c.run)}`);
-    if (c.cwd !== '.') L.push(`  #   cwd: ${c.cwd}`);
-    if (c.port) L.push(`  #   port: ${c.port}`);
+  const trailer = (c: Candidate) =>
+    `# source: ${c.source}; kind? ${c.kind}${c.port ? `; port? ${c.port}` : ''}`;
+  /** The field lines of a candidate under prefix p; its note goes last, as a comment. */
+  const body = (c: Candidate, p: string): string[] => {
+    // an empty description still has to read as a YAML string once uncommented
+    const out = [
+      `${p}description: ${c.description ? yamlStr(c.description) : '""'}`,
+    ];
+    if (c.kind !== 'unknown') out.push(`${p}kind: ${c.kind}`);
+    out.push(`${p}run: ${yamlStr(c.run)}`);
+    if (c.cwd !== '.') out.push(`${p}cwd: ${c.cwd}`);
+    if (c.port) out.push(`${p}port: ${c.port}`);
     if (c.port && c.kind !== 'worker')
-      L.push(`  #   url: http://localhost:${c.port}`);
-  }
+      out.push(`${p}url: http://localhost:${c.port}`);
+    if (c.depends_on?.length)
+      out.push(
+        `${p}depends_on: [${c.depends_on.map((x) => `{ app: ${x.app}, condition: ${x.condition} }`).join(', ')}]`
+      );
+    if (c.note) out.push(`${p}# ${c.note}`);
+    return out;
+  };
+  for (const c of live)
+    L.push(`  ${c.name}:    ${trailer(c)}`, ...body(c, '    '));
+  if (live.length && rest.length)
+    L.push('  # --- other scripts (commented out) ---');
+  // a commented candidate's description is left for the human to write
+  for (const c of rest)
+    L.push(
+      `  # ${c.name}:    ${trailer(c)}`,
+      ...body({ ...c, description: '' }, '  #   ')
+    );
+  L.push('profiles:');
+  for (const p of d.profiles)
+    L.push(`  ${p.live ? '' : '# '}${p.name}: [${p.apps.join(', ')}]`);
+  if (!d.profiles.some((p) => p.live)) L.push('  # base: [api-build, api]');
   L.push(
-    'profiles:',
-    '  # base: [api-build, api]',
     'hosts:',
     '  # stand: { ssh: my-alias, cwd: /srv/project }',
     '  # prod: { ssh: prod-alias, cwd: /srv/project, readonly: true }',
@@ -708,11 +743,18 @@ export function initProject(
     const k = c.source.split(':')[0].replace(/^.*\//, '');
     by_source[k] = (by_source[k] ?? 0) + 1;
   }
+  const live = d.candidates.filter((c) => c.live).map((c) => c.name);
+  const profiles = d.profiles.filter((p) => p.live).map((p) => p.name);
   return {
     path: file,
     created,
     candidates: d.candidates.length,
     by_source,
-    next: `Edit ${file}: uncomment the apps your dev stack needs, write a description for each, then run start <app|profile> and ls to confirm the ports.`,
+    live,
+    profiles,
+    libs: d.libs,
+    next: profiles.length
+      ? `Edit ${file}: write a description for each live app (they start with TODO), then run start ${profiles[0]} and ls to confirm the ports; the other scripts are commented out below.`
+      : `Edit ${file}: uncomment the apps your dev stack needs, write a description for each, then run start <app|profile> and ls to confirm the ports.`,
   };
 }

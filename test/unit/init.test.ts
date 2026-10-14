@@ -12,7 +12,7 @@ import {
   sanitizeName,
   LIVE_DESCRIPTION,
 } from '../../src/core/init.js';
-import { parseManifest } from '../../src/core/manifest.js';
+import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const turbo = path.join(here, '..', 'fixtures', 'projects', 'turbo');
@@ -532,6 +532,151 @@ describe('renderDraft / initProject', () => {
     expect(initProject(root, { force: true }).created).toContain(
       path.join(root, '.mcproc', 'mcproc.yaml')
     );
+  });
+});
+
+describe('renderDraft on a turbo repo', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  /** A throwaway copy of the turbo fixture, removed after the suite. */
+  const copy = () => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-init-'));
+    made.push(r);
+    fs.cpSync(turbo, r, { recursive: true });
+    return r;
+  };
+  const draftOf = (r: string) => renderDraft(r, 'fx', discover(r));
+  /** No root scripts and a workspace app named dev: the live profile becomes dev-apps. */
+  const liveAppNamedDev = (r: string) => {
+    fs.rmSync(path.join(r, 'package.json'));
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ workspaces: ['apps/*', 'packages/*'] })
+    );
+    write(
+      r,
+      'apps/dev/package.json',
+      JSON.stringify({ name: '@t/dev', scripts: { dev: 'node s.js' } })
+    );
+  };
+  it('writes live apps uncommented, the divider, the dev profile and the start profile; the draft loads', () => {
+    const text = draftOf(turbo);
+    expect(text).toContain(
+      "# Apps found through turbo's persistent dev task are live and grouped in the dev profile; everything else is commented out."
+    );
+    expect(text).toMatch(
+      /^ {2}libs: {4}# source: turbo\.json:build; kind\? task\n {4}description: .*\n {4}kind: task\n {4}run: "bunx turbo run build --filter=@t\/domain --ui=stream"\n/m
+    );
+    expect(text).toContain(
+      '  libs-watch:    # source: turbo.json:build; kind? build\n'
+    );
+    expect(text).toContain(
+      '    run: "bunx turbo watch build --filter=@t/domain --ui=stream"\n'
+    );
+    expect(text).toContain(
+      '    depends_on: [{ app: libs, condition: completed }]\n'
+    );
+    expect(text).toMatch(
+      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed \}\]\n {4}# contracts's first build is not awaited/m
+    );
+    expect(text).toContain('  # --- other scripts (commented out) ---\n');
+    expect(text).toContain(
+      [
+        '  # dev:    # source: package.json:dev; kind? server',
+        '  #   description: ""',
+        '  #   kind: server',
+        '  #   run: bun run dev',
+        '  #   # the dev profile replaces this: turbo would start every package as one process',
+        '',
+      ].join('\n')
+    );
+    expect(text).toContain(
+      'profiles:\n  dev: [libs, libs-watch, api, web, contracts]\n  # start: [web-start]\nhosts:\n'
+    );
+    expect(text).not.toContain('# base: [api-build, api]');
+    const m = parseManifest(
+      text,
+      turbo,
+      path.join(turbo, '.mcproc', 'mcproc.yaml')
+    );
+    expect(Object.keys(m.apps)).toEqual([
+      'libs',
+      'libs-watch',
+      'api',
+      'web',
+      'contracts',
+    ]);
+    expect(m.profiles.dev).toEqual([
+      'libs',
+      'libs-watch',
+      'api',
+      'web',
+      'contracts',
+    ]);
+    expect(m.apps.api.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeoutMs: 60_000 },
+    ]);
+    expect(m.apps.libs.kind).toBe('task');
+    expect(m.apps.contracts.kind).toBe('build');
+  });
+  it('every drafted variant loads', () => {
+    const variants: [string, (r: string) => void][] = [
+      [
+        'no dist libraries',
+        (r) => {
+          fs.rmSync(path.join(r, 'packages', 'domain'), { recursive: true });
+          fs.rmSync(path.join(r, 'packages', 'contracts'), {
+            recursive: true,
+          });
+        },
+      ],
+      [
+        'turbo 1',
+        (r) =>
+          write(
+            r,
+            'turbo.json',
+            JSON.stringify({
+              pipeline: { dev: { persistent: true }, build: {} },
+            })
+          ),
+      ],
+      ['a live app named dev', liveAppNamedDev],
+    ];
+    for (const [label, mutate] of variants) {
+      const r = copy();
+      mutate(r);
+      const text = draftOf(r);
+      expect(
+        () => parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml')),
+        label
+      ).not.toThrow();
+    }
+  });
+  it('the header names the live profile: dev-apps when a live app is named dev', () => {
+    const r = copy();
+    liveAppNamedDev(r);
+    const text = draftOf(r);
+    expect(text).toContain('grouped in the dev-apps profile;');
+    expect(text).toContain('\n  dev-apps: [');
+  });
+  it('a plain repo renders as before: every app commented, the base example profile', () => {
+    const text = renderDraft(root, 'mono', discover(root)); // the non-turbo fixture of this file
+    expect(text).not.toContain('--- other scripts');
+    expect(text).toContain('profiles:\n  # base: [api-build, api]\n');
+    expect(text).not.toContain('persistent dev task');
+  });
+  it('initProject reports live apps, profiles and libs, and points at start dev', () => {
+    const r = copy();
+    const res = initProject(r);
+    expect(res.live).toEqual(['libs', 'libs-watch', 'api', 'web', 'contracts']);
+    expect(res.profiles).toEqual(['dev']);
+    expect(res.libs).toEqual(['@t/domain']);
+    expect(res.next).toContain('start dev');
+    expect(() => loadManifest(r)).not.toThrow();
   });
 });
 
