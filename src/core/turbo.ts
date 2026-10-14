@@ -108,17 +108,23 @@ export function turboBin(pm: string): string {
 }
 
 /**
- * One folder filter per globbed workspace folder holding a library; a library
- * elsewhere is filtered by name, and so is one whose folder also holds a live
- * library: the folder filter would build and watch that one too, a second
- * writer to the dist/ its own dev task keeps.
+ * One folder filter per globbed workspace folder whose packages with a build script are all folded libraries. A
+ * library elsewhere, or in a folder that also holds another package with a build script (an app, a library live
+ * through its own dev task, a package not built into dist/), is filtered by name: the folder filter would build and
+ * watch that package too, a build nobody asked for, or a second writer beside its own dev task (`next build` under
+ * `next dev`, which share `.next/`). `all` is every workspace package, the folded ones included.
  */
 export function libsFilters(
   libs: WsPackage[],
   globParents: string[],
-  live: WsPackage[] = []
+  all: WsPackage[] = []
 ): string[] {
-  const shared = new Set(live.map((l) => path.dirname(l.dir)));
+  const folded = new Set(libs.map((l) => l.name));
+  const shared = new Set(
+    all
+      .filter((p) => p.scripts.build && !folded.has(p.name))
+      .map((p) => path.dirname(p.dir))
+  );
   const out: string[] = [];
   for (const l of libs) {
     const parent = path.dirname(l.dir);

@@ -191,17 +191,49 @@ describe('turboBin / libsFilters', () => {
     ]);
     expect(libsFilters([], ['packages'])).toEqual([]);
   });
+  const build = { build: 'tsc -p .' };
   it('a folder that also holds a live library filters its folded libraries by name', () => {
     const libs = [
-      pkg('@t/domain', 'packages/domain'),
-      pkg('@t/std', 'packages/std'),
-      pkg('@t/x', 'libs/x'),
+      pkg('@t/domain', 'packages/domain', { scripts: build, distLib: true }),
+      pkg('@t/std', 'packages/std', { scripts: build, distLib: true }),
+      pkg('@t/x', 'libs/x', { scripts: build, distLib: true }),
     ];
-    const live = [pkg('@t/contracts', 'packages/contracts')];
-    expect(libsFilters(libs, ['packages', 'libs'], live)).toEqual([
+    const live = pkg('@t/contracts', 'packages/contracts', {
+      scripts: { ...build, dev: 'tsc -w' },
+      distLib: true,
+    });
+    expect(libsFilters(libs, ['packages', 'libs'], [...libs, live])).toEqual([
       '--filter=@t/domain',
       '--filter=@t/std',
       "--filter='./libs/*'",
+    ]);
+  });
+  it('so does a folder holding any other package with a build script: an app, or a package not built into dist/', () => {
+    const domain = pkg('@t/domain', 'packages/domain', {
+      scripts: build,
+      distLib: true,
+    });
+    const x = pkg('@t/x', 'libs/x', { scripts: build, distLib: true });
+    // next build in the folder filter would rebuild .next/ under the app's own next dev
+    const site = pkg('@t/site', 'packages/site', {
+      scripts: { dev: 'next dev', build: 'next build' },
+    });
+    const tool = pkg('@t/tool', 'libs/tool', { scripts: build });
+    expect(
+      libsFilters([domain, x], ['packages', 'libs'], [domain, site, x, tool])
+    ).toEqual(['--filter=@t/domain', '--filter=@t/x']);
+  });
+  it('packages without a build script do not stop a folder filter', () => {
+    const domain = pkg('@t/domain', 'packages/domain', {
+      scripts: build,
+      distLib: true,
+    });
+    const config = pkg('@t/config', 'packages/config', {
+      scripts: { lint: 'eslint .' },
+    });
+    const ui = pkg('@t/ui', 'packages/ui');
+    expect(libsFilters([domain], ['packages'], [domain, config, ui])).toEqual([
+      "--filter='./packages/*'",
     ]);
   });
 });

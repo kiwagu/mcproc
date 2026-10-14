@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { McprocError } from './errors.js';
-import { defaultProject, MANIFEST_REL, type AppKind } from './manifest.js';
+import {
+  DEP_TIMEOUT_MAX_S,
+  defaultProject,
+  MANIFEST_REL,
+  type AppKind,
+} from './manifest.js';
 import {
   dependsOnDistLib,
   libsFilters,
@@ -24,7 +29,7 @@ export interface Candidate {
   live?: boolean;
   /** Live apps: the placeholder; libs/libs-watch: their own text. */
   description?: string;
-  depends_on?: { app: string; condition: 'completed' }[];
+  depends_on?: { app: string; condition: 'completed'; timeout: number }[];
   /** One comment line written under the candidate. */
   note?: string;
 }
@@ -307,8 +312,17 @@ interface PkgTurbo {
   liveLibDeps: string[];
   /** Its build script is folded into libs. */
   dropBuild: boolean;
-  libsName: string;
 }
+
+/**
+ * The wait on libs' first build: up to the manifest's cap, since a cold build of many libraries outlasts the default
+ * and every app waiting on it would be skipped; a failed build still ends the wait at once.
+ */
+const LIBS_DEP = {
+  app: 'libs',
+  condition: 'completed',
+  timeout: DEP_TIMEOUT_MAX_S,
+} as const;
 
 const notAwaited = (lib: string): string => {
   const app = pkgAppName(lib);
@@ -344,9 +358,7 @@ function packageCandidates(
         port: turbo.isLib ? undefined : portFor(kind, cmd, pkgDir),
         live: true,
         description: LIVE_DESCRIPTION,
-        ...(turbo.waitsForLibs
-          ? { depends_on: [{ app: turbo.libsName, condition: 'completed' }] }
-          : {}),
+        ...(turbo.waitsForLibs ? { depends_on: [{ ...LIBS_DEP }] } : {}),
         ...(turbo.liveLibDeps.length
           ? { note: turbo.liveLibDeps.map(notAwaited).join('; ') }
           : {}),
@@ -405,7 +417,7 @@ function expandWorkspaces(
  */
 function libsBuilders(
   folded: WsPackage[],
-  liveLibs: WsPackage[],
+  all: WsPackage[],
   globParents: string[],
   pm: string,
   version: 1 | 2
@@ -413,7 +425,7 @@ function libsBuilders(
   const bin = turboBin(pm);
   // turbo 2's interactive UI would hold the terminal; turbo 1 has no --ui flag
   const ui = version === 2 ? ' --ui=stream' : '';
-  const filters = libsFilters(folded, globParents, liveLibs).join(' ');
+  const filters = libsFilters(folded, globParents, all).join(' ');
   const parents = [...new Set(folded.map((p) => path.dirname(p.dir)))].join(
     ', '
   );
@@ -438,7 +450,7 @@ function libsBuilders(
       live: true,
       description:
         "rebuilds a changed library's dist/ (and its dependents) while you work",
-      depends_on: [{ app: 'libs', condition: 'completed' }],
+      depends_on: [{ ...LIBS_DEP }],
     },
   ];
 }
@@ -534,7 +546,7 @@ export function discover(root: string): Discovery {
   const liveLibNames = new Set(liveLibs.map((p) => p.name));
   if (turbo && folded.length) {
     candidates.push(
-      ...libsBuilders(folded, liveLibs, expanded.globParents, pm, turbo.version)
+      ...libsBuilders(folded, pkgs, expanded.globParents, pm, turbo.version)
     );
     const one = folded.length === 1;
     const apps = turbo.version === 1 ? 'libs' : 'libs and libs-watch';
@@ -569,7 +581,6 @@ export function discover(root: string): Discovery {
               waitsForLibs: dependsOnDistLib(p, pkgs, foldedNames).length > 0,
               liveLibDeps: dependsOnDistLib(p, pkgs, liveLibNames),
               dropBuild: foldedNames.has(p.name),
-              libsName: 'libs',
             }
           : undefined
       )
@@ -743,7 +754,7 @@ export function renderDraft(
       out.push(`${p}url: http://localhost:${c.port}`);
     if (c.depends_on?.length)
       out.push(
-        `${p}depends_on: [${c.depends_on.map((x) => `{ app: ${x.app}, condition: ${x.condition} }`).join(', ')}]`
+        `${p}depends_on: [${c.depends_on.map((x) => `{ app: ${x.app}, condition: ${x.condition}, timeout: ${x.timeout} }`).join(', ')}]`
       );
     if (c.note) out.push(`${p}# ${c.note}`);
     return out;

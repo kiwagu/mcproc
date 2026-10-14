@@ -112,7 +112,9 @@ replace it. The root `dev` script, other persistent tasks (under a commented pro
 - Libraries consumed from `dist/` (a `build` script plus `main`, `module`, `types` or an `exports` target under `dist/`)
   share two apps instead of a `<pkg>-build` each: `libs`, one `turbo run build` over them (`kind: task`), and `libs-watch`,
   `turbo watch build` once `libs` has completed (turbo 1 has no `turbo watch`, so there `libs` comes alone). A live app
-  that depends on such a library, directly or through other packages, gets `depends_on: [{ app: libs, condition: completed }]`.
+  that depends on such a library, directly or through other packages, gets
+  `depends_on: [{ app: libs, condition: completed, timeout: 600 }]`: the longest wait the manifest allows, since a cold
+  build of many libraries can outlast the default 60 s.
 - A library live through its own `dev` watch is drafted as a `build` app and left out of `libs`, so its first build is not
   awaited: the draft leaves a note on each app that uses it saying how to wait for it.
 - Ports are also guessed for Next (3000), Vite (`server.port` in `vite.config.*`, or `preview.port` for `vite preview`,

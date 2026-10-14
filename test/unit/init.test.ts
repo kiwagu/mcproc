@@ -208,7 +208,7 @@ describe('discover on a turbo repo', () => {
       live: true,
       kind: 'build',
       run: 'bunx turbo watch build --filter=@t/domain --ui=stream',
-      depends_on: [{ app: 'libs', condition: 'completed' }],
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
     });
     expect(c.api).toMatchObject({
       live: true,
@@ -218,14 +218,14 @@ describe('discover on a turbo repo', () => {
       kind: 'server',
       port: 3020,
       description: LIVE_DESCRIPTION,
-      depends_on: [{ app: 'libs', condition: 'completed' }],
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
     });
     expect(c.web).toMatchObject({
       live: true,
       cwd: 'apps/web',
       kind: 'server',
       port: 3002,
-      depends_on: [{ app: 'libs', condition: 'completed' }],
+      depends_on: [{ app: 'libs', condition: 'completed', timeout: 600 }],
     });
     expect(c.contracts).toMatchObject({
       live: true,
@@ -234,7 +234,7 @@ describe('discover on a turbo repo', () => {
       source: 'packages/contracts/package.json:dev',
     });
     expect(c.contracts.depends_on).toEqual([
-      { app: 'libs', condition: 'completed' },
+      { app: 'libs', condition: 'completed', timeout: 600 },
     ]); // contracts → domain
     expect(c.contracts.port).toBeUndefined();
     expect(c.api.note).toContain("contracts's first build is not awaited"); // api depends on the live library contracts
@@ -312,7 +312,9 @@ describe('discover on a turbo repo', () => {
     expect(d.notes).toContain(
       'turbo 1 has no turbo watch: libs-watch is not drafted; run libs again after changing a library, or move to turbo 2'
     );
-    expect(c.api.depends_on).toEqual([{ app: 'libs', condition: 'completed' }]);
+    expect(c.api.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeout: 600 },
+    ]);
     expect(d.profiles[0].apps).toEqual(['libs', 'api', 'web', 'contracts']);
     expect(d.notes).toContain(
       '1 library built into dist/ is drafted as libs: @t/domain'
@@ -355,6 +357,43 @@ describe('discover on a turbo repo', () => {
     );
     expect(byName(discover(r)).libs.run).toBe(
       "bunx turbo run build --filter='./packages/*' --ui=stream"
+    );
+  });
+  it('a folder that also holds an app or another package with a build script filters its libraries by name', () => {
+    const r = copy();
+    const contracts = JSON.parse(
+      fs.readFileSync(
+        path.join(r, 'packages', 'contracts', 'package.json'),
+        'utf8'
+      )
+    );
+    delete contracts.scripts.dev; // contracts and domain are both folded now
+    write(r, 'packages/contracts/package.json', JSON.stringify(contracts));
+    write(
+      r,
+      'packages/site/package.json',
+      JSON.stringify({
+        name: '@t/site',
+        scripts: { dev: 'next dev', build: 'next build' },
+      })
+    );
+    const d = discover(r);
+    expect(byName(d).site).toMatchObject({ live: true, port: 3000 });
+    expect(byName(d).libs.run).toBe(
+      'bunx turbo run build --filter=@t/contracts --filter=@t/domain --ui=stream'
+    );
+    expect(byName(d)['libs-watch'].run).toBe(
+      'bunx turbo watch build --filter=@t/contracts --filter=@t/domain --ui=stream'
+    );
+    // not live, not a library, but built by a folder filter all the same
+    fs.rmSync(path.join(r, 'packages', 'site'), { recursive: true });
+    write(
+      r,
+      'packages/tool/package.json',
+      JSON.stringify({ name: '@t/tool', scripts: { build: 'tsc -p .' } })
+    );
+    expect(byName(discover(r)).libs.run).toBe(
+      'bunx turbo run build --filter=@t/contracts --filter=@t/domain --ui=stream'
     );
   });
   it('a persistent dev task no package implements drafts as before: no live apps, no profile, no root note', () => {
@@ -584,10 +623,10 @@ describe('renderDraft on a turbo repo', () => {
       '    run: "bunx turbo watch build --filter=@t/domain --ui=stream"\n'
     );
     expect(text).toContain(
-      '    depends_on: [{ app: libs, condition: completed }]\n'
+      '    depends_on: [{ app: libs, condition: completed, timeout: 600 }]\n'
     );
     expect(text).toMatch(
-      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed \}\]\n {4}# contracts's first build is not awaited; uncomment contracts-build and add \{ app: contracts-build, condition: completed \} to its depends_on to wait for it\n/m
+      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed, timeout: 600 \}\]\n {4}# contracts's first build is not awaited; uncomment contracts-build and add \{ app: contracts-build, condition: completed \} to its depends_on to wait for it\n/m
     );
     expect(text).toContain('  # --- other scripts (commented out) ---\n');
     expect(text).toContain(
@@ -624,7 +663,10 @@ describe('renderDraft on a turbo repo', () => {
       'contracts',
     ]);
     expect(m.apps.api.depends_on).toEqual([
-      { app: 'libs', condition: 'completed', timeoutMs: 60_000 },
+      { app: 'libs', condition: 'completed', timeoutMs: 600_000 },
+    ]);
+    expect(m.apps['libs-watch'].depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeoutMs: 600_000 },
     ]);
     expect(m.apps.libs.kind).toBe('task');
     expect(m.apps.contracts.kind).toBe('build');
@@ -680,10 +722,18 @@ describe('renderDraft on a turbo repo', () => {
       const r = copy();
       mutate(r);
       const text = draftOf(r);
-      expect(
-        () => parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml')),
-        label
-      ).not.toThrow();
+      const m = parseManifest(text, r, path.join(r, '.mcproc', 'mcproc.yaml'));
+      // every wait on libs is drafted at the cap: a cold build of many libraries outlasts the default
+      const waits = Object.values(m.apps).flatMap((a) =>
+        a.depends_on.filter((d) => d.app === 'libs')
+      );
+      expect(waits.length > 0, label).toBe(label !== 'no dist libraries');
+      for (const w of waits)
+        expect(w, label).toEqual({
+          app: 'libs',
+          condition: 'completed',
+          timeoutMs: 600_000,
+        });
     }
   });
   it('the header names the live profile: dev-apps when a live app is named dev', () => {
