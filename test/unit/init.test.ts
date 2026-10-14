@@ -565,8 +565,15 @@ describe('renderDraft on a turbo repo', () => {
   it('writes live apps uncommented, the divider, the dev profile and the start profile; the draft loads', () => {
     const text = draftOf(turbo);
     expect(text).toContain(
-      "# Apps found through turbo's persistent dev task are live and grouped in the dev profile; everything else is commented out."
+      [
+        '#',
+        "# Live apps below come from turbo's persistent dev task and form the dev profile: start dev runs them.",
+        '# The other candidates are commented out. Uncomment the ones your dev stack needs,',
+        '# write a description for each app, then run start + ls to confirm the ports; fix; repeat.',
+        '',
+      ].join('\n')
     );
+    expect(text).not.toContain('# Candidates below are commented out.');
     expect(text).toMatch(
       /^ {2}libs: {4}# source: turbo\.json:build; kind\? task\n {4}description: .*\n {4}kind: task\n {4}run: "bunx turbo run build --filter=@t\/domain --ui=stream"\n/m
     );
@@ -580,7 +587,7 @@ describe('renderDraft on a turbo repo', () => {
       '    depends_on: [{ app: libs, condition: completed }]\n'
     );
     expect(text).toMatch(
-      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed \}\]\n {4}# contracts's first build is not awaited/m
+      /^ {2}api: {4}# source: apps\/api\/package\.json:dev; kind\? server; port\? 3020\n {4}description: "TODO: what this app does"\n {4}kind: server\n {4}run: bun run dev\n {4}cwd: apps\/api\n {4}port: 3020\n {4}url: http:\/\/localhost:3020\n {4}depends_on: \[\{ app: libs, condition: completed \}\]\n {4}# contracts's first build is not awaited; uncomment contracts-build and add \{ app: contracts-build, condition: completed \} to its depends_on to wait for it\n/m
     );
     expect(text).toContain('  # --- other scripts (commented out) ---\n');
     expect(text).toContain(
@@ -645,6 +652,29 @@ describe('renderDraft on a turbo repo', () => {
           ),
       ],
       ['a live app named dev', liveAppNamedDev],
+      [
+        'a live app named all',
+        (r) =>
+          write(
+            r,
+            'apps/all/package.json',
+            JSON.stringify({ name: '@t/all', scripts: { dev: 'node s.js' } })
+          ),
+      ],
+      [
+        'live apps named dev and dev-apps',
+        (r) => {
+          liveAppNamedDev(r);
+          write(
+            r,
+            'apps/dev-apps/package.json',
+            JSON.stringify({
+              name: '@t/dev-apps',
+              scripts: { dev: 'node s.js' },
+            })
+          );
+        },
+      ],
     ];
     for (const [label, mutate] of variants) {
       const r = copy();
@@ -660,14 +690,119 @@ describe('renderDraft on a turbo repo', () => {
     const r = copy();
     liveAppNamedDev(r);
     const text = draftOf(r);
-    expect(text).toContain('grouped in the dev-apps profile;');
+    expect(text).toContain(
+      'form the dev-apps profile: start dev-apps runs them.'
+    );
     expect(text).toContain('\n  dev-apps: [');
+  });
+  it('a commented profile steps aside from an app of the same name', () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    pkg.scripts.start = 'turbo run start';
+    write(r, 'package.json', JSON.stringify(pkg));
+    const text = draftOf(r);
+    expect(text).toContain('  # start:    # source: package.json:start;');
+    expect(text).toContain('  # start-apps: [web-start]\n');
+  });
+  it('a live cwd is quoted when YAML would cut it', () => {
+    const r = copy();
+    write(
+      r,
+      'apps/web #2/package.json',
+      JSON.stringify({ name: '@t/hash', scripts: { dev: 'node s.js' } })
+    );
+    const m = parseManifest(
+      draftOf(r),
+      r,
+      path.join(r, '.mcproc', 'mcproc.yaml')
+    );
+    expect(m.apps.hash.cwd).toBe('apps/web #2');
   });
   it('a plain repo renders as before: every app commented, the base example profile', () => {
     const text = renderDraft(root, 'mono', discover(root)); // the non-turbo fixture of this file
     expect(text).not.toContain('--- other scripts');
     expect(text).toContain('profiles:\n  # base: [api-build, api]\n');
     expect(text).not.toContain('persistent dev task');
+    // the first line carries the date and the temp path
+    expect(text.slice(text.indexOf('\n') + 1)).toMatchInlineSnapshot(`
+      "#
+      # Candidates below are commented out. Uncomment the ones your dev stack needs,
+      # write a description for each app, then run start + ls to confirm the ports; fix; repeat.
+      # Fields: kind build|server|worker|task (task = runs once, e.g. a build or a migration; ls shows done/failed); run = shell command; cwd relative to the project root;
+      # port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its
+      # build output changes); depends_on = start order; profiles = named groups of apps;
+      # url = the address to open in a browser; ls/describe show it with the HTTP answer, monit shows it;
+      # hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container);
+      # host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.
+      # note: ecosystem.config.cjs found: JavaScript ecosystem files are not executed by init; port its apps by hand
+      version: 1
+      project: mono
+      apps:
+        # dev:    # source: package.json:dev; kind? server; port? 7777
+        #   description: ""
+        #   kind: server
+        #   run: yarn dev
+        #   port: 7777
+        #   url: http://localhost:7777
+        # build-watch:    # source: package.json:build:watch; kind? build
+        #   description: ""
+        #   kind: build
+        #   run: "yarn build:watch"
+        # build:    # source: package.json:build; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: yarn build
+        # migrate:    # source: package.json:migrate; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: yarn migrate
+        # api-dev:    # source: packages/api/package.json:dev; kind? server; port? 4100
+        #   description: ""
+        #   kind: server
+        #   run: yarn dev
+        #   cwd: packages/api
+        #   port: 4100
+        #   url: http://localhost:4100
+        # api-start-worker:    # source: packages/api/package.json:start:worker; kind? worker; port? 4100
+        #   description: ""
+        #   kind: worker
+        #   run: "yarn start:worker"
+        #   cwd: packages/api
+        #   port: 4100
+        # web-serve:    # source: apps/web/project.json:serve; kind? server; port? 4200
+        #   description: ""
+        #   kind: server
+        #   run: "npx nx run web:serve"
+        #   port: 4200
+        #   url: http://localhost:4200
+        # web-build:    # source: apps/web/project.json:build; kind? build
+        #   description: ""
+        #   kind: build
+        #   run: "npx nx run web:build --watch"
+        # legacy:    # source: ecosystem.json:legacy; kind? server; port? 8080
+        #   description: ""
+        #   kind: server
+        #   run: node build.server.js
+        #   port: 8080
+        #   url: http://localhost:8080
+        # web:    # source: Procfile:web; kind? unknown; port? 5000
+        #   description: ""
+        #   run: node server.js --port 5000
+        #   port: 5000
+        #   url: http://localhost:5000
+        # migrate-2:    # source: Procfile:migrate; kind? task
+        #   description: ""
+        #   kind: task
+        #   run: node migrate.js
+      profiles:
+        # base: [api-build, api]
+      hosts:
+        # stand: { ssh: my-alias, cwd: /srv/project }
+        # prod: { ssh: prod-alias, cwd: /srv/project, readonly: true }
+      "
+    `);
   });
   it('initProject reports live apps, profiles and libs, and points at start dev', () => {
     const r = copy();
@@ -676,6 +811,7 @@ describe('renderDraft on a turbo repo', () => {
     expect(res.profiles).toEqual(['dev']);
     expect(res.libs).toEqual(['@t/domain']);
     expect(res.next).toContain('start dev');
+    expect(res.next).toContain('replace each TODO description');
     expect(() => loadManifest(r)).not.toThrow();
   });
 });

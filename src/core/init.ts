@@ -241,7 +241,7 @@ interface PkgTurbo {
 
 const notAwaited = (lib: string): string => {
   const app = pkgAppName(lib);
-  return `${app}'s first build is not awaited; uncomment ${app}-build and add depends_on: [{ app: ${app}-build, condition: completed }] to wait for it`;
+  return `${app}'s first build is not awaited; uncomment ${app}-build and add { app: ${app}-build, condition: completed } to its depends_on to wait for it`;
 };
 
 function packageCandidates(
@@ -372,19 +372,34 @@ function libsBuilders(
   ];
 }
 
+/** `base`, else `base-apps`, `base-apps-2`, …: the first name not taken. */
+function freeName(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  let n = `${base}-apps`;
+  for (let i = 2; taken.has(n); i++) n = `${base}-apps-${i}`;
+  return n;
+}
+
 /**
  * The live profile of the dev task's apps, and a commented one per other
- * persistent task. A profile may not share an app's name, so the live one
- * steps aside when a live app is called `dev`.
+ * persistent task. A profile may not share an app's name (the loader refuses
+ * it), so each steps aside: the live one from the live apps, a commented one
+ * from every candidate, since uncommenting both would clash.
  */
 function draftProfiles(
   candidates: Candidate[],
   persistent: string[]
 ): DraftProfile[] {
   const live = candidates.filter((c) => c.live).map((c) => c.name);
+  const taken = new Set(['all', ...candidates.map((c) => c.name)]);
   const out: DraftProfile[] = [
-    { name: live.includes('dev') ? 'dev-apps' : 'dev', apps: live, live: true },
+    {
+      name: freeName('dev', new Set(['all', ...live])),
+      apps: live,
+      live: true,
+    },
   ];
+  taken.add(out[0].name);
   for (const t of persistent.filter((t) => t !== 'dev')) {
     // a package's own script: the root one runs the task over every package
     const apps = candidates
@@ -395,7 +410,10 @@ function draftProfiles(
           c.source.endsWith(`:${t}`)
       )
       .map((c) => c.name);
-    if (apps.length) out.push({ name: t, apps, live: false });
+    if (!apps.length) continue;
+    const name = freeName(t, taken);
+    taken.add(name);
+    out.push({ name, apps, live: false });
   }
   return out;
 }
@@ -577,11 +595,13 @@ export function discover(root: string): Discovery {
     }
   }
 
-  const seen = new Map<string, number>();
+  // all is the loader's built-in profile of every app, so no app may take it
+  const taken = new Set(['all']);
   for (const c of candidates) {
-    const n = seen.get(c.name) ?? 0;
-    seen.set(c.name, n + 1);
-    if (n) c.name = `${c.name}-${n + 1}`;
+    let name = c.name;
+    for (let i = 2; taken.has(name); i++) name = `${c.name}-${i}`;
+    taken.add(name);
+    c.name = name;
   }
   // libs comes first, so the dedupe above never renames it and depends_on: libs holds
   return {
@@ -604,10 +624,20 @@ export function renderDraft(
   project: string,
   d: Discovery
 ): string {
+  const live = d.candidates.filter((c) => c.live);
+  const rest = d.candidates.filter((c) => !c.live);
+  const liveProfile = d.profiles.find((p) => p.live);
   const L: string[] = [
     `# mcproc manifest draft, generated on ${new Date().toISOString().slice(0, 10)} from ${root}`,
     '#',
-    '# Candidates below are commented out. Uncomment the ones your dev stack needs,',
+    ...(liveProfile
+      ? [
+          `# Live apps below come from turbo's persistent dev task and form the ${liveProfile.name} profile: start ${liveProfile.name} runs them.`,
+          '# The other candidates are commented out. Uncomment the ones your dev stack needs,',
+        ]
+      : [
+          '# Candidates below are commented out. Uncomment the ones your dev stack needs,',
+        ]),
     '# write a description for each app, then run start + ls to confirm the ports; fix; repeat.',
     '# Fields: kind build|server|worker|task (task = runs once, e.g. a build or a migration; ls shows done/failed); run = shell command; cwd relative to the project root;',
     '# port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its',
@@ -616,14 +646,6 @@ export function renderDraft(
     '# hosts = where this project also runs (ssh alias from ~/.ssh/config and/or docker container);',
     '# host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.',
   ];
-  const live = d.candidates.filter((c) => c.live);
-  const rest = d.candidates.filter((c) => !c.live);
-  // the profile is dev-apps when a live app took the name dev
-  const liveProfile = d.profiles.find((p) => p.live);
-  if (liveProfile)
-    L.push(
-      `# Apps found through turbo's persistent dev task are live and grouped in the ${liveProfile.name} profile; everything else is commented out.`
-    );
   for (const n of d.notes) L.push(`# note: ${n}`);
   L.push('version: 1', `project: ${project}`, 'apps:');
   if (d.candidates.length === 0)
@@ -644,7 +666,7 @@ export function renderDraft(
     ];
     if (c.kind !== 'unknown') out.push(`${p}kind: ${c.kind}`);
     out.push(`${p}run: ${yamlStr(c.run)}`);
-    if (c.cwd !== '.') out.push(`${p}cwd: ${c.cwd}`);
+    if (c.cwd !== '.') out.push(`${p}cwd: ${yamlStr(c.cwd)}`);
     if (c.port) out.push(`${p}port: ${c.port}`);
     if (c.port && c.kind !== 'worker')
       out.push(`${p}url: http://localhost:${c.port}`);
@@ -668,7 +690,7 @@ export function renderDraft(
   L.push('profiles:');
   for (const p of d.profiles)
     L.push(`  ${p.live ? '' : '# '}${p.name}: [${p.apps.join(', ')}]`);
-  if (!d.profiles.some((p) => p.live)) L.push('  # base: [api-build, api]');
+  if (!liveProfile) L.push('  # base: [api-build, api]');
   L.push(
     'hosts:',
     '  # stand: { ssh: my-alias, cwd: /srv/project }',
@@ -754,7 +776,7 @@ export function initProject(
     profiles,
     libs: d.libs,
     next: profiles.length
-      ? `Edit ${file}: write a description for each live app (they start with TODO), then run start ${profiles[0]} and ls to confirm the ports; the other scripts are commented out below.`
+      ? `Edit ${file}: replace each TODO description, then run start ${profiles[0]} and ls to confirm the ports; the other scripts are commented out below.`
       : `Edit ${file}: uncomment the apps your dev stack needs, write a description for each, then run start <app|profile> and ls to confirm the ports.`,
   };
 }
