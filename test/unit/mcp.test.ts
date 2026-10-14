@@ -100,6 +100,14 @@ describe('mcp server', () => {
     );
     expect(waitDesc).not.toMatch(/before the action/); // a blocking call cannot precede the action it waits for
     expect(waitDesc).toMatch(/BAD_ARGUMENT/);
+    // each until the app cannot show, named with what makes it so
+    expect(waitDesc).toContain(
+      'Refused (BAD_ARGUMENT): listening with no declared port, url-ok with no url, reloaded with reloads: false.'
+    );
+    // what a reloaded answer carries
+    expect(waitDesc).toMatch(
+      /reloaded \(.*with its time, line count and first line/
+    );
     expect(waitDesc).toMatch(/without pm2's time stamp.*keeps the stamp/);
     expect(waitDesc).toMatch(
       /autorestart off.*other app shows pm2's stopped or errored/
@@ -130,6 +138,9 @@ describe('mcp server', () => {
     expect(byName.init.description).not.toContain('Candidates are commented');
     expect(byName.init.description).not.toContain('—');
     expect(INSTRUCTIONS).toContain('init adopt_ports');
+    // a watcher reloads in place: after an edit the agent waits for that reload, not for a port
+    expect(INSTRUCTIONS).toContain('reloaded');
+    expect(INSTRUCTIONS).toContain('after an edit, wait until reloaded');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
