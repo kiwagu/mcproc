@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { listFleet } from '../../src/core/fleet.js';
 import { CONTEXT_BYTES, READ_CAP } from '../../src/core/incidents/cursor.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { Manifest } from '../../src/core/manifest.js';
 import { countReloads, listWithReloads } from '../../src/core/reloadcount.js';
+import { renderLs } from '../../src/mcp/render.js';
 import {
   fakeHosts,
   fleetManifest,
@@ -182,6 +187,87 @@ describe('countReloads (ls --reloads)', () => {
       partial: false,
     });
   });
+  it('a missing err log (an app that never wrote to stderr) is not a failed read: the count is whole', async () => {
+    const r = await lsReloads({
+      files: { '/l/web-out': thisRun },
+      procs: { box: [running('web', 3)] },
+    });
+    expect(r.scripts[0]).toContain("[ -r '/l/web-err' ]"); // checked, and found missing rather than unreadable
+    expect(r.row('web').reloads).toEqual({
+      count: 3,
+      last: '2026-10-12T11:00:30',
+      partial: false,
+    });
+    expect(r.errors).toEqual([]);
+  });
+  it('a log that exists but the host user may not read leaves its app without reloads and names the app and the file in errors; the other apps of its host are counted', async () => {
+    const r = await lsReloads({
+      unreadable: ['/l/tool-err'],
+      files: {
+        '/l/watch-out': `${S(12)}File change detected. Starting incremental compilation...\n`,
+        '/l/tool-out': `${S(12)}[nodemon] restarting due to changes...\n`,
+        '/l/tool-err': `${S(20)}[nodemon] restarting due to changes...\n`,
+      },
+      procs: { local: [running('watch', 0), running('tool', 1)] },
+    });
+    expect(r.row('watch').reloads).toEqual({
+      count: 1,
+      last: '2026-10-12T11:00:12',
+      partial: false,
+    });
+    expect(r.row('tool')).not.toHaveProperty('reloads');
+    expect(r.errors).toEqual([
+      {
+        host: 'local',
+        apps: ['tool'],
+        message: 'reloads not counted: cannot read the log /l/tool-err of tool',
+      },
+    ]);
+    expect(renderLs(r.rows, 'local', r.errors).split('\n').at(-1)).toBe(
+      'local: reloads not counted: cannot read the log /l/tool-err of tool'
+    );
+  });
+  it.skipIf(process.getuid?.() === 0)(
+    'run by sh, the read script names a log that exists but may not be read, and neither a missing nor a readable one',
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-rc-'));
+      const file = (name: string) => path.join(dir, name);
+      try {
+        fs.writeFileSync(
+          file('watch-out'),
+          `${S(12)}[tsx] change Restarting...\n`
+        );
+        fs.writeFileSync(file("tool's-out"), `${S(12)}listening on :3000\n`);
+        fs.writeFileSync(file("tool's-err"), `${S(20)}listening on :3000\n`);
+        fs.chmodSync(file("tool's-err"), 0o000);
+        const logs = (app: string, prefix = app) => ({
+          pm_out_log_path: file(`${prefix}-out`),
+          pm_err_log_path: file(`${prefix}-err`),
+        });
+        const r = await lsReloads({
+          files: {},
+          procs: {
+            local: [
+              running('watch', 0, logs('watch')), // its err log does not exist
+              running('tool', 1, logs('tool', "tool's")),
+            ],
+          },
+        });
+        const stdout = execFileSync('sh', ['-c', r.scripts[0]], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        // ids: watch's out and err logs are reads 0 and 1, tool's 2 and 3
+        expect(stdout.slice(0, stdout.indexOf('__MCPROC_INC_0__'))).toBe(
+          '__MCPROC_RL_UNREAD_3__\n__MCPROC_RL_UNREAD_END__\n'
+        );
+        expect(stdout).toContain('__MCPROC_INC_3__\n0 0 0 \n'); // what the check is for: the read itself measures 0
+      } finally {
+        fs.chmodSync(file("tool's-err"), 0o600);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  );
   it('a stopped app, an app with reloads: false, an app without a start and an app not started get no reloads field, and no log is read', async () => {
     const m = withApps({
       tool: { ...fleetManifest.apps.tool, reloads: null },

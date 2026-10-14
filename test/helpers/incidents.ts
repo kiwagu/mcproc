@@ -17,6 +17,7 @@ export const S = (sec: number) =>
  * `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading).
  * `clocks`: one host's own `now` and `zone` in place of the shared ones (hosts in different time zones).
  * `failReads`: hosts whose read script fails as a dropped ssh connection does (exit 255).
+ * `unreadable`: files that exist but the host's user may not read: they measure as empty, as `wc -c` failing does.
  */
 export interface FakeState {
   files: Record<string, string>;
@@ -27,6 +28,7 @@ export interface FakeState {
   unwritable?: string[];
   short?: string[];
   failReads?: string[];
+  unreadable?: string[];
 }
 
 /**
@@ -86,11 +88,17 @@ export function fakeHosts(
               };
             return {
               stdout:
+                answerChecks(cmd, state.unreadable ?? []) +
                 (cmd.includes('__MCPROC_NOW__')
                   ? `__MCPROC_NOW__ ${state.now ?? ''}\n`
                   : '') +
                 (cmd.includes('__MCPROC_LS_CLOCK__') ? clock(host) : '') +
-                answerReads(cmd, state.files, state.short ?? []),
+                answerReads(
+                  cmd,
+                  state.files,
+                  state.short ?? [],
+                  state.unreadable ?? []
+                ),
             };
           },
         },
@@ -111,11 +119,27 @@ export function fakeHosts(
   });
   return { fleet, reads, scripts };
 }
+/**
+ * Executes what a script runs before its reads: a readability check `[ ! -e 'f' ] || [ -r 'f' ] || echo M` prints M
+ * when f is unreadable (such a file exists); a plain `echo M` prints M.
+ */
+function answerChecks(cmd: string, unreadable: string[]): string {
+  let out = '';
+  for (const step of cmd.split('echo __MCPROC_INC_')[0].split('; ')) {
+    const check =
+      /^\[ ! -e '([^']+)' \] \|\| \[ -r '\1' \] \|\| echo (\S+)$/.exec(step);
+    const echo = /^echo (\S+)$/.exec(step);
+    if (check && unreadable.includes(check[1])) out += `${check[2]}\n`;
+    else if (echo) out += `${echo[1]}\n`;
+  }
+  return out;
+}
 /** Executes the read snippets against the in-memory files: same arithmetic as the shell. */
 export function answerReads(
   cmd: string,
   files: Record<string, string>,
-  short: string[] = []
+  short: string[] = [],
+  unreadable: string[] = []
 ): string {
   let out = '';
   for (const part of cmd.split('echo __MCPROC_INC_').slice(1)) {
@@ -124,7 +148,11 @@ export function answerReads(
     const off = Number(/off=(-?\d+)/.exec(part)![1]);
     const at = Number(/ at=(-?\d+)/.exec(part)?.[1] ?? -1);
     const ah = /ah='([0-9a-f]*)'/.exec(part)?.[1] ?? '';
-    const buf = Buffer.from(files[file] ?? '', 'utf8');
+    // a file the user may not read measures as empty: `wc -c` fails and the size falls back to 0
+    const buf = Buffer.from(
+      unreadable.includes(file) ? '' : (files[file] ?? ''),
+      'utf8'
+    );
     const sz = buf.length;
     const hex16 = (end: number) =>
       buf.subarray(Math.max(0, end - 16), end).toString('hex');
