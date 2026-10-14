@@ -211,43 +211,62 @@ function readPort(expr: string, text: string): number | undefined {
 }
 
 /**
+ * The config a Vite call names with `--config <path>`, `--config=<path>` or `-c <path>`, read from the call's own
+ * arguments (up to the next `;`, `&` or `|`): the path, quotes removed; null when the shell would compute it (`$X`,
+ * `~`, a glob); undefined when the call names none.
+ */
+function viteConfigFlag(args: string): string | null | undefined {
+  const own = /^[^;&|\n]*/.exec(args)![0];
+  const m = /(?:^|\s)(?:--config(?:=|\s+)|-c\s+)(\S+)/.exec(own);
+  if (!m) return undefined;
+  const p = /^(["'])(.*)\1$/.exec(m[1])?.[2] ?? m[1];
+  return /[$`~*?{}"']/.test(p) ? null : p;
+}
+
+/**
  * Vite's port from its config: the `server` or `preview` block's `port`, as `readPort` reads it. Every
  * `<section>: {` is tried in order, since a block of that name without a port can come first (vitest's
- * `test: { server: { deps } }`). null when the block has a `port` that cannot be read: the default would then be a
- * confident wrong guess. undefined when no block has a port, or there is no config.
+ * `test: { server: { deps } }`). `config` is the file the command names (see `viteConfigFlag`); without one the
+ * standard `vite.config.*` is read. null when the block has a `port` that cannot be read, or when the named config
+ * cannot be read: Vite then reads no other file, so the default would be a confident wrong guess. undefined when no
+ * block has a port, or there is no standard config.
  */
 function vitePort(
   dir: string,
-  section: 'server' | 'preview'
+  section: 'server' | 'preview',
+  config?: string | null
 ): number | null | undefined {
-  for (const f of VITE_CONFIGS) {
-    const p = path.join(dir, f);
-    if (!fs.existsSync(p)) continue;
-    // comments out, so a word "port" in one is no key; only those after a blank or at a line start, which keeps
-    // `http://…` and `src/**/*` in strings
-    const text = fs
-      .readFileSync(p, 'utf8')
-      .replace(/(^|\s)\/\*[\s\S]*?\*\//g, '$1')
-      .replace(/(^|\s)\/\/[^\n]*/g, '$1');
-    for (const h of text.matchAll(
-      new RegExp(`\\b${section}\\s*:\\s*\\{`, 'g')
-    )) {
-      const at = h.index;
-      // the block's text up to its closing brace, nested braces (proxy maps) counted
-      let depth = 0;
-      let end = at + h[0].length - 1;
-      for (; end < text.length; end++) {
-        if (text[end] === '{') depth++;
-        else if (text[end] === '}' && --depth === 0) break;
-      }
-      // a `port` of the block itself, not of a nested map such as `hmr: { port }`:
-      // one pass drops every brace pair with no brace inside (the block's own pair
-      // is never one: its closing brace is not in the slice); what deeper maps
-      // such as proxy entries leave behind holds no `port` key in practice
-      const value = portKey(text.slice(at, end).replace(/\{[^{}]*\}/g, ''));
-      if (value !== undefined) return readPort(value, text) ?? null;
+  if (config === null) return null;
+  let raw: string | undefined;
+  for (const f of config ? [config] : VITE_CONFIGS) {
+    try {
+      raw = fs.readFileSync(path.resolve(dir, f), 'utf8');
+      break;
+    } catch {
+      /* not there, or not a file */
     }
-    return undefined;
+  }
+  if (raw === undefined) return config ? null : undefined;
+  // comments out, so a word "port" in one is no key; only those after a blank or at a line start, which keeps
+  // `http://…` and `src/**/*` in strings
+  const text = raw
+    .replace(/(^|\s)\/\*[\s\S]*?\*\//g, '$1')
+    .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+  for (const h of text.matchAll(new RegExp(`\\b${section}\\s*:\\s*\\{`, 'g'))) {
+    const at = h.index;
+    // the block's text up to its closing brace, nested braces (proxy maps) counted
+    let depth = 0;
+    let end = at + h[0].length - 1;
+    for (; end < text.length; end++) {
+      if (text[end] === '{') depth++;
+      else if (text[end] === '}' && --depth === 0) break;
+    }
+    // a `port` of the block itself, not of a nested map such as `hmr: { port }`:
+    // one pass drops every brace pair with no brace inside (the block's own pair
+    // is never one: its closing brace is not in the slice); what deeper maps
+    // such as proxy entries leave behind holds no `port` key in practice
+    const value = portKey(text.slice(at, end).replace(/\{[^{}]*\}/g, ''));
+    if (value !== undefined) return readPort(value, text) ?? null;
   }
   return undefined;
 }
@@ -265,8 +284,10 @@ export function guessPort(cmd: string, dir: string): number | undefined {
   const vite = [...cmd.matchAll(VITE_RE)].find((v) => v[1] !== 'build');
   if (vite) {
     const section = vite[1] === 'preview' ? 'preview' : 'server';
-    const p = vitePort(dir, section);
-    // the defaults only when the config names no port: one it names but cannot be read gets no guess
+    const config = viteConfigFlag(cmd.slice(vite.index + vite[0].length));
+    const p = vitePort(dir, section, config);
+    // the defaults only when the config names no port: one it names but cannot be read, or a named config that
+    // cannot be read, gets no guess
     return p === null ? undefined : (p ?? (section === 'server' ? 5173 : 4173));
   }
   const src = path.join(dir, 'src');

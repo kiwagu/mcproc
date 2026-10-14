@@ -1066,6 +1066,46 @@ describe('guessPort: frameworks and source constants', () => {
     expect(guessPort('vite build && vite preview', mk({}))).toBe(4173);
     expect(guessPort('tsx vite.config.ts', mk({}))).toBeUndefined();
   });
+  it('vite --config / -c names the config to read: no standard config then, and no guess when it cannot be read', () => {
+    const dev = 'export default { server: { port: 3400 } }';
+    const named = mk({ 'config/dev.ts': dev });
+    expect(guessPort('vite --config config/dev.ts', named)).toBe(3400);
+    expect(guessPort('vite --config=config/dev.ts', named)).toBe(3400);
+    expect(guessPort('vite -c config/dev.ts --host', named)).toBe(3400);
+    expect(guessPort("vite serve --config 'config/dev.ts'", named)).toBe(3400);
+    const both = mk({
+      'vite.config.ts': 'export default { server: { port: 3002 } }',
+      'config/dev.ts': dev,
+    });
+    expect(guessPort('vite --config config/dev.ts', both)).toBe(3400);
+    // without the flag the standard config is read
+    expect(guessPort('vite', both)).toBe(3002);
+    expect(guessPort('vite --configLoader runner', both)).toBe(3002);
+    // a named config with no port: Vite's default
+    expect(
+      guessPort(
+        'vite -c config/dev.ts',
+        mk({ 'config/dev.ts': 'export default {}' })
+      )
+    ).toBe(5173);
+    // a named config that cannot be read, or a path the shell computes: no guess, standard config or not
+    expect(guessPort('vite --config config/missing.ts', both)).toBeUndefined();
+    expect(
+      guessPort('vite --config config/missing.ts', mk({}))
+    ).toBeUndefined();
+    expect(guessPort('vite --config config', both)).toBeUndefined();
+    expect(guessPort('vite --config $VITE_CONFIG', both)).toBeUndefined();
+    // the flag belongs to its own call: the build's config is not the preview's
+    const split = mk({
+      'config/b.ts': 'export default { preview: { port: 4400 } }',
+    });
+    expect(guessPort('vite build -c config/b.ts && vite preview', split)).toBe(
+      4173
+    );
+    expect(guessPort('vite build && vite preview -c config/b.ts', split)).toBe(
+      4400
+    );
+  });
   it('vite reads a port named by a constant of the config, the port shorthand, loadEnv and parseInt reads', () => {
     const vite = (config: string, cmd = 'vite') =>
       guessPort(cmd, mk({ 'vite.config.ts': config }));
