@@ -139,6 +139,12 @@ export interface ErrorSettings {
   stderr: boolean;
   defaults: boolean;
 }
+/** What counts as an in-process reload in an app's logs (a watcher's restart or rebuild that pm2 does not see). */
+export interface ReloadSettings {
+  match: string[];
+  ignore: string[];
+  defaults: boolean;
+}
 export interface App {
   name: string;
   description: string;
