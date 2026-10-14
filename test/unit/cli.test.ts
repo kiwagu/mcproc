@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildProgram } from '../../src/cli/program.js';
+import { buildProgram, printSince } from '../../src/cli/program.js';
+import { parseSince } from '../../src/core/logsince.js';
+import { fakeHosts, proc, S } from '../helpers/incidents.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -137,11 +139,14 @@ describe('cli', () => {
       [['logs', '-n', '5', '--since', '2m', '--project', basic], '-n'],
     ] as const) {
       const c = capture();
-      await buildProgram(c.io).parseAsync(argv, { from: 'user' });
-      expect(c.err[0]).toContain('BAD_ARGUMENT');
-      expect(c.err.join('\n')).toContain(needle);
-      expect(process.exitCode).toBe(1);
-      process.exitCode = 0;
+      try {
+        await buildProgram(c.io).parseAsync(argv, { from: 'user' });
+        expect(c.err[0]).toContain('BAD_ARGUMENT');
+        expect(c.err.join('\n')).toContain(needle);
+        expect(process.exitCode).toBe(1);
+      } finally {
+        process.exitCode = 0;
+      }
     }
   });
   it('monit --once reports MANIFEST_NOT_FOUND cleanly outside a project', async () => {
@@ -278,5 +283,72 @@ describe('cli', () => {
         '--context',
       ])
     );
+  });
+});
+
+describe('printSince (logs --since, one shot)', () => {
+  const state = () => ({
+    now: '2026-10-12T11:00:40',
+    procs: { local: [proc('watch', 0)], box: [proc('web', 2)] },
+    files: {
+      '/l/watch-out': `${S(5)}old\n${S(35)}change\n`,
+      '/l/watch-err': '',
+      '/l/web-out': `${S(38)}listening\n`,
+      '/l/web-err': '',
+    },
+  });
+  it('prints the merged lines with the labels and colors of the follow, notes on stderr, and returns where each app follows from', async () => {
+    const st = state();
+    const { fleet } = fakeHosts(st);
+    const c = capture();
+    const at = await printSince(
+      fleet,
+      ['watch', 'web', 'tool'],
+      parseSince('10s'),
+      { stream: 'both', color: true, json: false },
+      c.io
+    );
+    // colors by host-group order (local: watch, tool; box: web), as the follow assigns them
+    expect(c.out).toEqual([
+      `\x1b[36mwatch\x1b[0m | ${S(35)}change`,
+      `\x1b[33mweb  \x1b[0m | ${S(38)}listening`,
+    ]);
+    expect(c.err).toEqual(['not started: tool']);
+    // each mark is the end of what was read: the follow continues right after it
+    for (const app of ['watch', 'web'] as const)
+      expect(at?.[app]?.out).toMatchObject({
+        path: `/l/${app}-out`,
+        offset: Buffer.byteLength(st.files[`/l/${app}-out`]),
+      });
+    expect(at?.tool).toEqual({}); // no mark: its follow starts at the file's end
+    expect(process.exitCode).not.toBe(1);
+  });
+  it('a reader that went away (EPIPE on stdout, or the stream aborted) stops the print quietly and gives nothing to follow', async () => {
+    const { fleet } = fakeHosts(state());
+    const err: string[] = [];
+    let writes = 0;
+    const io = {
+      out: () => {
+        writes++;
+        throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+      },
+      err: (s: string) => {
+        err.push(s);
+      },
+    };
+    const how = { stream: 'both', color: false, json: false } as const;
+    const apps = ['watch', 'web', 'tool'];
+    expect(
+      await printSince(fleet, apps, parseSince('10s'), how, io)
+    ).toBeNull();
+    expect(writes).toBe(1);
+    expect(err).toEqual(['not started: tool']); // stderr still says what it has to
+    const ac = new AbortController();
+    ac.abort();
+    const c = capture();
+    expect(
+      await printSince(fleet, apps, parseSince('10s'), how, c.io, ac.signal)
+    ).toBeNull();
+    expect(c.out).toEqual([]);
   });
 });

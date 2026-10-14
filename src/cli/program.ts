@@ -70,6 +70,59 @@ const defaultIo: Io = {
   err: (s) => process.stderr.write(`${s}\n`),
 };
 
+/**
+ * The one-shot read of `logs --since`: the merged lines since the cutoff on stdout, labeled and colored as the follow
+ * labels them (the longest name, each app's index in host-group order), the notes on stderr, exit code 1 when a host
+ * was not read. Returns where each app's follow starts, or null when the reader of stdout went away.
+ */
+export async function printSince(
+  fleet: Fleet,
+  apps: string[],
+  since: SinceSpec,
+  how: { stream: 'out' | 'err' | 'both'; color: boolean; json: boolean },
+  io: Io,
+  signal?: AbortSignal
+): Promise<StreamOptions['startAt'] | null> {
+  const marks = new LogMarks();
+  const a = await readSince(fleet, apps, {
+    since,
+    stream: how.stream,
+    marks,
+    keepColors: how.color && !how.json,
+  });
+  const order = fleet.groups(apps).flatMap((gr) => gr.apps);
+  const width = Math.max(...apps.map((x) => x.length));
+  let closed = false; // `| head` read enough: stop printing, no stack trace
+  for (const l of a.lines) {
+    if (closed || signal?.aborted) break;
+    try {
+      io.out(
+        how.json
+          ? JSON.stringify(l)
+          : formatLine(
+              { app: l.app, stream: l.stream, text: l.text },
+              width,
+              how.color ? colorFor(order.indexOf(l.app)) : null
+            )
+      );
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'EPIPE') throw e;
+      closed = true;
+    }
+  }
+  for (const n of sinceNotes(a)) io.err(n);
+  if (a.errors.length) process.exitCode = 1; // a host was not read: the lines of the others are printed, the exit code says so
+  if (closed || signal?.aborted) return null;
+  // an app without a mark (not started at the read, its host not read, or a read cut short) is followed from the
+  // file's end: lines written between this read and its first poll are not printed
+  return Object.fromEntries(
+    apps.map((x) => [
+      x,
+      marks.get(LogMarks.key(fleet.manifest.path, fleet.hostOf(x), x)) ?? {},
+    ])
+  );
+}
+
 export function buildProgram(io: Io = defaultIo): Command {
   const program = new Command()
     .name('mcproc')
@@ -226,8 +279,7 @@ export function buildProgram(io: Io = defaultIo): Command {
           Boolean(process.stdout.isTTY)
         );
         const stream = o.out ? 'out' : o.err ? 'err' : 'both';
-        let history = Math.min(Math.max(1, Number(o.lines) || 100), 2000);
-        let startAt: StreamOptions['startAt'];
+        let since: SinceSpec | undefined;
         if (o.since !== undefined) {
           if (o.lines !== undefined)
             throw new McprocError(
@@ -237,7 +289,7 @@ export function buildProgram(io: Io = defaultIo): Command {
                 hint: 'Drop -n; with -f the follow continues from where the since read ended.',
               }
             );
-          const since: SinceSpec = parseSince(String(o.since));
+          since = parseSince(String(o.since));
           if (since.kind === 'last')
             throw new McprocError(
               'BAD_ARGUMENT',
@@ -246,38 +298,26 @@ export function buildProgram(io: Io = defaultIo): Command {
                 hint: 'Use a time such as --since 2m, or --since 2026-10-14T07:30.',
               }
             );
-          const marks = new LogMarks();
-          const a = await readSince(fleet, apps, {
+        }
+        const ac = new AbortController();
+        // a reader that closes early (`| head`) raises EPIPE asynchronously on stdout, possibly after the stream already returned:
+        // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
+        process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+          if (e.code === 'EPIPE') ac.abort();
+          else throw e;
+        });
+        let startAt: StreamOptions['startAt'];
+        if (since) {
+          const at = await printSince(
+            fleet,
+            apps,
             since,
-            stream,
-            marks,
-            keepColors: color && !g.json,
-          });
-          // labels and colors as the follow gives them: the longest name, each app's index in host-group order
-          const order = fleet.groups(apps).flatMap((gr) => gr.apps);
-          const width = Math.max(...apps.map((x) => x.length));
-          for (const l of a.lines)
-            io.out(
-              g.json
-                ? JSON.stringify(l)
-                : formatLine(
-                    { app: l.app, stream: l.stream, text: l.text },
-                    width,
-                    color ? colorFor(order.indexOf(l.app)) : null
-                  )
-            );
-          for (const n of sinceNotes(a)) io.err(n);
-          if (a.errors.length) process.exitCode = 1; // a host was not read: the lines of the others are printed, the exit code says so
-          if (!o.follow) return;
-          history = 0;
-          startAt = Object.fromEntries(
-            apps.map((x) => [
-              x,
-              marks.get(
-                LogMarks.key(fleet.manifest.path, fleet.hostOf(x), x)
-              ) ?? {},
-            ])
+            { stream, color, json: Boolean(g.json) },
+            io,
+            ac.signal
           );
+          if (!o.follow || at === null) return;
+          startAt = at;
         }
         // every host at once; one that cannot be reached becomes a note per app instead of ending the stream, and is
         // connected again later while following (fleet.ctx keeps no failed connection)
@@ -291,20 +331,16 @@ export function buildProgram(io: Io = defaultIo): Command {
             }
           })
         );
-        const ac = new AbortController();
+        if (ac.signal.aborted) return; // the reader of the since lines went away meanwhile: nothing to follow for
         const stop = () => ac.abort();
         process.once('SIGINT', stop);
-        // a reader that closes early (`| head`) raises EPIPE asynchronously on stdout, possibly after the stream already returned:
-        // the listener stays for the rest of the process, ends the stream and swallows the error instead of a crash
-        process.stdout.on('error', (e: NodeJS.ErrnoException) => {
-          if (e.code === 'EPIPE') ac.abort();
-          else throw e;
-        });
         try {
           await streamLogs(
             sources,
             {
-              lines: history,
+              lines: since
+                ? 0
+                : Math.min(Math.max(1, Number(o.lines) || 100), 2000),
               follow: Boolean(o.follow),
               intervalMs: Math.max(200, Number(o.interval) || 1000),
               color,
