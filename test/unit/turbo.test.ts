@@ -191,4 +191,17 @@ describe('turboBin / libsFilters', () => {
     ]);
     expect(libsFilters([], ['packages'])).toEqual([]);
   });
+  it('a folder that also holds a live library filters its folded libraries by name', () => {
+    const libs = [
+      pkg('@t/domain', 'packages/domain'),
+      pkg('@t/std', 'packages/std'),
+      pkg('@t/x', 'libs/x'),
+    ];
+    const live = [pkg('@t/contracts', 'packages/contracts')];
+    expect(libsFilters(libs, ['packages', 'libs'], live)).toEqual([
+      '--filter=@t/domain',
+      '--filter=@t/std',
+      "--filter='./libs/*'",
+    ]);
+  });
 });

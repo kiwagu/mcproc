@@ -107,17 +107,25 @@ export function turboBin(pm: string): string {
   return 'npx turbo';
 }
 
-/** One folder filter per globbed workspace folder holding a library; a library elsewhere is filtered by name. */
+/**
+ * One folder filter per globbed workspace folder holding a library; a library
+ * elsewhere is filtered by name, and so is one whose folder also holds a live
+ * library: the folder filter would build and watch that one too, a second
+ * writer to the dist/ its own dev task keeps.
+ */
 export function libsFilters(
   libs: WsPackage[],
-  globParents: string[]
+  globParents: string[],
+  live: WsPackage[] = []
 ): string[] {
+  const shared = new Set(live.map((l) => path.dirname(l.dir)));
   const out: string[] = [];
   for (const l of libs) {
     const parent = path.dirname(l.dir);
-    const f = globParents.includes(parent)
-      ? `--filter='./${parent}/*'`
-      : `--filter=${l.name}`;
+    const f =
+      globParents.includes(parent) && !shared.has(parent)
+        ? `--filter='./${parent}/*'`
+        : `--filter=${l.name}`;
     if (!out.includes(f)) out.push(f);
   }
   return out;

@@ -322,12 +322,13 @@ function expandWorkspaces(
 }
 
 /**
- * The two builders that stand for every dist library without a dev script of
- * its own: a one-shot build the live apps wait for, then a watch that keeps
- * dist/ fresh.
+ * The builders that stand for every dist library without a dev script of its
+ * own: a one-shot build the live apps wait for, then a watch that keeps dist/
+ * fresh. `turbo watch` came with turbo 2, so turbo 1 gets the build alone.
  */
 function libsBuilders(
   folded: WsPackage[],
+  liveLibs: WsPackage[],
   globParents: string[],
   pm: string,
   version: 1 | 2
@@ -335,20 +336,22 @@ function libsBuilders(
   const bin = turboBin(pm);
   // turbo 2's interactive UI would hold the terminal; turbo 1 has no --ui flag
   const ui = version === 2 ? ' --ui=stream' : '';
-  const filters = libsFilters(folded, globParents).join(' ');
+  const filters = libsFilters(folded, globParents, liveLibs).join(' ');
   const parents = [...new Set(folded.map((p) => path.dirname(p.dir)))].join(
     ', '
   );
+  const libs: Candidate = {
+    name: 'libs',
+    source: 'turbo.json:build',
+    run: `${bin} run build ${filters}${ui}`,
+    cwd: '.',
+    kind: 'task',
+    live: true,
+    description: `one-shot build of the libraries consumed from dist/ (${parents}); the apps import these builds`,
+  };
+  if (version === 1) return [libs];
   return [
-    {
-      name: 'libs',
-      source: 'turbo.json:build',
-      run: `${bin} run build ${filters}${ui}`,
-      cwd: '.',
-      kind: 'task',
-      live: true,
-      description: `one-shot build of the libraries consumed from dist/ (${parents}); the apps import these builds`,
-    },
+    libs,
     {
       name: 'libs-watch',
       source: 'turbo.json:build',
@@ -420,26 +423,33 @@ export function discover(root: string): Discovery {
       "turbo.json could not be parsed (comments are not read); drafted without turbo's tasks"
     );
   // only the bare task: a package-scoped key (`web#dev`) configures one package, not the stack
-  const liveTask = turbo?.persistent.includes('dev') ? 'dev' : null;
-  const pkgs = liveTask ? loadWorkspace(root, expanded.dirs) : [];
+  const pkgs = turbo?.persistent.includes('dev')
+    ? loadWorkspace(root, expanded.dirs)
+    : [];
+  // the live stack is the packages implementing the task; with none there is nothing to start
+  const liveTask = pkgs.some((p) => p.scripts.dev) ? 'dev' : null;
   // a dist library with a dev script of its own is live through it; the rest are built by libs
   const folded = liveTask
     ? pkgs.filter((p) => p.distLib && !p.scripts[liveTask])
     : [];
   const foldedNames = new Set(folded.map((p) => p.name));
-  const liveLibs = new Set(
-    liveTask
-      ? pkgs.filter((p) => p.distLib && p.scripts[liveTask]).map((p) => p.name)
-      : []
-  );
+  const liveLibs = liveTask
+    ? pkgs.filter((p) => p.distLib && p.scripts[liveTask])
+    : [];
+  const liveLibNames = new Set(liveLibs.map((p) => p.name));
   if (turbo && folded.length) {
     candidates.push(
-      ...libsBuilders(folded, expanded.globParents, pm, turbo.version)
+      ...libsBuilders(folded, liveLibs, expanded.globParents, pm, turbo.version)
     );
     const one = folded.length === 1;
+    const apps = turbo.version === 1 ? 'libs' : 'libs and libs-watch';
     notes.push(
-      `${folded.length} librar${one ? 'y' : 'ies'} built into dist/ ${one ? 'is' : 'are'} drafted as libs and libs-watch: ${folded.map((p) => p.name).join(', ')}`
+      `${folded.length} librar${one ? 'y' : 'ies'} built into dist/ ${one ? 'is' : 'are'} drafted as ${apps}: ${folded.map((p) => p.name).join(', ')}`
     );
+    if (turbo.version === 1)
+      notes.push(
+        'turbo 1 has no turbo watch: libs-watch is not drafted; run libs again after changing a library, or move to turbo 2'
+      );
   }
 
   candidates.push(...packageCandidates(root, root, pm));
@@ -462,7 +472,7 @@ export function discover(root: string): Discovery {
               liveTask,
               isLib: p.distLib,
               waitsForLibs: dependsOnDistLib(p, pkgs, foldedNames).length > 0,
-              liveLibDeps: dependsOnDistLib(p, pkgs, liveLibs),
+              liveLibDeps: dependsOnDistLib(p, pkgs, liveLibNames),
               dropBuild: foldedNames.has(p.name),
               libsName: 'libs',
             }

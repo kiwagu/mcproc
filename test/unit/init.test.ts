@@ -201,13 +201,13 @@ describe('discover on a turbo repo', () => {
       kind: 'task',
       cwd: '.',
       source: 'turbo.json:build',
-      run: "bunx turbo run build --filter='./packages/*' --ui=stream",
+      run: 'bunx turbo run build --filter=@t/domain --ui=stream',
     });
     expect(c.libs.description).toContain('packages');
     expect(c['libs-watch']).toMatchObject({
       live: true,
       kind: 'build',
-      run: "bunx turbo watch build --filter='./packages/*' --ui=stream",
+      run: 'bunx turbo watch build --filter=@t/domain --ui=stream',
       depends_on: [{ app: 'libs', condition: 'completed' }],
     });
     expect(c.api).toMatchObject({
@@ -297,7 +297,7 @@ describe('discover on a turbo repo', () => {
     );
     expect(discover(r).candidates.some((c) => c.live)).toBe(false);
   });
-  it('turbo 1 pipeline: no --ui flag; npm, yarn and pnpm binaries', () => {
+  it('turbo 1 pipeline: no --ui flag, no libs-watch (no turbo watch); npm, yarn and pnpm binaries', () => {
     const r = copy();
     fs.rmSync(path.join(r, 'bun.lock'));
     write(
@@ -305,21 +305,46 @@ describe('discover on a turbo repo', () => {
       'turbo.json',
       JSON.stringify({ pipeline: { dev: { persistent: true }, build: {} } })
     );
-    expect(byName(discover(r)).libs.run).toBe(
-      "npx turbo run build --filter='./packages/*'"
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.libs.run).toBe('npx turbo run build --filter=@t/domain');
+    expect(c['libs-watch']).toBeUndefined();
+    expect(d.notes).toContain(
+      'turbo 1 has no turbo watch: libs-watch is not drafted; run libs again after changing a library, or move to turbo 2'
+    );
+    expect(c.api.depends_on).toEqual([{ app: 'libs', condition: 'completed' }]);
+    expect(d.profiles[0].apps).toEqual(['libs', 'api', 'web', 'contracts']);
+    expect(d.notes).toContain(
+      '1 library built into dist/ is drafted as libs: @t/domain'
     );
     write(r, 'yarn.lock', '');
-    expect(byName(discover(r))['libs-watch'].run).toBe(
-      "yarn turbo watch build --filter='./packages/*'"
+    expect(byName(discover(r)).libs.run).toBe(
+      'yarn turbo run build --filter=@t/domain'
     );
     fs.rmSync(path.join(r, 'yarn.lock'));
     write(r, 'pnpm-lock.yaml', '');
     expect(byName(discover(r)).libs.run).toBe(
-      "pnpm exec turbo run build --filter='./packages/*'"
+      'pnpm exec turbo run build --filter=@t/domain'
     );
   });
-  it('a ./-prefixed workspace pattern still filters libs by its folder', () => {
+  it('libraries share a folder filter when no live library sits in their folder, ./-prefixed patterns too', () => {
     const r = copy();
+    const contracts = JSON.parse(
+      fs.readFileSync(
+        path.join(r, 'packages', 'contracts', 'package.json'),
+        'utf8'
+      )
+    );
+    delete contracts.scripts.dev;
+    write(r, 'packages/contracts/package.json', JSON.stringify(contracts));
+    const d = discover(r);
+    expect(byName(d).libs.run).toBe(
+      "bunx turbo run build --filter='./packages/*' --ui=stream"
+    );
+    expect(d.libs).toEqual(['@t/contracts', '@t/domain']);
+    expect(d.notes).toContain(
+      '2 libraries built into dist/ are drafted as libs and libs-watch: @t/contracts, @t/domain'
+    );
     const pkg = JSON.parse(
       fs.readFileSync(path.join(r, 'package.json'), 'utf8')
     );
@@ -331,6 +356,36 @@ describe('discover on a turbo repo', () => {
     expect(byName(discover(r)).libs.run).toBe(
       "bunx turbo run build --filter='./packages/*' --ui=stream"
     );
+  });
+  it('a persistent dev task no package implements drafts as before: no live apps, no profile, no root note', () => {
+    const r = copy();
+    for (const dir of ['apps/api', 'apps/web', 'packages/contracts']) {
+      const p = JSON.parse(
+        fs.readFileSync(path.join(r, dir, 'package.json'), 'utf8')
+      );
+      delete p.scripts.dev;
+      write(r, `${dir}/package.json`, JSON.stringify(p));
+    }
+    const d = discover(r);
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(byName(d).dev.note).toBeUndefined();
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+  });
+  it('a turbo task no script implements is drafted as turbo-<task>', () => {
+    const r = copy();
+    const t = JSON.parse(fs.readFileSync(path.join(r, 'turbo.json'), 'utf8'));
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ tasks: { ...t.tasks, watch: { cache: false } } })
+    );
+    expect(byName(discover(r))['turbo-watch']).toMatchObject({
+      source: 'turbo.json:watch',
+      run: 'npx turbo run watch',
+      cwd: '.',
+    });
   });
   it('an unparsable turbo.json is noted and drafted the old way; one without tasks is not noted', () => {
     const r = copy();
