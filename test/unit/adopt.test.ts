@@ -167,6 +167,13 @@ describe('planAdoption', () => {
       ],
     });
   });
+  it('a port the manifest already declares for the same app is not adopted again', () => {
+    // api declares 3310 and 3311; a row read against an older copy still calls 3311 undeclared
+    expect(planAdoption([row('api', [3311, 3313])], m)).toEqual({
+      adopted: [{ app: 'api', host: 'local', ports: [3313] }],
+      skipped: [],
+    });
+  });
   it('ephemeral starts at 32768', () => {
     expect(EPHEMERAL_FROM).toBe(32768);
     expect(planAdoption([row('tool', [32767, 32768])], m)).toEqual({
@@ -409,6 +416,80 @@ apps:
       other: [],
     });
     expect(m.apps.web.env).toEqual({ NODE_ENV: 'development' });
+  });
+  it("a block's commented tail ends at a blank line or a comment at the field's indent or left of it", () => {
+    const text = `version: 1
+apps:
+  api:
+    description: api
+    run: a
+  web:
+    description: web
+    run: w
+    depends_on:
+      - api
+      # - db
+
+  # the next app
+  other:
+    description: o
+    run: o
+    env:
+      A: '1'
+      # B: '2'
+# profiles below
+profiles:
+  dev: [web]
+`;
+    const after = spliced(text, [
+      { app: 'web', host: 'local', ports: [3000] },
+      { app: 'other', host: 'local', ports: [4000] },
+    ]);
+    expect(after).toBe(
+      text
+        .replace('      # - db\n', '      # - db\n    port: 3000\n')
+        .replace("      # B: '2'\n", "      # B: '2'\n    port: 4000\n")
+    );
+    expect(portsOf(parse(after))).toEqual({
+      api: [],
+      web: [3000],
+      other: [4000],
+    });
+  });
+  it("a block ports list's commented tail ends the same way: the new item goes right under it", () => {
+    const text = `version: 1
+apps:
+  api:
+    description: api
+    run: a
+    ports:
+      - 3310
+      # - 3311
+
+  # the next app
+  web:
+    description: web
+    run: w
+    ports:
+      - 3320
+      # - 3321
+# profiles below
+profiles:
+  dev: [web]
+`;
+    const after = spliced(text, [
+      { app: 'api', host: 'local', ports: [3312] },
+      { app: 'web', host: 'local', ports: [3330] },
+    ]);
+    expect(after).toBe(
+      text
+        .replace('      # - 3311\n', '      # - 3311\n      - 3312\n')
+        .replace('      # - 3321\n', '      # - 3321\n      - 3330\n')
+    );
+    expect(portsOf(parse(after))).toEqual({
+      api: [3310, 3312],
+      web: [3320, 3330],
+    });
   });
   it('an app written as a flow map gets the port inside its braces, also over several lines', () => {
     const text =
@@ -745,13 +826,8 @@ apps:
           ports: [3001],
           reason: 'declared by tool',
         },
+        // api's 3312 is in the file now: no longer undeclared, so neither adopted nor skipped
         { app: 'api', host: 'local', ports: [45000], reason: 'ephemeral' },
-        {
-          app: 'api',
-          host: 'local',
-          ports: [3312],
-          reason: 'already declared in the file',
-        },
       ],
     });
     expect(fs.readFileSync(file, 'utf8')).toBe(

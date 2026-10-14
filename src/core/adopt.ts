@@ -22,7 +22,8 @@ export interface Skipped {
 
 /**
  * Which undeclared ports each running app may take: not ephemeral, not declared by another app. A port taken earlier in
- * the same run counts as declared by the app that took it, so two apps never adopt one port.
+ * the same run counts as declared by the app that took it, so two apps never adopt one port; a port `m` declares for
+ * the app itself is left out.
  */
 export function planAdoption(
   rows: LsRow[],
@@ -38,8 +39,10 @@ export function planAdoption(
     const eph: number[] = [];
     for (const p of r.ports.undeclared) {
       const by = declaredBy.get(p);
+      // the plan's manifest may be newer than the one the row was read against: what the app declares there is not undeclared
+      if (by === r.app) continue;
       if (p >= EPHEMERAL_FROM) eph.push(p);
-      else if (by && by !== r.app)
+      else if (by)
         skipped.push({
           app: r.app,
           host: r.host,
@@ -75,6 +78,23 @@ const contentEnd = (t: string, at: number) => {
   let e = at;
   while (e > 0 && /\s/.test(t[e - 1])) e--;
   return e;
+};
+/**
+ * The end of the line holding `at`, carried over the comment lines right below it indented at least `min` columns: a
+ * block's commented-out tail (`      # - db`). A blank line, or any line left of `min` (the next key, the next app's
+ * header comment, a top-level section comment), ends it. The yaml library's range[2] does not stop there: it runs
+ * through every blank line and comment up to the next key.
+ */
+const tailEnd = (t: string, at: number, min: number) => {
+  let end = lineEnd(t, at);
+  while (end < t.length) {
+    const next = lineEnd(t, end + 1);
+    const line = t.slice(end + 1, next);
+    const body = line.trimStart();
+    if (!body.startsWith('#') || line.length - body.length < min) break;
+    end = next;
+  }
+  return end;
 };
 
 const NOT_EDITABLE = 'not editable in place (alias or unusual key)';
@@ -167,10 +187,11 @@ export function spliceManifest(text: string, adopted: Adopted[]): Splice {
           );
         }
         if (after.length) {
-          const last = items[items.length - 1].r;
+          const pre = prefix(items[items.length - 1].r);
+          const dash = pre.length - pre.trimStart().length; // commented-out items sit at the items' own indent
           insertAt(
-            lineEnd(text, contentEnd(text, vr[2])),
-            after.map((p) => `\n${prefix(last)}${p}`).join('')
+            tailEnd(text, contentEnd(text, vr[1]), dash),
+            after.map((p) => `\n${pre}${p}`).join('')
           );
         }
       } else if (
@@ -200,8 +221,11 @@ export function spliceManifest(text: string, adopted: Adopted[]): Splice {
     }
     const kr = rangeOf(app.items[0].key)!;
     const indent = text.slice(lineStart(text, kr[0]), kr[0]);
-    // past what trails the last value (its comment, the commented-out entries that close its block): the new line goes under them
-    insertAt(lineEnd(text, contentEnd(text, lr[2])), `\n${indent}${field}`);
+    // under the last value's line and the commented-out entries that close its block, which sit deeper than the keys
+    insertAt(
+      tailEnd(text, contentEnd(text, lr[1]), indent.length + 1),
+      `\n${indent}${field}`
+    );
   }
   let out = text;
   for (const e of edits.sort((x, y) => y.start - x.start))
