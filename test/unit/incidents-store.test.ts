@@ -325,6 +325,46 @@ describe('clearLogs', () => {
       )
     ).toEqual([`${S(30)}ERROR: after the clear`]); // the old err error does not come back
   });
+  it("a clear keeps each run's boot state, so the first re-listen after it is a reload; a point without one gets none", async () => {
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0000',
+      files: { '/l/watch-out': '' },
+      procs: {
+        local: [
+          proc('watch', 0, { pm_uptime: Date.parse('2026-10-12T11:00:00Z') }),
+        ],
+      },
+    };
+    const h = fakeHosts(state);
+    await clearLogs(h.fleet, ['watch'], file);
+    expect(readStore(file).apps['local/watch']).not.toHaveProperty('start');
+    expect(readStore(file).apps['local/watch']).not.toHaveProperty('boot');
+    state.files['/l/watch-out'] = `${S(2)}listening on :3000\n`;
+    const boot = await takeIncidents(
+      h.fleet,
+      ['watch'],
+      { includeReloads: true },
+      file
+    );
+    expect(boot.answer.incidents).toEqual([]);
+    await clearLogs(h.fleet, ['watch'], file);
+    expect(readStore(file).apps['local/watch']).toMatchObject({
+      start: '2026-10-12T11:00:00.000',
+      boot: false,
+      out: { offset: 0 },
+    });
+    state.files['/l/watch-out'] = `${S(30)}listening on :3000\n`;
+    const r = await takeIncidents(
+      h.fleet,
+      ['watch'],
+      { includeReloads: true },
+      file
+    );
+    expect(r.answer.incidents).toMatchObject([
+      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:30' },
+    ]);
+  });
   it('a readonly host is refused before any log or the store is touched', async () => {
     const state = {
       files: { '/l/audit-out': `${S(1)}ERROR: keep\n` },

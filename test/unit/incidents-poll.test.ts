@@ -265,8 +265,8 @@ describe('pollIncidents with includeReloads', () => {
         host: 'box',
         kind: 'reloaded',
         stream: 'out',
-        time: '2026-10-12T11:00:06.000',
-        first_time: '2026-10-12T11:00:01.000',
+        time: '2026-10-12T11:00:06',
+        first_time: '2026-10-12T11:00:01',
         count: 2,
         line: `${S(6)}[vite] hmr update /src/c.ts`,
         before: [],
@@ -307,8 +307,8 @@ describe('pollIncidents with includeReloads', () => {
       {
         kind: 'reloaded',
         count: 1,
-        time: '2026-10-12T11:00:09.000',
-        first_time: '2026-10-12T11:00:09.000',
+        time: '2026-10-12T11:00:09',
+        first_time: '2026-10-12T11:00:09',
         line: `${S(9)}listening on :3000`,
       },
     ]);
@@ -318,7 +318,7 @@ describe('pollIncidents with includeReloads', () => {
       cursor: first.next,
     });
     expect(second.answer.incidents).toMatchObject([
-      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:30.000' },
+      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:30' },
     ]); // not taken for a boot: this run's boot was seen by the first poll
   });
   it("after a pm2 restart between polls the new run's boot is not a reload", async () => {
@@ -395,7 +395,7 @@ describe('pollIncidents with includeReloads', () => {
       cursor: third.next,
     });
     expect(fourth.answer.incidents).toMatchObject([
-      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:50.000' },
+      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:50' },
     ]);
   });
   it('a first poll of an app that started before the window: its boot is behind the point, so the first re-listen in the window counts', async () => {
@@ -440,7 +440,7 @@ describe('pollIncidents with includeReloads', () => {
       cursor: off.next,
     });
     expect(on.answer.incidents).toMatchObject([
-      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:20.000' },
+      { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:20' },
     ]);
   });
   it('the boot stays pending across a poll that saw no burst of the run', async () => {
@@ -525,6 +525,7 @@ describe('pollIncidents with includeReloads', () => {
     });
     expect(r.answer.incidents.map((i) => i.kind)).toEqual(['error']);
     expect(r.next.apps['box/web']).not.toHaveProperty('start');
+    expect(r.next.apps['box/web']).not.toHaveProperty('boot');
   });
   it('an app whose reloads patterns run away is reported and keeps its point, its errors held back with it; the other apps still answer', async () => {
     const m = structuredClone(fleetManifest);
@@ -552,10 +553,87 @@ describe('pollIncidents with includeReloads', () => {
       {
         host: 'box',
         apps: ['web'],
-        message: expect.stringContaining('TIMEOUT'),
+        message: expect.stringMatching(
+          /TIMEOUT.*the reloads patterns of web ran over 200 ms/
+        ),
       },
     ]);
     expect(r.next.apps['box/web']).toBeUndefined(); // not analysed: the next poll reads the same lines again
     expect(r.next.apps['local/watch']).toBeDefined();
+  });
+  it('an app stalled by its errors patterns gets no reload pass: only that error, no point, no start or boot written', async () => {
+    const m = structuredClone(fleetManifest);
+    m.apps.web.errors = {
+      match: ['^(a|a)*$'],
+      ignore: [],
+      context: [3, 5],
+      stderr: false,
+      defaults: true,
+    };
+    m.apps.web.reloads = { match: ['^(a|a)*$'], ignore: [], defaults: true }; // would name itself if it ran
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `${S(1)}${'a'.repeat(30)}!\n${S(2)}[vite] page reload src/a.ts\n`,
+      },
+      procs: { box: [proc('web', 3)] },
+    };
+    const r = await pollIncidents(fakeHosts(state, [], m).fleet, ['web'], {
+      includeReloads: true,
+      budgetMs: 200,
+    });
+    expect(r.answer.incidents).toEqual([]);
+    expect(r.answer.errors).toMatchObject([
+      {
+        host: 'box',
+        apps: ['web'],
+        message: expect.stringContaining('the errors patterns of web'),
+      },
+    ]);
+    expect(r.next.apps['box/web']).toBeUndefined();
+  });
+  it('a short read of one stream: the other still feeds the reloads, and the short one keeps its point', async () => {
+    const state: {
+      now: string;
+      zone: string;
+      files: Record<string, string>;
+      procs: Record<string, object[]>;
+      short?: string[];
+    } = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `${S(1)}ready\n`,
+        '/l/web-err': `${S(1)}warming up\n`,
+      },
+      procs: {
+        box: [proc('web', 3, { pm_uptime: startedAt('2026-10-12T11:00:00') })],
+      },
+    };
+    const h = fakeHosts(state);
+    const first = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+    });
+    state.files['/l/web-out'] += `${S(20)}[vite] page reload src/a.ts\n`;
+    state.files['/l/web-err'] += `${S(21)}${'w'.repeat(40)}\n`;
+    state.short = ['/l/web-err'];
+    const second = await pollIncidents(h.fleet, ['web'], {
+      includeReloads: true,
+      cursor: first.next,
+    });
+    expect(second.answer.incidents).toMatchObject([
+      {
+        kind: 'reloaded',
+        count: 1,
+        line: `${S(20)}[vite] page reload src/a.ts`,
+      },
+    ]);
+    expect(second.next.apps['box/web'].err).toEqual(
+      first.next.apps['box/web'].err
+    );
+    expect(second.next.apps['box/web'].out).not.toEqual(
+      first.next.apps['box/web'].out
+    );
   });
 });

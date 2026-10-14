@@ -326,14 +326,18 @@ function bootAhead(
   return ctxStamps.every((s) => beforeStart(s, start));
 }
 
-/** An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's first marker line. */
+/**
+ * An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's first marker
+ * line. Times are the stamps as pm2 wrote them on those lines, like the other incidents' (an unstamped marker line keeps
+ * the stamp it inherited).
+ */
 const reloaded = (app: string, host: string, rs: Reload[]): Incident => ({
   app,
   host,
   kind: 'reloaded',
   stream: 'out',
-  time: rs[rs.length - 1].time,
-  first_time: rs[0].time,
+  time: stampOf(rs[rs.length - 1].line) ?? rs[rs.length - 1].time,
+  first_time: stampOf(rs[0].line) ?? rs[0].time,
   count: rs.length,
   line: rs[rs.length - 1].line,
   before: [],

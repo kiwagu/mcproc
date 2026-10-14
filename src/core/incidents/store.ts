@@ -241,6 +241,9 @@ export async function clearLogs(
             status: f.proc.status,
             out: mark(f.proc.out_log, prev?.out),
             err: mark(f.proc.err_log, prev?.err),
+            ...(prev && 'start' in prev
+              ? { start: prev.start, boot: prev.boot }
+              : {}), // a clear ends no run: the boot state stays with the start it was taken for
           };
           if (f.failed.length === 0) next.cleared[key] = at;
           if (f.failed.length < 2) next.clears[key] = (s.clears[key] ?? 0) + 1; // a file of it was emptied

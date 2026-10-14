@@ -824,12 +824,12 @@ describe('mcp server', () => {
         kind: 'reloaded',
         app: 'api',
         count: 1,
-        time: '2026-10-12T11:00:05.000',
+        time: '2026-10-12T11:00:05',
         line: `${S(5)}[tsx] change in ./src/a.ts Restarting...`,
       },
     ]);
     expect(text(r)).toContain(
-      `api@local 2026-10-12T11:00:05.000 reloaded: ${S(5)}[tsx] change in ./src/a.ts Restarting...`
+      `api@local 2026-10-12T11:00:05 reloaded: ${S(5)}[tsx] change in ./src/a.ts Restarting...`
     );
   });
 });
