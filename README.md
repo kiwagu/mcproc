@@ -213,7 +213,7 @@ from exactly where that read ended. `last` needs the session that keeps the mark
 | `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
 | `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
-| `logs [app \| targets, since]` | tail of one app's out/err (ANSI stripped), or the merged, time-ordered lines of several apps: the latest lines, or since a span (`2m`), a host-local time, or `last` (since your previous call in this MCP session); `app \| line`, `app ! line` for stderr |
+| `logs [app \| targets, since]` | tail of one app's out/err (ANSI stripped), or the merged, time-ordered lines of several apps: the latest lines, or since a span (`2m`), a host-local time, or `last` (since your previous `logs` call over those apps in this MCP session); `app \| line`, `app ! line` for stderr |
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
 | `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |

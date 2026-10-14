@@ -323,6 +323,26 @@ describe('printSince (logs --since, one shot)', () => {
     expect(at?.tool).toEqual({}); // no mark: its follow starts at the file's end
     expect(process.exitCode).not.toBe(1);
   });
+  it("a host that was not read: the other host's lines are printed, the note goes to stderr, and the exit code is 1", async () => {
+    const { fleet } = fakeHosts(state(), ['box']);
+    const c = capture();
+    try {
+      await printSince(
+        fleet,
+        ['watch', 'web'],
+        parseSince('10s'),
+        { stream: 'both', color: false, json: false },
+        c.io
+      );
+      expect(c.out).toEqual([`watch | ${S(35)}change`]);
+      expect(c.err).toEqual([
+        'box not read (web): TRANSPORT_FAILED: ssh box: Connection refused',
+      ]);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = 0;
+    }
+  });
   it('a reader that went away (EPIPE on stdout, or the stream aborted) stops the print quietly and gives nothing to follow', async () => {
     const { fleet } = fakeHosts(state());
     const err: string[] = [];

@@ -111,6 +111,10 @@ describe('mcp server', () => {
     expect(logsDesc).toContain('since');
     expect(logsDesc).toContain('targets');
     expect(logsDesc).not.toContain('—');
+    // marks are per file: a last call covers what the previous logs call read over the same apps
+    expect(logsDesc).toContain(
+      'since your previous logs call over those apps in this session'
+    );
     expect(INSTRUCTIONS).toContain('since');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
@@ -611,10 +615,10 @@ describe('mcp server', () => {
 });
 
 describe('logs since', () => {
-  // the basic fixture's base profile, both apps started on local; the host's clock reads 11:00:40
+  // the basic fixture's base profile, both apps started on local; the host's clock reads 11:00:40. A since read
+  // writes nothing next to the manifest, so the fixture is used in place
   const setup = () => {
-    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-since-'));
-    fs.cpSync(basic, project, { recursive: true });
+    const project = basic;
     const p = (app: string, pm_id: number) => ({
       pid: 10 + pm_id,
       name: `demo-${app}`,

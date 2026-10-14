@@ -609,9 +609,25 @@ describe('renderLogsSince', () => {
       'truncated 3 older lines',
       'skipped 2K of api out on local (more than the 1 MB read before the window)',
       'not started: logger',
-      'box unreachable (tool): TRANSPORT_FAILED: ssh box: Connection refused',
+      'box not read (tool): TRANSPORT_FAILED: ssh box: Connection refused',
     ]);
     expect(t.endsWith(sinceNotes(a).join('\n'))).toBe(true);
+  });
+  it('a host that answered without a readable clock is "not read" too, not "unreachable"', () => {
+    const notes = sinceNotes({
+      ...a,
+      errors: [
+        {
+          host: 'box',
+          apps: ['web'],
+          message:
+            'TRANSPORT_FAILED: the host did not report a readable clock and zone',
+        },
+      ],
+    });
+    expect(notes.at(-1)).toBe(
+      'box not read (web): TRANSPORT_FAILED: the host did not report a readable clock and zone'
+    );
   });
   it('hosts whose zone could not be read are one note: their lines may be out of place among the other hosts', () => {
     expect(sinceNotes({ ...a, unzoned: ['box'] })).toContain(

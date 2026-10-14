@@ -264,8 +264,9 @@ export function sinceNotes(a: SinceAnswer): string[] {
     notes.push(
       `zone unknown on ${a.unzoned.join(', ')}: ${a.unzoned.length === 1 ? 'its' : 'their'} lines are placed by their stamps as if in UTC, so they may be out of place among the other hosts' lines`
     );
+  // unreachable, or it answered without a clock the since needs: either way its apps were not read
   for (const e of a.errors)
-    notes.push(`${e.host} unreachable (${e.apps.join(', ')}): ${e.message}`);
+    notes.push(`${e.host} not read (${e.apps.join(', ')}): ${e.message}`);
   return notes;
 }
 /** Header, then compose lines (`app | text`, `app ! text` for stderr, no colors), then the notes. */

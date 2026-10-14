@@ -168,7 +168,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Logs',
       description:
-        'Read pm2 logs. One app, last N lines (default 100, max 2000) as out/err sections: pass app. Several apps since a point in time: pass targets (apps, profiles or ["all"]) and since: a span like 2m, a time like 2026-10-14T07:30 (the host\'s local time; add Z or +02:00 for an absolute instant), or last (everything since your previous logs call in this session). Lines come merged across apps in time order, each labelled `app | line` (`app ! line` for stderr), ANSI stripped; lines then caps the merged output (most recent kept). targets without since: the latest lines across the apps. After a change, read since over the profile instead of tailing each app.',
+        'Read pm2 logs. One app, last N lines (default 100, max 2000) as out/err sections: pass app. Several apps since a point in time: pass targets (apps, profiles or ["all"]) and since: a span like 2m, a time like 2026-10-14T07:30 (the host\'s local time; add Z or +02:00 for an absolute instant), or last (everything since your previous logs call over those apps in this session). Lines come merged across apps in time order, each labelled `app | line` (`app ! line` for stderr), ANSI stripped; lines then caps the merged output (most recent kept). targets without since: the latest lines across the apps. After a change, read since over the profile instead of tailing each app.',
       inputSchema: {
         ...commonInput,
         app: z
