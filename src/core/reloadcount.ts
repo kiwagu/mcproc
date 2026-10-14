@@ -1,53 +1,22 @@
 import { describeError, isMcprocError } from './errors.js';
 import type { Fleet, HostError, HostProbe } from './fleet.js';
 import type { LsRow } from './list.js';
-import { msStamp } from './logsince.js';
 import { findProcess } from './pm2.js';
 import {
-  beforeStart,
   compileReloadRules,
   detectReloads,
+  reach,
+  reloadStamp,
   type ReloadInput,
 } from './reloads.js';
-import { stampOf } from './incidents/detect.js';
-import {
-  CONTEXT_BYTES,
-  parseRead,
-  readSnippet,
-  type FileRead,
-} from './incidents/cursor.js';
+import { CONTEXT_BYTES, parseRead, readSnippet } from './incidents/cursor.js';
 import { ensureOk } from '../transport/index.js';
 
-/**
- * A log read from its first byte began with this run when its first stamped line comes this soon after the start (a
- * slow boot included); a log cleared during the run (flush, monit's c) also begins at byte 0, with lines from long after.
- */
-const FRESH_LOG_MS = 60_000;
 /** pm2 statuses of a process that is running this run: an app that is not has no reloads to count. */
 const RUNNING = new Set(['online', 'launching']);
 const STREAMS = ['out', 'err'] as const;
 
 type Counted = NonNullable<LsRow['reloads']>;
-/**
- * How far back one stream's read reaches. `start`: it holds a line of an earlier run (stamped before the start), or it
- * begins at the file's first byte with its first stamped line soon after the start. `nothing`: it begins at the first
- * byte and holds no stamped line, so this run left nothing there to count. `after`: the read is the last part of a longer
- * log, the log was cleared during the run, or the read did not come through whole.
- */
-type Reach = 'start' | 'nothing' | 'after';
-
-const wallMs = (stamp: string): number => Date.parse(`${msStamp(stamp)}Z`);
-
-function reach(r: FileRead | null, started: string): Reach {
-  if (!r || r.short) return 'after';
-  const stamps = r.lines.map(stampOf).filter((t): t is string => t !== null);
-  if (stamps.some((t) => beforeStart(t, started))) return 'start';
-  if (r.start > CONTEXT_BYTES) return 'after'; // a read begins CONTEXT_BYTES before its start, at byte 0 at the earliest
-  if (stamps.length === 0) return 'nothing';
-  return wallMs(stamps[0]) - wallMs(started) <= FRESH_LOG_MS
-    ? 'start'
-    : 'after';
-}
 
 /**
  * Each running app's in-process reloads since pm2 started it (ls --reloads), on top of the rows and probes of listFleet:
@@ -114,7 +83,12 @@ export async function countReloads(
       const errors: HostError[] = [];
       targets.forEach((t, k) => {
         const reads = STREAMS.map((_, s) => parseRead(stdout, id(k, s), null));
-        const reaches = reads.map((r) => reach(r, t.started));
+        // a read that did not come through whole reaches nowhere; one begins CONTEXT_BYTES before its start, at byte 0 at the earliest
+        const reaches = reads.map((r) =>
+          r && !r.short
+            ? reach(r.lines, t.started, r.start <= CONTEXT_BYTES)
+            : 'after'
+        );
         const input: ReloadInput[] = reads.flatMap((r, s) =>
           r && !r.short
             ? r.lines.map((text) => ({ stream: STREAMS[s], text }))
@@ -134,7 +108,7 @@ export async function countReloads(
           const last = found.at(-1);
           counted.set(t.app, {
             count: found.length,
-            last: last ? (stampOf(last.line) ?? last.time) : null,
+            last: last ? reloadStamp(last) : null,
             partial: reaches.includes('after'),
           });
         } catch (e) {

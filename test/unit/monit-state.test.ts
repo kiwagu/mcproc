@@ -117,6 +117,32 @@ describe('reduce', () => {
       error: null,
     });
   });
+  it("reloads store each counted app's info, replace it on the next count, drop it on null; a host switch starts over", () => {
+    let s = reduce(s0(), {
+      type: 'reloads',
+      app: 'api',
+      info: { count: 2, last: '2026-10-14T12:01:05', partial: false },
+    });
+    s = reduce(s, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 1, last: null, partial: true },
+    });
+    expect(s.reloads).toEqual({
+      api: { count: 2, last: '2026-10-14T12:01:05', partial: false },
+      web: { count: 1, last: null, partial: true },
+    });
+    s = reduce(s, {
+      type: 'reloads',
+      app: 'api',
+      info: { count: 0, last: null, partial: false },
+    });
+    expect(s.reloads.api).toEqual({ count: 0, last: null, partial: false });
+    s = reduce(s, { type: 'reloads', app: 'web', info: null });
+    expect(s.reloads).not.toHaveProperty('web');
+    s = reduce(s, { type: 'host', host: 'stand' });
+    expect(s.reloads).toEqual({});
+  });
 });
 
 describe('keyIntent', () => {

@@ -337,6 +337,51 @@ describe('renderFrame', () => {
       renderFrame(base(), { width: 160, height: 40 }).table[0]
     ).not.toContain('HOST');
   });
+  it("the details put the selected app's reloads next to its restarts: +N, +≥N when partial, as before without a count", () => {
+    const pm2Line = (st: ReturnType<typeof base>) =>
+      renderFrame(st, { width: 200, height: 40 }).details[2];
+    const restarted = reduce(base(), {
+      type: 'rows',
+      rows: [{ ...web, restarts: 2 }, docs],
+      at: new Date('2026-10-11T13:41:07'),
+    });
+    expect(pm2Line(restarted)).toContain('restarts 2  procs 3');
+    const counted = reduce(restarted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 3, last: '2026-10-11T12:01:05.120', partial: false },
+    });
+    expect(pm2Line(counted)).toContain(
+      'restarts 2 (+3 reloads, last 12:01:05)  procs 3'
+    );
+    const partial = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 3, last: '2026-10-11T12:01:05', partial: true },
+    });
+    expect(pm2Line(partial)).toContain(
+      'restarts 2 (+≥3 reloads, last 12:01:05)  procs 3'
+    );
+    const one = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 1, last: null, partial: false },
+    });
+    expect(pm2Line(one)).toContain('restarts 2 (+1 reload)  procs 3');
+    const none = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 0, last: null, partial: true },
+    });
+    expect(pm2Line(none)).toContain('restarts 2  procs 3');
+    // another app's count is not the selected one's
+    const other = reduce(restarted, {
+      type: 'reloads',
+      app: 'docs',
+      info: { count: 4, last: null, partial: false },
+    });
+    expect(pm2Line(other)).toContain('restarts 2  procs 3');
+  });
   it('wraps by terminal columns: a wide character takes two and is never split across rows', () => {
     expect(wrapText('中文中文中', 4, 0)).toEqual(['中文', '中文', '中']);
     expect(wrapText('ab中文', 3, 1)).toEqual(['ab', ' 中', ' 文']);

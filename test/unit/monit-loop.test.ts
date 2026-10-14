@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -97,6 +97,7 @@ function harness(
     dir?: string;
     down?: (host: string) => boolean;
     gate?: (host: string) => Promise<void> | null;
+    budgetMs?: number;
   } = {}
 ) {
   const dir = opts.dir ?? basic;
@@ -144,7 +145,7 @@ function harness(
   const loop = new MonitLoop(
     fleet,
     deps,
-    { lines: 10 },
+    { lines: 10, budgetMs: opts.budgetMs },
     () => state,
     (a) => {
       actions.push(a);
@@ -802,6 +803,220 @@ describe('MonitLoop live logs', () => {
     await settle(80);
     expect(h.state.logs.watch.map((l) => l.text)).toContain('local line');
     slow.resolve();
+    h.loop.close();
+  });
+});
+
+/** followers fed by the test: `feed` queues lines for an app's next poll; `wakes` holds the wake of each watched app */
+function fedFollowers() {
+  const next = new Map<string, string[]>();
+  const wakes = new Map<string, () => void>();
+  const follower: LoopDeps['follower'] = (_c, paths) => {
+    const app = /\/l\/([\w-]+)-out/.exec(paths.out)![1];
+    return {
+      poll: async () => ({
+        lines: (next.get(app) ?? []).splice(0).map((text) => ({
+          stream: 'out' as const,
+          text,
+        })),
+        reset: false,
+      }),
+      watch: (w) => {
+        wakes.set(app, w);
+      },
+      close: () => {
+        wakes.delete(app);
+      },
+    };
+  };
+  const feed = (app: string, ...lines: string[]) =>
+    next.set(app, [...(next.get(app) ?? []), ...lines]);
+  return { follower, feed, wakes };
+}
+/** pm2's stamp `sec` seconds after 12:00:00, with the separator pm2 writes after it */
+const at = (sec: number) =>
+  `${new Date(Date.UTC(2026, 9, 14, 12, 0, sec)).toISOString().slice(0, 23)}: `;
+const START = '2026-10-14T12:00:00.000';
+
+describe('MonitLoop reloads', () => {
+  let now = 1_000_000;
+  /** the wall clock the trackers read: a burst counts once no marker arrived for 2 s of it */
+  const clock = () => vi.spyOn(Date, 'now').mockImplementation(() => now);
+  afterEach(() => vi.restoreAllMocks());
+  /** a loop whose rows carry each app's pm2 start and restarts from `runs` (null: no start known) */
+  function counted(
+    runs: Record<string, { started: string | null; restarts: number }>,
+    over: Partial<LoopDeps> = {},
+    budgetMs?: number
+  ) {
+    clock();
+    const fed = fedFollowers();
+    const h = harness(
+      undefined,
+      {
+        follower: fed.follower,
+        rows: (ctx, _snap, apps) =>
+          apps
+            .filter((a) => a !== 'api-build')
+            .map((a) => ({ ...row(a, ctx.host.name), ...runs[a] })),
+        ...over,
+      },
+      { budgetMs }
+    );
+    /** one refresh now, then one past the quiet gap: whatever burst the lines opened is counted */
+    const settled = async () => {
+      await h.loop.refresh();
+      now += 2500;
+      await h.loop.refresh();
+    };
+    return Object.assign(h, fed, { settled }); // onto h: its state getter stays live
+  }
+
+  it("counts the selected app's reloads from its history: the boot is not one, a burst counts once it went quiet; an app not followed gets no entry", async () => {
+    const h = counted({
+      api: { started: START, restarts: 0 },
+      worker: { started: START, restarts: 0 },
+    });
+    h.feed(
+      'api',
+      `${at(1)}api listening on 3310`,
+      `${at(10)}[vite] (client) page reload /src/a.ts`,
+      `${at(10)}[vite] (client) page reload /src/b.ts`
+    );
+    await h.loop.refresh();
+    expect(h.state.reloads.api).toEqual({
+      count: 0,
+      last: null,
+      partial: false,
+    }); // the Vite burst is still open
+    now += 2500;
+    await h.loop.refresh();
+    expect(h.state.reloads.api).toEqual({
+      count: 1,
+      last: '2026-10-14T12:00:10.000',
+      partial: false,
+    });
+    expect(h.state.reloads).not.toHaveProperty('worker'); // the dashboard follows only the selected app
+    h.feed('api', `${at(30)}api listening on 3310`);
+    await h.settled();
+    expect(h.state.reloads.api).toMatchObject({
+      count: 2,
+      last: '2026-10-14T12:00:30.000',
+    });
+    h.loop.close();
+  });
+
+  it('a pm2 restart (a higher restarts) starts the count over at 0, exact; the new boot is not counted, a later reload is', async () => {
+    const runs = { api: { started: START, restarts: 0 } };
+    const h = counted(runs);
+    h.feed(
+      'api',
+      `${at(1)}api listening on 3310`,
+      `${at(10)}[vite] (client) page reload /src/a.ts`
+    );
+    await h.settled();
+    expect(h.state.reloads.api).toMatchObject({ count: 1 });
+    runs.api = { started: '2026-10-14T12:01:00.000', restarts: 1 };
+    h.feed('api', `${at(61)}api listening on 3310`);
+    await h.loop.refresh();
+    expect(h.state.reloads.api).toEqual({
+      count: 0,
+      last: null,
+      partial: false,
+    });
+    now += 2500;
+    await h.loop.refresh();
+    expect(h.state.reloads.api).toMatchObject({ count: 0 });
+    h.feed('api', `${at(90)}api listening on 3310`);
+    await h.settled();
+    expect(h.state.reloads.api).toEqual({
+      count: 1,
+      last: '2026-10-14T12:01:30.000',
+      partial: false,
+    });
+    h.loop.close();
+  });
+
+  it("a new run's boot that a wake delivered before the refresh saw the restart is still taken for the boot", async () => {
+    const runs = { api: { started: START, restarts: 0 } };
+    const h = counted(runs);
+    h.feed('api', `${at(1)}api listening on 3310`);
+    await h.settled();
+    expect(h.state.reloads.api).toMatchObject({ count: 0 });
+    // pm2 restarted the app: its boot reaches the screen through the follower's wake, the rows only on the next refresh
+    h.feed('api', `${at(61)}api listening on 3310`);
+    h.wakes.get('api')!();
+    await settle();
+    runs.api = { started: '2026-10-14T12:01:00.000', restarts: 1 };
+    await h.settled();
+    expect(h.state.reloads.api).toEqual({
+      count: 0,
+      last: null,
+      partial: false,
+    });
+    h.feed('api', `${at(90)}api listening on 3310`);
+    await h.settled();
+    expect(h.state.reloads.api).toMatchObject({ count: 1 });
+    h.loop.close();
+  });
+
+  it('a history that does not reach back to the start is partial, and its first re-listen is a reload, not the boot', async () => {
+    const h = counted({ api: { started: START, restarts: 0 } });
+    h.feed('api', '2026-10-14T13:00:00.000: api listening on 3310');
+    await h.settled();
+    expect(h.state.reloads.api).toEqual({
+      count: 1,
+      last: '2026-10-14T13:00:00.000',
+      partial: true,
+    });
+    h.loop.close();
+  });
+
+  it('the flat view counts every followed app; an app with reloads off or without a known start gets no entry', async () => {
+    const h = counted({
+      api: { started: START, restarts: 0 },
+      worker: { started: START, restarts: 0 },
+    });
+    h.loop.fleet.manifest.apps.worker.reloads = null;
+    h.loop.dispatch({ type: 'view', view: 'flat' });
+    h.feed(
+      'api',
+      `${at(1)}api listening on 3310`,
+      `${at(20)}[vite] hmr update /src/a.css`
+    );
+    h.feed('worker', `${at(1)}[vite] hmr update /src/a.css`);
+    await h.settled();
+    expect(h.state.reloads).toEqual({
+      api: { count: 1, last: '2026-10-14T12:00:20.000', partial: false },
+    });
+    h.loop.close();
+    const none = counted({ api: { started: null, restarts: 0 } });
+    none.feed('api', `${at(20)}[vite] hmr update /src/a.css`);
+    await none.settled();
+    expect(none.state.reloads).toEqual({});
+    expect(none.actions.map((a) => a.type)).not.toContain('reloads');
+    none.loop.close();
+  });
+
+  it("an app whose own reloads patterns run away is no longer counted and the notice says why; its logs and the host's rows go on", async () => {
+    const h = counted({ api: { started: START, restarts: 0 } }, {}, 50);
+    h.loop.fleet.manifest.apps.api.reloads = {
+      match: ['^(a|aa)+$'],
+      ignore: [],
+      defaults: true,
+    };
+    h.feed('api', `${at(1)}${'a'.repeat(40)}b`);
+    await h.loop.refresh();
+    expect(h.state.reloads).toEqual({});
+    expect(h.state.notice).toMatch(
+      /reloads of api not counted: TIMEOUT.*the reloads patterns of api/
+    );
+    expect(h.state.error).toBeNull();
+    expect(h.state.logs.api).toHaveLength(1);
+    h.feed('api', `${at(30)}[vite] hmr update /src/a.css`);
+    await h.settled();
+    expect(h.state.reloads).toEqual({});
+    expect(h.state.logs.api).toHaveLength(2);
     h.loop.close();
   });
 });

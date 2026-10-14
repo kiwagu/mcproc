@@ -125,6 +125,43 @@ export const beforeStart = (stamp: string, start: string): boolean =>
   stamp < (stamp.length > 19 ? start : start.slice(0, 19));
 
 /**
+ * A log read from its first byte began with this run when its first stamped line comes this soon after the start (a
+ * slow boot included); a log cleared during the run (flush, monit's c) also begins at byte 0, with lines from long after.
+ */
+export const FRESH_LOG_MS = 60_000;
+
+/**
+ * How far one stream's lines reach back toward the start. `start`: they hold a line of an earlier run (stamped before
+ * the start), or the read began at the file's first byte (or where it began is not known: a follower's history) and
+ * its first stamped line comes soon after the start. `nothing`: no line at all, so this run left nothing there to
+ * count. `after`: the read is the last part of a longer log, the log was cleared during the run, or its lines carry no
+ * stamp and cannot be placed.
+ */
+export type Reach = 'start' | 'nothing' | 'after';
+
+const wallMs = (stamp: string): number => Date.parse(`${msStamp(stamp)}Z`);
+
+/** `fromFirstByte`: whether the read began at the file's first byte; undefined when the reader cannot tell. */
+export function reach(
+  lines: string[],
+  started: string,
+  fromFirstByte?: boolean
+): Reach {
+  const stamps = lines.map(stampOf).filter((t): t is string => t !== null);
+  if (stamps.some((t) => beforeStart(t, started))) return 'start';
+  if (fromFirstByte === false) return 'after';
+  if (lines.length === 0) return 'nothing';
+  if (stamps.length === 0) return 'after';
+  return wallMs(stamps[0]) - wallMs(started) <= FRESH_LOG_MS
+    ? 'start'
+    : 'after';
+}
+
+/** When a reload happened, as its first marker line's stamp was written (seconds or milliseconds), else the burst's time. */
+export const reloadStamp = (r: Reload): string | null =>
+  stampOf(r.line) ?? r.time;
+
+/**
  * Each line's time: its stamp in milliseconds, or the previous stamp of its own stream (`last` carries it across
  * calls). With a start, lines before it and lines that cannot be placed are dropped. The rest are ordered by time,
  * out before err on equal time, file order within a stream; untimed lines go first. Times are host-local wall clock,

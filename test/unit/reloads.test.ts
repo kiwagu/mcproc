@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   compileReloadRules,
   detectReloads,
+  reach,
+  reloadStamp,
   ReloadTracker,
 } from '../../src/core/reloads.js';
 
@@ -345,5 +347,57 @@ describe('ReloadTracker', () => {
     expect(t.flush()).toEqual([
       expect.objectContaining({ time: '2026-10-14T12:00:30.000' }),
     ]);
+  });
+});
+
+describe('reach', () => {
+  const started = '2026-10-14T12:00:05.000';
+  it('a stream with a line stamped before the start reaches it, wherever its read began', () => {
+    const lines = [`${T('01')}old run`, `${T('30')}this run`];
+    expect(reach(lines, started, true)).toBe('start');
+    expect(reach(lines, started, false)).toBe('start');
+    expect(reach(lines, started)).toBe('start');
+  });
+  it('from byte 0 (or not known) the stream reaches the start when its first stamped line comes within a minute of it', () => {
+    const soon = [`orphan`, `${T('20')}listening on :3000`];
+    expect(reach(soon, started, true)).toBe('start');
+    expect(reach(soon, started)).toBe('start');
+    const late = ['2026-10-14T12:05:00.000: listening on :3000'];
+    expect(reach(late, started, true)).toBe('after');
+    expect(reach(late, started)).toBe('after');
+  });
+  it('a read that began past byte 0 without a line before the start is after it, even with nothing in it', () => {
+    expect(reach([`${T('06')}listening on :3000`], started, false)).toBe(
+      'after'
+    );
+    expect(reach([], started, false)).toBe('after');
+  });
+  it('a stream with no lines at all holds nothing of this run', () => {
+    expect(reach([], started, true)).toBe('nothing');
+    expect(reach([], started)).toBe('nothing');
+  });
+  it('a stream from byte 0 whose lines carry no stamp cannot be placed: after, not nothing', () => {
+    expect(reach(['no stamp here', 'nor here'], started, true)).toBe('after');
+    expect(reach(['no stamp here'], started)).toBe('after');
+  });
+});
+
+describe('reloadStamp', () => {
+  it("is the marker line's stamp as written, else the burst's time", () => {
+    const r = detectReloads(
+      [out('2026-10-14T12:00:30: [vite] (client) page reload /a.js')],
+      rules,
+      opts
+    );
+    expect(reloadStamp(r[0])).toBe('2026-10-14T12:00:30');
+    expect(
+      reloadStamp({
+        time: '2026-10-14T12:00:30.000',
+        last_time: null,
+        lines: 1,
+        line: 'no stamp',
+        marker: 'vite',
+      })
+    ).toBe('2026-10-14T12:00:30.000');
   });
 });
