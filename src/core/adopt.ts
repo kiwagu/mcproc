@@ -97,9 +97,12 @@ const tailEnd = (t: string, at: number, min: number) => {
   return end;
 };
 
+/** A line's lead-in without the anchors and tags in it: a node's range starts after them. */
+const noProps = (lead: string) => lead.replace(/[&!][^\s]*\s+/g, '');
+
 const NOT_EDITABLE = 'not editable in place (alias or unusual key)';
 const ALREADY_DECLARED = 'already declared in the file';
-const SHARED = 'shares its ports through a YAML anchor';
+const ANCHORED = 'its edit would change another value through a YAML anchor';
 
 export interface Splice {
   text: string;
@@ -121,7 +124,7 @@ export interface Splice {
  *   own in a block map, after any commented-out entries that close the last field's block; `, field` before the
  *   closing brace of a flow map.
  * An app that is an alias, or whose ports are all in the text already, is left alone and listed in `unedited`; so is
- * one whose ports node is shared through a YAML anchor (see `spliceManifest`).
+ * one whose edit would reach another value through a YAML anchor (see `spliceManifest`).
  */
 function spliceRaw(
   text: string,
@@ -181,7 +184,7 @@ function spliceRaw(
         // "      - ": the item's indent and dash, without an anchor or tag of its own (`- &main 3310`), which a new item
         // must not copy: a second `&main` would move every `*main` after it to the new port
         const prefix = (r: Range) =>
-          text.slice(lineStart(text, r[0]), r[0]).replace(/[&!][^\s]*\s+/g, '');
+          noProps(text.slice(lineStart(text, r[0]), r[0]));
         const before = new Map<number, number[]>();
         const after: number[] = [];
         for (const p of added) {
@@ -230,7 +233,8 @@ function spliceRaw(
       continue;
     }
     const kr = rangeOf(app.items[0].key)!;
-    const indent = text.slice(lineStart(text, kr[0]), kr[0]);
+    // the first key's column, without its anchor or tag (`&k description:`): a new `&k port:` would move every `*k`
+    const indent = noProps(text.slice(lineStart(text, kr[0]), kr[0]));
     // under the last value's line and the commented-out entries that close its block, which sit deeper than the keys
     insertAt(
       tailEnd(text, contentEnd(text, lr[1]), indent.length + 1),
@@ -243,72 +247,109 @@ function spliceRaw(
   return { text: out, edited, unedited, added: addedBy };
 }
 
-/** Each app's ports as the loader reads them (aliases resolved, `port` as a one-item list); undefined when the text does not parse. */
-function portsByApp(text: string): Map<string, unknown[]> | undefined {
-  let raw: unknown;
+/** The text as the loader reads it, aliases resolved; undefined when it does not parse. */
+function readDoc(text: string): { value: unknown } | undefined {
   try {
-    raw = parse(text);
+    return { value: parse(text) };
   } catch {
     return undefined; // e.g. an alias whose anchor the splice rewrote away
   }
-  const apps = (raw as { apps?: unknown } | null)?.apps;
-  const out = new Map<string, unknown[]>();
-  if (apps && typeof apps === 'object')
-    for (const [n, a] of Object.entries(apps as Record<string, unknown>)) {
-      const o = (a ?? {}) as { port?: unknown; ports?: unknown };
-      const v = o.ports ?? o.port;
-      out.set(
-        n,
-        v === undefined || v === null ? [] : Array.isArray(v) ? v : [v]
-      );
-    }
-  return out;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** An app's ports as the loader reads them, `port` as a one-item list. */
+function portsOf(app: unknown): unknown[] {
+  const o = isRecord(app) ? app : {};
+  const v = o.ports ?? o.port;
+  return v === undefined || v === null ? [] : Array.isArray(v) ? v : [v];
+}
+
+/** The document without the `port` and `ports` fields of the named apps. */
+function withoutPorts(doc: unknown, names: string[]): unknown {
+  if (!isRecord(doc) || !isRecord(doc.apps)) return doc;
+  const apps = { ...doc.apps };
+  for (const n of names) {
+    const a = apps[n];
+    if (!isRecord(a)) continue;
+    const { port: _port, ports: _ports, ...rest } = a;
+    apps[n] = rest;
+  }
+  return { ...doc, apps };
+}
+
+/** Deep equality of parsed YAML; `seen` pairs the nodes already being compared, since an alias can make a cycle. */
+function sameValue(
+  a: unknown,
+  b: unknown,
+  seen = new Map<object, object>()
+): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || !a || !b) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (seen.get(a) === b) return true;
+  seen.set(a, b);
+  const ka = Object.keys(a);
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  return (
+    ka.length === Object.keys(b).length &&
+    ka.every((k) => Object.hasOwn(b, k) && sameValue(ra[k], rb[k], seen))
+  );
 }
 
 /**
  * Whether a raw splice changed exactly what it meant to: every edited app now has its old ports plus the added ones,
- * and every other app has exactly its old ports.
+ * and the rest of the document, every other field of every app included, reads as it did.
  */
-function keepsOtherPorts(
-  before: Map<string, unknown[]>,
+function changesOnlyPorts(
+  before: { value: unknown },
   s: ReturnType<typeof spliceRaw>
 ): boolean {
-  const after = portsByApp(s.text);
+  const after = readDoc(s.text);
   if (!after) return false;
+  const edited = [...s.added.keys()];
+  if (
+    !sameValue(
+      withoutPorts(before.value, edited),
+      withoutPorts(after.value, edited)
+    )
+  )
+    return false;
+  const appOf = (doc: unknown, n: string) =>
+    isRecord(doc) && isRecord(doc.apps) ? doc.apps[n] : undefined;
   const sorted = (v: unknown[]) => JSON.stringify([...v].map(String).sort());
-  for (const n of new Set([...before.keys(), ...after.keys()])) {
-    const old = before.get(n) ?? [];
-    const now = after.get(n) ?? [];
-    const added = s.added.get(n);
-    if (added) {
-      if (sorted(now) !== sorted([...old, ...added])) return false;
-    } else if (JSON.stringify(now) !== JSON.stringify(old)) return false;
-  }
-  return true;
+  return edited.every(
+    (n) =>
+      sorted(portsOf(appOf(after.value, n))) ===
+      sorted([...portsOf(appOf(before.value, n)), ...s.added.get(n)!])
+  );
 }
 
 /**
- * `spliceRaw`, checked: a ports node can be shared through a YAML anchor (`ports: &p [3310]` read elsewhere as `*p`,
- * an anchored app map, an anchored list item a rewrite would drop), and editing it in place would change or break
- * every alias of it. The spliced text is parsed again, and an app whose edit changes any other app's ports, or does
- * not give it exactly its old ports plus the added ones, is left alone with that reason; the rest are spliced again
- * without it until the check holds.
+ * `spliceRaw`, checked: a node the splice edits can be read elsewhere through a YAML anchor (`ports: &p [3310]` read
+ * by another app as `*p`, `port: &p 3000` read by a `watch_delay: *p`, an anchored app map, an anchored `port` key
+ * whose alias reads the key's own text, an anchored list item a rewrite would drop), and editing it in place would
+ * change or break every alias of it. The spliced text is parsed again; an app whose edit changes anything but its own
+ * ports, or does not give it exactly its old ports plus the added ones, is left alone with that reason, and the rest
+ * are spliced again without it until the check holds.
  */
 export function spliceManifest(text: string, adopted: Adopted[]): Splice {
-  const before = portsByApp(text);
+  const before = readDoc(text);
   if (!before) {
     // nothing to check against; the loader refuses such a text before anything is written
     const { added: _, ...s } = spliceRaw(text, adopted);
     return s;
   }
-  const shared = new Set<string>();
+  const anchored = new Set<string>();
   for (;;) {
-    const rest = adopted.filter((a) => !shared.has(a.app));
+    const rest = adopted.filter((a) => !anchored.has(a.app));
     const s = spliceRaw(text, rest);
-    if (keepsOtherPorts(before, s)) {
+    if (changesOnlyPorts(before, s)) {
       // in the order the apps were adopted, like the raw splice reports them
       const why = new Map(s.unedited.map((u) => [u.app, u.reason]));
-      for (const n of shared) why.set(n, SHARED);
+      for (const n of anchored) why.set(n, ANCHORED);
       const unedited = [...new Set(adopted.map((a) => a.app))]
         .filter((n) => why.has(n))
         .map((n) => ({ app: n, reason: why.get(n)! }));
@@ -317,7 +358,7 @@ export function spliceManifest(text: string, adopted: Adopted[]): Splice {
     // the culprits are the apps whose edit alone breaks the check; if only edits together do, none of them is kept
     const alone = s.edited.filter(
       (n) =>
-        !keepsOtherPorts(
+        !changesOnlyPorts(
           before,
           spliceRaw(
             text,
@@ -325,7 +366,7 @@ export function spliceManifest(text: string, adopted: Adopted[]): Splice {
           )
         )
     );
-    for (const n of alone.length ? alone : s.edited) shared.add(n);
+    for (const n of alone.length ? alone : s.edited) anchored.add(n);
   }
 }
 

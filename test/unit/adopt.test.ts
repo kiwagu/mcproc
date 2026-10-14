@@ -505,8 +505,8 @@ profiles:
   });
 });
 
-describe('spliceManifest: ports shared through a YAML anchor', () => {
-  const SHARED = 'shares its ports through a YAML anchor';
+describe('spliceManifest: YAML anchors', () => {
+  const ANCHORED = 'its edit would change another value through a YAML anchor';
   /** api holds the anchored ports in `shape`; tool reads them through `*p`, web has a port of its own */
   const anchored = (shape: string, alias = '    ports: *p') => `version: 1
 apps:
@@ -561,7 +561,7 @@ ${alias}
       const text = anchored(shape);
       const s = spliceManifest(text, adopt);
       expect(s.edited).toEqual(['web']);
-      expect(s.unedited).toEqual([{ app: 'api', reason: SHARED }]);
+      expect(s.unedited).toEqual([{ app: 'api', reason: ANCHORED }]);
       expect(s.text).toBe(
         text.replace('    port: 3000\n', '    ports: [3000, 3001]\n')
       );
@@ -572,7 +572,7 @@ ${alias}
     const text = anchored('    ports: [&a 3310]', '    port: *a');
     const s = spliceManifest(text, adopt);
     expect(s.edited).toEqual(['web']);
-    expect(s.unedited).toEqual([{ app: 'api', reason: SHARED }]);
+    expect(s.unedited).toEqual([{ app: 'api', reason: ANCHORED }]);
     expect(portsOf(parse(s.text))).toEqual({
       api: [3310],
       tool: [3310],
@@ -593,7 +593,7 @@ apps:
     expect(s).toEqual({
       text,
       edited: [],
-      unedited: [{ app: 'api', reason: SHARED }],
+      unedited: [{ app: 'api', reason: ANCHORED }],
     });
   });
   it('when the alias holder is adopted too, its alias is replaced by its own list and both are edited', () => {
@@ -608,6 +608,82 @@ apps:
       api: [3310, 3312],
       tool: [3310, 3400],
       web: [3000],
+    });
+  });
+  it('an anchored port key is left alone: renaming it to ports would change what its alias reads', () => {
+    const text = `version: 1
+apps:
+  api:
+    description: api
+    run: x
+    &field port: 3000
+    env: { FIELD: *field }
+  web:
+    description: web
+    run: w
+    port: 3100
+`;
+    expect(parse(text).apps.api.env).toEqual({ FIELD: 'port' });
+    const s = spliceManifest(text, [
+      { app: 'api', host: 'local', ports: [3001] },
+      { app: 'web', host: 'local', ports: [3101] },
+    ]);
+    expect(s.edited).toEqual(['web']);
+    expect(s.unedited).toEqual([{ app: 'api', reason: ANCHORED }]);
+    expect(s.text).toBe(
+      text.replace('    port: 3100\n', '    ports: [3100, 3101]\n')
+    );
+    expect(parse(s.text).apps.api.env).toEqual({ FIELD: 'port' });
+  });
+  // an alias above the new line still reads the first anchor, so only the copied `&k` itself would show; one below it
+  // would read the new key
+  for (const [where, text, last, whatOf] of [
+    [
+      'in the same app, above the new line',
+      'version: 1\napps:\n  api:\n    &k !!str description: api\n    run: x\n    env: { WHAT: *k }\n',
+      '    env: { WHAT: *k }\n',
+      (m: ReturnType<typeof parse>) => m.apps.api.env.WHAT,
+    ],
+    [
+      'in a later app',
+      'version: 1\napps:\n  api:\n    &k !!str description: api\n    run: x\n  web:\n    description: w\n    run: w\n    env: { WHAT: *k }\n',
+      '    run: x\n',
+      (m: ReturnType<typeof parse>) => m.apps.web.env.WHAT,
+    ],
+  ] as const)
+    it(`a new port field copies no anchor or tag from the app's first key: an alias ${where} keeps its value`, () => {
+      expect(whatOf(parse(text))).toBe('description');
+      const s = spliceManifest(text, [
+        { app: 'api', host: 'local', ports: [3000] },
+      ]);
+      expect(s).toEqual({
+        text: text.replace(last, `${last}    port: 3000\n`),
+        edited: ['api'],
+        unedited: [],
+      });
+      expect(s.text).not.toContain('&k !!str port');
+      expect(parse(s.text).apps.api.ports).toEqual([3000]);
+      expect(whatOf(parse(s.text))).toBe('description');
+    });
+  it('an edit that would change a value of any other field through an anchor is left alone, free-form fields included', () => {
+    const text = `version: 1
+apps:
+  api:
+    description: api
+    run: x
+    port: &p 3000
+  spare:
+    description: spare
+    run: y
+    pm2: { max_restarts: *p }
+`;
+    const s = spliceManifest(text, [
+      { app: 'api', host: 'local', ports: [3001] },
+    ]);
+    expect(s).toEqual({
+      text,
+      edited: [],
+      unedited: [{ app: 'api', reason: ANCHORED }],
     });
   });
 });
@@ -970,7 +1046,7 @@ apps:
           app: 'web',
           host: 'local',
           ports: [3001],
-          reason: 'shares its ports through a YAML anchor',
+          reason: 'its edit would change another value through a YAML anchor',
         },
       ],
     });
@@ -983,9 +1059,9 @@ apps:
       tool: [7000],
     });
   });
-  it('a splice the loader would refuse is not written: MANIFEST_INVALID with the reason', async () => {
+  it('an app whose port another field reads through an anchor is skipped with the reason; nothing is written', async () => {
     // spare reads web's port through an anchor in a field that is not a port: writing web's ports into the anchored
-    // node keeps every app's ports right, but turns spare's watch_delay into a list
+    // node keeps every app's ports right, but would turn spare's watch_delay into a list
     const text = `version: 1
 project: fx
 apps:
@@ -999,11 +1075,20 @@ apps:
     watch_delay: *p
 `;
     const { dir, file } = project(text);
-    const err = await adoptPorts(fakeFleet(dir).fleet).catch((e) => e);
-    expect(err).toMatchObject({ code: 'MANIFEST_INVALID' });
-    expect(err.message).toBe(
-      `adopting the ports would make ${file} invalid, so nothing was written: apps.spare.watch_delay: Expected number, received array`
-    );
+    const r = await adoptPorts(fakeFleet(dir).fleet);
+    expect(r).toMatchObject({
+      written: false,
+      adopted: [],
+      skipped: [
+        {
+          app: 'web',
+          host: 'local',
+          ports: [3001],
+          reason: 'its edit would change another value through a YAML anchor',
+        },
+      ],
+      diff: [],
+    });
     expect(fs.readFileSync(file, 'utf8')).toBe(text);
   });
   it('with --host box only the apps that run there are probed and adopted', async () => {
