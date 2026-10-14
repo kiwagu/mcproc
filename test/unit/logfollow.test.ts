@@ -11,6 +11,8 @@ import {
   readChunk,
   sortByStamp,
 } from '../../src/core/logfollow.js';
+import { parseRead, readSnippet } from '../../src/core/incidents/cursor.js';
+import { sinceMark } from '../../src/core/logsince.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -476,6 +478,25 @@ describe('the local host reads its logs in-process', () => {
       expect(ctx.fake.calls).toHaveLength(1);
     }
   );
+  it('a since read that ended mid-line hands its follower an anchor at the offset: a file replaced before the first poll is read from its start', async () => {
+    const files = tmp();
+    try {
+      fs.writeFileSync(files.out, 'old\npartial');
+      fs.writeFileSync(files.err, '');
+      const read = execFileSync('sh', ['-c', readSnippet(0, files.out, null)], {
+        encoding: 'utf8',
+      });
+      const mark = sinceMark(files.out, parseRead(read, 0, null)!); // the mark readSince keeps
+      const f = new LogFollower(fakeCtx(basic, 'local', []), files, 0, true);
+      f.seek({ out: mark });
+      fs.writeFileSync(files.out, 'new1\nnew2\n'); // rotated or flushed, already past the offset
+      const got = await f.poll();
+      expect(got.reset).toBe(true);
+      expect(got.lines.map((l) => l.text)).toEqual(['new1', 'new2']);
+    } finally {
+      fs.rmSync(path.dirname(files.out), { recursive: true, force: true });
+    }
+  });
   it('a host reached over ssh or docker keeps the shell read', async () => {
     const ctx = fakeCtx(basic, 'local', [
       {

@@ -512,6 +512,30 @@ describe('readSince', () => {
     });
     expect(a.lines.map((l) => l.text)).toEqual([`${S(50)}fresh`]);
   });
+  it('a read that ends mid-line marks the last complete line with the anchor of the bytes before it; a replaced file is still seen', async () => {
+    const st = state();
+    const done = `${S(35)}done\n`;
+    st.files['/l/watch-out'] = `${done}${S(36)}half`;
+    const { fleet } = fakeHosts(st);
+    const marks = new LogMarks();
+    await readSince(fleet, ['watch'], { since: parseSince('10s'), marks });
+    const n = Buffer.byteLength(done);
+    expect(
+      marks.get(LogMarks.key(fleet.manifest.path, 'local', 'watch'))?.out
+    ).toEqual({
+      path: '/l/watch-out',
+      offset: n,
+      at: n,
+      anchor: Buffer.from(done).subarray(-16).toString('hex'),
+    });
+    const fresh = [`${S(50)}fresh one`, `${S(51)}fresh two`];
+    st.files['/l/watch-out'] = fresh.map((l) => `${l}\n`).join(''); // replaced, longer than the mark
+    const a = await readSince(fleet, ['watch'], {
+      since: parseSince('last'),
+      marks,
+    });
+    expect(a.lines.map((l) => l.text)).toEqual(fresh);
+  });
   it('every merged read moves the marks, a relative read included', async () => {
     const st = state();
     const { fleet } = fakeHosts(st);

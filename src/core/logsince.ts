@@ -5,6 +5,7 @@ import {
   parseRead,
   type FileMark,
   type Anchor,
+  type FileRead,
 } from './incidents/cursor.js';
 import { findProcess } from './pm2.js';
 import type { Fleet, HostError } from './fleet.js';
@@ -215,6 +216,15 @@ export class LogMarks {
     this.m.set(key, e);
   }
 }
+/**
+ * Where the next read of a file goes on after this one: the end of its last complete line, with the anchor of the
+ * bytes before it (taken at that offset, so a follower that continues there can tell a replaced file from a grown one).
+ */
+export const sinceMark = (path: string, r: FileRead): FileMark => ({
+  path,
+  offset: r.nextOffset,
+  ...(r.nextAnchor ? { at: r.nextAnchor.at, anchor: r.nextAnchor.hex } : {}),
+});
 export const MAX_MERGED_LINES = 2000;
 export interface SinceOptions {
   since: SinceSpec;
@@ -370,12 +380,7 @@ export async function readSince(
               time: k.time,
               text: k.text,
             });
-          if (opts.marks)
-            opts.marks.set(f.key, f.stream, {
-              path: f.path,
-              offset: r.nextOffset,
-              ...(r.anchor ? { at: r.anchor.at, anchor: r.anchor.hex } : {}),
-            });
+          if (opts.marks) opts.marks.set(f.key, f.stream, sinceMark(f.path, r));
         });
         return { host: g.host, cutoff, offset, lines, skipped, notStarted };
       } catch (e) {

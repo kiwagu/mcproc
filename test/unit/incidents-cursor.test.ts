@@ -135,6 +135,43 @@ describe('read snippet + parseRead', () => {
   it('an empty or missing file is no lines and no error', () => {
     expect(read('', 0)).toMatchObject({ lines: [], nextOffset: 0 });
   });
+  const hexOf = (b: string | Buffer) => Buffer.from(b).toString('hex');
+  it('a read that ends mid-line anchors its next offset: the 16 bytes before the last complete line, fewer near the start', () => {
+    const r = read('old\npartial', null);
+    expect(r.nextOffset).toBe(4);
+    expect(r.nextAnchor).toEqual({ at: 4, hex: hexOf('old\n') });
+    expect(r.anchor).toEqual({ at: 11, hex: hexOf('old\npartial') }); // the anchor at the size stays as it was
+    const long = `${'x'.repeat(40)}\n${'y'.repeat(30)}\nhalf`;
+    expect(read(long, null).nextAnchor).toEqual({
+      at: 72,
+      hex: hexOf(long.slice(56, 72)),
+    });
+  });
+  it('a read that ends with a newline: the next anchor is the anchor', () => {
+    const r = read('one\ntwo\n', null);
+    expect(r.nextAnchor).toEqual({ at: 8, hex: hexOf('one\ntwo\n') });
+    expect(r.nextAnchor).toEqual(r.anchor);
+  });
+  it('an invalid UTF-8 byte among the bytes before the next offset gives no next anchor: decoded, its length is lost', () => {
+    const bad = Buffer.concat([
+      Buffer.from('line\nab'),
+      Buffer.from([0xff]),
+      Buffer.from('cd\npart'),
+    ]);
+    const r = read(bad, null);
+    expect(r.nextOffset).toBe(11);
+    expect(r.nextAnchor).toBeNull();
+  });
+  it('a character cut by the context start (decoded as U+FFFD) does not shift the bytes before the next offset', () => {
+    const old = `${'é'.repeat(3000)}\nlast old!\n`; // 6011 bytes: the context starts at 1915, inside an é
+    const content = Buffer.from(`${old}new\nhal`);
+    const r = read(content, Buffer.byteLength(old));
+    expect(r.nextOffset).toBe(6015);
+    expect(r.nextAnchor).toEqual({
+      at: 6015,
+      hex: hexOf(content.subarray(5999, 6015)),
+    });
+  });
 });
 
 describe('windowStart', () => {
