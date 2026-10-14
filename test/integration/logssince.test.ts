@@ -35,15 +35,34 @@ function killDaemon(home: string) {
   });
 }
 
-/** The counters of each app in the order they were printed (`a | <stamp>: tick 7`). */
+/** One printed line (`a | <stamp>: tick 7`): its app, pm2 stamp and counter; null when it is not one of ours. */
+function parse(l: string): { app: 'a' | 'b'; time: string; n: number } | null {
+  const m = /^([ab]) \| (\S+): (tick|tock) (\d+)$/.exec(l);
+  const app = m?.[1] as 'a' | 'b' | undefined;
+  return m && app && WORD[app] === m[3]
+    ? { app, time: m[2], n: Number(m[4]) }
+    : null;
+}
+/** The counters of each app in the order they were printed. */
 function counters(lines: string[]): Record<'a' | 'b', number[]> {
   const seen = { a: [] as number[], b: [] as number[] };
   for (const l of lines) {
-    const m = /^([ab]) \| \S+: (tick|tock) (\d+)$/.exec(l);
-    if (m && WORD[m[1] as 'a' | 'b'] === m[2])
-      seen[m[1] as 'a' | 'b'].push(Number(m[3]));
+    const x = parse(l);
+    if (x) seen[x.app].push(x.n);
   }
   return seen;
+}
+/** Lines of the since answer as the CLI prints them, for `counters`. */
+const printed = (lines: SinceLine[]) =>
+  lines.map((l) => `${l.app} | ${l.text}`);
+/** This machine's wall clock at `ms` in pm2's stamp shape (the apps run here, so their stamps use the same clock). */
+const stampAt = (ms: number) =>
+  new Date(ms - new Date(ms).getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 23);
+async function until(cond: () => boolean, ms: number): Promise<void> {
+  const t0 = Date.now();
+  while (!cond() && Date.now() - t0 < ms) await sleep(50);
 }
 const consecutive = (ns: number[]) =>
   ns.every((n, i) => i === 0 || n === ns[i - 1] + 1);
@@ -73,10 +92,11 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
     child.stderr!.on('data', (d) => {
       err += String(d);
     });
-    const exited = new Promise<number | null>((resolve) =>
-      child.on('exit', (code) => resolve(code))
+    // 'close', not 'exit': stdio may still deliver data after the process exited
+    const closed = new Promise<number | null>((resolve) =>
+      child.on('close', (code) => resolve(code))
     );
-    return { child, exited, stderr: () => err };
+    return { child, closed, stderr: () => err };
   };
   beforeAll(async () => {
     base = fs.mkdtempSync('/tmp/mcproc-ls-'); // short: unix socket paths are capped at 108 bytes
@@ -144,6 +164,12 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
     }
     for (let i = 1; i < r.lines.length; i++)
       expect(r.lines[i].time! >= r.lines[i - 1].time!).toBe(true);
+    // inside the window nothing is lost or repeated: each app's counters run on
+    const seen = counters(printed(r.lines));
+    for (const app of ['a', 'b'] as const)
+      expect(consecutive(seen[app]), `${app}: ${seen[app].join(' ')}`).toBe(
+        true
+      );
   });
 
   it('since last: the second call returns only what came after the first, nothing repeated or lost', async () => {
@@ -168,11 +194,7 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
         expect(l.time! > top, `${l.time} <= ${top}`).toBe(true);
       expect(after.filter((l) => seen.has(l.text))).toEqual([]);
       // the counters run on across the two calls without a gap
-      const ns = counters(
-        [...first.lines, ...second.lines]
-          .filter((l) => l.app === app)
-          .map((l) => `${l.app} | ${l.text}`)
-      )[app];
+      const ns = counters(printed([...first.lines, ...second.lines]))[app];
       expect(consecutive(ns), ns.join(' ')).toBe(true);
     }
   });
@@ -204,7 +226,8 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
     expect(seen.b.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('CLI -f --since follows from exactly where the since read ended: every counter once, in order, then exits 0 on SIGINT', async () => {
+  it('CLI -f --since reads the window, then follows from exactly where that read ended: every counter once, in order, and exits 0 on SIGINT', async () => {
+    const spawned = Date.now();
     const p = run([
       'logs',
       'pair',
@@ -216,19 +239,40 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
       '200',
     ]);
     let out = '';
+    let firstAt: number | null = null;
     p.child.stdout!.on('data', (d) => {
+      firstAt ??= Date.now();
       out += String(d);
     });
-    await sleep(2500);
+    // the since read ended before its first line reached us, and its window ends at most ~1 s after the spawn: a line
+    // stamped 2.5 s after the spawn and 1 s after that first output can only have come through the follow
+    const followed = () => {
+      if (firstAt === null) return false;
+      const late = stampAt(Math.max(spawned + 2500, firstAt + 1000));
+      const got = out.split('\n').map(parse);
+      return (['a', 'b'] as const).every((app) =>
+        got.some((x) => x?.app === app && x.time >= late)
+      );
+    };
+    const ended = () =>
+      p.child.exitCode !== null || p.child.signalCode !== null;
+    await until(() => followed() || ended(), 15_000);
+    expect(ended(), 'the CLI ended instead of following').toBe(false);
+    expect(
+      followed(),
+      `no line from the follow for both apps within 15 s:\n${out}`
+    ).toBe(true);
+    // still running here, so the SIGINT reaches the follow's handler, which ends the command
     p.child.kill('SIGINT');
     const code = await Promise.race([
-      p.exited,
+      p.closed,
       sleep(10_000).then(() => 'hung'),
     ]);
     expect(code).toBe(0);
     expect(p.stderr()).toBe('');
     const lines = out.split('\n').filter(Boolean);
     for (const l of lines) expect(l).toMatch(/^[ab] \| /);
+    // the since part and the follow part together: no counter twice, none skipped at the seam
     const seen = counters(lines);
     for (const app of ['a', 'b'] as const) {
       expect(seen[app].length, app).toBeGreaterThanOrEqual(5);
@@ -236,13 +280,13 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
         true
       );
     }
-  }, 20_000);
+  }, 30_000);
 
   it('CLI --since to a reader that closes the pipe at once ends quietly with exit 0', async () => {
     const p = run(['logs', 'pair', '--since', '5s']);
     p.child.stdout!.destroy(); // the first write meets a closed pipe
     const code = await Promise.race([
-      p.exited,
+      p.closed,
       sleep(10_000).then(() => 'hung'),
     ]);
     expect(code).toBe(0);

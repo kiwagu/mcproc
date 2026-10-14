@@ -32,7 +32,7 @@ $EDITOR .mcproc/mcproc.yaml   # uncomment the apps you need, write a description
 mcproc start base    # or an app name, or "all"
 mcproc ls            # status, pid, uptime and real vs declared ports
 mcproc logs api -n 200
-mcproc logs stack --since 2m   # every app of a profile, merged by time stamp
+mcproc logs base --since 2m    # every app of a profile, merged by time stamp
 mcproc doctor        # why a host cannot be driven, and what to do
 ```
 
@@ -194,14 +194,14 @@ restarts the apps that are already online the same way.
 
 After a restart, "what happened since" is one call over a profile instead of a tail per app. The MCP `logs` tool takes
 `targets` (apps, profiles or `all`) and `since`: a span (`90s`, `2m`, `2h`, at most 24 h), a time
-(`2026-10-14T07:30[:00[.000]]`), or `last`, everything since your previous `logs` call in this MCP session (a first
-call gives the last 100 lines of each log file). A time without a zone is the host's local time; with `Z` or `+02:00`
-it is converted with each host's own zone. Lines are picked and ordered by pm2's stamps, so across hosts whose clocks
-differ the order is only as good as those clocks. Each file is read at most 1 MB back: when the window reaches
-further, `skipped` names the bytes not read. `lines` caps the merged answer (the most recent kept) and `truncated`
-counts what was dropped; `targets` without `since` gives the latest `lines` (default 100) across the apps. On the
-command line, `mcproc logs stack --since 2m` prints the merged lines and exits, and `-f --since 2m` then follows from
-exactly where that read ended. `last` needs the session that keeps the marks, so the CLI refuses it.
+(`2026-10-14T07:30[:00[.000]]`), or `last`, everything since your previous `logs` call over those apps in this MCP
+session (a first call gives the last 100 lines of each log file). A time without a zone is the host's local time; with
+`Z` or `+02:00` it is converted with each host's own zone. Lines are picked and ordered by pm2's stamps, so across
+hosts whose clocks differ the order is only as good as those clocks. Each file is read at most 1 MB back: when the
+window reaches further, `skipped` names the bytes not read. `lines` caps the merged answer (the most recent kept) and
+`truncated` counts what was dropped; `targets` without `since` gives the latest `lines` (default 100) across the apps.
+On the command line, `mcproc logs base --since 2m` prints the merged lines and exits, and `-f --since 2m` then follows
+from exactly where that read ended. `last` needs the session that keeps the marks, so the CLI refuses it.
 
 ## Tools (MCP) and commands (CLI)
 
