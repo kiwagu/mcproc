@@ -3,6 +3,7 @@ import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
 import { hex16 } from '../shell/snippets.js';
+import type { FileMark } from './incidents/cursor.js';
 import { open, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { dirWatchers } from './logwatch.js';
@@ -227,6 +228,24 @@ export class LogFollower {
     this.stream?.remove(this);
     this.stream = null;
     this.wake = null;
+  }
+
+  /**
+   * Continue after marks a one-shot read returned (the end of what it read, with the anchor of the bytes before it): the
+   * next poll reads only what came after them, and a file replaced since is detected through the anchor and read from
+   * its start. A mark of another path is ignored; an anchor taken elsewhere than at the offset is dropped.
+   */
+  seek(marks: { out?: FileMark; err?: FileMark }): void {
+    for (const s of ['out', 'err'] as const) {
+      const m = marks[s];
+      if (!m || m.path !== this.paths[s]) continue;
+      this.offsets[s] = m.offset;
+      this.anchors[s] =
+        m.anchor !== undefined && m.at === m.offset && HEX.test(m.anchor)
+          ? m.anchor
+          : null;
+      this.pending[s] = '';
+    }
   }
 
   /** where each file is followed from, for the host stream */

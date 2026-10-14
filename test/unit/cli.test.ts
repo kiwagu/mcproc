@@ -127,6 +127,23 @@ describe('cli', () => {
     );
     expect(c2.err[0]).toMatch(/TRANSPORT_FAILED|PM2_NOT_FOUND/); // a real target reaches the (unreachable) host: the command shape is accepted
   });
+  it('logs --since refuses a bad time, last, and -n together, before contacting a host', async () => {
+    for (const [argv, needle] of [
+      [
+        ['logs', '--since', 'yesterday', '--project', basic],
+        'since is a span like',
+      ],
+      [['logs', '--since', 'last', '--project', basic], 'MCP session'],
+      [['logs', '-n', '5', '--since', '2m', '--project', basic], '-n'],
+    ] as const) {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(argv, { from: 'user' });
+      expect(c.err[0]).toContain('BAD_ARGUMENT');
+      expect(c.err.join('\n')).toContain(needle);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    }
+  });
   it('monit --once reports MANIFEST_NOT_FOUND cleanly outside a project', async () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(

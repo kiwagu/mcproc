@@ -18,8 +18,17 @@ import {
   streamLogs,
   defaultStreamDeps,
   resolveColor,
+  formatLine,
+  colorFor,
   type LogSource,
+  type StreamOptions,
 } from '../core/logstream.js';
+import {
+  parseSince,
+  readSince,
+  LogMarks,
+  type SinceSpec,
+} from '../core/logsince.js';
 import { doctor } from '../core/doctor.js';
 import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
@@ -42,6 +51,7 @@ import {
   renderMutation,
   renderWait,
   hostsOf,
+  sinceNotes,
 } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
@@ -201,11 +211,74 @@ export function buildProgram(io: Io = defaultIo): Command {
       '--no-color',
       'plain text (also when NO_COLOR is set or stdout is not a terminal)'
     )
+    .option(
+      '--since <time>',
+      'lines since a span (2m, 90s) or a host-local time (2026-10-14T07:30; add Z or +02:00 for an instant), merged across the targets; prints and exits, with -f then follows'
+    )
     .action(
       wrap(async (g, o, args) => {
         const targets = (args[0] as unknown as string[] | undefined) ?? [];
         const fleet = fleetOf(g);
         const apps = fleet.select(targets.length ? targets : ['all']);
+        const color = resolveColor(
+          o.color as boolean | undefined,
+          process.env,
+          Boolean(process.stdout.isTTY)
+        );
+        const stream = o.out ? 'out' : o.err ? 'err' : 'both';
+        let history = Math.min(Math.max(1, Number(o.lines) || 100), 2000);
+        let startAt: StreamOptions['startAt'];
+        if (o.since !== undefined) {
+          if (o.lines !== undefined)
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              '-n and --since do not combine: --since decides what is printed first',
+              {
+                hint: 'Drop -n; with -f the follow continues from where the since read ended.',
+              }
+            );
+          const since: SinceSpec = parseSince(String(o.since));
+          if (since.kind === 'last')
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              'since last needs an MCP session, which keeps the marks',
+              {
+                hint: 'Use a time such as --since 2m, or --since 2026-10-14T07:30.',
+              }
+            );
+          const marks = new LogMarks();
+          const a = await readSince(fleet, apps, {
+            since,
+            stream,
+            marks,
+            keepColors: color && !g.json,
+          });
+          // labels and colors as the follow gives them: the longest name, each app's index in host-group order
+          const order = fleet.groups(apps).flatMap((gr) => gr.apps);
+          const width = Math.max(...apps.map((x) => x.length));
+          for (const l of a.lines)
+            io.out(
+              g.json
+                ? JSON.stringify(l)
+                : formatLine(
+                    { app: l.app, stream: l.stream, text: l.text },
+                    width,
+                    color ? colorFor(order.indexOf(l.app)) : null
+                  )
+            );
+          for (const n of sinceNotes(a)) io.err(n);
+          if (a.errors.length) process.exitCode = 1; // a host was not read: the lines of the others are printed, the exit code says so
+          if (!o.follow) return;
+          history = 0;
+          startAt = Object.fromEntries(
+            apps.map((x) => [
+              x,
+              marks.get(
+                LogMarks.key(fleet.manifest.path, fleet.hostOf(x), x)
+              ) ?? {},
+            ])
+          );
+        }
         // every host at once; one that cannot be reached becomes a note per app instead of ending the stream, and is
         // connected again later while following (fleet.ctx keeps no failed connection)
         const sources = await Promise.all(
@@ -231,17 +304,14 @@ export function buildProgram(io: Io = defaultIo): Command {
           await streamLogs(
             sources,
             {
-              lines: Math.min(Math.max(1, Number(o.lines) || 100), 2000),
+              lines: history,
               follow: Boolean(o.follow),
               intervalMs: Math.max(200, Number(o.interval) || 1000),
-              color: resolveColor(
-                o.color as boolean | undefined,
-                process.env,
-                Boolean(process.stdout.isTTY)
-              ),
+              color,
               json: Boolean(g.json),
-              stream: o.out ? 'out' : o.err ? 'err' : 'both',
+              stream,
               signal: ac.signal,
+              startAt,
             },
             defaultStreamDeps()
           );

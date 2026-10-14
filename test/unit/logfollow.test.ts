@@ -282,6 +282,35 @@ describe('LogFollower', () => {
       { stream: 'out', text: 'next' },
     ]);
   });
+  it('seek continues exactly at the given offset: the next poll asks from there and returns only what follows', async () => {
+    const ctx = scripted([
+      resp({ size: 26, body: 'new-1\n', start: 20 }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    f.seek({
+      out: { path: paths.out, offset: 20, at: 20, anchor: 'ab'.repeat(16) },
+    });
+    expect(f.offsets.out).toBe(20);
+    const got = await f.poll();
+    expect(got.lines.map((l) => l.text)).toEqual(['new-1']);
+    expect(ctx.fake.calls[0].cmd).toContain('st=20'); // a positional read from the seeked offset, not history
+    expect(ctx.fake.calls[0].cmd).toContain(`'${'ab'.repeat(16)}'`); // with the anchor, so a replaced file is detected
+    expect(f.offsets.out).toBe(26);
+  });
+  it('seek ignores a mark of another path and an anchor that is not at the offset', async () => {
+    const ctx = scripted([
+      resp({ size: 6, body: 'a\n', history: true, start: 4 }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    f.seek({
+      out: { path: '/elsewhere', offset: 20 },
+      err: { path: paths.err, offset: 7, at: 9, anchor: 'cd'.repeat(16) },
+    });
+    expect(f.offsets.out).toBeNull();
+    expect(f.offsets.err).toBe(7);
+    await f.poll();
+    expect(ctx.fake.calls[0].cmd).not.toContain('cd'.repeat(16)); // the anchor is for byte 9, the read starts at 7: dropped
+  });
   it('sortByStamp orders by the pm2 timestamp prefix and keeps unstamped lines in place', () => {
     const s = sortByStamp([
       { stream: 'err', text: '2026-10-11T13:00:08: boom' },
