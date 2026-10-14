@@ -11,11 +11,10 @@ import type { Fleet, HostApps } from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
 import type { LogLine } from '../core/logfollow.js';
 import type { Cleared } from '../core/incidents/store.js';
-import type { ReloadSettings } from '../core/manifest.js';
 import {
   compileReloadRules,
-  detectReloads,
-  reach,
+  historyReaches,
+  reloadCount,
   reloadStamp,
   ReloadTracker,
 } from '../core/reloads.js';
@@ -68,51 +67,6 @@ export interface LoopDeps {
 }
 
 export { describeError };
-
-/**
- * How far a follower's lines reach back toward the app's start, stream by stream, as ls --reloads judges its reads: a
- * follower does not say where in the file its history began, so each stream is judged by its lines alone. The first
- * `listening`-only burst may be the boot when a stream reaches the start; the count is partial when one does not.
- */
-export function historyReach(
-  lines: LogLine[],
-  started: string
-): { coversStart: boolean; partial: boolean } {
-  const reaches = (['out', 'err'] as const).map((s) =>
-    reach(
-      lines.filter((l) => l.stream === s).map((l) => l.text),
-      started
-    )
-  );
-  return {
-    coversStart: reaches.includes('start'),
-    partial: reaches.includes('after'),
-  };
-}
-
-/**
- * The reloads in a history read once (monit --once): null when the app turned them off or its start is not known. An
- * app's own patterns that run away throw TIMEOUT.
- */
-export function historyReloads(
-  settings: ReloadSettings | null,
-  row: LsRow,
-  lines: LogLine[]
-): ReloadInfo | null {
-  if (!settings || row.started === null) return null;
-  const { coversStart, partial } = historyReach(lines, row.started);
-  const found = detectReloads(lines, compileReloadRules(settings), {
-    app: row.app,
-    start: row.started,
-    coversStart,
-  });
-  const last = found.at(-1);
-  return {
-    count: found.length,
-    last: last ? reloadStamp(last) : null,
-    partial,
-  };
-}
 
 /** One followed app's reloads since its pm2 start: the run it counts (its start and restarts) and the count so far. */
 interface Counter {
@@ -249,6 +203,7 @@ export class MonitLoop {
         const r = await e.f.poll();
         if (gen !== this.gen) return; // the view moved on during the poll
         if (this.epochs.get(app) !== epoch) continue; // cleared during the read: these lines are from before the clear
+        const before = this.getState().logs[app] ?? [];
         this.dispatch({
           type: 'logs',
           app,
@@ -256,7 +211,7 @@ export class MonitLoop {
           reset: r.reset,
           paths,
         });
-        this.track(app, r.lines);
+        this.track(app, r.lines, before);
       }
       this.syncWatches();
     } catch (e) {
@@ -352,6 +307,7 @@ export class MonitLoop {
           this.epochs.get(app) !== epoch
         )
           continue;
+        const before = this.getState().logs[app] ?? [];
         if (r.lines.length || r.reset)
           this.dispatch({
             type: 'logs',
@@ -360,7 +316,7 @@ export class MonitLoop {
             reset: r.reset,
             paths: e.paths,
           });
-        this.track(app, r.lines);
+        this.track(app, r.lines, before);
       }
     } finally {
       q.running = false;
@@ -369,50 +325,57 @@ export class MonitLoop {
   }
 
   /**
-   * Counts the reloads in a followed app's new lines, which were dispatched just before (its buffer holds them), and
-   * closes a burst that went quiet. The first look at a run, the app's first poll or the first after pm2 restarted it,
-   * starts a tracker over all the screen holds of the app's log: a new run's boot that a wake delivered before the rows
-   * told of the restart is still taken for the boot. After a restart the count starts at 0 and is exact (the new run is
-   * followed from its start); a first look is judged by how far the history reaches back.
+   * Counts the reloads in a followed app's new lines and closes a burst that went quiet. The first look at a run (the
+   * app's first poll, or the first after pm2 started it again) starts a tracker over what the screen buffered of the
+   * app's log before this poll, then every line of this poll: a new run's boot that a wake delivered before the rows told
+   * of the restart is still taken for the boot, and a catch-up poll longer than the buffer loses nothing. After a
+   * restart the count starts at 0 and is exact (the new run is followed from its start); a first look is judged by how
+   * far those lines reach back.
    */
-  private track(app: string, lines: LogLine[]): void {
+  private track(app: string, lines: LogLine[], before: LogLine[]): void {
     const settings = this.fleet.manifest.apps[app]?.reloads;
     const row = this.latest.get(app);
     if (!settings || !row || this.uncounted.has(app)) return;
-    let c = this.counters.get(app);
-    let input = lines;
+    const prev = this.counters.get(app);
     const { started, restarts } = row;
-    const fresh =
-      started !== null &&
-      (!c || c.started !== started || c.restarts !== restarts);
-    if (fresh) {
-      input = this.getState().logs[app] ?? [];
-      const { coversStart, partial } = c
-        ? { coversStart: true, partial: false }
-        : historyReach(input, started);
-      c = {
-        tracker: new ReloadTracker(
-          compileReloadRules(settings, this.opts.budgetMs),
-          { app, start: started, coversStart }
-        ),
-        started,
-        restarts,
-        info: { count: 0, last: null, partial },
-      };
-      this.counters.set(app, c);
-    }
-    if (!c) return;
     const now = Date.now();
     try {
-      const found = [...c.tracker.push(input, now), ...c.tracker.idle(now)];
+      if (
+        started !== null &&
+        (!prev || prev.started !== started || prev.restarts !== restarts)
+      ) {
+        const input = [...before, ...lines];
+        const rules = compileReloadRules(settings, this.opts.budgetMs);
+        let tracker = null as ReloadTracker | null;
+        const info = reloadCount(
+          prev ? ['start'] : historyReaches(input, started),
+          (coversStart) => {
+            tracker = new ReloadTracker(rules, {
+              app,
+              start: started,
+              coversStart,
+            });
+            return [...tracker.push(input, now), ...tracker.idle(now)];
+          }
+        );
+        if (!tracker) return;
+        this.counters.set(app, { tracker, started, restarts, info });
+        this.dispatch({ type: 'reloads', app, info });
+        return;
+      }
+      if (!prev) return;
+      const found = [
+        ...prev.tracker.push(lines, now),
+        ...prev.tracker.idle(now),
+      ];
       const last = found.at(-1);
-      if (last)
-        c.info = {
-          ...c.info,
-          count: c.info.count + found.length,
-          last: reloadStamp(last),
-        };
-      if (last || fresh) this.dispatch({ type: 'reloads', app, info: c.info });
+      if (!last) return;
+      prev.info = {
+        ...prev.info,
+        count: prev.info.count + found.length,
+        last: reloadStamp(last),
+      };
+      this.dispatch({ type: 'reloads', app, info: prev.info });
     } catch (e) {
       if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
       // its own patterns ran away: this app goes without a count, its logs and the other apps' counts go on

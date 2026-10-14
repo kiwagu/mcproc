@@ -161,6 +161,61 @@ export function reach(
 export const reloadStamp = (r: Reload): string | null =>
   stampOf(r.line) ?? r.time;
 
+/** An app's reloads since its process start: how many, the last one's stamp, and whether the count is only a lower bound. */
+export interface ReloadCount {
+  count: number;
+  last: string | null;
+  partial: boolean;
+}
+
+/**
+ * The count ls and monit report for lines read back toward a process start, from how far each stream's lines reach:
+ * the first `listening`-only burst may be the boot when one stream reaches the start, and the count is partial (a
+ * lower bound) when one does not. `detect` finds the reloads, told whether the lines cover the start.
+ */
+export function reloadCount(
+  reaches: Reach[],
+  detect: (coversStart: boolean) => Reload[]
+): ReloadCount {
+  const found = detect(reaches.includes('start'));
+  const last = found.at(-1);
+  return {
+    count: found.length,
+    last: last ? reloadStamp(last) : null,
+    partial: reaches.includes('after'),
+  };
+}
+
+/** How far a log follower's lines reach, stream by stream: a follower does not say where in the file its history began. */
+export const historyReaches = (
+  input: ReloadInput[],
+  started: string
+): Reach[] =>
+  (['out', 'err'] as const).map((s) =>
+    reach(
+      input.filter((l) => l.stream === s).map((l) => l.text),
+      started
+    )
+  );
+
+/**
+ * The reloads in a history read once (monit --once): null when the app turned them off or its start is not known. An
+ * app's own patterns that run longer than `budgetMs` (default MATCH_BUDGET_MS) throw TIMEOUT.
+ */
+export function historyReloads(
+  input: ReloadInput[],
+  settings: ReloadSettings | null,
+  run: { app: string; started: string | null },
+  budgetMs?: number
+): ReloadCount | null {
+  const start = run.started;
+  if (!settings || start === null) return null;
+  const rules = compileReloadRules(settings, budgetMs);
+  return reloadCount(historyReaches(input, start), (coversStart) =>
+    detectReloads(input, rules, { app: run.app, start, coversStart })
+  );
+}
+
 /**
  * Each line's time: its stamp in milliseconds, or the previous stamp of its own stream (`last` carries it across
  * calls). With a start, lines before it and lines that cannot be placed are dropped. The rest are ordered by time,

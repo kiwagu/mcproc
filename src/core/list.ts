@@ -22,6 +22,7 @@ import {
 import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
+import type { ReloadCount } from './reloads.js';
 import { MARK, probeScript } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -55,7 +56,7 @@ export interface LsRow {
    * started it, the last one's stamp as its log wrote it, and partial when the logs read did not reach back to the start
    * (the count is then a lower bound)
    */
-  reloads?: { count: number; last: string | null; partial: boolean };
+  reloads?: ReloadCount;
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
 }

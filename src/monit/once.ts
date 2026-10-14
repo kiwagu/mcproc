@@ -3,8 +3,9 @@ import { describeError, isMcprocError } from '../core/errors.js';
 import { Fleet, listFleet } from '../core/fleet.js';
 import type { Manifest } from '../core/manifest.js';
 import { findProcess } from '../core/pm2.js';
-import { createFollower } from '../core/logfollow.js';
-import { historyReloads, type LoopDeps } from './loop.js';
+import { createFollower, type LogLine } from '../core/logfollow.js';
+import { historyReloads } from '../core/reloads.js';
+import type { Context } from '../core/resolve.js';
 import {
   appInfos,
   initialState,
@@ -18,7 +19,7 @@ import { frameToText, renderFrame } from './frame.js';
 /**
  * One frame of the monit surface as plain text: the same renderer the interactive screen uses, the same view it opens
  * on, with the selected app's reloads counted from the history it reads. `deps` stand in for the project's manifest,
- * its fleet and the log follower (tests).
+ * its fleet and the log follower, and bound the app's own reloads patterns (budgetMs, default MATCH_BUDGET_MS): tests.
  */
 export async function monitOnce(
   opts: {
@@ -29,8 +30,13 @@ export async function monitOnce(
   },
   deps: {
     manifest?: Manifest;
-    fleet?: LoopDeps['fleet'];
-    follower?: LoopDeps['follower'];
+    fleet?: (requested: string | undefined) => Fleet;
+    follower?: (
+      ctx: Context,
+      paths: { out: string; err: string },
+      lines: number
+    ) => { poll(): Promise<{ lines: LogLine[]; reset: boolean }> };
+    budgetMs?: number;
   } = {}
 ): Promise<string> {
   const manifest = deps.manifest ?? prepare({ project: opts.project }).manifest;
@@ -66,7 +72,12 @@ export async function monitOnce(
     const { lines } = await follow(probe.ctx, paths, opts.lines).poll();
     state = reduce(state, { type: 'logs', app: row.app, lines, paths });
     try {
-      const info = historyReloads(manifest.apps[row.app]?.reloads, row, lines);
+      const info = historyReloads(
+        lines,
+        manifest.apps[row.app]?.reloads ?? null,
+        row,
+        deps.budgetMs
+      );
       if (info) state = reduce(state, { type: 'reloads', app: row.app, info });
     } catch (e) {
       if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;

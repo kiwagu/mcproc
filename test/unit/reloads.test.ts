@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   compileReloadRules,
   detectReloads,
+  historyReaches,
   reach,
+  reloadCount,
   reloadStamp,
   ReloadTracker,
 } from '../../src/core/reloads.js';
@@ -399,5 +401,52 @@ describe('reloadStamp', () => {
         marker: 'vite',
       })
     ).toBe('2026-10-14T12:00:30.000');
+  });
+});
+
+describe('reloadCount', () => {
+  const started = '2026-10-14T12:00:05.000';
+  const lines = [
+    out(`${T('06')}api listening on 3010`),
+    out(`${T('30')}api listening on 3010`),
+  ];
+  const count = (reaches: ReturnType<typeof historyReaches>) =>
+    reloadCount(reaches, (coversStart) =>
+      detectReloads(lines, rules, { app: 'api', start: started, coversStart })
+    );
+  it('one stream reaching the start makes the first listening-only burst the boot; one stream after it makes the count partial', () => {
+    expect(count(['start', 'nothing'])).toEqual({
+      count: 1,
+      last: '2026-10-14T12:00:30.000',
+      partial: false,
+    });
+    expect(count(['start', 'after'])).toMatchObject({
+      count: 1,
+      partial: true,
+    });
+    expect(count(['after', 'nothing'])).toEqual({
+      count: 2,
+      last: '2026-10-14T12:00:30.000',
+      partial: true,
+    });
+    expect(count(['nothing', 'nothing'])).toEqual({
+      count: 2,
+      last: '2026-10-14T12:00:30.000',
+      partial: false,
+    });
+  });
+  it("a follower's history is judged stream by stream from its lines alone", () => {
+    expect(
+      historyReaches([out(`${T('06')}api listening on 3010`)], started)
+    ).toEqual(['start', 'nothing']);
+    expect(
+      historyReaches(
+        [
+          { stream: 'err', text: 'no stamp' },
+          out('2026-10-14T13:00:00.000: api listening on 3010'),
+        ],
+        started
+      )
+    ).toEqual(['after', 'after']);
   });
 });

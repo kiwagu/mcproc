@@ -6,7 +6,8 @@ import {
   compileReloadRules,
   detectReloads,
   reach,
-  reloadStamp,
+  reloadCount,
+  type ReloadCount,
   type ReloadInput,
 } from './reloads.js';
 import { CONTEXT_BYTES, parseRead, readSnippet } from './incidents/cursor.js';
@@ -15,8 +16,6 @@ import { ensureOk } from '../transport/index.js';
 /** pm2 statuses of a process that is running this run: an app that is not has no reloads to count. */
 const RUNNING = new Set(['online', 'launching']);
 const STREAMS = ['out', 'err'] as const;
-
-type Counted = NonNullable<LsRow['reloads']>;
 
 /**
  * Each running app's in-process reloads since pm2 started it (ls --reloads), on top of the rows and probes of listFleet:
@@ -32,7 +31,7 @@ export async function countReloads(
   rows: LsRow[],
   opts: { budgetMs?: number } = {}
 ): Promise<{ rows: LsRow[]; errors: HostError[] }> {
-  const counted = new Map<string, Counted>();
+  const counted = new Map<string, ReloadCount>();
   const perHost = await Promise.all(
     probes.map(async (p): Promise<HostError[]> => {
       const { ctx, snap } = p;
@@ -94,23 +93,18 @@ export async function countReloads(
             ? r.lines.map((text) => ({ stream: STREAMS[s], text }))
             : []
         );
+        const rules = compileReloadRules(t.settings, opts.budgetMs);
         try {
-          const found = detectReloads(
-            input,
-            compileReloadRules(t.settings, opts.budgetMs),
-            {
-              app: t.app,
-              start: t.started,
-              // lines of the run's beginning are in the read: its first `listening`-only burst may be the boot
-              coversStart: reaches.includes('start'),
-            }
+          counted.set(
+            t.app,
+            reloadCount(reaches, (coversStart) =>
+              detectReloads(input, rules, {
+                app: t.app,
+                start: t.started,
+                coversStart,
+              })
+            )
           );
-          const last = found.at(-1);
-          counted.set(t.app, {
-            count: found.length,
-            last: last ? reloadStamp(last) : null,
-            partial: reaches.includes('after'),
-          });
         } catch (e) {
           if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
           errors.push({
