@@ -14,6 +14,7 @@ import {
   describeProject,
   snapshot,
   rowsFor,
+  statusWord,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -193,6 +194,27 @@ describe('listApps', () => {
     expect(snap.metrics.api?.cpu).toBeCloseTo(20, 0); // 40 ticks / 100 / ~2 s
     expect(snap.stats.samples).toHaveLength(1);
   });
+  it('snapshot with metrics none asks for the light probe and still joins ports', async () => {
+    const ctx = fakeCtx(basic, 'local', [
+      {
+        match: MARK.JLIST,
+        result: {
+          stdout: probeOut({ jlist, ps: fx('ps.txt'), tcp: fx('ss-tcp.txt') }),
+        },
+      },
+    ]);
+    const snap = await snapshot(ctx, {
+      cpu: 'none',
+      urls: 'none',
+      metrics: 'none',
+    });
+    expect(ctx.fake.calls[0].cmd).not.toContain('/proc/[0-9]*/stat');
+    expect(snap.ports.api.checks[0]).toEqual({
+      port: 3310,
+      status: 'listening',
+    });
+    expect(snap.metrics.api).toBeNull();
+  });
   it('filters by app and maps jlist exit 127 to PM2_NOT_FOUND', async () => {
     const ctx = fakeCtx(basic, 'local', [probeRule]);
     expect((await listApps(ctx, 'worker')).map((r) => r.app)).toEqual([
@@ -296,5 +318,62 @@ describe('hostsInfo / describe', () => {
     expect(d.hosts).toHaveLength(3);
     expect(d.readme).toBeNull();
     expect(ctx.fake.calls).toHaveLength(0);
+  });
+  it('describeProject reports each dependency with its condition and timeout in seconds', () => {
+    const m = loadManifest(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness')
+    );
+    const web = describeProject(m).apps.find((a) => a.name === 'web')!;
+    expect(web.depends_on).toEqual([
+      { app: 'api', condition: 'ready', timeout_s: 90 },
+      { app: 'logger', condition: 'started', timeout_s: 60 },
+    ]);
+  });
+});
+
+describe('statusWord', () => {
+  const m = loadManifest(
+    path.join(here, '..', 'fixtures', 'projects', 'readiness')
+  );
+  const proc = (status: string, exit_code: number | null) =>
+    ({
+      status,
+      exit_code,
+    }) as unknown as import('../../src/core/pm2.js').Pm2Process;
+  it('a task that exited reads done / failed (exit N) / stopped by its exit code', () => {
+    expect(statusWord(proc('stopped', 0), m.apps.libs)).toBe('done');
+    expect(statusWord(proc('stopped', 2), m.apps.libs)).toBe('failed (exit 2)');
+    expect(statusWord(proc('stopped', 1), m.apps.libs)).toBe('failed (exit 1)');
+    expect(statusWord(proc('stopped', null), m.apps.libs)).toBe('stopped');
+    expect(statusWord(proc('stopped', 130), m.apps.libs)).toBe('stopped');
+    expect(statusWord(proc('stopped', 143), m.apps.libs)).toBe('stopped');
+  });
+  it('a server keeps pm2 words whatever the exit code; online and errored pass through', () => {
+    expect(statusWord(proc('stopped', 0), m.apps.api)).toBe('stopped');
+    expect(statusWord(proc('stopped', 2), m.apps.api)).toBe('stopped');
+    expect(statusWord(proc('online', null), m.apps.libs)).toBe('online');
+    expect(statusWord(proc('errored', 1), m.apps.libs)).toBe('errored');
+    expect(statusWord(undefined, m.apps.libs)).toBe('not-started');
+  });
+  it('rowsFor shows the word and the exit code', async () => {
+    const list = JSON.stringify([
+      {
+        pid: 0,
+        name: 'ready-libs',
+        pm_id: 0,
+        pm2_env: { status: 'stopped', namespace: 'ready', exit_code: 0 },
+      },
+    ]);
+    const ctx = fakeCtx(
+      path.join(here, '..', 'fixtures', 'projects', 'readiness'),
+      'local',
+      [{ match: MARK.JLIST, result: { stdout: probeOut({ jlist: list }) } }]
+    );
+    const rows = await listApps(ctx, 'libs');
+    expect(rows[0]).toMatchObject({
+      status: 'done',
+      exit_code: 0,
+      uptime_ms: null,
+    });
   });
 });

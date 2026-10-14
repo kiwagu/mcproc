@@ -10,6 +10,7 @@ import {
   assertWritable,
   resolveProjectDir,
 } from '../core/resolve.js';
+import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
 import type { CursorState } from '../core/incidents/cursor.js';
@@ -20,6 +21,7 @@ import {
   type LogSource,
 } from '../core/logstream.js';
 import { doctor } from '../core/doctor.js';
+import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
 import {
   Fleet,
@@ -38,6 +40,7 @@ import {
   renderIncidents,
   renderFlushed,
   renderMutation,
+  renderWait,
   hostsOf,
 } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
@@ -104,9 +107,10 @@ export function buildProgram(io: Io = defaultIo): Command {
     opts: { reload?: boolean } = {}
   ) => {
     const fleet = fleetOf(g);
-    const rows = await actOn(fleet, target, act, opts);
-    const { text, failed } = renderMutation(rows, fleet.fallback, act);
-    emit(g, text, { ...hostsOf(rows, fleet.fallback), rows });
+    const waits: WaitRecord[] = [];
+    const rows = await actOn(fleet, target, act, { ...opts, waits });
+    const { text, failed } = renderMutation(rows, fleet.fallback, act, waits);
+    emit(g, text, { ...hostsOf(rows, fleet.fallback), rows, waits });
     if (failed) process.exitCode = 1; // a host failed or was skipped: the first line says so, the exit code too
   };
 
@@ -315,6 +319,43 @@ export function buildProgram(io: Io = defaultIo): Command {
             if (a.incidents.length || a.errors.length)
               emit(g, renderIncidents(a, { color }), a);
           }
+        } finally {
+          process.off('SIGINT', stop);
+        }
+      })
+    );
+  program
+    .command('wait <app>')
+    .description(
+      'block until the app is listening, answers its url, exited, printed a matching line or went idle; exit 1 when it was not reached'
+    )
+    .requiredOption(
+      '--until <cond>',
+      'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+    )
+    .option(
+      '-t, --timeout <s>',
+      'seconds to wait (max 600)',
+      String(WAIT_TIMEOUT_DEFAULT_MS / 1000)
+    )
+    .action(
+      wrap(async (g, o, [app]) => {
+        const until = parseUntil(String(o.until)); // a bad request is refused before any host is touched
+        const timeoutMs =
+          Math.max(1, Number(o.timeout) || WAIT_TIMEOUT_DEFAULT_MS / 1000) *
+          1000; // waitFor holds the 600 s cap
+        const fleet = fleetOf(g);
+        const ctx = await fleet.ctx(fleet.one(app));
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        process.once('SIGINT', stop);
+        try {
+          const r = await waitFor(ctx, app, until, {
+            timeoutMs,
+            signal: ac.signal,
+          });
+          emit(g, renderWait(app, r), { app, host: ctx.host.name, ...r });
+          if (!r.ok) process.exitCode = 1; // not reached (timeout, process gone, Ctrl-C): scripts see it
         } finally {
           process.off('SIGINT', stop);
         }

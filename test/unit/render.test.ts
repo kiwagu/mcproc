@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   startNote,
+  waitNote,
+  renderWait,
   renderLs,
   renderPorts,
   renderDoctor,
@@ -12,6 +14,7 @@ import {
   renderMutation,
   fmtCpu,
   fmtUrl,
+  fmtDeps,
 } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
@@ -26,6 +29,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   pid: 1,
   uptime_ms: 0,
   restarts: 0,
+  exit_code: null,
   cpu: 0,
   memory: 0,
   procs: 1,
@@ -45,12 +49,12 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
 });
 
 describe('startNote', () => {
-  it('tells the reader to look again when an online app does not listen on its declared port yet', () => {
+  it('points the reader at wait, not at polling ls, when an online app does not listen on its declared port yet', () => {
     expect(
       startNote([
         row('online', [{ port: 3000, status: 'declared-not-listening' }]),
       ])
-    ).toContain('call ls again');
+    ).toContain('call wait until listening instead of polling ls');
   });
   it('stays silent when every port listens, when someone else holds the port, or when the app is not online', () => {
     expect(
@@ -395,5 +399,164 @@ describe('renderMutation', () => {
       failed: false,
       text: expect.not.stringContaining('failed'),
     });
+  });
+  it('waitNote lists successful waits; renderMutation appends it', () => {
+    const waits = [
+      {
+        app: 'api',
+        dep: 'libs',
+        condition: 'completed' as const,
+        ms: 4210,
+        ok: true,
+      },
+      {
+        app: 'web',
+        dep: 'api',
+        condition: 'ready' as const,
+        ms: 1100,
+        ok: true,
+      },
+      {
+        app: 'x',
+        dep: 'y',
+        condition: 'ready' as const,
+        ms: 9,
+        ok: false,
+        reason: 'timeout',
+      },
+    ];
+    expect(waitNote(waits)).toBe(
+      'waited 4.2 s for libs (completed), 1.1 s for api (ready)'
+    );
+    expect(waitNote([])).toBe('');
+    const r = renderMutation([row('online', [])], 'local', 'start', waits);
+    expect(r.text).toContain('waited 4.2 s for libs (completed)');
+  });
+  it('renderWait: one line per outcome', () => {
+    const base = { until: 'listening', waited_ms: 1300, status: 'online' };
+    expect(renderWait('web', { ...base, ok: true, observed: ':3000 ✓' })).toBe(
+      'web: listening after 1.3 s (:3000 ✓)'
+    );
+    expect(
+      renderWait('libs', {
+        until: 'exited',
+        waited_ms: 12_400,
+        ok: true,
+        status: 'done',
+        exit_code: 0,
+      })
+    ).toBe('libs: done after 12.4 s (exit 0)');
+    expect(
+      renderWait('api', {
+        until: 'log:listening',
+        waited_ms: 800,
+        ok: true,
+        status: 'online',
+        matched_line: '2026-10-13T20:00:00.123: listening on 3010',
+      })
+    ).toBe(
+      'api: log matched after 0.8 s: 2026-10-13T20:00:00.123: listening on 3010'
+    );
+    expect(
+      renderWait('libs', {
+        until: 'idle:5',
+        waited_ms: 20_100,
+        ok: true,
+        status: 'online',
+      })
+    ).toBe('libs: idle:5 after 20.1 s');
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'timeout',
+        waited_ms: 60_000,
+        observed: 'status online, :3000 ✗ nothing listens',
+      })
+    ).toBe(
+      'web: listening not reached after 60.0 s (status online, :3000 ✗ nothing listens)'
+    );
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'exited',
+        waited_ms: 3100,
+        status: 'failed (exit 2)',
+        exit_code: 2,
+      })
+    ).toBe(
+      'web: exited (failed (exit 2)) after 3.1 s while waiting for listening'
+    );
+    expect(
+      renderWait('web', {
+        ...base,
+        ok: false,
+        reason: 'crashed',
+        status: 'errored',
+      })
+    ).toBe('web: crashed (errored) after 1.3 s while waiting for listening');
+    expect(renderWait('web', { ...base, ok: false, reason: 'aborted' })).toBe(
+      'web: aborted after 1.3 s while waiting for listening'
+    );
+  });
+  it('renderWait: an exited wait names the exit code once, and not at all when there is none', () => {
+    const exited = { until: 'exited', waited_ms: 3100, ok: true };
+    expect(
+      renderWait('libs', {
+        ...exited,
+        status: 'failed (exit 2)',
+        exit_code: 2,
+      })
+    ).toBe('libs: failed (exit 2) after 3.1 s');
+    expect(
+      renderWait('libs', { ...exited, status: 'stopped', exit_code: null })
+    ).toBe('libs: stopped after 3.1 s');
+    expect(renderWait('libs', { ...exited, status: 'stopped' })).toBe(
+      'libs: stopped after 3.1 s'
+    );
+    expect(
+      renderWait('libs', {
+        ...exited,
+        waited_ms: 500,
+        status: 'stopped',
+        exit_code: 143,
+      })
+    ).toBe('libs: stopped after 0.5 s (exit 143)'); // a stop by signal: the code is news, the status does not carry it
+  });
+  it('a skipped dependent is a failed row', () => {
+    const r = renderMutation(
+      [{ ...row('skipped', []), error: 'libs failed (exit 2)' }],
+      'local',
+      'start'
+    );
+    expect(r.failed).toBe(true);
+    expect(r.text).toContain(
+      'start partly failed: web (local): libs failed (exit 2)'
+    );
+  });
+});
+
+describe('fmtDeps', () => {
+  it('names a started dependency bare and any other with its condition', () => {
+    expect(
+      fmtDeps([
+        { app: 'libs', condition: 'completed' },
+        { app: 'api', condition: 'ready' },
+        { app: 'logger', condition: 'started' },
+      ])
+    ).toBe('libs (completed), api (ready), logger');
+    expect(fmtDeps([])).toBe('');
+  });
+});
+
+describe('ls shows the status word', () => {
+  it('a finished task reads done, a failed one reads failed (exit N)', () => {
+    expect(renderLs([{ ...row('done', []), kind: 'task' }], 'local')).toContain(
+      'done'
+    );
+    expect(renderLs([{ ...row('failed (exit 2)', []) }], 'local')).toContain(
+      'failed (exit 2)'
+    );
   });
 });

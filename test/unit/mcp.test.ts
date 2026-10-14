@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +14,7 @@ import type { UnpackDeps } from '../../src/runtime/unpack.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
 const fleet = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
 
 async function client(
   spawner?: Spawner,
@@ -33,7 +34,7 @@ const neverSpawn: Spawner = async (argv) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 14 tools with annotations and short instructions', async () => {
+  it('registers the 15 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -52,13 +53,22 @@ describe('mcp server', () => {
       'start',
       'stop',
       'unpack',
+      'wait',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
     }); // taking writes the local pick-up point
-    for (const n of ['hosts', 'doctor', 'ls', 'describe', 'logs', 'ports'])
+    for (const n of [
+      'hosts',
+      'doctor',
+      'ls',
+      'describe',
+      'logs',
+      'ports',
+      'wait',
+    ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
     for (const n of ['stop', 'delete', 'flush', 'init'])
       expect(byName[n].annotations?.destructiveHint).toBe(true); // init with force replaces the owner's manifest
@@ -77,6 +87,25 @@ describe('mcp server', () => {
     expect(byName.unpack.description).not.toMatch(
       /bundled with mcproc|ships inside/
     );
+    // what an agent must know before it calls wait
+    const waitDesc = byName.wait.description as string;
+    expect(waitDesc).toMatch(
+      /log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
+    );
+    expect(waitDesc).not.toMatch(/before the action/); // a blocking call cannot precede the action it waits for
+    expect(waitDesc).toMatch(/BAD_ARGUMENT/);
+    expect(waitDesc).toMatch(/without pm2's time stamp.*keeps the stamp/);
+    expect(waitDesc).toMatch(
+      /autorestart off.*other app shows pm2's stopped or errored/
+    );
+    expect(waitDesc).not.toContain('—');
+    expect(waitDesc.length).toBeLessThan(1200);
+    const waitProps = byName.wait.inputSchema.properties as Record<
+      string,
+      { description?: string }
+    >;
+    expect(waitProps.app.description).toBeTruthy();
+    expect(waitProps.timeout_s.description).toMatch(/default 60, max 600/);
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -164,6 +193,196 @@ describe('mcp server', () => {
     expect(r.structuredContent.rows).toHaveLength(3);
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
+  });
+  it('start answers with the waits it made (none for an app without conditions)', async () => {
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes(MARK.JLIST))
+        return { code: 0, stdout: probeOut({ jlist: '[]' }), stderr: '' };
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (/pm2 'jlist'/.test(cmd) || cmd.includes('--version'))
+        return { code: 0, stdout: '[]', stderr: '' };
+      if (/cat >|startOrRestart/.test(cmd))
+        return { code: 0, stdout: '', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+    };
+    const cl = await client(spawner);
+    const r: any = await cl.callTool({
+      name: 'start',
+      arguments: { project: basic, target: 'worker' },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.waits).toEqual([]);
+  });
+  it('wait: a finished one-shot answers ok with its exit code; a bad until is refused before any transport call', async () => {
+    const jlist = JSON.stringify([
+      {
+        pid: 0,
+        name: 'ready-libs',
+        pm_id: 0,
+        pm2_env: { status: 'stopped', namespace: 'ready', exit_code: 0 },
+      },
+    ]);
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'"))
+        return { code: 0, stdout: jlist, stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+    };
+    vi.useFakeTimers({ toFake: ['Date'] }); // the clock stands still: the wait took exactly 0.0 s
+    try {
+      const cl = await client(spawner);
+      const r: any = await cl.callTool({
+        name: 'wait',
+        arguments: { project: readiness, app: 'libs', until: 'exited' },
+      });
+      expect(r.isError).toBeUndefined();
+      expect(text(r)).toBe('libs: done after 0.0 s (exit 0)');
+      expect(r.structuredContent).toMatchObject({
+        app: 'libs',
+        host: 'local',
+        ok: true,
+        until: 'exited',
+        status: 'done',
+        exit_code: 0,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    const cl = await client(neverSpawn);
+    const bad = await cl.callTool({
+      name: 'wait',
+      arguments: { project: readiness, app: 'libs', until: 'nope' },
+    });
+    expect(bad.isError).toBe(true);
+    expect(text(bad)).toMatch(/^BAD_ARGUMENT/);
+    expect(
+      text(
+        await cl.callTool({
+          name: 'wait',
+          arguments: { project: readiness, app: 'nope', until: 'exited' },
+        })
+      )
+    ).toContain('UNKNOWN_APP');
+  });
+  it('wait: not reaching the condition is an answer, not an error; an app that never started is an error', async () => {
+    const online = (extra: object) =>
+      JSON.stringify([
+        {
+          pid: 4242,
+          name: 'ready-api',
+          pm_id: 1,
+          pm2_env: { status: 'online', namespace: 'ready', ...extra },
+        },
+      ]);
+    const run = async (jlist: string) => {
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, ps: '4242 1\n', tcp: '' }),
+            stderr: '',
+          };
+        if (cmd.includes("'jlist'"))
+          return { code: 0, stdout: jlist, stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+      return (await client(spawner)).callTool({
+        name: 'wait',
+        arguments: {
+          project: readiness,
+          app: 'api',
+          until: 'listening',
+          timeout_s: 1,
+        },
+      }) as Promise<any>;
+    };
+    const late = await run(online({}));
+    expect(late.isError).toBeUndefined();
+    expect(late.structuredContent).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'online',
+    });
+    expect(text(late)).toMatch(
+      /^api: listening not reached after 1\.\d s \(status online, :3100 ✗ nothing listens\)$/
+    );
+    const never = await run('[]');
+    expect(never.isError).toBe(true);
+    expect(text(never)).toMatch(/^NOT_STARTED/);
+  });
+  describe('a call the client cancels stops polling the host', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    /** Starts the call, cancels it after 200 ms (the client sends notifications/cancelled) and counts what the host was asked afterwards. */
+    const cancelAfter200ms = async (
+      jlist: string,
+      name: string,
+      args: Record<string, unknown>
+    ) => {
+      let calls = 0;
+      const spawner: Spawner = async (argv) => {
+        calls++;
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, ps: '4242 1\n', tcp: '' }),
+            stderr: '',
+          };
+        if (cmd.includes("'jlist'"))
+          return { code: 0, stdout: jlist, stderr: '' };
+        if (/cat >|startOrRestart/.test(cmd))
+          return { code: 0, stdout: '', stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+      const cl = await client(spawner);
+      const ac = new AbortController();
+      const call = cl
+        .callTool({ name, arguments: args }, undefined, { signal: ac.signal })
+        .then(
+          () => 'answered',
+          () => 'cancelled'
+        );
+      await sleep(200);
+      expect(calls, 'the wait had reached the host').toBeGreaterThan(0);
+      ac.abort();
+      expect(await call).toBe('cancelled');
+      await sleep(300);
+      const settled = calls;
+      await sleep(1200); // a poll every 500 ms would show up twice here
+      expect(calls).toBe(settled);
+    };
+    const proc = (name: string, status: string) =>
+      JSON.stringify([
+        {
+          pid: 4242,
+          name: `ready-${name}`,
+          pm_id: 1,
+          pm2_env: { status, namespace: 'ready', pm_cwd: readiness },
+        },
+      ]);
+    it('wait', async () => {
+      await cancelAfter200ms(proc('api', 'online'), 'wait', {
+        project: readiness,
+        app: 'api',
+        until: 'listening',
+        timeout_s: 5,
+      });
+    });
+    it('start, while it waits for a dependency (api needs libs to complete, and libs is still running)', async () => {
+      await cancelAfter200ms(proc('libs', 'online'), 'start', {
+        project: readiness,
+        target: 'api',
+      });
+    });
   });
   it('host-bound apps: a target on another host than --host, or on a readonly host, is refused before any transport call', async () => {
     const cl = await client(neverSpawn);

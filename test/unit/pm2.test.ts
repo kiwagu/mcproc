@@ -51,6 +51,31 @@ describe('parseJlist', () => {
     });
     expect(procs[0].uptime_ms).toBeGreaterThan(0);
   });
+  it('carries exit_code: a number after a natural exit, null when pm2 recorded none', () => {
+    const procs = parseJlist(
+      JSON.stringify([
+        {
+          pid: 0,
+          name: 'p-t',
+          pm_id: 1,
+          pm2_env: { status: 'stopped', namespace: 'p', exit_code: 2 },
+        },
+        {
+          pid: 0,
+          name: 'p-s',
+          pm_id: 2,
+          pm2_env: { status: 'stopped', namespace: 'p', exit_code: null },
+        },
+        {
+          pid: 9,
+          name: 'p-o',
+          pm_id: 3,
+          pm2_env: { status: 'online', namespace: 'p' },
+        },
+      ])
+    );
+    expect(procs.map((p) => p.exit_code)).toEqual([2, null, null]);
+  });
   it('parses an empty list and defaults namespace/pid', () => {
     expect(parseJlist('[]')).toEqual([]);
     const [w] = parseJlist(fx('jlist/two-namespaces.json')).filter(

@@ -20,7 +20,7 @@ describe('mcproc mcp over stdio (built dist)', () => {
     const client = new Client({ name: 'smoke', version: '0' });
     await client.connect(transport);
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(14);
+    expect(tools.tools).toHaveLength(15);
     expect(tools.tools.map((t) => t.name)).toContain('incidents');
     const r: any = await client.callTool({ name: 'hosts', arguments: {} });
     expect(r.structuredContent.hosts).toHaveLength(3);

@@ -210,7 +210,9 @@ describe('scopeManifest', () => {
     const box = scopeManifest(fleet, 'box', 'local');
     expect(box.apps.web.depends_on).toEqual([]);
     expect(box.profiles).toEqual({ dev: ['web'], builds: [] });
-    expect(fleet.apps.web.depends_on).toEqual(['watch']); // the full manifest is untouched
+    expect(fleet.apps.web.depends_on).toEqual([
+      { app: 'watch', condition: 'started', timeoutMs: 60_000 },
+    ]); // the full manifest is untouched
   });
 });
 
@@ -316,5 +318,75 @@ describe('errors settings', () => {
         `version: 1\napps:\n  a: { description: d, run: r, pm2: { ${key} } }\n`,
         `apps.a.pm2.${key.split(':')[0]}: managed by mcproc`
       );
+  });
+});
+
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+
+describe('kind: task and depends_on conditions', () => {
+  it('a task has autorestart off by default; the other kinds keep it on', () => {
+    const m = loadManifest(readiness);
+    expect(m.apps.libs.kind).toBe('task');
+    expect(m.apps.libs.autorestart).toBe(false);
+    expect(m.apps.api.autorestart).toBe(true);
+    expect(m.apps.logger.autorestart).toBe(true);
+  });
+  it('autorestart: true on a task is refused', () => {
+    expectInvalid(
+      'version: 1\napps:\n  t: { description: d, kind: task, run: r, autorestart: true }\n',
+      'apps.t.autorestart: a task runs once'
+    );
+  });
+  it('depends_on takes names and objects; names mean started with the default timeout', () => {
+    const m = loadManifest(readiness);
+    expect(m.apps.api.depends_on).toEqual([
+      { app: 'libs', condition: 'completed', timeoutMs: 60_000 },
+    ]);
+    expect(m.apps.web.depends_on).toEqual([
+      { app: 'api', condition: 'ready', timeoutMs: 90_000 },
+      { app: 'logger', condition: 'started', timeoutMs: 60_000 },
+    ]);
+    expect(m.apps.cli.depends_on).toEqual([
+      { app: 'libs', condition: 'started', timeoutMs: 60_000 },
+    ]);
+  });
+  it('completed needs a task; ready needs a port or a url', () => {
+    expectInvalid(
+      'version: 1\napps:\n  s: { description: d, run: r }\n  w: { description: d, run: r, depends_on: [{ app: s, condition: completed }] }\n',
+      'apps.w.depends_on: "s" must be kind: task for condition completed (it is server)'
+    );
+    expectInvalid(
+      'version: 1\napps:\n  s: { description: d, run: r }\n  w: { description: d, run: r, depends_on: [{ app: s, condition: ready }] }\n',
+      'apps.w.depends_on: "s" declares no port or url, so ready cannot be observed'
+    );
+  });
+  it('depends_on objects are validated', () => {
+    expectInvalid(
+      'version: 1\napps:\n  t: { description: d, kind: task, run: r }\n  w: { description: d, run: r, depends_on: [{ app: t, condition: completed, timeout: 0 }] }\n',
+      'apps.w.depends_on.0.timeout'
+    );
+    expectInvalid(
+      'version: 1\napps:\n  t: { description: d, kind: task, run: r }\n  w: { description: d, run: r, depends_on: [{ app: t, condition: completed, timeout: 601 }] }\n',
+      'apps.w.depends_on.0.timeout'
+    );
+    expectInvalid(
+      'version: 1\napps:\n  t: { description: d, kind: task, run: r }\n  w: { description: d, run: r, depends_on: [{ app: t, condition: finished }] }\n',
+      'apps.w.depends_on.0.condition'
+    );
+    expectInvalid(
+      'version: 1\napps:\n  w: { description: d, run: r, depends_on: [{ app: nope }] }\n',
+      'apps.w.depends_on: unknown app "nope"'
+    );
+  });
+  it('cycles are found through object entries too', () => {
+    expectInvalid(
+      'version: 1\napps:\n  a: { description: d, kind: task, run: r, depends_on: [{ app: b, condition: ready }] }\n  b: { description: d, run: r, port: 1, depends_on: [a] }\n',
+      'depends_on cycle: a -> b -> a'
+    );
+  });
+  it('scopeManifest keeps the conditions of the dependencies that stay', () => {
+    const m = loadManifest(readiness);
+    const s = scopeManifest(m, 'local', 'local');
+    expect(s.apps.web.depends_on.map((d) => d.app)).toEqual(['api', 'logger']);
   });
 });

@@ -5,6 +5,13 @@ import { pm2Name } from './pm2.js';
 /** The stamp pm2 writes before every log line; mcproc's log readers accept it and the older second-only form. */
 export const LOG_STAMP = 'YYYY-MM-DDTHH:mm:ss.SSS';
 
+/**
+ * In front of a one-shot app's command. pm2 records exit_code 0 for a process killed by a signal, so a plain
+ * `pm2 stop` would read as a successful run; the shell runs the trap after its foreground child exits and leaves
+ * 130 (SIGINT) or 143 (SIGTERM) instead, which the status word reads as "stopped". Natural exits pass through.
+ */
+export const STOP_TRAP = "trap 'exit 130' INT; trap 'exit 143' TERM; ";
+
 export interface Pm2AppConfig {
   name: string;
   namespace: string;
@@ -45,7 +52,10 @@ export function buildEcosystem(
       namespace: m.project,
       cwd: appCwd(host, app),
       script: host.shell.bin,
-      args: [...host.shell.flags, app.run],
+      args: [
+        ...host.shell.flags,
+        app.autorestart ? app.run : STOP_TRAP + app.run,
+      ],
       interpreter: 'none',
       env: { ...app.env, ...host.env },
       autorestart: app.autorestart,

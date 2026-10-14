@@ -115,11 +115,12 @@ function ownHits(texts: string[], rules: Rules, app: string): number[] | null {
 
 export const stampOf = (line: string): string | null =>
   PM2_STAMP.exec(line)?.[1] ?? null;
-const body = (line: string): string => line.replace(PM2_STAMP, '');
+/** The line without pm2's leading time stamp (the rest of it is what patterns are matched against). */
+export const bodyOf = (line: string): string => line.replace(PM2_STAMP, '');
 const cut = (s: string): string =>
   s.length > MAX_LINE ? `${s.slice(0, MAX_LINE - 1)}…` : s;
 /** What patterns are matched against: the line without its stamp, as far as the output shows it (a huge line stays cheap). */
-const searched = (line: string): string => body(line).slice(0, MAX_LINE);
+const searched = (line: string): string => bodyOf(line).slice(0, MAX_LINE);
 
 /**
  * A group repeated without bound whose content can end in an unbounded repeat — `(a+)+`, `(\w+\s*)*`, `(a+b?)+`, `(.*)+` —
@@ -204,7 +205,7 @@ function timeAt(lines: string[], i: number): string | null {
 
 /** What makes two occurrences the same error: the text without the stamp, with numbers, ids, hex, paths and quoted strings masked. */
 export function fingerprint(line: string): string {
-  return body(line)
+  return bodyOf(line)
     .replace(/"[^"]*"|'[^']*'/g, '"…"')
     .replace(
       /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,

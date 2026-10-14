@@ -1,6 +1,6 @@
 import path from 'node:path';
-import { McprocError } from './errors.js';
-import type { Manifest } from './manifest.js';
+import { describeError, McprocError } from './errors.js';
+import type { Dep, DepCondition, Manifest } from './manifest.js';
 import {
   appCwd,
   buildEcosystem,
@@ -8,7 +8,8 @@ import {
   generatedDir,
 } from './ecosystem.js';
 import { findProcess, pm2Name, type Pm2Process } from './pm2.js';
-import { rowsFor, snapshot, type LsRow } from './list.js';
+import { rowsFor, snapshot, unreachableRow, type LsRow } from './list.js';
+import { depFailure, waitDependency, type WaitResult } from './wait.js';
 import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
@@ -32,7 +33,7 @@ export function orderWithDeps(m: Manifest, names: string[]): string[] {
   const visit = (n: string) => {
     if (seen.has(n)) return;
     seen.add(n);
-    for (const d of m.apps[n].depends_on) visit(d);
+    for (const d of m.apps[n].depends_on) visit(d.app);
     out.push(n);
   };
   for (const n of names) visit(n);
@@ -103,24 +104,134 @@ export async function shipEcosystem(ctx: Context): Promise<string> {
   return file;
 }
 
+/** One wait made on behalf of an app before it started: how long, and how it ended. */
+export interface WaitRecord {
+  app: string;
+  dep: string;
+  condition: DepCondition;
+  ms: number;
+  ok: boolean;
+  reason?: string;
+}
+export interface StartOptions {
+  reload?: boolean;
+  /** waits for one dependency (default: on this context); actOn passes one that finds the dependency's host */
+  waitDep?: (dep: Dep, forApp: string) => Promise<WaitResult>;
+  /** the dependencies of an app to wait for; default the context's (host-scoped) manifest entry, the fleet passes the full manifest's */
+  depsOf?: (app: string) => Dep[];
+  /** every wait made, appended */
+  waits?: WaitRecord[];
+  /** apps that failed or were skipped so far (app -> why), shared across host runs by actOn */
+  failed?: Map<string, string>;
+  /** ends the default dependency wait as `aborted` (a client that cancelled the call); a waitDep of the caller's own is not given it */
+  signal?: AbortSignal;
+}
+
+/**
+ * Starts the apps in dependency order. Before launching an app it waits, in the order declared, for each of its
+ * ready/completed dependencies; one that times out, fails or dies leaves the app (and everything that depends on
+ * it) unstarted: its row is `skipped` with the reason, while unrelated apps still start.
+ */
 export async function startApps(
   ctx: Context,
   target: Targets,
-  opts: { reload?: boolean } = {}
+  opts: StartOptions = {}
 ): Promise<LsRow[]> {
   const names =
     typeof target === 'string'
       ? orderWithDeps(ctx.manifest, namesOf(ctx, target))
       : target;
+  const waitDep =
+    opts.waitDep ??
+    ((d: Dep) => waitDependency(ctx, d, { signal: opts.signal }));
+  const depsOf =
+    opts.depsOf ?? ((n: string) => ctx.manifest.apps[n].depends_on);
+  const failed = opts.failed ?? new Map<string, string>();
+  const skipped = new Map<string, string>();
+  /** an app that is not started, and the apps that need it must not be either */
+  const skip = (n: string, why: string) => {
+    skipped.set(n, why);
+    failed.set(n, why);
+  };
+  /** One dependency wait, recorded. Why it is unmet, or undefined when met; a wait that throws (a host that cannot be reached, say) is an unmet one, not a crash of the whole start. */
+  const unmetAfterWait = async (d: Dep, n: string) => {
+    const t0 = Date.now();
+    const record = (ok: boolean, reason?: string) =>
+      opts.waits?.push({
+        app: n,
+        dep: d.app,
+        condition: d.condition,
+        ms: Date.now() - t0,
+        ok,
+        ...(reason ? { reason } : {}),
+      });
+    try {
+      const r = await waitDep(d, n);
+      record(r.ok, r.reason);
+      return r.ok ? undefined : depFailure(d, r);
+    } catch (e) {
+      record(false, 'error');
+      return `${d.app}: ${describeError(e)}`;
+    }
+  };
   const file = await shipEcosystem(ctx);
   const before = await ctx.pm2.jlist(); // pm2's own list: the URL checks of a full probe could time out the start before it began
   assertNoCollision(ctx, before, names);
   for (const n of names) {
+    // running already: left alone, whatever happened to what it needs (it is neither waited for nor skipped)
     const p = findProcess(before, ctx.manifest.project, n);
     if (p && p.status === 'online' && !opts.reload) continue;
+    // the caller cancelled: nothing more is launched, unrelated apps included
+    if (opts.signal?.aborted) {
+      skip(n, 'start cancelled');
+      continue;
+    }
+    if (failed.has(n)) {
+      // decided before this run (a dependency on another host failed, timed out or was not started)
+      skip(n, failed.get(n)!);
+      continue;
+    }
+    // a dependency that did not start (on this host or another): the dependent cannot either
+    const blocked = depsOf(n).find((d) => failed.has(d.app));
+    if (blocked) {
+      skip(
+        n,
+        `skipped: ${blocked.app} was not started (${failed.get(blocked.app)})`
+      );
+      continue;
+    }
+    let unmet: string | undefined;
+    for (const d of depsOf(n)) {
+      if (d.condition === 'started') continue;
+      unmet = await unmetAfterWait(d, n);
+      if (unmet !== undefined) break;
+    }
+    if (unmet !== undefined) {
+      skip(n, unmet);
+      continue;
+    }
+    // the client may have gone while the dependency waits ran (a probe that found the condition met still answers ok)
+    if (opts.signal?.aborted) {
+      skip(n, 'start cancelled');
+      continue;
+    }
     await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));
   }
-  return rowsFor(ctx, await snapshot(ctx, { urls: names }), names);
+  const live = names.filter((n) => !skipped.has(n));
+  const rows = live.length
+    ? rowsFor(ctx, await snapshot(ctx, { urls: live }), live)
+    : [];
+  const byApp = new Map(rows.map((r) => [r.app, r]));
+  return names.map(
+    (n) =>
+      byApp.get(n) ??
+      unreachableRow(
+        ctx.manifest.apps[n],
+        ctx.host.name,
+        skipped.get(n)!,
+        'skipped'
+      )
+  );
 }
 
 export async function restartApps(

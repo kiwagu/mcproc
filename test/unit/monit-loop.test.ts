@@ -43,6 +43,7 @@ const row = (app: string, host = 'local'): LsRow => ({
   runtime: null,
   pm2_cpu: 0,
   pm2_memory: 0,
+  exit_code: null,
   metrics_source: 'tree',
   url: null,
   url_status: 'unchecked',

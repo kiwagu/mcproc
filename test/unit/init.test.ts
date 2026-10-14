@@ -31,10 +31,13 @@ beforeAll(() => {
         dev: 'concurrently "yarn dev:*"',
         test: 'vitest',
         'build:watch': 'tsc -b -w',
+        build: 'tsc -p .',
+        migrate: 'prisma migrate deploy',
       },
     })
   );
   write(root, 'yarn.lock', '');
+  write(root, '.env', 'PORT=7777\n');
   write(
     root,
     'packages/api/package.json',
@@ -68,7 +71,11 @@ beforeAll(() => {
     })
   );
   write(root, 'ecosystem.config.cjs', 'module.exports = {}');
-  write(root, 'Procfile', 'web: node server.js --port 5000\n');
+  write(
+    root,
+    'Procfile',
+    'web: node server.js --port 5000\nmigrate: node migrate.js\n'
+  );
   write(
     root,
     'node_modules/junk/project.json',
@@ -82,6 +89,13 @@ describe('guesses', () => {
     expect(guessKind('build:watch', 'tsc -b -w')).toBe('build');
     expect(guessKind('start:worker', 'node dist/worker.js')).toBe('worker');
     expect(guessKind('lint', 'eslint .')).toBe('unknown');
+    expect(guessKind('build', 'tsc -p .')).toBe('task');
+    expect(guessKind('build', 'turbo run build')).toBe('task');
+    expect(guessKind('migrate', 'prisma migrate deploy')).toBe('task');
+    expect(guessKind('seed', 'node seed.js')).toBe('task');
+    expect(guessKind('build:watch', 'tsc -b -w')).toBe('build');
+    expect(guessKind('libs', 'turbo watch build')).toBe('build');
+    expect(guessKind('dev', 'next dev')).toBe('server');
   });
   it('guessPort from command, .env and src', () => {
     expect(guessPort('next dev --port 3005', '/nowhere')).toBe(3005);
@@ -107,6 +121,11 @@ describe('discover', () => {
       kind: 'server',
     });
     expect(byName['build-watch']).toMatchObject({ kind: 'build' });
+    expect(byName.build).toMatchObject({ kind: 'task', run: 'yarn build' });
+    expect(byName.build.port).toBeUndefined();
+    expect(byName.migrate).toMatchObject({ kind: 'task' });
+    expect(byName.migrate.port).toBeUndefined();
+    expect(byName.dev.port).toBe(7777);
     expect(byName.test).toBeUndefined();
     expect(byName['api-dev']).toMatchObject({
       source: 'packages/api/package.json:dev',
@@ -138,6 +157,11 @@ describe('discover', () => {
       run: 'node server.js --port 5000',
       port: 5000,
     });
+    expect(byName['migrate-2']).toMatchObject({
+      source: 'Procfile:migrate',
+      kind: 'task',
+    });
+    expect(byName['migrate-2'].port).toBeUndefined();
     expect(d.candidates.some((c) => c.name.startsWith('junk'))).toBe(false);
     expect(d.notes.some((n) => n.includes('ecosystem.config.cjs'))).toBe(true);
   });
@@ -147,9 +171,22 @@ describe('renderDraft / initProject', () => {
   it('renders a draft whose only error is "at least one app"', () => {
     const draft = renderDraft(root, 'mono', discover(root));
     expect(draft).toContain('version: 1');
+    expect(draft).toContain('kind build|server|worker|task');
     expect(draft).toContain('# api-dev:');
     expect(draft).toContain('#   port: 4100');
     expect(draft).toContain('#   url: http://localhost:4100');
+    const mlines = draft.split('\n');
+    const mstart = mlines.findIndex((l) => l.startsWith('  # migrate-2:'));
+    expect(mstart).toBeGreaterThan(-1);
+    const mblock = [mlines[mstart]];
+    for (
+      let i = mstart + 1;
+      i < mlines.length && mlines[i].startsWith('  #   ');
+      i++
+    )
+      mblock.push(mlines[i]);
+    expect(mblock.join('\n')).not.toContain('url:');
+    expect(mblock.join('\n')).not.toContain('port:');
     expect(() => parseManifest(draft, root, 'x')).toThrowError(
       /at least one app/
     );
@@ -201,7 +238,7 @@ describe('renderDraft / initProject', () => {
     ).toBe('*\n');
     expect(fs.existsSync(path.join(root, '.mcproc', 'README.md'))).toBe(true);
     expect(r.candidates).toBeGreaterThan(5);
-    expect(r.by_source['package.json']).toBe(4); // root dev + build:watch, workspace api dev + start:worker
+    expect(r.by_source['package.json']).toBe(6); // root dev + build:watch + build + migrate, workspace api dev + start:worker
     expect(r.next).toContain('uncomment');
     expect(() => initProject(root)).toThrowError(/already exists/);
     expect(initProject(root, { force: true }).created).toContain(

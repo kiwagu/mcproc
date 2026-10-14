@@ -17,6 +17,8 @@ export interface Pm2Process {
   err_log: string;
   restarts: number;
   unstable_restarts: number;
+  /** pm2's last recorded exit code for the process, any app; null when pm2 has recorded none (it never exited, or the field is absent) */
+  exit_code: number | null;
   uptime_ms: number | null;
   cpu: number;
   memory: number;
@@ -49,6 +51,7 @@ function normalize(p: RawProc): Pm2Process {
     err_log: String(env.pm_err_log_path ?? ''),
     restarts: Number(env.restart_time ?? 0),
     unstable_restarts: Number(env.unstable_restarts ?? 0),
+    exit_code: typeof env.exit_code === 'number' ? env.exit_code : null,
     uptime_ms: status === 'online' && up ? Math.max(0, Date.now() - up) : null,
     cpu: p.monit?.cpu ?? 0,
     memory: p.monit?.memory ?? 0,

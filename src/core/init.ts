@@ -24,7 +24,13 @@ export interface InitResult {
   next: string;
 }
 
-const SCRIPT_RE = /dev|start|serve|watch|build|worker|queue|cron|preview/i;
+const SCRIPT_RE =
+  /dev|start|serve|watch|build|worker|queue|cron|preview|migrate|seed|once/i;
+/** A command that keeps running and rebuilds on change. */
+const WATCH_RE = /(--watch|\bwatch\b|\s-w\b|tsc -b -w)/i;
+const SERVERISH_RE = /\b(dev|serve|start|preview)\b/i;
+/** Script names of one-shot jobs: a build, a migration, a seed. */
+const ONCE_RE = /\b(build|migrate|seed|once)\b/i;
 const SKIP_DIRS = new Set([
   'node_modules',
   'dist',
@@ -85,12 +91,10 @@ export function walk(dir: string, maxDepth: number, depth = 0): string[] {
 export function guessKind(name: string, cmd: string): AppKind | 'unknown' {
   const s = `${name} ${cmd}`;
   if (/worker|queue|cron|consumer/i.test(s)) return 'worker';
-  if (
-    /(--watch|\bwatch\b|tsc -w|tsc -b -w|\bbuild\b)/i.test(s) &&
-    !/\b(dev|serve|start|preview)\b/i.test(name)
-  )
-    return 'build';
-  if (/\b(dev|serve|start|preview)\b/i.test(s)) return 'server';
+  const serverish = SERVERISH_RE.test(name);
+  if (WATCH_RE.test(s) && !serverish) return 'build';
+  if (ONCE_RE.test(name) && !serverish) return 'task';
+  if (SERVERISH_RE.test(s)) return 'server';
   return 'unknown';
 }
 
@@ -113,6 +117,15 @@ export function guessPort(cmd: string, dir: string): number | undefined {
     }
   }
   return undefined;
+}
+
+/** A one-shot job (build, task) declares no port, so none is guessed for it. */
+function portFor(
+  kind: AppKind | 'unknown',
+  cmd: string,
+  dir: string
+): number | undefined {
+  return kind === 'build' || kind === 'task' ? undefined : guessPort(cmd, dir);
 }
 
 function packageCandidates(
@@ -143,7 +156,7 @@ function packageCandidates(
       run: `${pm} ${n}`,
       cwd: rel,
       kind,
-      port: kind === 'build' ? undefined : guessPort(cmd, pkgDir),
+      port: portFor(kind, cmd, pkgDir),
     });
   }
   return out;
@@ -283,15 +296,17 @@ export function discover(root: string): Discovery {
   if (fs.existsSync(procfile)) {
     for (const line of fs.readFileSync(procfile, 'utf8').split('\n')) {
       const m = /^\s*([A-Za-z0-9_-]+):\s*(.+)$/.exec(line);
-      if (m)
+      if (m) {
+        const kind = guessKind(m[1], m[2]);
         candidates.push({
           name: sanitizeName(m[1]),
           source: `Procfile:${m[1]}`,
           run: m[2].trim(),
           cwd: '.',
-          kind: guessKind(m[1], m[2]),
-          port: guessPort(m[2], root),
+          kind,
+          port: portFor(kind, m[2], root),
         });
+      }
     }
   }
 
@@ -320,7 +335,7 @@ export function renderDraft(
     '#',
     '# Candidates below are commented out. Uncomment the ones your dev stack needs,',
     '# write a description for each app, then run start + ls to confirm the ports; fix; repeat.',
-    '# Fields: kind build|server|worker; run = shell command; cwd relative to the project root;',
+    '# Fields: kind build|server|worker|task (task = runs once, e.g. a build or a migration; ls shows done/failed); run = shell command; cwd relative to the project root;',
     '# port/ports = declared listening ports; watch = pm2 watch paths (restart a server when its',
     '# build output changes); depends_on = start order; profiles = named groups of apps;',
     '# url = the address to open in a browser; ls/describe show it with the HTTP answer, monit shows it;',

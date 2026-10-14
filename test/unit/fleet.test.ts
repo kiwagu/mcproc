@@ -8,7 +8,9 @@ import {
   listFleet,
   describeFleetApp,
 } from '../../src/core/fleet.js';
+import { describeProject } from '../../src/core/list.js';
 import { McprocError } from '../../src/core/errors.js';
+import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -296,7 +298,14 @@ describe('one app by name (describe, logs)', () => {
     });
     const d = await describeFleetApp(h.fleet, 'web');
     expect(d.host).toBe('box');
-    expect(d.app.depends_on).toEqual(['watch']);
+    expect(d.app.depends_on).toEqual([
+      { app: 'watch', condition: 'started', timeout_s: 60 },
+    ]);
+    // the project summary says the same thing about the same dependency
+    expect(
+      describeProject(h.fleet.manifest).apps.find((a) => a.name === 'web')
+        ?.depends_on
+    ).toEqual(d.app.depends_on);
     expect(d.row).toMatchObject({ host: 'box', status: 'online' });
     expect(d.pm2.cwd).toBe('/home/dev/fleet');
     expect(h.connected).toEqual(['box']);
@@ -353,7 +362,13 @@ describe('actOn when a host fails or refuses', () => {
       ...ro,
       apps: {
         ...ro.apps,
-        web: { ...ro.apps.web, depends_on: ['watch', 'audit'] },
+        web: {
+          ...ro.apps.web,
+          depends_on: [
+            { app: 'watch', condition: 'started' as const, timeoutMs: 60_000 },
+            { app: 'audit', condition: 'started' as const, timeoutMs: 60_000 },
+          ],
+        },
       },
     };
     const f = new Fleet(mm, undefined, never);
@@ -362,5 +377,156 @@ describe('actOn when a host fails or refuses', () => {
       message: expect.stringContaining('"audit" (a dependency of "web")'),
       hint: expect.stringContaining('--host box'),
     });
+  });
+});
+
+describe('actOn start with conditions across hosts', () => {
+  const dir = path.join(here, '..', 'fixtures', 'projects', 'fleet-ready');
+  const m2 = loadManifest(dir);
+  const proc = (
+    name: string,
+    status: string,
+    extra: Record<string, unknown> = {},
+    cwd = dir
+  ) => ({
+    pid: status === 'online' ? 100 : 0,
+    name: `fr-${name}`,
+    pm_id: 1,
+    pm2_env: { status, namespace: 'fr', pm_cwd: cwd, ...extra },
+  });
+  const rules = (list: unknown[]) => [
+    {
+      match: MARK.JLIST,
+      result: {
+        stdout: probeOut({ jlist: JSON.stringify(list), ps: '1 0\n' }),
+      },
+    },
+    { match: /pm2 'jlist'/, result: { stdout: JSON.stringify(list) } },
+    { match: 'cat >', result: {} },
+    { match: /startOrRestart/, result: {} },
+  ];
+  it('waits for a dependency on the host it runs on, then starts the dependent on its own host', async () => {
+    const ctxs: Record<string, ReturnType<typeof fakeCtx>> = {
+      local: fakeCtx(
+        dir,
+        'local',
+        rules([proc('libs', 'stopped', { exit_code: 0 })]),
+        'local'
+      ),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(m2, undefined, async (_m, host) => ctxs[host]);
+    const waits: WaitRecord[] = [];
+    const rows = await actOn(f, 'web', 'start', { waits });
+    expect(rows.map((r) => [r.app, r.host, r.status])).toEqual([
+      ['libs', 'local', 'done'],
+      ['web', 'box', 'not-started'],
+    ]);
+    expect(waits).toEqual([
+      expect.objectContaining({
+        app: 'web',
+        dep: 'libs',
+        condition: 'completed',
+        ok: true,
+      }),
+    ]);
+    // the wait's jlist ran on local, the dependent's start on box
+    expect(ctxs.local.fake.calls.some((c) => /pm2 'jlist'/.test(c.cmd))).toBe(
+      true
+    );
+    expect(
+      ctxs.box.fake.calls.some((c) => /startOrRestart.*'fr-web'/.test(c.cmd))
+    ).toBe(true);
+  });
+  it('a dependency that failed on its host leaves the dependent skipped on the other host', async () => {
+    const ctxs = {
+      local: fakeCtx(
+        dir,
+        'local',
+        rules([proc('libs', 'stopped', { exit_code: 2 })]),
+        'local'
+      ),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(
+      m2,
+      undefined,
+      async (_m, host) => ctxs[host as 'local' | 'box']
+    );
+    const rows = await actOn(f, 'web', 'start');
+    expect(rows.find((r) => r.app === 'web')).toMatchObject({
+      status: 'skipped',
+      error: 'libs failed (exit 2)',
+    });
+    expect(ctxs.box.fake.calls.some((c) => /startOrRestart/.test(c.cmd))).toBe(
+      false
+    );
+  });
+  it('a skip decided in one host run holds in the later runs: libs (local) fails, web (box) is skipped, site (local, after web) is skipped and never launched', async () => {
+    const ctxs = {
+      local: fakeCtx(
+        dir,
+        'local',
+        rules([proc('libs', 'stopped', { exit_code: 2 })]),
+        'local'
+      ),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(
+      m2,
+      undefined,
+      async (_m, host) => ctxs[host as 'local' | 'box']
+    );
+    expect(f.runs(['libs', 'web', 'site']).map((r) => r.host)).toEqual([
+      'local',
+      'box',
+      'local',
+    ]);
+    const rows = await actOn(f, 'site', 'start');
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'libs failed (exit 2)',
+    });
+    expect(by.site).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: web was not started (libs failed (exit 2))',
+    });
+    const launched = (c: (typeof ctxs)[keyof typeof ctxs]) =>
+      c.fake.calls
+        .filter((x) => /startOrRestart/.test(x.cmd))
+        .map((x) => x.cmd);
+    expect(launched(ctxs.local)).toHaveLength(1); // libs only
+    expect(launched(ctxs.local)[0]).toContain("'fr-libs'");
+    expect(launched(ctxs.box)).toEqual([]);
+  });
+  it('a signal given to actOn reaches the wait on the dependency host: aborted, and the dependent on the other host is skipped', async () => {
+    const ctxs = {
+      local: fakeCtx(dir, 'local', rules([proc('libs', 'online')]), 'local'),
+      box: fakeCtx(dir, 'box', rules([]), 'local'),
+    };
+    const f = new Fleet(
+      m2,
+      undefined,
+      async (_m, host) => ctxs[host as 'local' | 'box']
+    );
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50); // while the wait polls; the start was not cancelled before it began
+    const rows = await actOn(f, 'web', 'start', { signal: ac.signal });
+    expect(rows.find((r) => r.app === 'web')).toMatchObject({
+      status: 'skipped',
+      error: 'libs: wait aborted',
+    });
+    expect(ctxs.box.fake.calls.some((c) => /startOrRestart/.test(c.cmd))).toBe(
+      false
+    );
+  });
+  it('with --host a conditional dependency elsewhere is left alone', async () => {
+    const box = fakeCtx(dir, 'box', rules([]), 'box');
+    const f = new Fleet(m2, 'box', async () => box);
+    const waits: WaitRecord[] = [];
+    const rows = await actOn(f, 'web', 'start', { waits });
+    expect(rows.map((r) => r.app)).toEqual(['web']);
+    expect(waits).toEqual([]);
   });
 });

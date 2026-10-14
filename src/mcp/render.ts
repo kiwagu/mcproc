@@ -4,6 +4,8 @@ import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
 import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
+import type { WaitRecord } from '../core/actions.js';
+import type { WaitResult } from '../core/wait.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -136,7 +138,7 @@ export function startNote(rows: LsRow[]): string {
       )
   );
   return booting.length
-    ? `note: ${booting.map((r) => r.app).join(', ')} not listening yet; ports are sampled right after start, call ls again if the app is still booting`
+    ? `note: ${booting.map((r) => r.app).join(', ')} not listening yet; ports are sampled right after start, call wait until listening instead of polling ls`
     : '';
 }
 
@@ -230,6 +232,38 @@ export function renderLogs(l: LogsResult): string {
     parts.push(`--- ${l.app} err (${l.paths.err}) ---\n${l.err}`);
   return parts.join('\n');
 }
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+/** One line: what was reached (or not) after how long, and what was seen. */
+export function renderWait(app: string, r: WaitResult): string {
+  const seen = r.observed ? ` (${r.observed})` : '';
+  if (r.ok) {
+    if (r.until === 'exited') {
+      // "failed (exit 2)" already names its code; a stop has none
+      const code =
+        typeof r.exit_code === 'number' && !r.status.includes('exit')
+          ? ` (exit ${r.exit_code})`
+          : '';
+      return `${app}: ${r.status} after ${secs(r.waited_ms)}${code}`;
+    }
+    if (r.until.startsWith('log:'))
+      return `${app}: log matched after ${secs(r.waited_ms)}: ${r.matched_line}`;
+    return `${app}: ${r.until} after ${secs(r.waited_ms)}${seen}`;
+  }
+  if (r.reason === 'timeout')
+    return `${app}: ${r.until} not reached after ${secs(r.waited_ms)}${seen}`;
+  if (r.reason === 'aborted')
+    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}`;
+  return `${app}: ${r.reason} (${r.status}) after ${secs(r.waited_ms)} while waiting for ${r.until}`;
+}
+/** `libs (completed), api (ready), logger`: a started dependency is its bare name. */
+export function fmtDeps(deps: { app: string; condition: string }[]): string {
+  return deps
+    .map((d) =>
+      d.condition === 'started' ? d.app : `${d.app} (${d.condition})`
+    )
+    .join(', ');
+}
+
 export function renderProject(d: {
   project: string;
   root: string;
@@ -239,7 +273,7 @@ export function renderProject(d: {
     description: string;
     ports: number[];
     url: string | null;
-    depends_on: string[];
+    depends_on: { app: string; condition: string }[];
     host: string | null;
   }[];
   profiles: Record<string, string[]>;
@@ -249,7 +283,7 @@ export function renderProject(d: {
   const L = [`project: ${d.project} (${d.root})`, 'apps:'];
   for (const a of d.apps)
     L.push(
-      `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${a.depends_on.join(',')}` : ''}: ${a.description}`
+      `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${fmtDeps(a.depends_on)}` : ''}: ${a.description}`
     );
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles))
@@ -323,19 +357,31 @@ export function renderFlushed(r: Cleared[], multi: boolean): string {
     .join('\n');
 }
 
-/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table and the start note. */
+/** `waited 4.2 s for libs (completed), 1.1 s for api (ready)`: the waits that were met; the failed ones are in the rows. */
+export function waitNote(waits: WaitRecord[]): string {
+  const ok = waits.filter((w) => w.ok);
+  return ok.length
+    ? `waited ${ok.map((w) => `${(w.ms / 1000).toFixed(1)} s for ${w.dep} (${w.condition})`).join(', ')}`
+    : '';
+}
+
+/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start note and the waits made. */
 export function renderMutation(
   rows: LsRow[],
   fallback: string,
-  act: string
+  act: string,
+  waits: WaitRecord[] = []
 ): { text: string; failed: boolean } {
   const bad = rows.filter((r) => r.error);
-  const note = act === 'start' || act === 'restart' ? startNote(rows) : '';
+  const notes = [
+    act === 'start' || act === 'restart' ? startNote(rows) : '',
+    waitNote(waits),
+  ].filter(Boolean);
   const head = bad.length
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`
     : '';
   return {
-    text: head + renderLs(rows, fallback) + (note ? `\n${note}` : ''),
+    text: head + renderLs(rows, fallback) + notes.map((n) => `\n${n}`).join(''),
     failed: bad.length > 0,
   };
 }

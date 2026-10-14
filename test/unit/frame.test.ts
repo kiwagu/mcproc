@@ -28,6 +28,7 @@ const web: LsRow = {
     'next-server (v16.2.9) with a very long tail of arguments that must be cut',
   pm2_cpu: 0,
   pm2_memory: 9_000_000,
+  exit_code: null,
   metrics_source: 'tree',
   url: 'http://localhost:3100/',
   url_status: 'ok',

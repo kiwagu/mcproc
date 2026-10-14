@@ -13,7 +13,11 @@ import {
   restartApps,
   stopApps,
   deleteApps,
+  type WaitRecord,
 } from '../../src/core/actions.js';
+import { McprocError } from '../../src/core/errors.js';
+import { loadManifest } from '../../src/core/manifest.js';
+import type { WaitResult } from '../../src/core/wait.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -210,5 +214,364 @@ describe('restart / stop / delete', () => {
       `pm2 'delete' '1'`,
       `pm2 'delete' '0'`,
     ]);
+  });
+});
+
+describe('startApps with depends_on conditions', () => {
+  const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+  const proc = (
+    name: string,
+    status: string,
+    extra: Record<string, unknown> = {}
+  ) => ({
+    pid: status === 'online' ? 100 : 0,
+    name: `ready-${name}`,
+    pm_id: 1,
+    pm2_env: { status, namespace: 'ready', pm_cwd: readiness, ...extra },
+  });
+  const rules = (list: unknown[]) => [
+    {
+      match: MARK.JLIST,
+      result: {
+        stdout: probeOut({ jlist: JSON.stringify(list), ps: '1 0\n' }),
+      },
+    },
+    { match: /pm2 'jlist'/, result: { stdout: JSON.stringify(list) } },
+    { match: 'cat >', result: {} },
+    { match: /startOrRestart/, result: {} },
+  ];
+  const okWait = (status = 'done'): WaitResult => ({
+    ok: true,
+    until: 'exited',
+    waited_ms: 1500,
+    status,
+    exit_code: 0,
+  });
+  const launchedOf = (ctx: ReturnType<typeof fakeCtx>) =>
+    ctx.fake.calls
+      .filter((c) => /startOrRestart/.test(c.cmd))
+      .map((c) => /'--only' '([^']+)'/.exec(c.cmd)![1]);
+  it('waits for each conditional dependency after it was launched and before the dependent starts', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const waited: string[] = [];
+    const waits: WaitRecord[] = [];
+    const rows = await startApps(ctx, 'web', {
+      waits,
+      waitDep: async (d, forApp) => {
+        waited.push(`${forApp}<-${d.app}:${d.condition}`);
+        return okWait();
+      },
+    });
+    expect(launchedOf(ctx)).toEqual([
+      'ready-libs',
+      'ready-api',
+      'ready-logger',
+      'ready-web',
+    ]);
+    expect(waited).toEqual(['api<-libs:completed', 'web<-api:ready']); // started deps (logger) are not waited for
+    expect(waits.map((w) => [w.app, w.dep, w.ok])).toEqual([
+      ['api', 'libs', true],
+      ['web', 'api', true],
+    ]);
+    expect(rows.map((r) => r.app)).toEqual(['libs', 'api', 'logger', 'web']);
+  });
+  it('a failed dependency skips the dependent and everything that depends on it; unrelated apps still start', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const waits: WaitRecord[] = [];
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', {
+      waits,
+      failed,
+      waitDep: async (d) =>
+        d.app === 'libs'
+          ? {
+              ok: false,
+              reason: 'failed',
+              until: 'exited',
+              waited_ms: 300,
+              status: 'failed (exit 2)',
+              exit_code: 2,
+            }
+          : okWait(),
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api).toMatchObject({
+      status: 'skipped',
+      error: 'libs failed (exit 2)',
+    });
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: api was not started (libs failed (exit 2))',
+    });
+    expect(by.logger.status).not.toBe('skipped');
+    expect(launchedOf(ctx)).toEqual(['ready-libs', 'ready-logger']);
+    // web was never waited for: its dependency api was not started
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({
+      app: 'api',
+      dep: 'libs',
+      condition: 'completed',
+      ok: false,
+      reason: 'failed',
+    });
+    expect([...failed]).toEqual([
+      ['api', 'libs failed (exit 2)'],
+      ['web', 'skipped: api was not started (libs failed (exit 2))'],
+    ]);
+  });
+  it('an app decided elsewhere (the failed map) is skipped with the stored reason, its dependents too, and the map keeps both', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const failed = new Map([['api', 'libs failed (exit 2)']]);
+    const waited: string[] = [];
+    const rows = await startApps(ctx, 'stack', {
+      failed,
+      waitDep: async (d) => {
+        waited.push(d.app);
+        return okWait();
+      },
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api).toMatchObject({
+      status: 'skipped',
+      error: 'libs failed (exit 2)',
+    });
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: api was not started (libs failed (exit 2))',
+    });
+    expect(waited).toEqual([]);
+    expect(launchedOf(ctx)).toEqual(['ready-libs', 'ready-logger']);
+    expect(failed.get('api')).toBe('libs failed (exit 2)');
+    expect(failed.get('web')).toBe(
+      'skipped: api was not started (libs failed (exit 2))'
+    );
+  });
+  it('depsOf supplies the dependencies the host-scoped manifest dropped: they are waited for, and block the dependent when they were not started', async () => {
+    const fleetReady = path.join(
+      here,
+      '..',
+      'fixtures',
+      'projects',
+      'fleet-ready'
+    );
+    const full = loadManifest(fleetReady);
+    const depsOf = (n: string) => full.apps[n].depends_on;
+    const boxCtx = () => fakeCtx(fleetReady, 'box', rules([]), 'local');
+    const plain = boxCtx();
+    expect(plain.manifest.apps.web.depends_on).toEqual([]); // libs runs on local: invisible from box
+    const waited: string[] = [];
+    const waits: WaitRecord[] = [];
+    await startApps(plain, ['web'], {
+      depsOf,
+      waits,
+      waitDep: async (d, forApp) => {
+        waited.push(`${forApp}<-${d.app}:${d.condition}`);
+        return okWait();
+      },
+    });
+    expect(waited).toEqual(['web<-libs:completed']);
+    expect(waits.map((w) => [w.app, w.dep, w.ok])).toEqual([
+      ['web', 'libs', true],
+    ]);
+    expect(launchedOf(plain)).toEqual(['fr-web']);
+    const blocked = boxCtx();
+    const rows = await startApps(blocked, ['web'], {
+      depsOf,
+      failed: new Map([['libs', 'libs failed (exit 2)']]),
+      waitDep: async () => {
+        throw new Error('must not wait for a dependency that was not started');
+      },
+    });
+    expect(rows[0]).toMatchObject({
+      status: 'skipped',
+      error: 'skipped: libs was not started (libs failed (exit 2))',
+    });
+    expect(launchedOf(blocked)).toEqual([]);
+  });
+  it('a cancelled start launches nothing more, unrelated apps included: each is skipped as cancelled', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const ac = new AbortController();
+    ac.abort();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', {
+      signal: ac.signal,
+      failed,
+      waitDep: async () => {
+        throw new Error('must not wait once the start is cancelled');
+      },
+    });
+    expect(rows.map((r) => [r.app, r.status, r.error])).toEqual([
+      ['libs', 'skipped', 'start cancelled'],
+      ['api', 'skipped', 'start cancelled'],
+      ['logger', 'skipped', 'start cancelled'],
+      ['web', 'skipped', 'start cancelled'],
+    ]);
+    expect(launchedOf(ctx)).toEqual([]);
+    expect([...failed.keys()]).toEqual(['libs', 'api', 'logger', 'web']);
+  });
+  it('a cancelled start leaves an app that is online as it is: it is not launched, so it is not skipped', async () => {
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([{ ...proc('logger', 'online'), pm_id: 4 }])
+    );
+    const ac = new AbortController();
+    ac.abort();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', { signal: ac.signal, failed });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.logger.status).toBe('online');
+    expect(by.libs.status).toBe('skipped');
+    expect(failed.has('logger')).toBe(false);
+    expect(launchedOf(ctx)).toEqual([]);
+  });
+  it('a cancel that arrives while a dependency wait is answered ok launches nothing after it: the dependent is skipped, a reload does not restart it', async () => {
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([{ ...proc('api', 'online'), pm_id: 2 }])
+    );
+    const ac = new AbortController();
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'web', {
+      reload: true,
+      signal: ac.signal,
+      failed,
+      waitDep: async () => {
+        ac.abort(); // the client goes away during the probe that finds the condition met
+        return okWait();
+      },
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api).toMatchObject({
+      status: 'skipped',
+      error: 'start cancelled',
+    });
+    expect(by.web).toMatchObject({
+      status: 'skipped',
+      error: 'start cancelled',
+    });
+    expect(launchedOf(ctx)).toEqual(['ready-libs']); // libs came before anything was awaited
+    expect(failed.get('api')).toBe('start cancelled');
+  });
+  it('an app already online is not skipped when what it needs was: it is left alone and not marked failed', async () => {
+    // libs fails, api (not running) is skipped, web is up already: it stays as it is, with its row and no cascade
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([{ ...proc('web', 'online'), pm_id: 3 }])
+    );
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', {
+      failed,
+      waitDep: async () => ({
+        ok: false,
+        reason: 'failed',
+        until: 'exited',
+        waited_ms: 300,
+        status: 'failed (exit 2)',
+        exit_code: 2,
+      }),
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api.status).toBe('skipped');
+    expect(by.web.status).not.toBe('skipped');
+    expect(launchedOf(ctx)).toEqual(['ready-libs', 'ready-logger']);
+    expect(failed.has('api')).toBe(true);
+    expect(failed.has('web')).toBe(false);
+  });
+  it('a wait that throws skips that dependent with the error, records it, and the other apps still start', async () => {
+    const ctx = fakeCtx(readiness, 'local', rules([]));
+    const waits: WaitRecord[] = [];
+    const failed = new Map<string, string>();
+    const rows = await startApps(ctx, 'stack', {
+      waits,
+      failed,
+      waitDep: async (d) => {
+        if (d.app === 'libs')
+          throw new McprocError('TRANSPORT_FAILED', 'host dev is unreachable');
+        return okWait();
+      },
+    });
+    const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+    expect(by.api).toMatchObject({
+      status: 'skipped',
+      error: 'libs: TRANSPORT_FAILED: host dev is unreachable',
+    });
+    expect(by.web.status).toBe('skipped');
+    expect(by.logger.status).not.toBe('skipped');
+    expect(launchedOf(ctx)).toEqual(['ready-libs', 'ready-logger']);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({
+      app: 'api',
+      dep: 'libs',
+      ok: false,
+      reason: 'error',
+    });
+    expect(failed.get('api')).toBe(
+      'libs: TRANSPORT_FAILED: host dev is unreachable'
+    );
+  });
+  it('an online task dependency is waited on, not restarted; a done one is re-run', async () => {
+    const online = fakeCtx(readiness, 'local', rules([proc('libs', 'online')]));
+    await startApps(online, 'api', { waitDep: async () => okWait() });
+    expect(launchedOf(online)).toEqual(['ready-api']);
+    const done = fakeCtx(
+      readiness,
+      'local',
+      rules([proc('libs', 'stopped', { exit_code: 0 })])
+    );
+    await startApps(done, 'api', { waitDep: async () => okWait() });
+    expect(launchedOf(done)).toEqual(['ready-libs', 'ready-api']);
+  });
+  it('an app already online is left alone without waiting (no reload)', async () => {
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([
+        proc('libs', 'stopped', { exit_code: 0 }),
+        { ...proc('api', 'online'), pm_id: 2 },
+      ])
+    );
+    const waited: string[] = [];
+    await startApps(ctx, 'api', {
+      waitDep: async (d) => {
+        waited.push(d.app);
+        return okWait();
+      },
+    });
+    expect(waited).toEqual([]);
+  });
+  it('an aborted signal ends the default wait as aborted and the dependent is skipped with that reason', async () => {
+    // libs is still running (a task not yet done): without the signal this wait would last its whole timeout
+    const ctx = fakeCtx(readiness, 'local', rules([proc('libs', 'online')]));
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50); // while the wait polls; the start was not cancelled before it began
+    const waits: WaitRecord[] = [];
+    const rows = await startApps(ctx, 'api', { waits, signal: ac.signal });
+    expect(waits).toMatchObject([
+      { app: 'api', dep: 'libs', ok: false, reason: 'aborted' },
+    ]);
+    const api = rows.find((r) => r.app === 'api')!;
+    expect(api.status).toBe('skipped');
+    expect(api.error).toBe('libs: wait aborted');
+    expect(launchedOf(ctx)).toEqual([]);
+  });
+  it('by default the wait runs on this context (no fleet)', async () => {
+    // libs is already done: the default waiter sees exit 0 at once
+    const ctx = fakeCtx(
+      readiness,
+      'local',
+      rules([proc('libs', 'stopped', { exit_code: 0 })])
+    );
+    const waits: WaitRecord[] = [];
+    const rows = await startApps(ctx, 'api', { waits });
+    expect(waits[0]).toMatchObject({
+      app: 'api',
+      dep: 'libs',
+      condition: 'completed',
+      ok: true,
+    });
+    expect(rows.find((r) => r.app === 'api')!.status).not.toBe('skipped');
   });
 });

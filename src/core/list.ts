@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { McprocError } from './errors.js';
-import type { App, AppKind, Manifest } from './manifest.js';
+import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
   parseJlist,
@@ -34,6 +34,8 @@ export interface LsRow {
   pid: number | null;
   uptime_ms: number | null;
   restarts: number;
+  /** pm2's last recorded exit code for the process, any app; null when none is recorded (see statusWord) */
+  exit_code: number | null;
   cpu: number | null;
   memory: number;
   procs: number | null;
@@ -61,6 +63,8 @@ export interface Snapshot {
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
   cpu?: 'inline' | 'none';
+  /** 'none': the light probe (no /proc stat, RSS, args or docker); tree metrics stay null */
+  metrics?: 'tree' | 'none';
   prev?: { sample: StatSample; at: number };
   urls?: 'check' | 'none' | string[];
 }
@@ -93,7 +97,8 @@ export async function snapshot(
   ctx: Context,
   opts: SnapshotOptions = {}
 ): Promise<Snapshot> {
-  const cpuSample = (opts.cpu ?? 'inline') === 'inline';
+  const withMetrics = opts.metrics !== 'none';
+  const cpuSample = (opts.cpu ?? 'inline') === 'inline' && withMetrics;
   const which = opts.urls ?? 'check';
   const urls =
     which === 'none'
@@ -103,9 +108,12 @@ export async function snapshot(
           .map((a) => a.url)
           .filter((u): u is string => u !== null);
   const res = ensureOk(
-    await ctx.transport.exec(probeScript(ctx.pm2.bin, { cpuSample, urls }), {
-      env: ctx.pm2.env(),
-    }),
+    await ctx.transport.exec(
+      probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
+      {
+        env: ctx.pm2.env(),
+      }
+    ),
     ctx.host,
     'probe'
   );
@@ -162,6 +170,24 @@ export async function snapshot(
   };
 }
 
+/** Exit codes bash reports for SIGINT and SIGTERM: the process was stopped, it did not fail. */
+const SIGNAL_EXITS = new Set([130, 143]);
+
+/**
+ * The word a process is shown with: pm2's status, except that a one-shot app (autorestart off, every kind: task) that
+ * exited reads done / failed (exit N) / stopped by its exit code — pm2 itself says only "stopped" and cannot tell a
+ * manual stop from a natural exit. A manual stop reaches 130 / 143 through the trap the ecosystem puts in front of the
+ * command of every autorestart-off app; null and those codes read as stopped.
+ */
+export function statusWord(p: Pm2Process | undefined, app: App): string {
+  if (!p) return 'not-started';
+  if (p.status !== 'stopped' || app.autorestart) return p.status;
+  const c = p.exit_code;
+  if (c === 0) return 'done';
+  if (c === null || SIGNAL_EXITS.has(c)) return 'stopped';
+  return `failed (exit ${c})`;
+}
+
 export function rowsFor(
   ctx: Context,
   snap: Snapshot,
@@ -176,11 +202,12 @@ export function rowsFor(
       host: ctx.host.name,
       kind: app.kind,
       description: app.description,
-      status: p?.status ?? 'not-started',
+      status: statusWord(p, app),
       pm_id: p?.pm_id ?? null,
       pid: p && p.pid > 0 ? p.pid : null,
       uptime_ms: p?.uptime_ms ?? null,
       restarts: p?.restarts ?? 0,
+      exit_code: p?.exit_code ?? null,
       cpu: m ? m.cpu : (p?.cpu ?? 0),
       memory: m ? m.memory : (p?.memory ?? 0),
       procs: m ? m.procs : null,
@@ -212,6 +239,7 @@ export function unreachableRow(
     pid: null,
     uptime_ms: null,
     restarts: 0,
+    exit_code: null,
     cpu: null,
     memory: 0,
     procs: null,
@@ -292,6 +320,13 @@ export async function describeApp(
   return { app, row, logs: p ? { out: p.out_log, err: p.err_log } : null, pm2 };
 }
 
+/** A dependency as the describe answers show it (the manifest keeps the timeout in ms): one shape for the project and for one app. */
+export const depView = (d: Dep) => ({
+  app: d.app,
+  condition: d.condition,
+  timeout_s: d.timeoutMs / 1000,
+});
+
 export function describeProject(m: Manifest) {
   const readmePath = path.join(m.root, '.mcproc', 'README.md');
   const readme = fs.existsSync(readmePath)
@@ -307,7 +342,7 @@ export function describeProject(m: Manifest) {
       description: a.description,
       ports: a.ports,
       url: a.url,
-      depends_on: a.depends_on,
+      depends_on: a.depends_on.map(depView),
       host: a.host,
     })),
     profiles: { ...m.profiles, all: Object.keys(m.apps) },

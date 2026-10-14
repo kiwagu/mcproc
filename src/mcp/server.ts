@@ -12,6 +12,7 @@ export const INSTRUCTIONS = [
   'Loop: (1) no manifest → call init, then fill in a description per app in .mcproc/mcproc.yaml and verify with start + ls (ports) + logs.',
   '(2) manifest present → call describe first, then act by app or profile name: start, restart, stop, logs. ls answers "is it up and on which port"; ports answers "who holds port N".',
   "On long work with running apps, call incidents now and then (your client's loop or cron if it has one): it returns only new errors with context, each once, and is nearly free when nothing happened.",
+  'After start, call wait (until listening, url-ok, exited, log:<regex> or idle:<seconds>) instead of sleeping or polling ls; a start whose manifest declares depends_on conditions waits by itself.',
   'Apps with `host:` in the manifest always run on that host; without a host argument every app is reached where it runs (others on local), with one only the apps that run there. Readonly hosts refuse changes. doctor explains why a host cannot be driven; unpack brings pm2 (and Node when missing) to a host that has none.',
   'Never compose pm2 or shell commands by hand for apps the manifest knows.',
 ].join(' ');
