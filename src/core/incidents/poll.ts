@@ -4,8 +4,9 @@ import type { Fleet, HostError } from '../fleet.js';
 import { ensureOk } from '../../transport/index.js';
 import { CLOCK_SNIPPET, hostClock, hostStamp } from '../logsince.js';
 import {
+  beforeStart,
   compileReloadRules,
-  detectReloads,
+  ReloadTracker,
   type Reload,
   type ReloadInput,
 } from '../reloads.js';
@@ -132,7 +133,12 @@ export async function pollIncidents(
         let latest: string | null = null;
         const perApp = new Map<
           string,
-          { mark: AppMark; errLines: string[]; newLines: ReloadInput[] }
+          {
+            mark: AppMark;
+            errLines: string[];
+            newLines: ReloadInput[];
+            ctxStamps: string[];
+          }
         >();
         const stalled = new Map<string, string>();
         files.forEach((f, i) => {
@@ -141,6 +147,7 @@ export async function pollIncidents(
             mark: { restarts: f.t.p.restarts, status: f.t.p.status },
             errLines: [],
             newLines: [],
+            ctxStamps: [],
           };
           perApp.set(f.t.app, entry);
           if (!r) return;
@@ -173,9 +180,12 @@ export async function pollIncidents(
           const contextOnly = from
             ? Math.max(r.contextOnly, insideFrom(r.lines, from))
             : r.contextOnly;
-          if (f.t.reloads)
+          if (f.t.reloads) {
+            const before = lastStampBefore(r.lines, contextOnly);
+            if (before) entry.ctxStamps.push(before);
             for (const text of r.lines.slice(contextOnly))
               entry.newLines.push({ stream: f.stream, text });
+          }
           if (!f.t.settings) return; // errors: false, here for its reloads only
           try {
             incidents.push(
@@ -198,16 +208,20 @@ export async function pollIncidents(
                 ? hostStamp(t.p.started_at, zone)
                 : null;
             try {
-              const found = detectReloads(
-                entry.newLines,
+              const tracker = new ReloadTracker(
                 compileReloadRules(t.reloads, opts.budgetMs),
                 {
                   app: t.app,
                   start,
-                  coversStart: !t.prev || t.prev.start !== start, // a first poll, or a new run, may begin with the boot
+                  coversStart: bootAhead(start, t.prev, entry.ctxStamps),
                 }
               );
+              const found = [
+                ...tracker.push(entry.newLines, 0),
+                ...tracker.flush(),
+              ];
               entry.mark.start = start;
+              entry.mark.boot = tracker.awaitingBoot; // no burst closed: the boot is still to come
               if (found.length) incidents.push(reloaded(t.app, g.host, found));
             } catch (e) {
               if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
@@ -284,6 +298,32 @@ function insideFrom(lines: string[], from: string): number {
     if (t !== null && t >= from) return i;
   }
   return lines.length;
+}
+
+/** The stamp of the last stamped line before index `end`; null when none is. */
+function lastStampBefore(lines: string[], end: number): string | null {
+  for (let k = end - 1; k >= 0; k--) {
+    const t = stampOf(lines[k]);
+    if (t) return t;
+  }
+  return null;
+}
+
+/**
+ * Whether the run's boot may still come in the lines this poll analyses. A run looked at before keeps the state that
+ * poll left; a new run since then has its boot ahead. A run not looked at yet (a first poll, or polls without reloads):
+ * its boot is behind the point when a line before the analysed ones (`ctxStamps`, the last stamp of each stream's
+ * context) is of this run. Without a start nothing is taken for the boot.
+ */
+function bootAhead(
+  start: string | null,
+  prev: AppMark | undefined,
+  ctxStamps: string[]
+): boolean {
+  if (start === null) return false;
+  if (prev?.start === start) return prev.boot === true;
+  if (typeof prev?.start === 'string') return true;
+  return ctxStamps.every((s) => beforeStart(s, start));
 }
 
 /** An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's first marker line. */

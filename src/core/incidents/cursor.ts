@@ -24,8 +24,9 @@ const HEX = /^[0-9a-f]{0,64}$/;
 const REPLACEMENT = Buffer.from('\ufffd');
 
 /**
- * `start`: the process start (the host's wall time, pm2's stamp shape) a poll that looked for reloads saw; while it stays
- * the same, the run's boot is behind the point. Null when the host's zone or pm2's start was unknown.
+ * Written only by a poll that looked for reloads: `start`, the run it looked at (pm2's start in the host's wall time,
+ * pm2's stamp shape; null when the host's zone or pm2's start was unknown), and `boot`, true while that run's first
+ * burst is still ahead of the point (a `listening`-only first burst is the boot, not a reload).
  */
 export interface AppMark {
   out?: FileMark;
@@ -33,6 +34,7 @@ export interface AppMark {
   restarts: number;
   status: string;
   start?: string | null;
+  boot?: boolean;
 }
 /** Where the previous poll stopped: per `host/app` the read offset of each log file, pm2's restart count and status. */
 export interface CursorState {

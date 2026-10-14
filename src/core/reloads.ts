@@ -121,7 +121,7 @@ interface Timed {
  * is compared with the start's second: read as `.000`, the boot line logged in the start's own second would fall
  * before a start such as `…:05.700` and the next re-listen would be taken for the boot.
  */
-const beforeStart = (stamp: string, start: string): boolean =>
+export const beforeStart = (stamp: string, start: string): boolean =>
   stamp < (stamp.length > 19 ? start : start.slice(0, 19));
 
 /**
@@ -295,6 +295,11 @@ export class ReloadTracker {
   /** When `idle` will close the open burst if no marker arrives before then (wall ms); null with no burst open. */
   idleAt(): number | null {
     return this.open ? this.openWall + RELOAD_GAP_MS : null;
+  }
+
+  /** Whether the next burst to close is still taken for the boot when it is only `listening` lines: none has closed yet. */
+  get awaitingBoot(): boolean {
+    return this.bootPending;
   }
 
   /** Closes the open burst unconditionally. */
