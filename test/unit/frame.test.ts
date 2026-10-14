@@ -20,6 +20,7 @@ const web: LsRow = {
   pm_id: 1,
   pid: 971175,
   uptime_ms: 22 * 60_000,
+  started: null,
   restarts: 0,
   cpu: 84.4,
   memory: 2_200_000_000,

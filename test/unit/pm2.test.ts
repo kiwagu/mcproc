@@ -76,6 +76,43 @@ describe('parseJlist', () => {
     );
     expect(procs.map((p) => p.exit_code)).toEqual([2, null, null]);
   });
+  it("carries started_at: pm2's last start (pm_uptime, epoch ms) whatever the status, null when absent", () => {
+    const procs = parseJlist(
+      JSON.stringify([
+        {
+          pid: 9,
+          name: 'p-o',
+          pm_id: 1,
+          pm2_env: {
+            status: 'online',
+            namespace: 'p',
+            pm_uptime: 1_760_000_000_000,
+          },
+        },
+        {
+          pid: 0,
+          name: 'p-s',
+          pm_id: 2,
+          pm2_env: {
+            status: 'stopped',
+            namespace: 'p',
+            pm_uptime: 1_760_000_500_000,
+          },
+        },
+        {
+          pid: 0,
+          name: 'p-n',
+          pm_id: 3,
+          pm2_env: { status: 'stopped', namespace: 'p' },
+        },
+      ])
+    );
+    expect(procs.map((p) => p.started_at)).toEqual([
+      1_760_000_000_000,
+      1_760_000_500_000,
+      null,
+    ]);
+  });
   it('parses an empty list and defaults namespace/pid', () => {
     expect(parseJlist('[]')).toEqual([]);
     const [w] = parseJlist(fx('jlist/two-namespaces.json')).filter(

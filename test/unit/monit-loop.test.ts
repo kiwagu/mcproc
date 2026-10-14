@@ -36,6 +36,7 @@ const row = (app: string, host = 'local'): LsRow => ({
   pm_id: 0,
   pid: 1,
   uptime_ms: 0,
+  started: null,
   restarts: 0,
   cpu: 0,
   memory: 0,
@@ -77,6 +78,7 @@ const snap = (p = procs): Snapshot => ({
   metrics: {},
   sampledAt: Date.now(),
   urls: new Map(),
+  zone: null,
 });
 const deferred = <T>() => {
   let resolve!: (v: T) => void;

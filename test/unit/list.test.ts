@@ -15,6 +15,7 @@ import {
   snapshot,
   rowsFor,
   statusWord,
+  unreachableRow,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -328,6 +329,54 @@ describe('hostsInfo / describe', () => {
       { app: 'api', condition: 'ready', timeout_s: 90 },
       { app: 'logger', condition: 'started', timeout_s: 60 },
     ]);
+  });
+});
+
+describe('started', () => {
+  const at = Date.UTC(2026, 9, 14, 7, 30);
+  const proc = (name: string, status: string, env: object = {}) => ({
+    pid: status === 'online' ? 4000 : 0,
+    name,
+    pm_id: 0,
+    pm2_env: { status, namespace: 'demo', ...env },
+  });
+  const rowsOf = async (procs: object[], clock: string) => {
+    const ctx = fakeCtx(basic, 'local', [
+      {
+        match: MARK.JLIST,
+        result: { stdout: probeOut({ jlist: JSON.stringify(procs), clock }) },
+      },
+    ]);
+    const snap = await snapshot(ctx);
+    return { snap, rows: rowsFor(ctx, snap, ['api', 'api-build', 'worker']) };
+  };
+  it("is pm2's start of the process in the host's own zone, whatever the zone of the machine running mcproc", async () => {
+    const procs = [
+      proc('demo-api', 'online', { pm_uptime: at }),
+      proc('demo-api-build', 'stopped', { pm_uptime: at + 1500 }),
+    ];
+    const utc = await rowsOf(procs, '+0000');
+    expect(utc.snap.zone).toBe('+0000');
+    expect(utc.rows.map((r) => r.started)).toEqual([
+      '2026-10-14T07:30:00.000',
+      '2026-10-14T07:30:01.500', // a stopped process keeps its last start
+      null, // no process
+    ]);
+    expect((await rowsOf(procs, '+0200')).rows[0].started).toBe(
+      '2026-10-14T09:30:00.000'
+    );
+  });
+  it('is null without the host zone, without a start time, and on a row whose host did not answer', async () => {
+    const noZone = await rowsOf(
+      [proc('demo-api', 'online', { pm_uptime: at })],
+      ''
+    );
+    expect(noZone.snap.zone).toBeNull();
+    expect(noZone.rows[0].started).toBeNull();
+    const noStart = await rowsOf([proc('demo-api', 'online')], '+0000');
+    expect(noStart.rows[0].started).toBeNull();
+    const m = loadManifest(basic);
+    expect(unreachableRow(m.apps.api, 'local', 'down').started).toBeNull();
   });
 });
 

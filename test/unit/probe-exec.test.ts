@@ -65,6 +65,7 @@ describe('probe script executed on this host', () => {
       d.stats.samples[0].ticks.get(process.pid)!
     );
     expect(d.stats.args.get(process.pid)).toMatch(/node|vitest|bun/);
+    expect(d.zone).toMatch(/^[+-]\d{4}$/); // this host's `date +%z`
   }, 70_000);
   it('the stat/rss awk programs keep going past a vanished /proc entry (mawk and busybox awk abort on a missing file)', async () => {
     const host: Host = {

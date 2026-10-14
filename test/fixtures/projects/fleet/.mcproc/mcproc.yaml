@@ -13,6 +13,7 @@ apps:
     url: http://localhost:3000/
     host: box
     depends_on: [watch]
+    reloads: { ignore: ['hmr update /src/noisy'] }
   tool:
     description: helper that runs wherever the command points
     kind: worker

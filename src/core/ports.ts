@@ -26,6 +26,8 @@ export interface ProbeData {
   listeners: Listener[];
   stats: ProcStats;
   urls: Map<string, number | null>;
+  /** the host's UTC offset as `date +%z` prints it ('+0200', '-0330'); null when the section is absent or garbled */
+  zone: string | null;
 }
 export interface PortCheck {
   port: number;
@@ -165,6 +167,7 @@ function sections(stdout: string, marks: string[]): Record<string, string> {
 export function parseProbe(stdout: string): ProbeData {
   const sec = sections(stdout, [
     MARK.JLIST,
+    MARK.CLOCK,
     MARK.PS,
     MARK.TCP,
     MARK.UDP,
@@ -227,6 +230,7 @@ export function parseProbe(stdout: string): ProbeData {
     listeners,
     stats,
     urls: parseUrlChecks(sec[MARK.URL]),
+    zone: /^[+-]\d{4}$/.exec((sec[MARK.CLOCK] ?? '').trim())?.[0] ?? null,
   };
 }
 

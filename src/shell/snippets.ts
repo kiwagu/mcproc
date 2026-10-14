@@ -3,6 +3,7 @@ import { shq } from '../transport/quote.js';
 export const MARK = {
   JLIST: '__MCPROC_JLIST__',
   JLIST_RC: '__MCPROC_JLIST_RC__',
+  CLOCK: '__MCPROC_CLOCK__',
   PS: '__MCPROC_PS__',
   TCP: '__MCPROC_TCP__',
   UDP: '__MCPROC_UDP__',
@@ -31,8 +32,9 @@ export const RSS_AWK = `awk '/^Pid:/{ p=$2 } /^VmRSS:/{ print p, $2 }'`;
 const urlCheck = (q: string) =>
   `printf '%s\\t' ${q}; if command -v curl >/dev/null 2>&1; then curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' ${q} 2>/dev/null; echo; elif command -v wget >/dev/null 2>&1; then if wget -q --no-check-certificate -T 2 -O /dev/null ${q} 2>/dev/null; then echo 200; else echo 000; fi; else echo -; fi`;
 
-/** One round trip: pm2 state, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP request per declared url.
- * `metrics: false` is the light form for polling: pm2 state, tree, listeners and urls only, no /proc stat, RSS, args or docker passes. */
+/** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP
+ * request per declared url. `metrics: false` is the light form for polling: pm2 state, offset, tree, listeners and urls only, no /proc stat, RSS,
+ * args or docker passes. */
 export function probeScript(
   pm2Bin: string,
   opts: { cpuSample?: boolean; urls?: string[]; metrics?: boolean } = {}
@@ -40,6 +42,9 @@ export function probeScript(
   return [
     `echo ${MARK.JLIST}`,
     `${pm2Bin} jlist 2>/dev/null; echo "${MARK.JLIST_RC} $?"`,
+    // pm2 keeps start times as epoch ms and stamps log lines in the host's wall time: the offset turns one into the other
+    `echo ${MARK.CLOCK}`,
+    `date '+%z' 2>/dev/null`,
     `echo ${MARK.PS}`,
     `if command -v ps >/dev/null 2>&1; then ps -eo pid,ppid 2>/dev/null || ps -o pid,ppid 2>/dev/null; else ${PS_FALLBACK}; fi`,
     // F=1 once /proc is used for either protocol: an ss that is missing or fails (old iproute2) must not read as "no listeners"

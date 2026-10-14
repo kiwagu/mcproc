@@ -323,6 +323,47 @@ describe('errors settings', () => {
 
 const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
 
+describe('reloads settings', () => {
+  const app = (extra: string) =>
+    parse(`version: 1\napps:\n  a: { description: d, run: r${extra} }\n`).apps
+      .a;
+  it('defaults: built-in markers on, no own patterns; reloads: false turns detection off', () => {
+    expect(app('').reloads).toEqual({ match: [], ignore: [], defaults: true });
+    expect(app(', reloads: false').reloads).toBeNull();
+  });
+  it('per-app settings; what is left out keeps its default', () => {
+    expect(
+      app(`, reloads: { match: ['^x'], defaults: false }`).reloads
+    ).toEqual({ match: ['^x'], ignore: [], defaults: false });
+  });
+  it('an unknown key is MANIFEST_INVALID naming the field', () => {
+    expectInvalid(
+      'version: 1\napps:\n  a: { description: d, run: r, reloads: { context: [1, 2] } }\n',
+      "apps.a.reloads: Unrecognized key(s) in object: 'context'"
+    );
+  });
+  it('patterns are checked like the errors patterns: the same messages, under their own field', () => {
+    expectInvalid(
+      `version: 1\napps:\n  a: { description: d, run: r, reloads: { match: ['(unclosed'] } }\n`,
+      'apps.a.reloads.match: invalid pattern "(unclosed"'
+    );
+    let details: unknown;
+    try {
+      parse(
+        `version: 1\napps:\n  a: { description: d, run: r, errors: { ignore: ['(\\w+\\s*)+x'] }, reloads: { ignore: ['(\\w+\\s*)+x'] } }\n`
+      );
+    } catch (e) {
+      details = (e as McprocError).details;
+    }
+    const why =
+      'pattern "(\\w+\\s*)+x" repeats a group that ends in a repeat (like (a+)+), which can run for minutes on a log line that almost matches; rewrite it without the nested repeat';
+    expect(details).toEqual([
+      `apps.a.errors.ignore: ${why}`,
+      `apps.a.reloads.ignore: ${why}`,
+    ]);
+  });
+});
+
 describe('kind: task and depends_on conditions', () => {
   it('a task has autorestart off by default; the other kinds keep it on', () => {
     const m = loadManifest(readiness);

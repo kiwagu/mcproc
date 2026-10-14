@@ -32,6 +32,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   pm_id: 0,
   pid: 1,
   uptime_ms: 0,
+  started: null,
   restarts: 0,
   exit_code: null,
   cpu: 0,

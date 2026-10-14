@@ -69,6 +69,17 @@ const errorsSchema = z.union([
     .strict(),
 ]);
 
+const reloadsSchema = z.union([
+  z.literal(false),
+  z
+    .object({
+      match: z.array(z.string().min(1)).default([]),
+      ignore: z.array(z.string().min(1)).default([]),
+      defaults: z.boolean().default(true),
+    })
+    .strict(),
+]);
+
 const appSchema = z
   .object({
     description: z.string().min(1),
@@ -93,6 +104,7 @@ const appSchema = z
     pm2: z.record(z.unknown()).default({}),
     host: name.optional(),
     errors: errorsSchema.optional(),
+    reloads: reloadsSchema.optional(),
   })
   .strict();
 
@@ -163,6 +175,8 @@ export interface App {
   /** the host this app always runs on; null = wherever the command points (--host, default local) */
   host: string | null;
   errors: ErrorSettings | null;
+  /** null when the app turned reload detection off */
+  reloads: ReloadSettings | null;
 }
 export interface Host {
   name: string;
@@ -262,6 +276,31 @@ function flattenIssues(issues: z.ZodIssue[]): z.ZodIssue[] {
 /** A name the manifest itself declares (never one every JavaScript object has, like `constructor`). */
 const own = (o: object, k: string): boolean => Object.hasOwn(o, k);
 
+/**
+ * An app's own log patterns (`errors` and `reloads` lists): each must compile, and none may repeat a group that ends in
+ * a repeat, which backtracks for minutes on a line that almost matches. `field` names the list in the message.
+ */
+function checkPatterns(
+  problems: string[],
+  field: string,
+  patterns: string[]
+): void {
+  for (const p of patterns) {
+    try {
+      new RegExp(p);
+    } catch (e) {
+      problems.push(
+        `${field}: invalid pattern "${p}": ${(e as Error).message}`
+      );
+      continue;
+    }
+    if (repeatsARepeat(p))
+      problems.push(
+        `${field}: pattern "${p}" repeats a group that ends in a repeat (like (a+)+), which can run for minutes on a log line that almost matches; rewrite it without the nested repeat`
+      );
+  }
+}
+
 export function parseManifest(
   text: string,
   root: string,
@@ -355,22 +394,20 @@ export function parseManifest(
             stderr: a.errors?.stderr ?? false,
             defaults: a.errors?.defaults ?? true,
           };
-    for (const k of ['match', 'ignore'] as const) {
-      for (const p of errors?.[k] ?? []) {
-        try {
-          new RegExp(p);
-        } catch (e) {
-          problems.push(
-            `apps.${n}.errors.${k}: invalid pattern "${p}": ${(e as Error).message}`
-          );
-          continue;
-        }
-        if (repeatsARepeat(p))
-          problems.push(
-            `apps.${n}.errors.${k}: pattern "${p}" repeats a group that ends in a repeat (like (a+)+), which can run for minutes on a log line that almost matches; rewrite it without the nested repeat`
-          );
-      }
-    }
+    const reloads: ReloadSettings | null =
+      a.reloads === false
+        ? null
+        : {
+            match: a.reloads?.match ?? [],
+            ignore: a.reloads?.ignore ?? [],
+            defaults: a.reloads?.defaults ?? true,
+          };
+    for (const [field, s] of [
+      ['errors', errors],
+      ['reloads', reloads],
+    ] as const)
+      for (const k of ['match', 'ignore'] as const)
+        checkPatterns(problems, `apps.${n}.${field}.${k}`, s?.[k] ?? []);
     apps[n] = {
       name: n,
       description: a.description,
@@ -388,6 +425,7 @@ export function parseManifest(
       pm2: a.pm2,
       host: a.host ?? null,
       errors,
+      reloads,
     };
   }
   const cycle = findCycle(apps);

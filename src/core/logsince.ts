@@ -96,6 +96,11 @@ const zoneMs = (zone: string): number | null => {
   if (!m) return null;
   return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60_000;
 };
+/** An instant (epoch ms) as the host's wall time in pm2's millisecond stamp shape; null for a zone that does not parse. */
+export function hostStamp(epochMs: number, zone: string): string | null {
+  const z = zoneMs(zone);
+  return z === null ? null : wallStamp(epochMs + z);
+}
 const noClock = () =>
   new McprocError(
     'TRANSPORT_FAILED',
