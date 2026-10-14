@@ -352,6 +352,81 @@ describe('ReloadTracker', () => {
   });
 });
 
+describe('the line a reload shows', () => {
+  const boot = [
+    out(`${T('05')}svc listening on 3000`),
+    out(`${T('06')}[tsx] change in ./dist/index.js Restarting...`),
+    out(`${T('06', 300)}svc listening on 3000`),
+  ];
+  const run = {
+    app: 'svc',
+    start: '2026-10-14T12:00:04.000',
+    coversStart: true,
+  };
+  const restart = expect.objectContaining({
+    lines: 3,
+    marker: 'tsx',
+    time: '2026-10-14T12:00:06.000',
+    last_time: '2026-10-14T12:00:06.300',
+    line: expect.stringContaining('Restarting...'),
+  });
+  it("a restart less than 2 s after the boot's listening joins its burst, and the reload shows the restart, not the boot", () => {
+    expect(detectReloads(boot, rules, run)).toEqual([restart]);
+  });
+  it('the same when the boot and the restart come in two pushes', () => {
+    const t = new ReloadTracker(rules, run);
+    expect(t.push([boot[0]], 1_000)).toEqual([]);
+    expect(t.push(boot.slice(1), 1_500)).toEqual([]);
+    expect(t.flush()).toEqual([restart]);
+  });
+  it('between two restart or rebuild markers the earlier is shown, an older one pushed late included', () => {
+    const t = new ReloadTracker(rules, opts);
+    t.push(
+      [
+        out(`${T('30')}api listening on 3010`),
+        out(`${T('30', 800)}[vite] (client) page reload /a.js`),
+      ],
+      1_000
+    );
+    t.push(
+      [
+        {
+          stream: 'err',
+          text: `${T('30', 400)}[vite] (client) page reload /b.js`,
+        },
+      ],
+      1_100
+    );
+    expect(t.flush()).toEqual([
+      expect.objectContaining({
+        lines: 3,
+        marker: 'vite',
+        time: '2026-10-14T12:00:30.400',
+        last_time: '2026-10-14T12:00:30.800',
+        line: expect.stringContaining('/b.js'),
+      }),
+    ]);
+  });
+  it('a burst of listening lines only shows its first', () => {
+    expect(
+      detectReloads(
+        [
+          out(`${T('30', 500)}ws listening on 3011`),
+          { stream: 'err', text: `${T('30')}api listening on 3010` },
+        ],
+        rules,
+        opts
+      )
+    ).toEqual([
+      expect.objectContaining({
+        marker: 'listening',
+        time: '2026-10-14T12:00:30.000',
+        line: expect.stringContaining('api listening'),
+      }),
+    ]);
+  });
+});
+
 describe('reach', () => {
   const started = '2026-10-14T12:00:05.000';
   it('a stream with a line stamped before the start reaches it, wherever its read began', () => {

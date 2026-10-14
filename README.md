@@ -181,7 +181,7 @@ instead of sleeping and polling:
 | `exited` | the process left `online`; with autorestart off the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped`, otherwise pm2's `stopped` or `errored` |
 | `log:<regex>` | a new line of its out or err log matches (ANSI stripped, matched against the line without pm2's time stamp; the answer keeps the stamp; history is not searched) |
 | `idle:<seconds>` | no log output for that long: a watcher settled |
-| `reloaded` | the app's next in-process reload (see *Reloads*) has been quiet for 2 s; the answer carries its time, its line count and its first line |
+| `reloaded` | the app's next in-process reload (see *Reloads*) has been quiet for 2 s; the answer carries its time, its line count and its first restart or rebuild line, else its first line |
 
 `url-ok` needs `curl` or `wget` on the host: without either it runs to the timeout and reports `unchecked`.
 `log:`, `idle:` and `reloaded` see only output written after the call begins, and notice a dead process only every 5 s; for
@@ -254,8 +254,9 @@ reload is one of these lines, matched without pm2's stamp and with ANSI stripped
 
 Marker lines less than 2 s apart, stdout and stderr together, are one reload: a library rebuild that prints a line per
 changed file counts once, and so does a restart followed by the server's new `listening` line. The first burst after
-pm2 starts the process, when it holds only `listening` lines, is the boot, not a reload. Counting starts at pm2's start
-of the process: lines an earlier run left in the same log file never count.
+pm2 starts the process, when it holds only `listening` lines, is the boot, not a reload. A restart less than 2 s after
+the boot's `listening` line joins the boot's burst: it counts once, and is shown by the restart line. Counting starts at
+pm2's start of the process: lines an earlier run left in the same log file never count.
 
 Per app:
 
@@ -277,11 +278,13 @@ than 2 seconds on an app's log, which leaves that app's reloads uncounted with a
 Four places show them:
 
 - `wait until: reloaded` (`mcproc wait web --until reloaded`) answers once the app's next reload has been quiet for 2 s,
-  with its time, its line count and its first line: `web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000):
-  [vite] (client) page reload /src/a.ts`. A server whose reload restarts it may print its new `listening` line more
-  than 2 s later, after the reload was answered: wait until `listening` next.
+  with its time, its line count and its first restart or rebuild line, else its first line:
+  `web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000): [vite] (client) page reload /src/a.ts`. A server
+  whose reload restarts it may print its new `listening` line more than 2 s later, after the reload was answered: wait
+  until `listening` next.
 - `incidents` with `include_reloads: true` (`mcproc incidents --reloads`) adds one `reloaded` incident per app with
-  the reloads since the last call: how many, the first and the last one's time, and the last one's first line.
+  the reloads since the last call: how many, the first and the last one's time, and the last one's first restart or
+  rebuild line, else its first line.
 - `ls` with `reloads: true` (`mcproc ls --reloads`) adds each running app's reloads since its pm2 start to RESTARTS,
   `0 (+7)`, and to each JSON row as `reloads: { count, last, partial }`. It reads each host's logs once more, so a plain
   `ls` does not count them.

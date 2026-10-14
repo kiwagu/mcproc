@@ -67,7 +67,11 @@ export function compileReloadRules(
   };
 }
 
-/** One reload: a burst of marker lines; `line` is its first one (stamp kept), `marker` the id that line matched. */
+/**
+ * One reload: a burst of marker lines. `line` (stamp kept), `marker` (the id it matched) and `time` are the burst's
+ * first restart or rebuild line, else its first line: a restart that joined the boot's `listening` line is shown, not
+ * the boot. `last_time` and `lines` cover the whole burst.
+ */
 export interface Reload {
   time: string | null;
   last_time: string | null;
@@ -102,7 +106,8 @@ interface Hit {
   marker: Kind;
 }
 interface Burst {
-  first: Hit;
+  first: Hit; // the oldest marker, which the join rule measures from
+  shown: Hit; // the marker the reload is reported by
   lastTime: string | null;
   lastMs: number | null;
   lines: number;
@@ -157,7 +162,7 @@ export function reach(
     : 'after';
 }
 
-/** When a reload happened, as its first marker line's stamp was written (seconds or milliseconds), else the burst's time. */
+/** When a reload happened, as its shown line's stamp was written (seconds or milliseconds), else the burst's time. */
 export const reloadStamp = (r: Reload): string | null =>
   stampOf(r.line) ?? r.time;
 
@@ -304,36 +309,49 @@ function hits(
  * A marker joins the open burst when it comes less than RELOAD_GAP_MS after the burst's last one and less than that
  * before its first one: a line flushed late from inside the burst's span still joins, while a marker pushed later
  * with a much older stamp starts a burst of its own. An untimed marker always joins; a timed one never joins an
- * untimed burst, whose age is unknown.
+ * untimed burst, whose age is unknown, so a burst with a last time was opened by a timed marker and its first has one.
  */
 const joins = (b: Burst, h: Hit): boolean =>
   h.ms === null ||
   (b.lastMs !== null &&
     h.ms - b.lastMs < RELOAD_GAP_MS &&
-    (b.first.ms === null || b.first.ms - h.ms < RELOAD_GAP_MS));
+    b.first.ms! - h.ms < RELOAD_GAP_MS);
 const opened = (h: Hit): Burst => ({
   first: h,
+  shown: h,
   lastTime: h.time,
   lastMs: h.ms,
   lines: 1,
   relistenOnly: h.marker.kind === 'relisten',
 });
+const older = (h: Hit, than: Hit): boolean =>
+  h.ms !== null && than.ms !== null && h.ms < than.ms;
+/**
+ * Whether a marker is shown in place of the one shown so far: a restart or rebuild beats a re-listen (the re-listen is
+ * the boot or the restart's own new `listening`), and between two of the same class the older one wins.
+ */
+const shownOver = (h: Hit, shown: Hit): boolean => {
+  const relisten = h.marker.kind === 'relisten';
+  if (relisten !== (shown.marker.kind === 'relisten')) return !relisten;
+  return older(h, shown);
+};
 /** A marker older than the burst's first line (pushed in a later call) becomes its first, as it would in one call. */
 function add(b: Burst, h: Hit): void {
   b.lines++;
   b.relistenOnly &&= h.marker.kind === 'relisten';
-  if (h.ms !== null && b.first.ms !== null && h.ms < b.first.ms) b.first = h;
+  if (older(h, b.first)) b.first = h;
+  if (shownOver(h, b.shown)) b.shown = h;
   if (h.ms !== null && (b.lastMs === null || h.ms >= b.lastMs)) {
     b.lastMs = h.ms;
     b.lastTime = h.time;
   }
 }
 const reloadOf = (b: Burst): Reload => ({
-  time: b.first.time,
+  time: b.shown.time,
   last_time: b.lastTime,
   lines: b.lines,
-  line: cut(b.first.plain),
-  marker: b.first.marker.id,
+  line: cut(b.shown.plain),
+  marker: b.shown.marker.id,
 });
 
 /**

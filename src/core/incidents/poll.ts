@@ -327,8 +327,8 @@ function bootAhead(
 }
 
 /**
- * An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's first marker
- * line. Times are the stamps as pm2 wrote them on those lines, like the other incidents' (an unstamped marker line keeps
+ * An app's reloads of one poll as one incident: how many, the first and the last one's time, the last one's line (its
+ * first restart or rebuild line, else its first line). Times are the stamps as pm2 wrote them on those lines, like the other incidents' (an unstamped marker line keeps
  * the stamp it inherited).
  */
 const reloaded = (app: string, host: string, rs: Reload[]): Incident => ({

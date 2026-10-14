@@ -321,6 +321,30 @@ describe('pollIncidents with includeReloads', () => {
       { kind: 'reloaded', count: 1, time: '2026-10-12T11:00:30' },
     ]); // not taken for a boot: this run's boot was seen by the first poll
   });
+  it("a restart less than 2 s after the boot's listening is reported by the restart's line and time, not the boot's", async () => {
+    const state = {
+      now: '2026-10-12T11:01:00',
+      zone: '+0200',
+      files: {
+        '/l/web-out': `${S(1)}svc listening on :3000\n${S(2)}[tsx] change in ./dist/index.js Restarting...\n${S(2)}svc listening on :3000\n`,
+      },
+      procs: {
+        box: [proc('web', 3, { pm_uptime: startedAt('2026-10-12T11:00:00') })],
+      } as Record<string, object[]>,
+    };
+    const r = await pollIncidents(fakeHosts(state).fleet, ['web'], {
+      includeReloads: true,
+    });
+    expect(r.answer.incidents).toMatchObject([
+      {
+        kind: 'reloaded',
+        count: 1,
+        time: '2026-10-12T11:00:02',
+        first_time: '2026-10-12T11:00:02',
+        line: `${S(2)}[tsx] change in ./dist/index.js Restarting...`,
+      },
+    ]);
+  });
   it("after a pm2 restart between polls the new run's boot is not a reload", async () => {
     const state = {
       now: '2026-10-12T11:01:00',

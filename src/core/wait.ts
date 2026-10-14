@@ -37,7 +37,7 @@ export interface WaitResult {
   exit_code?: number | null;
   matched_line?: string;
   observed?: string;
-  /** reloaded: the reload that answered; `time` its first line's stamp, `line` that line as written */
+  /** reloaded: the reload that answered; `line` its first restart or rebuild line, else its first line, as written, and `time` that line's stamp */
   reloaded?: { time: string | null; lines: number; line: string };
 }
 export interface WaitDeps {

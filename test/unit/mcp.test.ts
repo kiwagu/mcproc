@@ -106,7 +106,7 @@ describe('mcp server', () => {
     );
     // what a reloaded answer carries
     expect(waitDesc).toMatch(
-      /reloaded \(.*with its time, line count and first line/
+      /reloaded \(.*with its time, line count and first restart or rebuild line/
     );
     expect(waitDesc).toMatch(/without pm2's time stamp.*keeps the stamp/);
     expect(waitDesc).toMatch(
