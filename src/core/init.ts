@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { McprocError } from './errors.js';
 import { defaultProject, MANIFEST_REL, type AppKind } from './manifest.js';
+import { readJson } from './turbo.js';
 
 export interface Candidate {
   name: string;
@@ -48,15 +49,6 @@ export function sanitizeName(s: string): string {
     .replace(/^[^a-z0-9]+/, '')
     .replace(/-+$/, '');
   return n || 'app';
-}
-
-// biome-ignore lint/suspicious/noExplicitAny: package.json, turbo.json and the like are untyped data, probed field by field
-function readJson(p: string): any | null {
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
 }
 
 function pmFor(root: string): string {
@@ -166,12 +158,14 @@ function packageCandidates(
 function expandWorkspaces(
   root: string,
   patterns: string[]
-): { dirs: string[]; unsupported: string[] } {
+): { dirs: string[]; unsupported: string[]; globParents: string[] } {
   const dirs = new Set<string>();
   const unsupported: string[] = [];
+  const globParents: string[] = [];
   for (const pat of patterns) {
     const glob = /^(.*?)\/\*\*?$/.exec(pat);
     if (glob) {
+      globParents.push(glob[1]);
       const base = path.join(root, glob[1]);
       let names: string[] = [];
       try {
@@ -179,6 +173,7 @@ function expandWorkspaces(
       } catch {
         /* no such dir */
       }
+      names.sort();
       for (const d of names)
         if (fs.existsSync(path.join(base, d, 'package.json')))
           dirs.add(path.join(base, d));
@@ -188,7 +183,7 @@ function expandWorkspaces(
       dirs.add(path.join(root, pat));
     }
   }
-  return { dirs: [...dirs], unsupported };
+  return { dirs: [...dirs], unsupported, globParents };
 }
 
 export function discover(root: string): Discovery {
