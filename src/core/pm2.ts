@@ -20,10 +20,16 @@ export interface Pm2Process {
   /** pm2's last recorded exit code for the process, any app; null when pm2 has recorded none (it never exited, or the field is absent) */
   exit_code: number | null;
   uptime_ms: number | null;
+  /** when pm2 last started the process (pm_uptime, epoch ms), any status: a stopped process keeps its last start; null when absent */
+  started_at: number | null;
   cpu: number;
   memory: number;
   watch: boolean;
 }
+
+const RUNNING = new Set(['online', 'launching']);
+/** Whether a pm2 status is a process that is running, or about to be: the only one with a current run to look at. */
+export const isRunning = (status: string): boolean => RUNNING.has(status);
 
 export const PM2_NOT_FOUND_HINT =
   'No usable pm2 on this host. Run unpack for it (brings pm2, and Node when missing), install pm2 there (Node 18 or newer), or set hosts.<host>.pm2.';
@@ -53,6 +59,7 @@ function normalize(p: RawProc): Pm2Process {
     unstable_restarts: Number(env.unstable_restarts ?? 0),
     exit_code: typeof env.exit_code === 'number' ? env.exit_code : null,
     uptime_ms: status === 'online' && up ? Math.max(0, Date.now() - up) : null,
+    started_at: up,
     cpu: p.monit?.cpu ?? 0,
     memory: p.monit?.memory ?? 0,
     watch: Boolean(env.watch),

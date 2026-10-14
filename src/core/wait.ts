@@ -1,5 +1,5 @@
 import { McprocError } from './errors.js';
-import { findProcess, type Pm2Process } from './pm2.js';
+import { findProcess, isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
   snapshot as probeSnapshot,
@@ -11,6 +11,7 @@ import { createFollower, type LogFollower } from './logfollow.js';
 import { bodyOf, repeatsARepeat } from './incidents/detect.js';
 import { stripAnsi } from './logs.js';
 import type { App, Dep } from './manifest.js';
+import { compileReloadRules, type Reload, ReloadTracker } from './reloads.js';
 import { fmtPorts } from '../mcp/render.js';
 
 export type Until =
@@ -18,7 +19,8 @@ export type Until =
   | { kind: 'url-ok' }
   | { kind: 'exited' }
   | { kind: 'log'; re: RegExp; source: string }
-  | { kind: 'idle'; seconds: number };
+  | { kind: 'idle'; seconds: number }
+  | { kind: 'reloaded' };
 export type WaitReason =
   | 'timeout'
   | 'exited'
@@ -35,6 +37,8 @@ export interface WaitResult {
   exit_code?: number | null;
   matched_line?: string;
   observed?: string;
+  /** reloaded: the reload that answered; `line` its first restart or rebuild line, else its first line, as written, and `time` that line's stamp */
+  reloaded?: { time: string | null; lines: number; line: string };
 }
 export interface WaitDeps {
   jlist(ctx: Context): Promise<Pm2Process[]>;
@@ -51,25 +55,24 @@ export const WAIT_TIMEOUT_MAX_MS = 600_000;
 /** How often the host is asked: a light probe or jlist, a login shell each time, so not faster than this. */
 const POLL_LOCAL_MS = 500;
 const POLL_REMOTE_MS = 1000;
-/** pm2 statuses of a process that is running, or about to be. */
-const LIVE = new Set(['online', 'launching']);
 /** pm2 statuses of a process in the middle of a restart (a watch restart, a restart delay): it is not dead, so a wait goes on. */
 const TRANSIENT = new Set(['stopping', 'waiting restart']);
 /** Not dead: running, or on its way through a restart. The timeout bounds a restart that does not end. */
 const notDead = (status: string): boolean =>
-  LIVE.has(status) || TRANSIENT.has(status);
-/** The log: and idle: waits look at the follower at least this often (a file wake makes it sooner). */
+  isRunning(status) || TRANSIENT.has(status);
+/** The log:, idle: and reloaded waits look at the follower at least this often (a file wake makes it sooner). */
 const LOG_TICK_MS = 1000;
 /** ...and ask pm2 about the process this often: each check is a login shell, so not every tick. */
 const STATUS_EVERY_MS = 5000;
 
 const bad = (msg: string) =>
   new McprocError('BAD_ARGUMENT', msg, {
-    hint: 'until is one of: listening, url-ok, exited, log:<regex>, idle:<seconds>',
+    hint: 'until is one of: listening, url-ok, exited, log:<regex>, idle:<seconds>, reloaded',
   });
 
 export function parseUntil(s: string): Until {
-  if (s === 'listening' || s === 'url-ok' || s === 'exited') return { kind: s };
+  if (s === 'listening' || s === 'url-ok' || s === 'exited' || s === 'reloaded')
+    return { kind: s };
   if (s.startsWith('log:')) {
     const source = s.slice(4);
     if (!source) throw bad('log: needs a regular expression after the colon');
@@ -158,22 +161,37 @@ interface LogRun {
   ) => WaitResult;
 }
 
+/** What a reloaded wait saw when it ends with a burst still open: a reload under way, not the absence of one. */
+const inProgress = (r: Reload): string =>
+  `reload in progress${r.time ? ` since ${r.time}` : ''} (${r.lines} line${r.lines === 1 ? '' : 's'}): ${bodyOf(r.line)}`;
+
 /**
- * log:/idle: sit on the log follower, which takes its position at the end of both files: nothing written before
- * that is searched, and a quiet period counts from that moment (or from the last byte since). Lines read in a poll
- * are judged before the process is looked at, so a last line still counts. The process is asked about every few
- * seconds, and once more when the quiet period of idle: ends.
+ * log:/idle:/reloaded sit on the log follower, which takes its position at the end of both files: nothing written
+ * before that is searched, and a quiet period counts from that moment (or from the last byte since). Lines read in a
+ * poll are judged before the process is looked at, so a last line still counts. The process is asked about every few
+ * seconds, and once more when the quiet period of idle: ends. reloaded feeds every line to a reload tracker and
+ * answers with the first reload it closes: a later marker closes a burst at once, quiet closes it RELOAD_GAP_MS after
+ * its last marker arrived, so the tick's sleep is cut to that moment. A re-listen line counts from its first burst:
+ * the app's boot was before the call. A wait that times out or is aborted with a burst open says so in `observed`.
  */
 async function waitOnLogs(
   ctx: Context,
   app: string,
   a: App,
-  until: Extract<Until, { kind: 'log' | 'idle' }>,
+  until: Extract<Until, { kind: 'log' | 'idle' | 'reloaded' }>,
   run: LogRun
 ): Promise<WaitResult> {
   const { deps, signal } = run;
   let p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
   if (!p) throw notStarted(ctx, app);
+  const tracker =
+    until.kind === 'reloaded' && a.reloads
+      ? new ReloadTracker(compileReloadRules(a.reloads), {
+          app,
+          start: null,
+          coversStart: false,
+        })
+      : null;
   const f = deps.follower(ctx, { out: p.out_log, err: p.err_log });
   // a file wake, or the signal, ends the sleep of the tick; a wake during a poll skips the next sleep
   let tick: AbortController | null = null;
@@ -192,6 +210,11 @@ async function waitOnLogs(
     let lastChange = lastCheck;
     let lastLine: string | undefined;
     let seen = { out: f.offsets.out, err: f.offsets.err };
+    /** what the wait ends with when the condition is unmet: the reload under way, else what was last seen */
+    const unmet = (observed: string): string => {
+      const r = tracker?.pending();
+      return r ? inProgress(r) : observed;
+    };
     for (;;) {
       const { lines, reset } = await f.poll();
       let now = deps.now();
@@ -211,11 +234,21 @@ async function waitOnLogs(
             matched_line: text,
           });
       }
+      if (tracker) {
+        // one batch carries both streams' new lines in arrival order, as the tracker needs them
+        const [r] = [...tracker.push(lines, now), ...tracker.idle(now)];
+        if (r)
+          return run.answer({
+            ok: true,
+            status: statusWord(p, a),
+            reloaded: { time: r.time, lines: r.lines, line: r.line },
+          });
+      }
       const observed =
         lastLine === undefined ? 'no new output' : `last line: ${lastLine}`;
       if (until.kind === 'idle' && now - lastChange >= quietMs) {
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
-        if (p && LIVE.has(p.status))
+        if (p && isRunning(p.status))
           return run.answer({ ok: true, status: statusWord(p, a), observed });
         if (!p || !notDead(p.status)) return run.gone(p, observed);
         // mid-restart: not settled yet and not dead; look again after a tick
@@ -227,7 +260,7 @@ async function waitOnLogs(
         if (!p || !notDead(p.status)) return run.gone(p, observed);
         now = deps.now(); // the check took a login shell, more over ssh: do not sleep from the time before it
       }
-      if (now >= run.deadline) return run.giveUp('timeout', p, observed);
+      if (now >= run.deadline) return run.giveUp('timeout', p, unmet(observed));
       // the next tick, cut to the deadline, the next status check and the end of the quiet period
       const sleeps = [
         LOG_TICK_MS,
@@ -237,13 +270,16 @@ async function waitOnLogs(
       // (not once the quiet period is over: a process still restarting is looked at again after a tick, not in a spin)
       if (until.kind === 'idle' && now - lastChange < quietMs)
         sleeps.push(lastChange + quietMs - now);
+      // the open reload burst is answered once it has been quiet for RELOAD_GAP_MS, not at the next tick after that
+      const burstEnd = tracker?.idleAt() ?? null;
+      if (burstEnd !== null) sleeps.push(burstEnd - now);
       if (!woken && !signal?.aborted) {
         tick = new AbortController();
         await deps.sleep(Math.max(0, Math.min(...sleeps)), tick.signal);
         tick = null;
       }
       woken = false;
-      if (signal?.aborted) return run.giveUp('aborted', p, observed);
+      if (signal?.aborted) return run.giveUp('aborted', p, unmet(observed));
     }
   } finally {
     signal?.removeEventListener('abort', onAbort);
@@ -270,6 +306,10 @@ export async function waitFor(
     throw bad(`"${app}" declares no port, so listening cannot be observed`);
   if (until.kind === 'url-ok' && !a.url)
     throw bad(`"${app}" declares no url, so url-ok cannot be observed`);
+  if (until.kind === 'reloaded' && !a.reloads)
+    throw bad(
+      `"${app}" has reloads: false in the manifest, so reloaded cannot be observed`
+    );
 
   const timeoutMs = Math.min(
     opts.timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS,
@@ -308,7 +348,11 @@ export async function waitFor(
     );
     return !opts.signal?.aborted;
   };
-  if (until.kind === 'log' || until.kind === 'idle')
+  if (
+    until.kind === 'log' ||
+    until.kind === 'idle' ||
+    until.kind === 'reloaded'
+  )
     return waitOnLogs(ctx, app, a, until, {
       deps,
       deadline,
@@ -328,7 +372,7 @@ export async function waitFor(
         if (first) throw notStarted(ctx, app);
         return gone(undefined);
       }
-      if (!LIVE.has(p.status) && p.status !== 'stopping')
+      if (!isRunning(p.status) && p.status !== 'stopping')
         return answer({
           ok: true,
           status: statusWord(p, a),
@@ -363,7 +407,7 @@ export async function waitFor(
       // another process) is not a ready app, and one that pm2 is restarting is not ready yet, whatever answers
       if (!p || !notDead(p.status)) return gone(p, observed);
       if (met) {
-        if (LIVE.has(p.status))
+        if (isRunning(p.status))
           return answer({ ok: true, status: statusWord(p, a), observed });
         observed = `status ${p.status}, ${observed}`;
       }

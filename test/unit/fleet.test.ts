@@ -306,6 +306,12 @@ describe('one app by name (describe, logs)', () => {
       describeProject(h.fleet.manifest).apps.find((a) => a.name === 'web')
         ?.depends_on
     ).toEqual(d.app.depends_on);
+    // the app's own reload settings, as the manifest normalises them
+    expect(d.app.reloads).toEqual({
+      match: [],
+      ignore: ['hmr update /src/noisy'],
+      defaults: true,
+    });
     expect(d.row).toMatchObject({ host: 'box', status: 'online' });
     expect(d.pm2.cwd).toBe('/home/dev/fleet');
     expect(h.connected).toEqual(['box']);

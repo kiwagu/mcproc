@@ -6,6 +6,8 @@ import {
   selectSince,
   mergeLines,
   hostClock,
+  hostStamp,
+  isZone,
   MAX_RELATIVE_MS,
   LogMarks,
   readSince,
@@ -140,6 +142,23 @@ describe('cutoffFor', () => {
     expect(
       cutoffFor(parseSince('2026-10-14T07:30'), { now: '', zone: '' })
     ).toBe('2026-10-14T07:30:00.000');
+  });
+});
+
+describe('hostStamp', () => {
+  it("an instant in a host's wall time, with milliseconds; null for a zone that does not parse", () => {
+    const at = Date.UTC(2026, 9, 14, 7, 30, 0, 250);
+    expect(hostStamp(at, '+0200')).toBe('2026-10-14T09:30:00.250');
+    expect(hostStamp(at, '-0330')).toBe('2026-10-14T04:00:00.250');
+    expect(hostStamp(at, '+0000')).toBe('2026-10-14T07:30:00.250');
+    expect(hostStamp(at, 'garbage')).toBeNull();
+    expect(hostStamp(at, '+9900')).toBeNull();
+  });
+  it('isZone: a `date +%z` offset of 00..23 hours and 00..59 minutes', () => {
+    for (const z of ['+0000', '+0200', '-0330', '+1400', '-2359'])
+      expect(isZone(z)).toBe(true);
+    for (const z of ['+9900', '+2400', '-0260', '+02:00', '0200', 'CEST', ''])
+      expect(isZone(z)).toBe(false);
   });
 });
 

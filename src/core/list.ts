@@ -11,6 +11,7 @@ import {
   type Pm2Process,
 } from './pm2.js';
 import { treeMetrics, type TreeMetrics } from './metrics.js';
+import { hostStamp } from './logsince.js';
 import {
   appPids,
   joinPorts,
@@ -21,6 +22,7 @@ import {
 import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
+import type { ReloadCount } from './reloads.js';
 import { MARK, probeScript } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -33,6 +35,8 @@ export interface LsRow {
   pm_id: number | null;
   pid: number | null;
   uptime_ms: number | null;
+  /** when pm2 last started the process, as the host's local time with milliseconds (pm2's log stamp shape, YYYY-MM-DDTHH:mm:ss.SSS); null without a process, a start time or the host's zone */
+  started: string | null;
   restarts: number;
   /** pm2's last recorded exit code for the process, any app; null when none is recorded (see statusWord) */
   exit_code: number | null;
@@ -47,6 +51,12 @@ export interface LsRow {
   url_status: 'ok' | 'error' | 'down' | 'unchecked';
   url_code: number | null;
   ports: AppPorts;
+  /**
+   * only when asked (ls --reloads) and the app runs with reloads on and a known start: its in-process reloads since pm2
+   * started it, the last one's stamp as its log wrote it, and partial when the logs read did not reach back to the start
+   * (the count is then a lower bound)
+   */
+  reloads?: ReloadCount;
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
 }
@@ -59,6 +69,8 @@ export interface Snapshot {
   metrics: Record<string, TreeMetrics | null>;
   sampledAt: number;
   urls: Map<string, number | null>;
+  /** the host's UTC offset ('+0200'); null when the probe could not read it */
+  zone: string | null;
 }
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
@@ -167,6 +179,7 @@ export async function snapshot(
     metrics,
     sampledAt,
     urls: data.urls,
+    zone: data.zone,
   };
 }
 
@@ -206,6 +219,10 @@ export function rowsFor(
       pm_id: p?.pm_id ?? null,
       pid: p && p.pid > 0 ? p.pid : null,
       uptime_ms: p?.uptime_ms ?? null,
+      started:
+        p?.started_at != null && snap.zone
+          ? hostStamp(p.started_at, snap.zone)
+          : null,
       restarts: p?.restarts ?? 0,
       exit_code: p?.exit_code ?? null,
       cpu: m ? m.cpu : (p?.cpu ?? 0),
@@ -238,6 +255,7 @@ export function unreachableRow(
     pm_id: null,
     pid: null,
     uptime_ms: null,
+    started: null,
     restarts: 0,
     exit_code: null,
     cpu: null,

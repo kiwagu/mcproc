@@ -1,4 +1,5 @@
 import type { LsRow } from '../core/list.js';
+import { isRunning } from '../core/pm2.js';
 import {
   fmtBytes,
   fmtCpu,
@@ -13,6 +14,7 @@ import {
   visibleLogs,
   type FlatLine,
   type MonitState,
+  type ReloadInfo,
 } from './state.js';
 import type { LogLine } from '../core/logfollow.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
@@ -266,6 +268,16 @@ function portDetails(r: LsRow): string {
   return parts.join(', ');
 }
 
+/**
+ * What follows the restarts: ` (+7 reloads, last 12:01:05)`, `+≥7` when partial; nothing without a count, nor for an
+ * app that is not running (pm2 keeps a stopped process's last start, but its run is over), as ls --reloads counts.
+ */
+function reloadsNote(r: LsRow, info: ReloadInfo | undefined): string {
+  if (!info || info.count === 0 || !isRunning(r.status)) return '';
+  const last = info.last ? `, last ${info.last.slice(11, 19)}` : '';
+  return ` (+${info.partial ? '≥' : ''}${info.count} reload${info.count === 1 ? '' : 's'}${last})`;
+}
+
 export function renderFrame(
   s: MonitState,
   size: { width: number; height: number }
@@ -352,7 +364,7 @@ export function renderFrame(
           ),
           cut(screenText(`run: ${a.run}   cwd: ${a.cwd}`), w),
           cut(
-            `pm2: ${a.pm2Name} on ${r.host}  pid ${r.pid ?? '-'}  restarts ${r.restarts}  procs ${r.procs ?? '?'}  mem ${r.memory ? fmtBytes(r.memory) : '-'} (RSS sum of the tree; pm2 root: ${fmtBytes(r.pm2_memory)})`,
+            `pm2: ${a.pm2Name} on ${r.host}  pid ${r.pid ?? '-'}  restarts ${r.restarts}${reloadsNote(r, s.reloads[r.app])}  procs ${r.procs ?? '?'}  mem ${r.memory ? fmtBytes(r.memory) : '-'} (RSS sum of the tree; pm2 root: ${fmtBytes(r.pm2_memory)})`,
             w
           ),
           cut(screenText(`ports: ${portDetails(r)}`), w), // process names from ss/ps are outside text too

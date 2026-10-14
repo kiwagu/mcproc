@@ -1,4 +1,5 @@
 import type { LsRow, HostInfo } from '../core/list.js';
+import type { HostError } from '../core/fleet.js';
 import type { DoctorReport } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
@@ -9,6 +10,7 @@ import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
 import { formatLine } from '../core/logstream.js';
+import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -72,14 +74,28 @@ export function fmtUrl(r: LsRow): string {
   if (r.url_status === 'down') return `${r.url} ✗ down`;
   return r.url;
 }
-/** One table; a HOST column and the list of hosts only when the rows span more than one, then one line per host that did not answer. */
-export function renderLs(rows: LsRow[], host: string): string {
+/** pm2's restarts, then the in-process reloads counted since the start when there are any: `0 (+3)`, `0 (+≥3)` when partial. */
+function fmtRestarts(r: LsRow): string {
+  const n = r.reloads;
+  return n && n.count > 0
+    ? `${r.restarts} (+${n.partial ? '≥' : ''}${n.count})`
+    : String(r.restarts);
+}
+/**
+ * One table; a HOST column and the list of hosts only when the rows span more than one, then one line per host that did
+ * not answer, then one per error of a later read of a host that did (`errors`, the reload count's).
+ */
+export function renderLs(
+  rows: LsRow[],
+  host: string,
+  errors: HostError[] = []
+): string {
   const hosts = [...new Set(rows.map((r) => r.host))];
   const multi = hosts.length > 1;
   const head = multi
     ? `hosts: ${hosts.join(', ')}`
     : `host: ${hosts[0] ?? host}`;
-  const errors = [
+  const unreachable = [
     ...new Map(
       rows.filter((r) => r.error).map((r) => [r.host, `${r.host}: ${r.error}`])
     ).values(),
@@ -109,7 +125,7 @@ export function renderLs(rows: LsRow[], host: string): string {
         r.status,
         r.pid === null ? '-' : String(r.pid),
         fmtUptime(r.uptime_ms),
-        String(r.restarts),
+        fmtRestarts(r),
         r.memory ? fmtBytes(r.memory) : '-',
         r.status === 'online' ? fmtCpu(r.cpu) : '-',
         fmtPorts(r.ports),
@@ -118,7 +134,8 @@ export function renderLs(rows: LsRow[], host: string): string {
         cut(r.description.split('\n')[0], 40),
       ]),
     ]),
-    ...errors,
+    ...unreachable,
+    ...errors.map((e) => `${e.host}: ${e.message}`),
   ].join('\n');
 }
 /** `host` when the rows come from one host (the shape results had before apps could run on several), `hosts` always. */
@@ -307,6 +324,12 @@ export function renderWait(app: string, r: WaitResult): string {
     }
     if (r.until.startsWith('log:'))
       return `${app}: log matched after ${secs(r.waited_ms)}: ${r.matched_line}`;
+    if (r.reloaded) {
+      // the time is shown once, in its own place: the line follows without pm2's stamp
+      const { time, lines, line } = r.reloaded;
+      const count = `${lines} line${lines === 1 ? '' : 's'}`;
+      return `${app}: reloaded after ${secs(r.waited_ms)} (${time ? `${count} from ${time}` : count}): ${bodyOf(line)}`;
+    }
     return `${app}: ${r.until} after ${secs(r.waited_ms)}${seen}`;
   }
   if (r.reason === 'timeout')
@@ -359,7 +382,10 @@ export function renderProject(d: {
   return L.join('\n');
 }
 
-/** Incidents newest first: a header, context lines `│`, the error line `▶`; then how to go on. Nothing new is one short line. */
+/**
+ * Incidents newest first: a header, context lines `│`, the error line `▶`; an app's reloads are one line with the last
+ * reload's line; then how to go on. Nothing new is one short line.
+ */
 export function renderIncidents(
   a: TakenAnswer,
   opts: { color?: boolean } = {}
@@ -389,10 +415,16 @@ export function renderIncidents(
     const count = i.count > 1 ? ` ×${i.count}` : '';
     const first =
       i.count > 1 && i.first_time && i.first_time !== i.time
-        ? `first ${i.first_time}, `
-        : '';
+        ? i.first_time
+        : null;
+    if (i.kind === 'reloaded') {
+      L.push(
+        `${i.app}@${i.host} ${i.time ?? '-'} reloaded${count}${first ? ` (first ${first})` : ''}: ${i.line}`
+      ); // both streams and no context, and not an error: one plain line
+      continue;
+    }
     L.push(
-      `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first}${i.stream})`
+      `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first ? `first ${first}, ` : ''}${i.stream})`
     );
     for (const b of i.before) L.push(`  │ ${b}`);
     L.push(red(`  ▶ ${i.line}`));

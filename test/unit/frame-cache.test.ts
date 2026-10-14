@@ -23,6 +23,7 @@ const row = (app: string): LsRow => ({
   pm_id: 0,
   pid: 1,
   uptime_ms: 0,
+  started: null,
   restarts: 0,
   cpu: 0,
   memory: 0,

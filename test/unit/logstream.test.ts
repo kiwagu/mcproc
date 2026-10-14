@@ -42,6 +42,7 @@ const snap = (apps: string[]): Snapshot => ({
   metrics: {},
   sampledAt: 0,
   urls: new Map(),
+  zone: null,
 });
 
 /** Fake followers: a queue of poll results per app; an exhausted queue yields no lines. */

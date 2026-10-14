@@ -18,6 +18,11 @@ export interface AppInfo {
   cwd: string;
   pm2Name: string;
 }
+/**
+ * An app's in-process reloads since pm2 started it, as ls --reloads reports them: how many, the last one's stamp as its
+ * log wrote it, and partial when the lines seen do not reach back to the start (the count is then a lower bound).
+ */
+export type ReloadInfo = NonNullable<LsRow['reloads']>;
 /** A buffered log line with its arrival number: hosts have their own clocks (and time zones), so across hosts arrival is the order. */
 export interface BufferedLine extends LogLine {
   seq: number;
@@ -51,6 +56,8 @@ export interface MonitState {
   armedAt: number | null;
   /** the recorded clears, keyed host/app, as the project's store has them */
   cleared: Record<string, string>;
+  /** per app whose logs this screen follows with reloads on and a known start: its reloads since that start */
+  reloads: Record<string, ReloadInfo>;
 }
 export type MonitAction =
   | { type: 'rows'; rows: LsRow[]; at?: Date } // no `at`: nothing new was heard (a host failed), so the clock stays
@@ -75,7 +82,8 @@ export type MonitAction =
   | { type: 'busy'; busy: boolean }
   | { type: 'host'; host: string }
   | { type: 'arm'; at: number | null; apps?: string[] }
-  | { type: 'cleared'; cleared: Record<string, string> };
+  | { type: 'cleared'; cleared: Record<string, string> }
+  | { type: 'reloads'; app: string; info: ReloadInfo | null }; // null: the app is no longer counted
 
 export function appInfos(m: Manifest): Record<string, AppInfo> {
   return Object.fromEntries(
@@ -134,6 +142,7 @@ export function initialState(p: {
     updatedAt: null,
     armedAt: null,
     cleared: {},
+    reloads: {},
   };
 }
 
@@ -246,12 +255,17 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
           };
     case 'cleared':
       return { ...s, cleared: a.cleared };
+    case 'reloads': {
+      const { [a.app]: _, ...rest } = s.reloads;
+      return { ...s, reloads: a.info ? { ...rest, [a.app]: a.info } : rest };
+    }
     case 'host':
       return {
         ...s,
         host: a.host,
         rows: [],
         logs: {},
+        reloads: {},
         logScroll: 0,
         logRowShift: 0,
         logPaths: null,

@@ -32,6 +32,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   pm_id: 0,
   pid: 1,
   uptime_ms: 0,
+  started: null,
   restarts: 0,
   exit_code: null,
   cpu: 0,
@@ -162,6 +163,47 @@ describe('renderLs with tree metrics', () => {
     );
     expect(t).toMatch(/CONTAINER/);
     expect(t).toContain('supabase_kong_zero-memory');
+  });
+});
+
+describe('renderLs RESTARTS with reloads (ls --reloads)', () => {
+  const base = row('online', []);
+  const line = (r: Partial<LsRow>) =>
+    renderLs([{ ...base, ...r }], 'local').split('\n')[2];
+  const counted = (count: number, partial: boolean): LsRow['reloads'] => ({
+    count,
+    last: count ? '2026-10-12T11:00:30' : null,
+    partial,
+  });
+  it("adds the reloads since the start to pm2's restarts: (+N), (+≥N) when the logs read did not reach back to the start", () => {
+    expect(line({ reloads: counted(3, false) })).toMatch(/\s0 \(\+3\)\s/);
+    expect(line({ reloads: counted(3, true) })).toMatch(/\s0 \(\+≥3\)\s/);
+    expect(line({ restarts: 2, reloads: counted(7, false) })).toMatch(
+      /\s2 \(\+7\)\s/
+    );
+  });
+  it('shows nothing more when no reload was counted, partial or not, and nothing changes without the field', () => {
+    const plain = renderLs([base], 'local');
+    expect(plain).toMatch(/UPTIME\s+RESTARTS\s+MEM/);
+    expect(plain.split('\n')[2]).toMatch(/\s0s\s+0\s+-\s/);
+    expect(renderLs([{ ...base, reloads: counted(0, true) }], 'local')).toBe(
+      plain
+    );
+    expect(renderLs([{ ...base, reloads: counted(0, false) }], 'local')).toBe(
+      plain
+    );
+  });
+  it('a host whose logs could not be read for the count gets one line after the table', () => {
+    const t = renderLs([base], 'local', [
+      {
+        host: 'box',
+        apps: ['web'],
+        message: 'reloads not counted: TRANSPORT_FAILED: ssh to box failed',
+      },
+    ]);
+    expect(t.split('\n').at(-1)).toBe(
+      'box: reloads not counted: TRANSPORT_FAILED: ssh to box failed'
+    );
   });
 });
 
@@ -361,6 +403,34 @@ describe('renderIncidents', () => {
       renderIncidents({ ...base, incidents: [inc] }, { color: true })
     ).toContain('\x1b[31m');
   });
+  it("a reloaded incident is one line: how many reloads, the first one when several, the last one's line; not colored as an error", () => {
+    const reloaded = {
+      ...inc,
+      kind: 'reloaded' as const,
+      time: '2026-10-12T11:24:50.120',
+      first_time: '2026-10-12T11:20:01.000',
+      count: 2,
+      line: '2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts',
+      before: [],
+      after: [],
+      fingerprint: 'reloaded',
+    };
+    const t = renderIncidents(
+      { ...base, incidents: [inc, reloaded] },
+      { color: true }
+    );
+    expect(t.split('\n')).toContain(
+      'web@local 2026-10-12T11:24:50.120 reloaded ×2 (first 2026-10-12T11:20:01.000): 2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts'
+    );
+    expect(
+      renderIncidents({
+        ...base,
+        incidents: [{ ...reloaded, count: 1, first_time: reloaded.time }],
+      }).split('\n')[0]
+    ).toBe(
+      'web@local 2026-10-12T11:24:50.120 reloaded: 2026-10-12T11:24:50.120: [vite] hmr update /src/a.ts'
+    );
+  });
 });
 
 describe('renderFlushed', () => {
@@ -503,6 +573,46 @@ describe('renderMutation', () => {
     expect(renderWait('web', { ...base, ok: false, reason: 'aborted' })).toBe(
       'web: aborted after 1.3 s while waiting for listening'
     );
+  });
+  it('renderWait: a reload names when it began, its line count and its first line (without the stamp shown twice)', () => {
+    const ok = {
+      until: 'reloaded',
+      waited_ms: 3000,
+      ok: true,
+      status: 'online',
+    };
+    expect(
+      renderWait('web', {
+        ...ok,
+        reloaded: {
+          time: '2026-10-14T12:00:01.000',
+          lines: 3,
+          line: '2026-10-14T12:00:01: [vite] (client) page reload /src/a.ts',
+        },
+      })
+    ).toBe(
+      'web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000): [vite] (client) page reload /src/a.ts'
+    );
+    expect(
+      renderWait('web', {
+        ...ok,
+        reloaded: {
+          time: null,
+          lines: 1,
+          line: '[tsx] change in x Restarting...',
+        },
+      })
+    ).toBe(
+      'web: reloaded after 3.0 s (1 line): [tsx] change in x Restarting...'
+    );
+    expect(
+      renderWait('web', {
+        ...ok,
+        ok: false,
+        reason: 'timeout',
+        observed: 'no new output',
+      })
+    ).toBe('web: reloaded not reached after 3.0 s (no new output)');
   });
   it('renderWait: an exited wait names the exit code once, and not at all when there is none', () => {
     const exited = { until: 'exited', waited_ms: 3100, ok: true };

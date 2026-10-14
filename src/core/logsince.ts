@@ -90,12 +90,21 @@ function wallMs(stamp: string): number {
     : Number.NaN;
 }
 const HOST_NOW = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+/** A UTC offset as `date +%z` prints it: sign, hours 00..23, minutes 00..59. */
+const ZONE = /^([+-])([01]\d|2[0-3])([0-5]\d)$/;
+/** Whether a host's `date +%z` output is a real offset (`+0200`), not just its shape (`+9900`). */
+export const isZone = (zone: string): boolean => ZONE.test(zone);
 /** The host's `date +%z` (`+0200`) as milliseconds east of UTC; null when it is not one. */
 const zoneMs = (zone: string): number | null => {
-  const m = /^([+-])([01]\d|2[0-3])([0-5]\d)$/.exec(zone);
+  const m = ZONE.exec(zone);
   if (!m) return null;
   return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60_000;
 };
+/** An instant (epoch ms) as the host's wall time in pm2's millisecond stamp shape; null for a zone that does not parse. */
+export function hostStamp(epochMs: number, zone: string): string | null {
+  const z = zoneMs(zone);
+  return z === null ? null : wallStamp(epochMs + z);
+}
 const noClock = () =>
   new McprocError(
     'TRANSPORT_FAILED',
@@ -132,10 +141,12 @@ export function cutoffFor(
   }
 }
 
+/** A pm2 stamp normalised to milliseconds: `…:ss` reads as `…:ss.000`. */
+export const msStamp = (t: string): string => (t.length > 19 ? t : `${t}.000`);
 /** pm2's stamp of a line, normalised to milliseconds (`…:ss` reads as `…:ss.000`); null for an unstamped line. */
 export function stampMs(line: string): string | null {
   const t = stampOf(line);
-  return t === null || t.length > 19 ? t : `${t}.000`;
+  return t === null ? null : msStamp(t);
 }
 
 export interface Stamped {

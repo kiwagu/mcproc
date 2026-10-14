@@ -250,8 +250,72 @@ describe('LogFollower', () => {
     expect(r).toEqual({
       lines: [{ stream: 'out', text: 'fresh' }],
       reset: true,
+      lost: true,
     });
     expect(f.offsets.out).toBe(6);
+  });
+  it('a poll says lost when lines written since the last one are not all in it: a skipped burst or a replaced file, never a history or new bytes', async () => {
+    const ctx = scripted([
+      resp(
+        { size: 6, body: 'old-1\n', history: true },
+        { size: 0, history: true }
+      ),
+      resp({ size: 12, body: 'new-1\n' }, { size: 0 }),
+      '__MCPROC_LF_out__\n3000000 1951424 S\nxx\nnew-9\n__MCPROC_LF_err__\n0 0 N\n',
+      resp({ size: 6, body: 'fresh\n', reset: true }, { size: 0 }),
+      resp({ size: 12, body: 'new-2\n' }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 50);
+    expect(await f.poll()).toMatchObject({ reset: false, lost: false });
+    expect(await f.poll()).toMatchObject({ reset: false, lost: false });
+    const burst = await f.poll();
+    expect(burst.lines.map((l) => l.text)).toEqual([
+      '… 1951412 bytes of new log skipped',
+      'new-9',
+    ]);
+    expect(burst).toMatchObject({ reset: false, lost: true });
+    expect(await f.poll()).toMatchObject({ reset: true, lost: true });
+    expect(await f.poll()).toMatchObject({ reset: false, lost: false });
+  });
+  it('what the host stream delivered is lost when it skipped a burst, or when more lines came than a poll keeps', async () => {
+    const ctx = scripted([
+      resp(
+        { size: 6, body: 'old-1\n', history: true },
+        { size: 0, history: true }
+      ),
+      resp({ size: 2_000_000 }, { size: 0 }),
+      resp({ size: 2_020_002 }, { size: 0 }),
+      resp({ size: 2_020_002 }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 50);
+    await f.poll();
+    expect(
+      f.offer(0, {
+        from: 6,
+        size: 2_000_000,
+        start: 951_424,
+        kind: 'S',
+        anchor: '',
+        body: `${'y'.repeat(1_048_571)}\nend\n`, // READ_CAP bytes
+        got: 1_048_576,
+      })
+    ).toBe(true);
+    expect(await f.poll()).toMatchObject({ reset: false, lost: true });
+    expect(
+      f.offer(0, {
+        from: 2_000_000,
+        size: 2_020_002,
+        start: 2_000_000,
+        kind: 'N',
+        anchor: '',
+        body: 'l\n'.repeat(10_001),
+        got: 20_002,
+      })
+    ).toBe(true);
+    const many = await f.poll();
+    expect(many.lines).toHaveLength(10_000); // the newest kept, the oldest one dropped
+    expect(many.lost).toBe(true);
+    expect((await f.poll()).lost).toBe(false);
   });
   it("keeps the app's colors and drops every other escape; a color code cut by a read boundary arrives whole", async () => {
     const ctx = scripted([

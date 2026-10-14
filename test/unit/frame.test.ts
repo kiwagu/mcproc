@@ -20,6 +20,7 @@ const web: LsRow = {
   pm_id: 1,
   pid: 971175,
   uptime_ms: 22 * 60_000,
+  started: null,
   restarts: 0,
   cpu: 84.4,
   memory: 2_200_000_000,
@@ -335,6 +336,74 @@ describe('renderFrame', () => {
     expect(
       renderFrame(base(), { width: 160, height: 40 }).table[0]
     ).not.toContain('HOST');
+  });
+  it("the details put the selected app's reloads next to its restarts: +N, +≥N when partial, as before without a count", () => {
+    const pm2Line = (st: ReturnType<typeof base>) =>
+      renderFrame(st, { width: 200, height: 40 }).details[2];
+    const restarted = reduce(base(), {
+      type: 'rows',
+      rows: [{ ...web, restarts: 2 }, docs],
+      at: new Date('2026-10-11T13:41:07'),
+    });
+    expect(pm2Line(restarted)).toContain('restarts 2  procs 3');
+    const counted = reduce(restarted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 3, last: '2026-10-11T12:01:05.120', partial: false },
+    });
+    expect(pm2Line(counted)).toContain(
+      'restarts 2 (+3 reloads, last 12:01:05)  procs 3'
+    );
+    const partial = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 3, last: '2026-10-11T12:01:05', partial: true },
+    });
+    expect(pm2Line(partial)).toContain(
+      'restarts 2 (+≥3 reloads, last 12:01:05)  procs 3'
+    );
+    const one = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 1, last: null, partial: false },
+    });
+    expect(pm2Line(one)).toContain('restarts 2 (+1 reload)  procs 3');
+    const none = reduce(counted, {
+      type: 'reloads',
+      app: 'web',
+      info: { count: 0, last: null, partial: true },
+    });
+    expect(pm2Line(none)).toContain('restarts 2  procs 3');
+    // another app's count is not the selected one's
+    const other = reduce(restarted, {
+      type: 'reloads',
+      app: 'docs',
+      info: { count: 4, last: null, partial: false },
+    });
+    expect(pm2Line(other)).toContain('restarts 2  procs 3');
+  });
+  it('the reloads note shows only while the selected app runs (online or launching): a stopped or errored one has none', () => {
+    const pm2Line = (status: string) =>
+      renderFrame(
+        reduce(
+          reduce(base(), {
+            type: 'rows',
+            rows: [{ ...web, status, restarts: 2 }, docs],
+            at: new Date('2026-10-11T13:41:07'),
+          }),
+          {
+            type: 'reloads',
+            app: 'web',
+            info: { count: 3, last: null, partial: false },
+          }
+        ),
+        { width: 200, height: 40 }
+      ).details[2];
+    expect(pm2Line('online')).toContain('restarts 2 (+3 reloads)  procs');
+    expect(pm2Line('launching')).toContain('restarts 2 (+3 reloads)  procs');
+    expect(pm2Line('stopped')).toContain('restarts 2  procs');
+    expect(pm2Line('errored')).toContain('restarts 2  procs');
+    expect(pm2Line('failed (exit 1)')).toContain('restarts 2  procs');
   });
   it('wraps by terminal columns: a wide character takes two and is never split across rows', () => {
     expect(wrapText('中文中文中', 4, 0)).toEqual(['中文', '中文', '中']);

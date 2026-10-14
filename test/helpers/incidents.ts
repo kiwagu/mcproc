@@ -3,7 +3,9 @@ import { fileURLToPath } from 'node:url';
 import { loadManifest } from '../../src/core/manifest.js';
 import { Fleet } from '../../src/core/fleet.js';
 import { McprocError } from '../../src/core/errors.js';
+import { MARK } from '../../src/shell/snippets.js';
 import { fakeCtx } from './ctx.js';
+import { probeOut } from './probe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const fleetDir = path.join(here, '..', 'fixtures', 'projects', 'fleet');
@@ -14,6 +16,8 @@ export const S = (sec: number) =>
 /**
  * `short`: files whose read delivers only half of what it announced (a file rotated between measuring and reading).
  * `clocks`: one host's own `now` and `zone` in place of the shared ones (hosts in different time zones).
+ * `failReads`: hosts whose read script fails as a dropped ssh connection does (exit 255).
+ * `unreadable`: files that exist but the host's user may not read: they measure as empty, as `wc -c` failing does.
  */
 export interface FakeState {
   files: Record<string, string>;
@@ -23,12 +27,15 @@ export interface FakeState {
   clocks?: Record<string, { now?: string; zone?: string }>;
   unwritable?: string[];
   short?: string[];
+  failReads?: string[];
+  unreadable?: string[];
 }
 
 /**
  * Hosts whose log files live in memory: the read script is answered from `files` (and the host's clock from `now` and
- * `zone`; a state without `now` answers a garbled clock line, a host whose `date` printed nothing), jlist from `procs`,
- * a flush empties files.
+ * `zone`; a state without `now` answers a garbled clock line, a host whose `date` printed nothing), jlist and the status
+ * probe from `procs` (the probe's zone is the host's `zone`, default +0000), a flush empties files. `reads` names the
+ * host of each read script, `scripts` keeps the scripts themselves.
  */
 export function fakeHosts(
   state: FakeState,
@@ -36,8 +43,14 @@ export function fakeHosts(
   manifest = fleetManifest
 ) {
   const reads: string[] = [];
+  const scripts: string[] = [];
+  const clockOf = (host: string) => ({
+    now: state.now,
+    zone: state.zone,
+    ...state.clocks?.[host],
+  });
   const clock = (host: string) => {
-    const c = { now: state.now, zone: state.zone, ...state.clocks?.[host] };
+    const c = clockOf(host);
     return `__MCPROC_LS_CLOCK__ ${c.now ?? ''} ${c.zone ?? '+0000'}\n`;
   };
   const fleet = new Fleet(manifest, undefined, async (_m, host, fallback) => {
@@ -51,6 +64,15 @@ export function fakeHosts(
       host,
       [
         {
+          match: MARK.JLIST,
+          result: () => ({
+            stdout: probeOut({
+              jlist: JSON.stringify(state.procs[host] ?? []),
+              clock: clockOf(host).zone ?? '+0000',
+            }),
+          }),
+        },
+        {
           match: /pm2 'jlist'/,
           result: () => ({ stdout: JSON.stringify(state.procs[host] ?? []) }),
         },
@@ -58,13 +80,25 @@ export function fakeHosts(
           match: '__MCPROC_INC_',
           result: (cmd: string) => {
             reads.push(host);
+            scripts.push(cmd);
+            if (state.failReads?.includes(host))
+              return {
+                code: 255,
+                stderr: `ssh: connect to host ${host} port 22: Connection reset by peer`,
+              };
             return {
               stdout:
+                answerChecks(cmd, state.unreadable ?? []) +
                 (cmd.includes('__MCPROC_NOW__')
                   ? `__MCPROC_NOW__ ${state.now ?? ''}\n`
                   : '') +
                 (cmd.includes('__MCPROC_LS_CLOCK__') ? clock(host) : '') +
-                answerReads(cmd, state.files, state.short ?? []),
+                answerReads(
+                  cmd,
+                  state.files,
+                  state.short ?? [],
+                  state.unreadable ?? []
+                ),
             };
           },
         },
@@ -83,13 +117,29 @@ export function fakeHosts(
       fallback
     );
   });
-  return { fleet, reads };
+  return { fleet, reads, scripts };
+}
+/**
+ * Executes what a script runs before its reads: a readability check `[ ! -e 'f' ] || [ -r 'f' ] || echo M` prints M
+ * when f is unreadable (such a file exists); a plain `echo M` prints M.
+ */
+function answerChecks(cmd: string, unreadable: string[]): string {
+  let out = '';
+  for (const step of cmd.split('echo __MCPROC_INC_')[0].split('; ')) {
+    const check =
+      /^\[ ! -e '([^']+)' \] \|\| \[ -r '\1' \] \|\| echo (\S+)$/.exec(step);
+    const echo = /^echo (\S+)$/.exec(step);
+    if (check && unreadable.includes(check[1])) out += `${check[2]}\n`;
+    else if (echo) out += `${echo[1]}\n`;
+  }
+  return out;
 }
 /** Executes the read snippets against the in-memory files: same arithmetic as the shell. */
 export function answerReads(
   cmd: string,
   files: Record<string, string>,
-  short: string[] = []
+  short: string[] = [],
+  unreadable: string[] = []
 ): string {
   let out = '';
   for (const part of cmd.split('echo __MCPROC_INC_').slice(1)) {
@@ -98,7 +148,11 @@ export function answerReads(
     const off = Number(/off=(-?\d+)/.exec(part)![1]);
     const at = Number(/ at=(-?\d+)/.exec(part)?.[1] ?? -1);
     const ah = /ah='([0-9a-f]*)'/.exec(part)?.[1] ?? '';
-    const buf = Buffer.from(files[file] ?? '', 'utf8');
+    // a file the user may not read measures as empty: `wc -c` fails and the size falls back to 0
+    const buf = Buffer.from(
+      unreadable.includes(file) ? '' : (files[file] ?? ''),
+      'utf8'
+    );
     const sz = buf.length;
     const hex16 = (end: number) =>
       buf.subarray(Math.max(0, end - 16), end).toString('hex');

@@ -3,13 +3,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { prepare, connect } from '../../core/resolve.js';
 import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
-import {
-  Fleet,
-  defaultConnector,
-  listFleet,
-  describeFleetApp,
-} from '../../core/fleet.js';
+import { Fleet, defaultConnector, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
+import { listWithReloads } from '../../core/reloadcount.js';
 import {
   LogMarks,
   parseSince,
@@ -97,22 +93,29 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'List apps',
       description:
-        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open".',
+        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open". reloads: true also counts each running app\'s in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2\'s restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.',
       inputSchema: {
         ...commonInput,
         app: z.string().optional().describe('Only this app'),
+        reloads: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also count each running app's in-process reloads since its pm2 start; costs one log read per host (default false)"
+          ),
       },
       annotations: RO,
     },
     (args) =>
       runTool(async () => {
         const fleet = await fleetOf(args);
-        const { rows, errors } = await listFleet(
+        const { rows, errors, unread } = await listWithReloads(
           fleet,
-          fleet.select(args.app ? [args.app] : ['all'])
+          fleet.select(args.app ? [args.app] : ['all']),
+          args.reloads ?? false
         );
         return {
-          text: renderLs(rows, fleet.fallback),
+          text: renderLs(rows, fleet.fallback, unread),
           data: {
             ...hostsOf(rows, fleet.fallback),
             project: fleet.manifest.project,
@@ -274,14 +277,14 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Wait',
       description:
-        "Block until an app is usable or finished. until: listening (every declared port is bound; the app must declare a port), url-ok (its url answers 2xx/3xx; the app must declare a url), exited (the process left online; for an app with autorestart off, kind task included, the answer carries exit_code and done / failed (exit N) / stopped, any other app shows pm2's stopped or errored), log:<regex> (a new log line matches; tested without pm2's time stamp and with ANSI stripped, the answer keeps the stamp), idle:<seconds> (no log output for that long: a watcher settled). log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok. listening or url-ok on an app without a declared port or url is refused with BAD_ARGUMENT. ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile; a result, not an error. A restart in progress (a watch restart, a restart delay) is waited out. Call it after start instead of sleeping or polling ls.",
+        "Block until an app is usable or finished. until: listening (every declared port is bound), url-ok (its url answers 2xx/3xx), exited (the process left online; with autorestart off, kind task included, the answer carries exit_code and done / failed (exit N) / stopped, any other app shows pm2's stopped or errored), log:<regex> (a new line matches; tested without pm2's time stamp, ANSI stripped, the answer keeps the stamp), idle:<seconds> (no log output for that long), reloaded (the next in-process reload: tsx/nodemon restart, Vite/Next rebuild, a repeated listening line; answered once quiet for 2 s with its time, line count and first restart or rebuild line; for a server whose reload restarts it, wait until: listening next). log:, idle: and reloaded see only output written after the call begins, so to know whether the app is up prefer listening or url-ok. Refused (BAD_ARGUMENT): listening with no declared port, url-ok with no url, reloaded with reloads: false. ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile; a result, not an error. A pm2 restart in progress is waited out. Call it after start instead of sleeping or polling ls.",
       inputSchema: {
         ...commonInput,
         app: z.string().describe('The app to wait for'),
         until: z
           .string()
           .describe(
-            'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+            'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded'
           ),
         timeout_s: z
           .number()
@@ -315,7 +318,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Incidents',
       description:
-        "Only the errors that are NEW since they were last taken, each with lines of context before and after (a folded stack trace included), plus crashes and restarts. A call takes what it returns: the pick-up point, kept in .mcproc/incidents.json and shared by every session, agent and CLI call, moves past them, so nobody gets them twice; peek: true looks without taking. A log clear (flush, or c in monit) starts incidents over from there. Cheap to poll: nothing new is one short line. During long work on running apps call it periodically, with your client's own loop/cron/monitor if it has one; read logs only for an incident worth a closer look.",
+        "Only the errors that are NEW since they were last taken, each with lines of context before and after (a folded stack trace included), plus crashes and restarts. A call takes what it returns: the pick-up point, kept in .mcproc/incidents.json and shared by every session, agent and CLI call, moves past them, so nobody gets them twice; peek: true looks without taking. A log clear (flush, or c in monit) starts incidents over from there. Cheap to poll: nothing new is one short line. During long work on running apps call it periodically, with your client's own loop/cron/monitor if it has one; read logs only for an incident worth a closer look. include_reloads: true adds each app's in-process reloads since the last call (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line) as one reloaded incident per app with how many and when.",
       inputSchema: {
         ...commonInput,
         app: z
@@ -351,6 +354,12 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           ])
           .optional()
           .describe('[lines before, lines after] (default per app, 3 and 5)'),
+        include_reloads: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also report each app's in-process reloads since the last call, one reloaded incident per app (default false)"
+          ),
       },
       annotations: MUT(false, false), // taking writes the local pick-up point; nothing changes on the hosts
     },
@@ -363,6 +372,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
           sinceMin: args.since,
           max: args.max,
           context: args.context,
+          includeReloads: args.include_reloads,
         });
         return {
           text: renderIncidents(answer),

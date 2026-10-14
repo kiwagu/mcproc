@@ -40,6 +40,7 @@ const app = (name: string, ports: number[] = []): App => ({
   pm2: {},
   host: null,
   errors: null,
+  reloads: null,
 });
 
 describe('probeScript', () => {
@@ -50,6 +51,17 @@ describe('probeScript', () => {
     expect(s).toContain("'/usr/bin/node' '/x/pm2' jlist");
     expect(s).toContain('ss -ltnp');
     expect(s).toContain('/proc/net/tcp');
+  });
+  it("prints the host's UTC offset right after pm2's list, in the full and the light form", () => {
+    for (const s of [
+      probeScript('pm2'),
+      probeScript('pm2', { metrics: false }),
+    ]) {
+      const at = s.indexOf('echo __MCPROC_CLOCK__');
+      expect(at).toBeGreaterThan(s.indexOf('__MCPROC_JLIST_RC__'));
+      expect(at).toBeLessThan(s.indexOf('echo __MCPROC_PS__'));
+      expect(s).toContain("echo __MCPROC_CLOCK__\ndate '+%z' 2>/dev/null");
+    }
   });
 });
 
@@ -116,6 +128,28 @@ describe('parsers', () => {
       { addr: '0.0.0.0', port: 3310, inode: 2171731 },
     ]);
     expect(parseFdMap(fx('proc-fd.txt')).get(2171731)).toBe(69265);
+  });
+  it("parseProbe reads the host's zone; an absent or garbled clock section is null and the rest still parses", () => {
+    expect(parseProbe(probeOut({ clock: '+0200' })).zone).toBe('+0200');
+    expect(parseProbe(probeOut({ clock: '-0330\n' })).zone).toBe('-0330');
+    expect(parseProbe(probeOut({ clock: '' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: 'CEST' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: '+02:00' })).zone).toBeNull();
+    // the shape of a zone but no real offset: refused as logs since refuses it, so both read the host alike
+    expect(parseProbe(probeOut({ clock: '+9900' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: '-0260' })).zone).toBeNull();
+    expect(parseProbe(probeOut({ clock: '+1400' })).zone).toBe('+1400');
+    // the output of a probe without the section (an older script): no zone, every other section as before
+    const old = probeOut({ jlist: '[]', ps: fx('ps.txt') }).replace(
+      `${MARK.CLOCK}\n+0000\n`,
+      ''
+    );
+    expect(old).not.toContain(MARK.CLOCK);
+    const d = parseProbe(old);
+    expect(d.zone).toBeNull();
+    expect(d.jlistRc).toBe(0);
+    expect(d.jlistRaw.trim()).toBe('[]');
+    expect(d.tree.size).toBe(7);
   });
   it('parseProbe splits sections (ss path) and falls back to /proc', () => {
     const d = parseProbe(

@@ -1,4 +1,4 @@
-import { describeError } from '../core/errors.js';
+import { describeError, isMcprocError } from '../core/errors.js';
 import {
   unreachableRow,
   type LsRow,
@@ -9,8 +9,15 @@ import { findProcess } from '../core/pm2.js';
 import { assertWritable, pickHost, type Context } from '../core/resolve.js';
 import type { Fleet, HostApps } from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
-import type { LogLine } from '../core/logfollow.js';
+import type { FollowPoll, LogLine } from '../core/logfollow.js';
 import type { Cleared } from '../core/incidents/store.js';
+import {
+  compileReloadRules,
+  historyReaches,
+  reloadCount,
+  reloadStamp,
+  ReloadTracker,
+} from '../core/reloads.js';
 import { fmtBytes } from '../mcp/render.js';
 import {
   monitViews,
@@ -18,11 +25,12 @@ import {
   viewLabel,
   type MonitAction,
   type MonitState,
+  type ReloadInfo,
 } from './state.js';
 
 export type Cmd = 'start' | 'restart' | 'stop';
 export interface Follower {
-  poll(): Promise<{ lines: LogLine[]; reset: boolean }>;
+  poll(): Promise<FollowPoll>;
   /** calls `wake` as soon as the followed files change, when the follower can tell */
   watch?(wake: () => void): void;
   /** stops the wakes */
@@ -60,6 +68,14 @@ export interface LoopDeps {
 
 export { describeError };
 
+/** One followed app's reloads since its pm2 start: the run it counts (its start and restarts) and the count so far. */
+interface Counter {
+  tracker: ReloadTracker;
+  started: string;
+  restarts: number;
+  info: ReloadInfo;
+}
+
 /** polls a wake asks for run at most this often: a chatty app repaints the screen in steps, not on every write */
 const WAKE_GAP_MS = 50;
 
@@ -85,13 +101,23 @@ export class MonitLoop {
   private epochs = new Map<string, number>(); // per app, bumped by each clear: a read begun before it is dropped
   private seen: Record<string, number> = {}; // the clear counts of the store this screen has acted on
   private switchSeq = 0; // the newest view switch asked for: an older one that connects late changes nothing
+  private counters = new Map<string, Counter>(); // per followed app with reloads on and a known start
+  /**
+   * per app, when its lines were last lost (a poll that lost some, or a clear), numbered by `losses`: until rows taken
+   * after it were looked at, a run those rows did not know yet may have begun in that gap, so a fresh look at a run
+   * counts as partial
+   */
+  private gaps = new Map<string, number>();
+  private losses = 0;
+  private uncounted = new Set<string>(); // apps whose own reloads patterns ran away: not counted again in this view
   private names: string[];
   private groups: HostApps[];
 
   constructor(
     public fleet: Fleet,
     private readonly deps: LoopDeps,
-    private readonly opts: { lines: number },
+    /** budgetMs: how long an app's own reloads patterns may take on one poll's lines (default MATCH_BUDGET_MS) */
+    private readonly opts: { lines: number; budgetMs?: number },
     private readonly getState: () => MonitState,
     public readonly dispatch: (a: MonitAction) => void
   ) {
@@ -146,6 +172,7 @@ export class MonitLoop {
   }
 
   private async runHost(gen: number, g: HostApps): Promise<void> {
+    const probed = this.losses; // a gap numbered after this was not seen by the rows this refresh takes
     try {
       const ctx = await this.fleet.ctx(g.host);
       // the live screen never requests the apps' URLs: dev servers log every request, and this pane is where those logs are read
@@ -184,6 +211,7 @@ export class MonitLoop {
         const r = await e.f.poll();
         if (gen !== this.gen) return; // the view moved on during the poll
         if (this.epochs.get(app) !== epoch) continue; // cleared during the read: these lines are from before the clear
+        const before = this.getState().logs[app] ?? [];
         this.dispatch({
           type: 'logs',
           app,
@@ -191,6 +219,12 @@ export class MonitLoop {
           reset: r.reset,
           paths,
         });
+        this.track(app, r.lines, before, r.lost === true);
+        // the rows were taken before this poll, so what it lost may hold a run they do not know yet; an older gap is
+        // settled once a counter of the app has looked at rows taken after it
+        if (r.lost) this.gaps.set(app, ++this.losses);
+        else if (this.counters.has(app) && (this.gaps.get(app) ?? 0) <= probed)
+          this.gaps.delete(app);
       }
       this.syncWatches();
     } catch (e) {
@@ -286,18 +320,95 @@ export class MonitLoop {
           this.epochs.get(app) !== epoch
         )
           continue;
-        if (!r.lines.length && !r.reset) continue;
-        this.dispatch({
-          type: 'logs',
-          app,
-          lines: r.lines,
-          reset: r.reset,
-          paths: e.paths,
-        });
+        const before = this.getState().logs[app] ?? [];
+        if (r.lines.length || r.reset)
+          this.dispatch({
+            type: 'logs',
+            app,
+            lines: r.lines,
+            reset: r.reset,
+            paths: e.paths,
+          });
+        this.track(app, r.lines, before, r.lost === true);
+        if (r.lost) this.gaps.set(app, ++this.losses);
       }
     } finally {
       q.running = false;
       this.kick(q);
+    }
+  }
+
+  /**
+   * Counts the reloads in a followed app's new lines and closes a burst that went quiet. The first look at a run (the
+   * app's first poll, or the first after pm2 started it again) starts a tracker over what the screen buffered of the
+   * app's log before this poll, then every line of this poll: a new run's boot that a wake delivered before the rows told
+   * of the restart is still taken for the boot, and a catch-up poll longer than the buffer loses nothing. After a
+   * restart the count starts at 0 and is exact (the new run is followed from its start); a first look is judged by how
+   * far those lines reach back. Lines lost by this poll (`lost`), or by one since the rows were taken (`gaps`), make the
+   * count partial for the rest of its run, and the change is shown even when no reload closed.
+   */
+  private track(
+    app: string,
+    lines: LogLine[],
+    before: LogLine[],
+    lost: boolean
+  ): void {
+    const settings = this.fleet.manifest.apps[app]?.reloads;
+    const row = this.latest.get(app);
+    if (!settings || !row || this.uncounted.has(app)) return;
+    const prev = this.counters.get(app);
+    const { started, restarts } = row;
+    const now = Date.now();
+    const gap = lost || this.gaps.has(app);
+    try {
+      if (
+        started !== null &&
+        (!prev || prev.started !== started || prev.restarts !== restarts)
+      ) {
+        const input = [...before, ...lines];
+        const rules = compileReloadRules(settings, this.opts.budgetMs);
+        let tracker = null as ReloadTracker | null;
+        const info = reloadCount(
+          prev ? ['start'] : historyReaches(input, started),
+          (coversStart) => {
+            tracker = new ReloadTracker(rules, {
+              app,
+              start: started,
+              coversStart,
+            });
+            return [...tracker.push(input, now), ...tracker.idle(now)];
+          }
+        );
+        if (!tracker) return;
+        if (gap) info.partial = true;
+        this.counters.set(app, { tracker, started, restarts, info });
+        this.dispatch({ type: 'reloads', app, info });
+        return;
+      }
+      if (!prev) return;
+      const found = [
+        ...prev.tracker.push(lines, now),
+        ...prev.tracker.idle(now),
+      ];
+      const last = found.at(-1);
+      const partial = prev.info.partial || gap;
+      if (!last && partial === prev.info.partial) return;
+      prev.info = {
+        count: prev.info.count + found.length,
+        last: last ? reloadStamp(last) : prev.info.last,
+        partial,
+      };
+      this.dispatch({ type: 'reloads', app, info: prev.info });
+    } catch (e) {
+      if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
+      // its own patterns ran away: this app goes without a count, its logs and the other apps' counts go on
+      this.counters.delete(app);
+      this.uncounted.add(app);
+      this.dispatch({ type: 'reloads', app, info: null });
+      this.dispatch({
+        type: 'notice',
+        message: `reloads of ${app} not counted: ${describeError(e)}`,
+      });
     }
   }
 
@@ -352,6 +463,9 @@ export class MonitLoop {
       this.groups = groups;
       for (const app of [...this.watched]) this.unwatch(app);
       this.followers.clear();
+      this.counters.clear(); // the new view's followers start with their history, which is counted afresh
+      this.gaps.clear();
+      this.uncounted.clear();
       this.prev.clear();
       this.latest.clear();
       this.errors.clear();
@@ -409,6 +523,7 @@ export class MonitLoop {
   /**
    * The logs of these apps start over (they were cleared): buffers empty, the next refresh reads the emptied files with a
    * new follower — the old one would go on at its offset if the file regrew past it — and a read begun before is dropped.
+   * A count kept across the clear is partial from now on: what the clear removed may hold reloads, or a new run's start.
    */
   private restart(apps: string[]): void {
     for (const app of apps) {
@@ -416,6 +531,12 @@ export class MonitLoop {
       this.followers.delete(app);
       this.epochs.set(app, (this.epochs.get(app) ?? 0) + 1);
       this.dispatch({ type: 'logs', app, lines: [], reset: true });
+      const c = this.counters.get(app);
+      if (!c) continue;
+      this.gaps.set(app, ++this.losses);
+      if (c.info.partial) continue;
+      c.info = { ...c.info, partial: true };
+      this.dispatch({ type: 'reloads', app, info: c.info });
     }
   }
 

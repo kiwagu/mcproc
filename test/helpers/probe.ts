@@ -1,9 +1,10 @@
 import { MARK } from '../../src/shell/snippets.js';
 
-/** Assemble the stdout of probeScript() from parts, for tests. */
+/** Assemble the stdout of probeScript() from parts, for tests. `clock` is the host's `date +%z` (default +0000). */
 export function probeOut(parts: {
   jlist?: string;
   rc?: number;
+  clock?: string;
   ps?: string;
   tcp?: string;
   udp?: string;
@@ -19,6 +20,8 @@ export function probeOut(parts: {
     MARK.JLIST,
     parts.jlist ?? '[]',
     `${MARK.JLIST_RC} ${parts.rc ?? 0}`,
+    MARK.CLOCK,
+    parts.clock ?? '+0000',
     MARK.PS,
     parts.ps ?? '',
     MARK.TCP,

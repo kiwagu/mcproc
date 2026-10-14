@@ -1,7 +1,10 @@
-import { prepare } from '../core/resolve.js';
+import { prepare, type Context } from '../core/resolve.js';
+import { describeError, isMcprocError } from '../core/errors.js';
 import { Fleet, listFleet } from '../core/fleet.js';
+import type { Manifest } from '../core/manifest.js';
 import { findProcess } from '../core/pm2.js';
-import { createFollower } from '../core/logfollow.js';
+import { createFollower, type LogLine } from '../core/logfollow.js';
+import { historyReloads } from '../core/reloads.js';
 import {
   appInfos,
   initialState,
@@ -12,16 +15,33 @@ import {
 } from './state.js';
 import { frameToText, renderFrame } from './frame.js';
 
-/** One frame of the monit surface as plain text: the same renderer the interactive screen uses, the same view it opens on. */
-export async function monitOnce(opts: {
-  project?: string;
-  host?: string;
-  lines: number;
-  width?: number;
-}): Promise<string> {
-  const { manifest } = prepare({ project: opts.project });
+/**
+ * One frame of the monit surface as plain text: the same renderer the interactive screen uses, the same view it opens
+ * on, with the selected app's reloads counted from the history it reads. `deps` stand in for the project's manifest,
+ * its fleet and the log follower, and bound the app's own reloads patterns (budgetMs, default MATCH_BUDGET_MS): tests.
+ */
+export async function monitOnce(
+  opts: {
+    project?: string;
+    host?: string;
+    lines: number;
+    width?: number;
+  },
+  deps: {
+    manifest?: Manifest;
+    fleet?: (requested: string | undefined) => Fleet;
+    follower?: (
+      ctx: Context,
+      paths: { out: string; err: string },
+      lines: number
+    ) => { poll(): Promise<{ lines: LogLine[]; reset: boolean }> };
+    budgetMs?: number;
+  } = {}
+): Promise<string> {
+  const manifest = deps.manifest ?? prepare({ project: opts.project }).manifest;
   const views = monitViews(manifest);
-  const fleet = new Fleet(manifest, opts.host ?? views[0]);
+  const requested = opts.host ?? views[0];
+  const fleet = deps.fleet?.(requested) ?? new Fleet(manifest, requested);
   let state = initialState({
     project: manifest.project,
     host: viewLabel(fleet.requested),
@@ -47,8 +67,24 @@ export async function monitOnce(opts: {
       : undefined;
   if (row && probe?.ctx && proc) {
     const paths = { out: proc.out_log, err: proc.err_log };
-    const { lines } = await createFollower(probe.ctx, paths, opts.lines).poll();
+    const follow = deps.follower ?? createFollower;
+    const { lines } = await follow(probe.ctx, paths, opts.lines).poll();
     state = reduce(state, { type: 'logs', app: row.app, lines, paths });
+    try {
+      const info = historyReloads(
+        lines,
+        manifest.apps[row.app]?.reloads ?? null,
+        row,
+        deps.budgetMs
+      );
+      if (info) state = reduce(state, { type: 'reloads', app: row.app, info });
+    } catch (e) {
+      if (!isMcprocError(e) || e.code !== 'TIMEOUT') throw e;
+      state = reduce(state, {
+        type: 'notice',
+        message: `reloads of ${row.app} not counted: ${describeError(e)}`,
+      });
+    }
   }
   return frameToText(
     renderFrame(state, {

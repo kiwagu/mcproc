@@ -92,10 +92,22 @@ describe('mcp server', () => {
     // what an agent must know before it calls wait
     const waitDesc = byName.wait.description as string;
     expect(waitDesc).toMatch(
-      /log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
+      /log:, idle: and reloaded see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
+    );
+    // a reload that restarts a server ends before the server listens again
+    expect(waitDesc).toMatch(
+      /reloaded \(the next in-process reload.*quiet for 2 s.*wait until: listening next\)/
     );
     expect(waitDesc).not.toMatch(/before the action/); // a blocking call cannot precede the action it waits for
     expect(waitDesc).toMatch(/BAD_ARGUMENT/);
+    // each until the app cannot show, named with what makes it so
+    expect(waitDesc).toContain(
+      'Refused (BAD_ARGUMENT): listening with no declared port, url-ok with no url, reloaded with reloads: false.'
+    );
+    // what a reloaded answer carries
+    expect(waitDesc).toMatch(
+      /reloaded \(.*with its time, line count and first restart or rebuild line/
+    );
     expect(waitDesc).toMatch(/without pm2's time stamp.*keeps the stamp/);
     expect(waitDesc).toMatch(
       /autorestart off.*other app shows pm2's stopped or errored/
@@ -126,6 +138,9 @@ describe('mcp server', () => {
     expect(byName.init.description).not.toContain('Candidates are commented');
     expect(byName.init.description).not.toContain('—');
     expect(INSTRUCTIONS).toContain('init adopt_ports');
+    // a watcher reloads in place: after an edit the agent waits for that reload, not for a port
+    expect(INSTRUCTIONS).toContain('reloaded');
+    expect(INSTRUCTIONS).toContain('after an edit, wait until reloaded');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -213,6 +228,67 @@ describe('mcp server', () => {
     expect(r.structuredContent.rows).toHaveLength(3);
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
+  });
+  it("ls reloads: true counts each running app's in-process reloads into its row and RESTARTS cell; without it ls reads no log", async () => {
+    const jlist = JSON.stringify([
+      {
+        pid: 4242,
+        name: 'demo-api',
+        pm_id: 1,
+        pm2_env: {
+          status: 'online',
+          namespace: 'demo',
+          restart_time: 1,
+          pm_uptime: Date.parse('2026-10-12T11:00:00Z'),
+          pm_out_log_path: '/l/api-out',
+          pm_err_log_path: '/l/api-err',
+        },
+      },
+    ]);
+    const files = {
+      '/l/api-out': `${S(1)}listening on 3310\n${S(10)}[tsx] change in ./dist/main.js Restarting...\n${S(11)}listening on 3310\n${S(30)}listening on 3310\n`,
+    };
+    // logs: false fails the call the moment a log read reaches the host
+    const spawner =
+      (logs: boolean): Spawner =>
+      async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({ jlist, clock: '+0000' }),
+            stderr: '',
+          };
+        if (cmd.includes('__MCPROC_INC_')) {
+          if (!logs) throw new Error(`ls must not read logs: ${cmd}`);
+          return { code: 0, stdout: answerReads(cmd, files), stderr: '' };
+        }
+        return { code: 1, stdout: '', stderr: `unexpected: ${cmd}` };
+      };
+    const r: any = await (await client(spawner(true))).callTool({
+      name: 'ls',
+      arguments: { project: basic, reloads: true },
+    });
+    expect(r.isError).toBeFalsy();
+    const rowOf = (res: any, app: string) =>
+      res.structuredContent.rows.find((x: any) => x.app === app);
+    expect(rowOf(r, 'api').reloads).toEqual({
+      count: 2,
+      last: '2026-10-12T11:00:30',
+      partial: false,
+    });
+    expect(rowOf(r, 'worker')).not.toHaveProperty('reloads'); // not running
+    expect(r.structuredContent.errors).toEqual([]);
+    expect(text(r)).toMatch(/api\s+server\s+online\s+4242\s+\S+\s+1 \(\+2\)\s/);
+    const plain: any = await (await client(spawner(false))).callTool({
+      name: 'ls',
+      arguments: { project: basic },
+    });
+    expect(plain.isError).toBeFalsy();
+    expect(rowOf(plain, 'api')).not.toHaveProperty('reloads');
+    expect(text(plain)).toMatch(/api\s+server\s+online\s+4242\s+\S+\s+1\s+-/);
   });
   it('start answers with the waits it made (none for an app without conditions)', async () => {
     const spawner: Spawner = async (argv) => {
@@ -756,6 +832,77 @@ describe('mcp server', () => {
       arguments: { project: proj, app: 'api' },
     });
     expect(text(second)).toMatch(/^no new incidents since/);
+  });
+  it('incidents include_reloads: the reloads of each app since the last call as one incident beside its errors; off by default', async () => {
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-inc-'));
+    fs.cpSync(basic, proj, { recursive: true });
+    const jlist = JSON.stringify([
+      {
+        pid: 10,
+        name: 'demo-api',
+        pm_id: 0,
+        pm2_env: {
+          status: 'online',
+          namespace: 'demo',
+          restart_time: 0,
+          pm_uptime: Date.parse('2026-10-12T11:00:00Z'),
+          pm_out_log_path: '/l/api-out',
+          pm_err_log_path: '/l/api-err',
+        },
+      },
+    ]);
+    // the boot's listening line, then a tsx restart that listens again, then an error
+    const files = {
+      '/l/api-out': `${S(2)}listening on 3310\n${S(5)}[tsx] change in ./src/a.ts Restarting...\n${S(6)}listening on 3310\n${S(8)}TypeError: boom\n`,
+      '/l/api-err': '',
+    };
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      if (cmd.includes("'jlist'"))
+        return { code: 0, stdout: jlist, stderr: '' };
+      if (cmd.includes('__MCPROC_INC_'))
+        return {
+          code: 0,
+          stdout: `__MCPROC_NOW__ 2026-10-12T11:01:00\n${cmd.includes('__MCPROC_LS_CLOCK__') ? '__MCPROC_LS_CLOCK__ 2026-10-12T11:01:00 +0000\n' : ''}${answerReads(cmd, files)}`,
+          stderr: '',
+        };
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    const cl = await client(spawner);
+    const tools = await cl.listTools();
+    const inc = tools.tools.find((t) => t.name === 'incidents')!;
+    expect(inc.description).toContain('include_reloads');
+    expect(
+      (inc.inputSchema.properties as Record<string, { description?: string }>)
+        .include_reloads.description
+    ).toBeTruthy();
+    const plain: any = await cl.callTool({
+      name: 'incidents',
+      arguments: { project: proj, app: 'api', peek: true },
+    });
+    expect(
+      plain.structuredContent.incidents.map((i: { kind: string }) => i.kind)
+    ).toEqual(['error']);
+    const r: any = await cl.callTool({
+      name: 'incidents',
+      arguments: { project: proj, app: 'api', include_reloads: true },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.structuredContent.incidents).toMatchObject([
+      { kind: 'error', app: 'api' },
+      {
+        kind: 'reloaded',
+        app: 'api',
+        count: 1,
+        time: '2026-10-12T11:00:05',
+        line: `${S(5)}[tsx] change in ./src/a.ts Restarting...`,
+      },
+    ]);
+    expect(text(r)).toContain(
+      `api@local 2026-10-12T11:00:05 reloaded: ${S(5)}[tsx] change in ./src/a.ts Restarting...`
+    );
   });
 });
 

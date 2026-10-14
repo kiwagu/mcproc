@@ -181,19 +181,24 @@ instead of sleeping and polling:
 | `exited` | the process left `online`; with autorestart off the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped`, otherwise pm2's `stopped` or `errored` |
 | `log:<regex>` | a new line of its out or err log matches (ANSI stripped, matched against the line without pm2's time stamp; the answer keeps the stamp; history is not searched) |
 | `idle:<seconds>` | no log output for that long: a watcher settled |
+| `reloaded` | the app's next in-process reload (see *Reloads*) has been quiet for 2 s; the answer carries its time, its line count and its first restart or rebuild line, else its first line |
 
 `url-ok` needs `curl` or `wget` on the host: without either it runs to the timeout and reports `unchecked`.
-`log:` and `idle:` see only output written after the call begins, and notice a dead process only every 5 s; for
+`log:`, `idle:` and `reloaded` see only output written after the call begins, and notice a dead process only every 5 s; for
 "is it up" prefer `listening` or `url-ok`. `wait --until exited` succeeds (exit code 0) once the process has exited,
 whatever its exit code; scripts read `exit_code` in `--json` or the `(exit N)` in the line. A wait on an app that
-was never started is a `NOT_STARTED` error, not a result. `listening` needs a declared port and `url-ok` a declared
-url, else `BAD_ARGUMENT`. `exited` on an app that has already stopped answers at once.
+was never started is a `NOT_STARTED` error, not a result. `listening` needs a declared port, `url-ok` a declared
+url and `reloaded` an app without `reloads: false`, else `BAD_ARGUMENT`. `exited` on an app that has already stopped answers at once.
+
+After a `restart`, and for an app that pm2 itself restarts on a change (`watch:`), wait until `listening`. An app that
+reloads in place (a watcher: tsx watch, nodemon, `node --watch`, Vite, `next dev`) keeps its process and its port, so
+`listening` answers at once while the old code may still run: after an edit, follow it with `wait until: reloaded`.
 
 The answer is one line: `web: listening after 1.3 s (:3000 ✓)`, `libs: done after 12.4 s (exit 0)`. On timeout
 (default 60 s, max 600) it says what was last seen (`web: listening not reached after 60.0 s (status online, :3000 ✗
 nothing listens)`), and `ok` is false. If the process dies meanwhile, the wait ends at once with its reason and
 status and no observation, for example `web: exited (stopped) after 3.2 s while waiting for listening` (`observed`
-is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. A process that pm2 is
+is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:`/`reloaded` read the log as it grows. A process that pm2 is
 restarting (a watch restart, a restart delay) is not dead: the wait goes on, bounded by the timeout. `listening` and
 `url-ok` count only while the process is online or launching; a restart in progress is waited out, and a port or url that
 still answers after the process died is not ready. Claude
@@ -235,16 +240,84 @@ On the command line, `mcproc logs base --since 2m` prints the merged lines and e
 from exactly where that read ended; an app that was not running yet is shown from the same cutoff once it starts. `last`
 needs the session that keeps the marks, so the CLI refuses it.
 
+## Reloads
+
+Dev tools in watch mode reload after an edit inside their own process. pm2 sees none of it: RESTARTS stays 0, and a
+port that never closed says nothing about which code answers. mcproc reads these reloads from the app's log. A
+reload is one of these lines, matched without pm2's stamp and with ANSI stripped:
+
+- a restart: tsx's `[tsx] … Restarting...`, nodemon's `restarting due to changes`, `node --watch`'s `Restarting '…'`;
+- a rebuild: Vite's `[vite] page reload` or `hmr update`, Next's `✓ Compiled in …` (with a page path, `✓ Compiled /page
+  in …`, it is that page's first compile and does not count) and `Reload env:`, tsc's `File change detected. Starting
+  incremental compilation`;
+- a repeated `listening on` or `listening at` line, for watchers that print nothing else (`bun --watch`).
+
+Marker lines less than 2 s apart, stdout and stderr together, are one reload: a library rebuild that prints a line per
+changed file counts once, and so does a restart followed by the server's new `listening` line. The first burst after
+pm2 starts the process, when it holds only `listening` lines, is the boot, not a reload. A restart less than 2 s after
+the boot's `listening` line joins the boot's burst: it counts once, and is shown by the restart line. Counting starts at
+pm2's start of the process: lines an earlier run left in the same log file never count.
+
+Per app:
+
+```yaml
+apps:
+  api:
+    description: API under a home-grown file watcher
+    run: node scripts/dev.js
+    reloads:
+      match: ['^\[devwatch\] reloaded']   # more markers (JavaScript regular expressions)
+      ignore: ['listening on queue']       # never a reload
+      defaults: true                       # false: only your own patterns, no built-in markers
+```
+
+`reloads: false` turns it off for an app. Own patterns follow the rules of `errors` patterns: matched against the first
+2000 characters of each line, a repeat of a repeat refused when the manifest loads, and stopped when they take longer
+than 2 seconds on an app's log, which leaves that app's reloads uncounted with an error while the other apps go on.
+
+Four places show them:
+
+- `wait until: reloaded` (`mcproc wait web --until reloaded`) answers once the app's next reload has been quiet for 2 s,
+  with its time, its line count and its first restart or rebuild line, else its first line:
+  `web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000): [vite] (client) page reload /src/a.ts`. A server
+  whose reload restarts it may print its new `listening` line more than 2 s later, after the reload was answered: wait
+  until `listening` next. A wait that times out or is aborted while a reload is still under way says so, with `ok`
+  false: `reload in progress since 2026-10-14T12:00:59.000 (2 lines): [tsx] change in src/a.ts Restarting...`.
+- `incidents` with `include_reloads: true` (`mcproc incidents --reloads`) adds one `reloaded` incident per app with
+  the reloads since the last call: how many, the first and the last one's time, and the last one's first restart or
+  rebuild line, else its first line.
+- `ls` with `reloads: true` (`mcproc ls --reloads`) adds each running app's reloads since its pm2 start to RESTARTS,
+  `0 (+7)`, and to each JSON row as `reloads: { count, last, partial }`. It reads each host's logs once more, so a plain
+  `ls` does not count them.
+- `monit` shows them in the selected app's detail line while it runs (online or launching), `restarts 0 (+7 reloads,
+  last 12:01:05)`, counted for the apps whose logs it follows: the selected one on the dashboard, every running one in
+  the flat view. `monit --once` counts from the history it reads.
+
+Limits. A count marked `≥` (`0 (+≥7)`, `+≥7 reloads`) is a lower bound: the log was cleared since the process started,
+or the app wrote more than the last 1 MB that is read. monit and `monit --once` count from the history they read, the
+last `--lines` lines of each log (200 by default), so an app that has run for a while often shows `+≥7` there where
+`ls --reloads` shows an exact `+7`. An err log whose first line came more than a minute after the start also marks
+monit's count `≥`: monit cannot tell where in the file its history began. A reload whose lines are split between two
+`incidents` calls is reported in both. With `include_reloads`, an app whose own `reloads` patterns run away also has
+its error incidents held back, and its point stays where it was, until the patterns are fixed. The process start is
+pm2's start time read in the host's current time zone, so a daylight saving change since the start, or a pm2 daemon
+started under a different `TZ`, can shift it, and with it which lines count.
+
+A process that runs several servers (a turbo or concurrently dev task, `docker compose up`) is one app, and only its
+first burst of `listening` lines is the boot: a later server whose first `listening` line comes more than 2 s after the
+one before it counts as a reload. Put that server's line in the app's `reloads.ignore`, for example
+`ignore: ['ws listening on']`.
+
 ## Tools (MCP) and commands (CLI)
 
 | tool | what it does |
 |------|--------------|
 | `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
-| `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command |
+| `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command; `reloads` (`--reloads`) adds each running app's in-process reloads since its pm2 start to RESTARTS, `0 (+2)` |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs [app \| targets, since]` | tail of one app's out/err (ANSI stripped), or the merged, time-ordered lines of several apps: the latest lines, or since a span (`2m`), a host-local time, or `last` (since your previous `logs` call over those apps in this MCP session); `app \| line`, `app ! line` for stderr |
-| `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
-| `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle, with a timeout; ok false with what was last seen |
+| `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking); `include_reloads` (`--reloads`) adds each app's in-process reloads since the last call |
+| `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle / reloaded, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json` (a turbo repo's dev task drafts live, with a `dev` profile and `libs` / `libs-watch` builders for dist-built libraries), `ecosystem.json`, `Procfile`; `adopt_ports` writes the ports `ls` reports as undeclared into the existing manifest |
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason |

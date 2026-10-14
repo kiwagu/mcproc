@@ -3,8 +3,11 @@ import type { ErrorSettings } from '../manifest.js';
 import { McprocError } from '../errors.js';
 
 export type Stream = 'out' | 'err';
-export type IncidentKind = 'error' | 'crashed' | 'restarted';
-/** One error occurrence with its context, or a process event; `count` > 1 when the same error repeated within one poll. */
+export type IncidentKind = 'error' | 'crashed' | 'restarted' | 'reloaded';
+/**
+ * One error occurrence with its context, a process event, or an app's in-process reloads of one poll; `count` > 1 when
+ * the same error repeated within one poll (for `reloaded`, how many reloads).
+ */
 export interface Incident {
   app: string;
   host: string;
@@ -84,43 +87,59 @@ const OWN = new vm.Script(
   'const m = match.map((p) => new RegExp(p)); const g = ignore.map((p) => new RegExp(p)); out = texts.map((t) => (g.some((re) => re.test(t)) ? 2 : m.some((re) => re.test(t)) ? 1 : 0));'
 );
 
-/** Per line: 2 when one of the app's `ignore` patterns matches, 1 when one of its `match` patterns does, 0 otherwise. */
-function ownHits(texts: string[], rules: Rules, app: string): number[] | null {
-  if (
-    texts.length === 0 ||
-    (rules.match.length === 0 && rules.ignore.length === 0)
-  )
+/**
+ * Runs a caller's own patterns over texts in a separate context with a time limit, which interrupts a pattern that
+ * backtracks without end. Per text: 2 = an ignore pattern matched, 1 = a match pattern matched, 0 = neither; null when
+ * there is nothing to run. On the limit it throws what `onTimeout` builds, so each caller names its own patterns.
+ */
+export function runOwnPatterns(
+  texts: string[],
+  match: string[],
+  ignore: string[],
+  budgetMs: number,
+  onTimeout: () => Error
+): number[] | null {
+  if (texts.length === 0 || (match.length === 0 && ignore.length === 0))
     return null;
-  const ctx = vm.createContext({
-    texts,
-    match: rules.match,
-    ignore: rules.ignore,
-    out: null,
-  });
+  const ctx = vm.createContext({ texts, match, ignore, out: null });
   try {
-    OWN.runInContext(ctx, { timeout: rules.budgetMs });
+    OWN.runInContext(ctx, { timeout: budgetMs });
   } catch (e) {
     if ((e as { code?: string }).code !== 'ERR_SCRIPT_EXECUTION_TIMEOUT')
       throw e;
-    throw new McprocError(
-      'TIMEOUT',
-      `the errors patterns of ${app} ran over ${rules.budgetMs} ms on its log: one of them backtracks without end on these lines`,
-      {
-        hint: `Simplify apps.${app}.errors.match/ignore (a repeat inside a repeat, or alternatives that match the same text); this app's incidents wait until then.`,
-      }
-    );
+    throw onTimeout();
   }
   return Array.from(ctx.out as number[]);
+}
+
+/** Per line: 2 when one of the app's `ignore` patterns matches, 1 when one of its `match` patterns does, 0 otherwise. */
+function ownHits(texts: string[], rules: Rules, app: string): number[] | null {
+  return runOwnPatterns(
+    texts,
+    rules.match,
+    rules.ignore,
+    rules.budgetMs,
+    () =>
+      new McprocError(
+        'TIMEOUT',
+        `the errors patterns of ${app} ran over ${rules.budgetMs} ms on its log: one of them backtracks without end on these lines`,
+        {
+          hint: `Simplify apps.${app}.errors.match/ignore (a repeat inside a repeat, or alternatives that match the same text); this app's incidents wait until then.`,
+        }
+      )
+  );
 }
 
 export const stampOf = (line: string): string | null =>
   PM2_STAMP.exec(line)?.[1] ?? null;
 /** The line without pm2's leading time stamp (the rest of it is what patterns are matched against). */
 export const bodyOf = (line: string): string => line.replace(PM2_STAMP, '');
-const cut = (s: string): string =>
+/** A line as an answer reports it: at most MAX_LINE characters, so one huge line cannot swell the answer. */
+export const cut = (s: string): string =>
   s.length > MAX_LINE ? `${s.slice(0, MAX_LINE - 1)}…` : s;
 /** What patterns are matched against: the line without its stamp, as far as the output shows it (a huge line stays cheap). */
-const searched = (line: string): string => bodyOf(line).slice(0, MAX_LINE);
+export const searched = (line: string): string =>
+  bodyOf(line).slice(0, MAX_LINE);
 
 /**
  * A group repeated without bound whose content can end in an unbounded repeat — `(a+)+`, `(\w+\s*)*`, `(a+b?)+`, `(.*)+` —

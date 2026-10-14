@@ -33,13 +33,8 @@ import { doctor } from '../core/doctor.js';
 import { parseUntil, waitFor, WAIT_TIMEOUT_DEFAULT_MS } from '../core/wait.js';
 import { initProject } from '../core/init.js';
 import { adoptPorts } from '../core/adopt.js';
-import {
-  Fleet,
-  actOn,
-  listFleet,
-  describeFleetApp,
-  type Act,
-} from '../core/fleet.js';
+import { Fleet, actOn, describeFleetApp, type Act } from '../core/fleet.js';
+import { listWithReloads } from '../core/reloadcount.js';
 import {
   renderLs,
   renderPorts,
@@ -131,6 +126,30 @@ export async function printSince(
       ];
     })
   );
+}
+
+/**
+ * `ls`: the rows of the named apps, each from its own host, as a table or JSON; with reloads, each running app's
+ * in-process reloads since its pm2 start, which reads the logs of each host once more. Exit code 1 when a host was not
+ * probed or its logs were not read.
+ */
+export async function printLs(
+  fleet: Fleet,
+  names: string[],
+  how: { reloads: boolean; json: boolean },
+  io: Io
+): Promise<void> {
+  const { rows, errors, unread } = await listWithReloads(
+    fleet,
+    names,
+    how.reloads
+  );
+  io.out(
+    how.json
+      ? JSON.stringify(rows, null, 2)
+      : renderLs(rows, fleet.fallback, unread)
+  );
+  if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
 }
 
 export function buildProgram(io: Io = defaultIo): Command {
@@ -237,15 +256,19 @@ export function buildProgram(io: Io = defaultIo): Command {
     .description(
       'apps with status, pid and real vs declared ports, each from the host it runs on'
     )
+    .option(
+      '--reloads',
+      "also count each running app's in-process reloads since its pm2 start, shown as RESTARTS 0 (+3); reads each host's logs once more"
+    )
     .action(
-      wrap(async (g, _o, [app]) => {
+      wrap(async (g, o, [app]) => {
         const fleet = fleetOf(g);
-        const { rows, errors } = await listFleet(
+        await printLs(
           fleet,
-          fleet.select(app ? [app] : ['all'])
+          fleet.select(app ? [app] : ['all']),
+          { reloads: Boolean(o.reloads), json: Boolean(g.json) },
+          io
         );
-        emit(g, renderLs(rows, fleet.fallback), rows);
-        if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
       })
     );
   program
@@ -393,6 +416,10 @@ export function buildProgram(io: Io = defaultIo): Command {
       '--context <before,after>',
       'lines of context (default per app, 3,5)'
     )
+    .option(
+      '--reloads',
+      "also each app's in-process reloads since the last poll (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), one line per app"
+    )
     .option('-f, --follow', 'keep polling and print each new incident')
     .option('--interval <s>', 'seconds between polls while following', '10')
     .option('--color', 'colors even when stdout is not a terminal')
@@ -426,6 +453,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             sinceMin: Number(o.since) || 15,
             max: Number(o.max) || 20,
             context,
+            includeReloads: Boolean(o.reloads),
           });
           if (peek) cursor = r.next;
           return r.answer;
@@ -454,11 +482,11 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('wait <app>')
     .description(
-      'block until the app is listening, answers its url, exited, printed a matching line or went idle; exit 1 when it was not reached'
+      'block until the app is listening, answers its url, exited, printed a matching line, went idle or reloaded; exit 1 when it was not reached'
     )
     .requiredOption(
       '--until <cond>',
-      'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+      'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded (the next in-process reload after the call: a tsx/nodemon restart, a Vite/Next rebuild, a repeated listening line; answered once its burst is quiet for 2 s; for a server whose reload restarts it, wait --until listening next)'
     )
     .option(
       '-t, --timeout <s>',
