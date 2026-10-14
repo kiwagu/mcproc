@@ -23,6 +23,8 @@ const cli = process.env.MCPROC_CLI ?? path.join(root, 'dist', 'cli.js');
 const counter = (word: string) =>
   `node -e "let i=0; setInterval(() => console.log('${word}', ++i), 200)"`;
 const WORD = { a: 'tick', b: 'tock' } as const;
+/** An app that says it booted once, then ticks: its boot line exists only in the history of its log. */
+const booting = `node -e "console.log('boot c'); let i=0; setInterval(() => console.log('tuck', ++i), 200)"`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Stops the daemon of a PM2_HOME with the bundled pm2, for a setup that failed before a context existed. */
@@ -117,6 +119,10 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
         '    description: counts tock lines',
         '    kind: worker',
         `    run: ${JSON.stringify(counter('tock'))}`,
+        '  c:',
+        '    description: says boot c once, then ticks; started only by its test',
+        '    kind: worker',
+        `    run: ${JSON.stringify(booting)}`,
         'profiles:',
         '  pair: [a, b]',
         'hosts:',
@@ -281,6 +287,48 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('logs since on real pm2', () => {
       );
     }
   }, 30_000);
+
+  it('CLI -f --since: an app started while following shows its first lines, read since the cutoff', async () => {
+    const p = run([
+      'logs',
+      'a',
+      'c',
+      '--since',
+      '5s',
+      '-f',
+      '--no-color',
+      '--interval',
+      '200',
+    ]);
+    let out = '';
+    p.child.stdout!.on('data', (d) => {
+      out += String(d);
+    });
+    const ended = () =>
+      p.child.exitCode !== null || p.child.signalCode !== null;
+    // the stream printed its first pass (c not started) and a line of a came through the follow after it
+    const following = () => {
+      const at = out.indexOf('c | (not started)\n');
+      return at >= 0 && /^a \| \S+: tick \d+$/m.test(out.slice(at));
+    };
+    await until(() => following() || ended(), 15_000);
+    expect(ended(), 'the CLI ended instead of following').toBe(false);
+    expect(following(), `the follow did not begin within 15 s:\n${out}`).toBe(
+      true
+    );
+    await actOn(f(), 'c', 'start');
+    // c is found on a re-probe (every 10 ticks of 200 ms): its boot line is already in its log by then
+    const booted = () => /^c \| \S+: boot c$/m.test(out);
+    await until(() => booted() || ended(), 15_000);
+    expect(booted(), `no boot line of c within 15 s:\n${out}`).toBe(true);
+    p.child.kill('SIGINT');
+    const code = await Promise.race([
+      p.closed,
+      sleep(10_000).then(() => 'hung'),
+    ]);
+    expect(code).toBe(0);
+    expect(out.match(/^c \| \S+: boot c$/gm)).toHaveLength(1);
+  }, 45_000);
 
   it('CLI --since to a reader that closes the pipe at once ends quietly with exit 0', async () => {
     const p = run(['logs', 'pair', '--since', '5s']);

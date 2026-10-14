@@ -320,8 +320,33 @@ describe('printSince (logs --since, one shot)', () => {
         path: `/l/${app}-out`,
         offset: Buffer.byteLength(st.files[`/l/${app}-out`]),
       });
-    expect(at?.tool).toEqual({}); // no mark: its follow starts at the file's end
+    // not started at the read: no mark, so its follow reads its first history since its host's cutoff
+    expect(at?.tool).toEqual({ cutoff: '2026-10-12T11:00:30.000' });
+    expect(at?.watch?.cutoff).toBe('2026-10-12T11:00:30.000');
     expect(process.exitCode).not.toBe(1);
+  });
+  it("each app gets its own host's cutoff; an app on a host that was not read gets neither marks nor a cutoff", async () => {
+    const st: Parameters<typeof fakeHosts>[0] = state();
+    st.clocks = { box: { now: '2026-10-12T11:00:50' } };
+    const read = await printSince(
+      fakeHosts(st).fleet,
+      ['watch', 'web', 'tool'],
+      parseSince('10s'),
+      { stream: 'both', color: false, json: false },
+      capture().io
+    );
+    expect(read?.tool).toEqual({ cutoff: '2026-10-12T11:00:30.000' });
+    expect(read?.web?.cutoff).toBe('2026-10-12T11:00:40.000');
+    const down = await printSince(
+      fakeHosts(state(), ['box']).fleet,
+      ['watch', 'web', 'tool'],
+      parseSince('10s'),
+      { stream: 'both', color: false, json: false },
+      capture().io
+    );
+    process.exitCode = 0;
+    expect(down?.web).toEqual({});
+    expect(down?.tool).toEqual({ cutoff: '2026-10-12T11:00:30.000' });
   });
   it("a host that was not read: the other host's lines are printed, the note goes to stderr, and the exit code is 1", async () => {
     const { fleet } = fakeHosts(state(), ['box']);

@@ -1,10 +1,14 @@
 import type { Context } from './resolve.js';
 import { snapshot as probeSnapshot, type Snapshot } from './list.js';
 import { findProcess } from './pm2.js';
-import { createFollower, sortByStamp, type LogLine } from './logfollow.js';
+import {
+  createFollower,
+  sortByStamp,
+  type LogLine,
+  type StartAt,
+} from './logfollow.js';
 import { describeError } from './errors.js';
 import { stripAnsi } from './logs.js';
-import type { FileMark } from './incidents/cursor.js';
 
 export interface StreamLine {
   app: string;
@@ -28,8 +32,8 @@ export interface Follower {
   watch?(wake: () => void): void;
   /** stops the wakes */
   close?(): void;
-  /** continues after the marks of a one-shot read instead of reading history */
-  seek?(marks: { out?: FileMark; err?: FileMark }): void;
+  /** continues after the marks of a one-shot read instead of reading history; a stream without one, since the cutoff */
+  seek?(at: StartAt): void;
 }
 export interface StreamDeps {
   snapshot(ctx: Context): Promise<Snapshot>;
@@ -51,8 +55,11 @@ export interface StreamOptions {
   /** while following, re-probe every N ticks for apps that were not started yet */
   resolveEvery?: number;
   signal?: AbortSignal;
-  /** per app, where its follower starts: the end of a read printed before the stream (applied when it is created) */
-  startAt?: Record<string, { out?: FileMark; err?: FileMark }>;
+  /**
+   * per app, where its follower starts: the end of a read printed before the stream, or that read's cutoff for a stream
+   * it left without a mark (applied when the follower is created, also for an app found on a later re-probe)
+   */
+  startAt?: Record<string, StartAt>;
 }
 
 /** polls a wake asks for run at most this often: a chatty app is printed in steps, not on every write */

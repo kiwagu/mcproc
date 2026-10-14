@@ -4,6 +4,7 @@ import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
 import { hex16 } from '../shell/snippets.js';
 import type { FileMark } from './incidents/cursor.js';
+import { selectSince } from './logsince.js';
 import { open, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { dirWatchers } from './logwatch.js';
@@ -28,6 +29,17 @@ const MAX_READY = 10_000;
 
 export type { ChunkRequest, LogChunk } from './logchunk.js';
 type ChunkReader = (reqs: ChunkRequest[]) => Promise<LogChunk[]>;
+
+/**
+ * Where a follower starts after a one-shot read: each stream with a mark continues right after it; a stream without one
+ * (its app was not running, or its read was cut short) shows from its history the lines at or after `cutoff`, a pm2
+ * stamp in the host's local time, instead of the last initialLines.
+ */
+export interface StartAt {
+  out?: FileMark;
+  err?: FileMark;
+  cutoff?: string;
+}
 
 /**
  * Every read is bounded to the size just measured: bytes appended between `wc -c` and `tail` belong to the next poll,
@@ -179,6 +191,11 @@ export class LogFollower {
     err: null,
   };
   private pending: { out: string; err: string } = { out: '', err: '' };
+  /** the stamp a stream's first history is cut at, when it was started without a mark */
+  private cutoffs: { out: string | null; err: string | null } = {
+    out: null,
+    err: null,
+  };
   private read: ChunkReader;
   private unwatch: (() => void)[] = [];
   private stream: HostStream | null = null;
@@ -233,18 +250,25 @@ export class LogFollower {
   /**
    * Continue after marks a one-shot read returned (the end of what it read, with the anchor of the bytes before it): the
    * next poll reads only what came after them, and a file replaced since is detected through the anchor and read from
-   * its start. A mark of another path is ignored; an anchor taken elsewhere than at the offset is dropped.
+   * its start. A mark of another path is ignored; an anchor taken elsewhere than at the offset is dropped. A stream left
+   * without a mark that has not been read yet takes the cutoff for its first history, so what its app wrote between
+   * that read and this follower's first poll is still shown.
    */
-  seek(marks: { out?: FileMark; err?: FileMark }): void {
+  seek(at: StartAt): void {
     for (const s of ['out', 'err'] as const) {
-      const m = marks[s];
-      if (!m || m.path !== this.paths[s]) continue;
+      const m = at[s];
+      if (!m || m.path !== this.paths[s]) {
+        if (at.cutoff !== undefined && this.offsets[s] === null)
+          this.cutoffs[s] = at.cutoff;
+        continue;
+      }
       this.offsets[s] = m.offset;
       this.anchors[s] =
         m.anchor !== undefined && m.at === m.offset && HEX.test(m.anchor)
           ? m.anchor
           : null;
       this.pending[s] = '';
+      this.cutoffs[s] = null;
     }
   }
 
@@ -330,13 +354,19 @@ export class LogFollower {
     if (longLine) this.pending[s] = '';
     // escapes are cleaned per complete line: a color code cut by a read boundary waits in `pending` with its line
     const lines = complete.split('\n').slice(0, -1);
-    // history is cut to the last initialLines (none for 0); a replaced file is cut the same way, except that with 0 the
-    // follower asked for no history, and everything a file replaced under it holds was written after it began
+    // history is cut to the last initialLines (none for 0), or by time when a cutoff was given: the lines at or after
+    // it, an unstamped line going with the stamped one before it. A replaced file is cut to the last initialLines too,
+    // except that with 0 the follower asked for no history, and everything a file replaced under it holds was written
+    // after it began
+    const cutoff = this.cutoffs[s];
+    this.cutoffs[s] = null; // only the first read, the one that starts the stream, is a history
     const shown =
       kind === 'H'
-        ? this.initialLines > 0
-          ? lines.slice(-this.initialLines)
-          : []
+        ? cutoff !== null
+          ? selectSince(lines, cutoff).kept.map((k) => k.text)
+          : this.initialLines > 0
+            ? lines.slice(-this.initialLines)
+            : []
         : kind === 'R' && this.initialLines > 0
           ? lines.slice(-this.initialLines)
           : lines;

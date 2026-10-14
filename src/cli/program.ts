@@ -113,13 +113,21 @@ export async function printSince(
   for (const n of sinceNotes(a)) io.err(n);
   if (a.errors.length) process.exitCode = 1; // a host was not read: the lines of the others are printed, the exit code says so
   if (closed || signal?.aborted) return null;
-  // an app without a mark (not started at the read, its host not read, or a read cut short) is followed from the
-  // file's end: lines written between this read and its first poll are not printed
+  // a stream the read left without a mark (its app not started yet, or its read cut short) starts at its host's cutoff,
+  // so what the app writes before its follower's first poll is still printed; an app on a host that was not read has
+  // no cutoff and is followed from the file's end
   return Object.fromEntries(
-    apps.map((x) => [
-      x,
-      marks.get(LogMarks.key(fleet.manifest.path, fleet.hostOf(x), x)) ?? {},
-    ])
+    apps.map((x) => {
+      const host = fleet.hostOf(x);
+      const cutoff = a.since[host];
+      return [
+        x,
+        {
+          ...marks.get(LogMarks.key(fleet.manifest.path, host, x)),
+          ...(typeof cutoff === 'string' ? { cutoff } : {}),
+        },
+      ];
+    })
   );
 }
 

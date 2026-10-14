@@ -311,6 +311,58 @@ describe('LogFollower', () => {
     await f.poll();
     expect(ctx.fake.calls[0].cmd).not.toContain('cd'.repeat(16)); // the anchor is for byte 9, the read starts at 7: dropped
   });
+  it('a stream without a mark reads its first history since the cutoff: lines at or after it, their continuations with them, nothing older', async () => {
+    const hist = [
+      'a line before any stamp', // cannot be placed in time
+      '2026-10-14T10:00:04.000: old',
+      '    at old frame',
+      '2026-10-14T10:00:05.000: boot',
+      '    at boot frame',
+      '2026-10-14T10:00:06: later', // a seconds stamp reads as .000
+    ]
+      .map((l) => `${l}\n`)
+      .join('');
+    const size = Buffer.byteLength(hist);
+    const ctx = scripted([
+      resp({ size, body: hist, history: true, start: 0 }, { size: 0 }),
+      resp({ size: size + 6, body: 'new-1\n' }, { size: 0 }),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    f.seek({ cutoff: '2026-10-14T10:00:05.000' });
+    expect((await f.poll()).lines.map((l) => l.text)).toEqual([
+      '2026-10-14T10:00:05.000: boot',
+      '    at boot frame',
+      '2026-10-14T10:00:06: later',
+    ]);
+    expect(f.offsets.out).toBe(size);
+    expect((await f.poll()).lines.map((l) => l.text)).toEqual(['new-1']); // only the first history is cut by time
+  });
+  it('the cutoff is only for a stream without a mark: a seeked stream shows everything after its mark, whatever its stamp', async () => {
+    const early = '2026-10-14T10:00:01.000: early out\n';
+    const errs =
+      '2026-10-14T10:00:02.000: old err\n2026-10-14T10:00:07.000: new err\n';
+    const ctx = scripted([
+      resp(
+        { size: 20 + Buffer.byteLength(early), body: early, start: 20 },
+        {
+          size: Buffer.byteLength(errs),
+          body: errs,
+          history: true,
+          start: 0,
+        }
+      ),
+    ]);
+    const f = new LogFollower(ctx, paths, 0);
+    f.seek({
+      out: { path: paths.out, offset: 20, at: 20, anchor: 'ab'.repeat(16) },
+      cutoff: '2026-10-14T10:00:05.000',
+    });
+    expect((await f.poll()).lines).toEqual([
+      { stream: 'out', text: '2026-10-14T10:00:01.000: early out' },
+      { stream: 'err', text: '2026-10-14T10:00:07.000: new err' },
+    ]);
+    expect(ctx.fake.calls[0].cmd).toContain('st=20'); // out went on from its mark
+  });
   it('sortByStamp orders by the pm2 timestamp prefix and keeps unstamped lines in place', () => {
     const s = sortByStamp([
       { stream: 'err', text: '2026-10-11T13:00:08: boom' },

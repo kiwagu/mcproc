@@ -204,7 +204,8 @@ earlier. Each file is read at most 1 MB back: when the window reaches further, `
 `lines` caps the merged answer (the most recent kept) and `truncated` counts what was dropped; `targets` without
 `since` gives the latest `lines` (default 100) across the apps.
 On the command line, `mcproc logs base --since 2m` prints the merged lines and exits, and `-f --since 2m` then follows
-from exactly where that read ended. `last` needs the session that keeps the marks, so the CLI refuses it.
+from exactly where that read ended; an app that was not running yet is shown from the same cutoff once it starts. `last`
+needs the session that keeps the marks, so the CLI refuses it.
 
 ## Tools (MCP) and commands (CLI)
 

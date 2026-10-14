@@ -231,6 +231,53 @@ describe('streamLogs', () => {
     ]);
     expect(h.out).toEqual(['api    | after the mark']);
   });
+  it('an app attached later, on a re-probe, gets its startAt (a cutoff here) before its first poll', async () => {
+    const ac = new AbortController();
+    const h = harness(
+      ['api'],
+      {
+        api: [{ lines: [{ stream: 'out', text: 'a0' }] }],
+        worker: [{ lines: [{ stream: 'out', text: 'w-boot' }] }],
+      },
+      [['api'], ['api', 'worker']]
+    ); // the second snapshot (tick 2, resolveEvery 2) sees the worker up
+    const calls: string[] = [];
+    const deps: StreamDeps = {
+      ...h.deps,
+      follower: (ctx, paths, lines) => {
+        const app = /\/l\/(.*)-out$/.exec(paths.out)![1];
+        const f = h.deps.follower(ctx, paths, lines);
+        return {
+          poll: () => {
+            calls.push(`${app} poll`);
+            return f.poll();
+          },
+          seek: (at) => {
+            calls.push(`${app} seek ${JSON.stringify(at)}`);
+          },
+        };
+      },
+      sleep: async () => {
+        if (h.out.includes('worker | w-boot')) ac.abort();
+      },
+    };
+    const cutoff = '2026-10-14T10:00:05.000';
+    await streamLogs(
+      [{ host: 'local', ctx: h.ctx, apps: ['api', 'worker'] }],
+      {
+        ...base,
+        lines: 0,
+        follow: true,
+        signal: ac.signal,
+        startAt: { api: { cutoff }, worker: { cutoff } },
+      },
+      deps
+    );
+    const seek = `worker seek ${JSON.stringify({ cutoff })}`;
+    expect(calls).toContain(seek);
+    expect(calls.indexOf(seek)).toBeLessThan(calls.indexOf('worker poll'));
+    expect(h.out).toContain('worker | w-boot');
+  });
   it('follow: polls every interval in app order, attaches apps that start later, stops on abort', async () => {
     const ac = new AbortController();
     const h = harness(
