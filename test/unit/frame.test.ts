@@ -382,6 +382,29 @@ describe('renderFrame', () => {
     });
     expect(pm2Line(other)).toContain('restarts 2  procs 3');
   });
+  it('the reloads note shows only while the selected app runs (online or launching): a stopped or errored one has none', () => {
+    const pm2Line = (status: string) =>
+      renderFrame(
+        reduce(
+          reduce(base(), {
+            type: 'rows',
+            rows: [{ ...web, status, restarts: 2 }, docs],
+            at: new Date('2026-10-11T13:41:07'),
+          }),
+          {
+            type: 'reloads',
+            app: 'web',
+            info: { count: 3, last: null, partial: false },
+          }
+        ),
+        { width: 200, height: 40 }
+      ).details[2];
+    expect(pm2Line('online')).toContain('restarts 2 (+3 reloads)  procs');
+    expect(pm2Line('launching')).toContain('restarts 2 (+3 reloads)  procs');
+    expect(pm2Line('stopped')).toContain('restarts 2  procs');
+    expect(pm2Line('errored')).toContain('restarts 2  procs');
+    expect(pm2Line('failed (exit 1)')).toContain('restarts 2  procs');
+  });
   it('wraps by terminal columns: a wide character takes two and is never split across rows', () => {
     expect(wrapText('中文中文中', 4, 0)).toEqual(['中文', '中文', '中']);
     expect(wrapText('ab中文', 3, 1)).toEqual(['ab', ' 中', ' 文']);

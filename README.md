@@ -289,9 +289,9 @@ Four places show them:
 - `ls` with `reloads: true` (`mcproc ls --reloads`) adds each running app's reloads since its pm2 start to RESTARTS,
   `0 (+7)`, and to each JSON row as `reloads: { count, last, partial }`. It reads each host's logs once more, so a plain
   `ls` does not count them.
-- `monit` shows them in the selected app's detail line, `restarts 0 (+7 reloads, last 12:01:05)`, counted for the apps
-  whose logs it follows: the selected one on the dashboard, every running one in the flat view. `monit --once` counts
-  from the history it reads.
+- `monit` shows them in the selected app's detail line while it runs (online or launching), `restarts 0 (+7 reloads,
+  last 12:01:05)`, counted for the apps whose logs it follows: the selected one on the dashboard, every running one in
+  the flat view. `monit --once` counts from the history it reads.
 
 Limits. A count marked `≥` (`0 (+≥7)`, `+≥7 reloads`) is a lower bound: the log was cleared since the process started,
 or the app wrote more than the last 1 MB that is read. A reload whose lines are split between two `incidents` calls is

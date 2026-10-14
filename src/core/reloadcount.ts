@@ -1,7 +1,7 @@
 import { describeError, isMcprocError } from './errors.js';
 import type { Fleet, HostError, HostProbe } from './fleet.js';
 import type { LsRow } from './list.js';
-import { findProcess } from './pm2.js';
+import { findProcess, isRunning } from './pm2.js';
 import {
   compileReloadRules,
   detectReloads,
@@ -13,8 +13,6 @@ import {
 import { CONTEXT_BYTES, parseRead, readSnippet } from './incidents/cursor.js';
 import { ensureOk } from '../transport/index.js';
 
-/** pm2 statuses of a process that is running this run: an app that is not has no reloads to count. */
-const RUNNING = new Set(['online', 'launching']);
 const STREAMS = ['out', 'err'] as const;
 
 /**
@@ -44,7 +42,7 @@ export async function countReloads(
           settings &&
           proc &&
           row.started !== null &&
-          RUNNING.has(row.status)
+          isRunning(row.status)
           ? [
               {
                 app: row.app,

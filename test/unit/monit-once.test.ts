@@ -11,13 +11,16 @@ const START = '2026-10-12T11:00:00';
 async function frame(
   lines: string[],
   manifest: Manifest = fleetManifest,
-  budgetMs?: number
+  budgetMs?: number,
+  status = 'online'
 ): Promise<string> {
   const h = fakeHosts(
     {
       files: {},
       procs: {
-        local: [proc('watch', 0, { pm_uptime: Date.parse(`${START}Z`) })],
+        local: [
+          proc('watch', 0, { pm_uptime: Date.parse(`${START}Z`), status }),
+        ],
       },
     },
     [],
@@ -73,6 +76,19 @@ describe('monitOnce', () => {
     expect(text).toMatch(
       /reloads of watch not counted: TIMEOUT.*the reloads patterns of watch/
     );
+  });
+  it('a stopped app whose history holds reloads shows no count: its run is over, as ls --reloads counts only running apps', async () => {
+    const text = await frame(
+      [
+        `${S(1)}Starting compilation in watch mode...`,
+        `${S(12)}File change detected. Starting incremental compilation...`,
+      ],
+      fleetManifest,
+      undefined,
+      'stopped'
+    );
+    expect(text).toMatch(/stopped/);
+    expect(text).toMatch(/restarts 0 {2}procs/);
   });
   it('without reloads in the history the details read as before', async () => {
     const text = await frame([`${S(1)}Starting compilation in watch mode...`]);

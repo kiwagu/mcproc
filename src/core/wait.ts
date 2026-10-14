@@ -1,5 +1,5 @@
 import { McprocError } from './errors.js';
-import { findProcess, type Pm2Process } from './pm2.js';
+import { findProcess, isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
   snapshot as probeSnapshot,
@@ -55,13 +55,11 @@ export const WAIT_TIMEOUT_MAX_MS = 600_000;
 /** How often the host is asked: a light probe or jlist, a login shell each time, so not faster than this. */
 const POLL_LOCAL_MS = 500;
 const POLL_REMOTE_MS = 1000;
-/** pm2 statuses of a process that is running, or about to be. */
-const LIVE = new Set(['online', 'launching']);
 /** pm2 statuses of a process in the middle of a restart (a watch restart, a restart delay): it is not dead, so a wait goes on. */
 const TRANSIENT = new Set(['stopping', 'waiting restart']);
 /** Not dead: running, or on its way through a restart. The timeout bounds a restart that does not end. */
 const notDead = (status: string): boolean =>
-  LIVE.has(status) || TRANSIENT.has(status);
+  isRunning(status) || TRANSIENT.has(status);
 /** The log:, idle: and reloaded waits look at the follower at least this often (a file wake makes it sooner). */
 const LOG_TICK_MS = 1000;
 /** ...and ask pm2 about the process this often: each check is a login shell, so not every tick. */
@@ -250,7 +248,7 @@ async function waitOnLogs(
         lastLine === undefined ? 'no new output' : `last line: ${lastLine}`;
       if (until.kind === 'idle' && now - lastChange >= quietMs) {
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
-        if (p && LIVE.has(p.status))
+        if (p && isRunning(p.status))
           return run.answer({ ok: true, status: statusWord(p, a), observed });
         if (!p || !notDead(p.status)) return run.gone(p, observed);
         // mid-restart: not settled yet and not dead; look again after a tick
@@ -374,7 +372,7 @@ export async function waitFor(
         if (first) throw notStarted(ctx, app);
         return gone(undefined);
       }
-      if (!LIVE.has(p.status) && p.status !== 'stopping')
+      if (!isRunning(p.status) && p.status !== 'stopping')
         return answer({
           ok: true,
           status: statusWord(p, a),
@@ -409,7 +407,7 @@ export async function waitFor(
       // another process) is not a ready app, and one that pm2 is restarting is not ready yet, whatever answers
       if (!p || !notDead(p.status)) return gone(p, observed);
       if (met) {
-        if (LIVE.has(p.status))
+        if (isRunning(p.status))
           return answer({ ok: true, status: statusWord(p, a), observed });
         observed = `status ${p.status}, ${observed}`;
       }

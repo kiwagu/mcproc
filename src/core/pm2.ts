@@ -27,6 +27,10 @@ export interface Pm2Process {
   watch: boolean;
 }
 
+const RUNNING = new Set(['online', 'launching']);
+/** Whether a pm2 status is a process that is running, or about to be: the only one with a current run to look at. */
+export const isRunning = (status: string): boolean => RUNNING.has(status);
+
 export const PM2_NOT_FOUND_HINT =
   'No usable pm2 on this host. Run unpack for it (brings pm2, and Node when missing), install pm2 there (Node 18 or newer), or set hosts.<host>.pm2.';
 
