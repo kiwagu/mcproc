@@ -292,6 +292,11 @@ export class ReloadTracker {
     return done;
   }
 
+  /** When `idle` will close the open burst if no marker arrives before then (wall ms); null with no burst open. */
+  idleAt(): number | null {
+    return this.open ? this.openWall + RELOAD_GAP_MS : null;
+  }
+
   /** Closes the open burst unconditionally. */
   flush(): Reload[] {
     const done: Reload[] = [];

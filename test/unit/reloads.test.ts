@@ -207,8 +207,10 @@ describe('ReloadTracker', () => {
         1_000
       )
     ).toEqual([]);
+    expect(t.idleAt()).toBe(3_000); // when idle closes it if no marker comes first
     expect(t.idle(2_500)).toEqual([]); // 1.5 s of wall time since the last marker arrived
     expect(t.idle(3_000)).toEqual([expect.objectContaining({ lines: 2 })]);
+    expect(t.idleAt()).toBeNull();
     expect(t.idle(9_000)).toEqual([]); // reported once
     t.push([out(`${T('20')}[vite] (client) page reload /c.js`)], 10_000);
     expect(

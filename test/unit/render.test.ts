@@ -505,6 +505,46 @@ describe('renderMutation', () => {
       'web: aborted after 1.3 s while waiting for listening'
     );
   });
+  it('renderWait: a reload names when it began, its line count and its first line (without the stamp shown twice)', () => {
+    const ok = {
+      until: 'reloaded',
+      waited_ms: 3000,
+      ok: true,
+      status: 'online',
+    };
+    expect(
+      renderWait('web', {
+        ...ok,
+        reloaded: {
+          time: '2026-10-14T12:00:01.000',
+          lines: 3,
+          line: '2026-10-14T12:00:01: [vite] (client) page reload /src/a.ts',
+        },
+      })
+    ).toBe(
+      'web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000): [vite] (client) page reload /src/a.ts'
+    );
+    expect(
+      renderWait('web', {
+        ...ok,
+        reloaded: {
+          time: null,
+          lines: 1,
+          line: '[tsx] change in x Restarting...',
+        },
+      })
+    ).toBe(
+      'web: reloaded after 3.0 s (1 line): [tsx] change in x Restarting...'
+    );
+    expect(
+      renderWait('web', {
+        ...ok,
+        ok: false,
+        reason: 'timeout',
+        observed: 'no new output',
+      })
+    ).toBe('web: reloaded not reached after 3.0 s (no new output)');
+  });
   it('renderWait: an exited wait names the exit code once, and not at all when there is none', () => {
     const exited = { until: 'exited', waited_ms: 3100, ok: true };
     expect(

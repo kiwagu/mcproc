@@ -81,10 +81,12 @@ const probe = (p: ReturnType<typeof proc>, tcp = '') =>
 const jl = (p: ReturnType<typeof proc>) => JSON.stringify([p]);
 
 describe('parseUntil', () => {
-  it('accepts the five forms and labels them back', () => {
+  it('accepts the six forms and labels them back', () => {
     expect(parseUntil('listening')).toEqual({ kind: 'listening' });
     expect(parseUntil('url-ok')).toEqual({ kind: 'url-ok' });
     expect(parseUntil('exited')).toEqual({ kind: 'exited' });
+    expect(parseUntil('reloaded')).toEqual({ kind: 'reloaded' });
+    expect(untilLabel(parseUntil('reloaded'))).toBe('reloaded');
     const l = parseUntil('log:listening on \\d+');
     expect(l.kind).toBe('log');
     if (l.kind === 'log') expect(l.re.test('listening on 3010')).toBe(true);
@@ -101,11 +103,20 @@ describe('parseUntil', () => {
       'idle:',
       'idle:0',
       'idle:x',
-      'reloaded',
+      'reload',
     ])
       expect(() => parseUntil(bad)).toThrowError(
         expect.objectContaining({ code: 'BAD_ARGUMENT' })
       );
+  });
+  it('the hint for an unknown until lists every form', () => {
+    expect(() => parseUntil('ready')).toThrowError(
+      expect.objectContaining({
+        hint: expect.stringMatching(
+          /listening.*url-ok.*exited.*log:<regex>.*idle:<seconds>.*reloaded/
+        ),
+      })
+    );
   });
 });
 
@@ -791,6 +802,180 @@ describe('waitFor: log: and pm2 stamps', () => {
       timeoutMs: 3000,
     });
     expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+  });
+});
+
+/**
+ * A follower over a timeline: each write lands at its time (ms after the wait began) and a poll returns what landed
+ * since the last one. Its file wake ends a sleep at the next write, as the real watch does.
+ */
+function timedFollower(
+  now: () => number,
+  writes: { at: number; out?: string[]; err?: string[] }[]
+) {
+  const base = now();
+  const offsets = { out: 0 as number | null, err: 0 as number | null };
+  let read = 0;
+  const f = {
+    offsets,
+    polls: 0,
+    closed: false,
+    async poll() {
+      f.polls++;
+      const lines: { stream: 'out' | 'err'; text: string }[] = [];
+      while (read < writes.length && base + writes[read].at <= now()) {
+        const w = writes[read++];
+        for (const text of w.out ?? []) lines.push({ stream: 'out', text });
+        for (const text of w.err ?? []) lines.push({ stream: 'err', text });
+        offsets.out = (offsets.out ?? 0) + (w.out ?? []).join('\n').length;
+        offsets.err = (offsets.err ?? 0) + (w.err ?? []).join('\n').length;
+      }
+      return { lines, reset: false };
+    },
+    watch() {},
+    close() {
+      f.closed = true;
+    },
+    /** how long a sleep of `ms` from now lasts: until the next write at the latest */
+    cut(ms: number) {
+      const next = writes.find((w) => base + w.at > now());
+      return next ? Math.min(ms, base + next.at - now()) : ms;
+    },
+  };
+  return f;
+}
+
+describe('waitFor: reloaded', () => {
+  const online = jl(proc('api', 'online'));
+  const at = (s: string) => `2026-10-14T12:00:${s}: `;
+  const vite = (s: string, file: string) =>
+    `${at(s)}[vite] (client) page reload /src/${file}`;
+  it('lines written before the call never count: the history the follower skips holds a whole reload', async () => {
+    const f = fakeFollower([
+      { out: [vite('01.000', 'a.ts'), vite('01.010', 'b.ts')] },
+    ]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: { ...h.deps, follower: () => f },
+      timeoutMs: 4000,
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      until: 'reloaded',
+      observed: 'no new output',
+    });
+    expect(r.reloaded).toBeUndefined();
+  });
+  it('ok only once the burst went quiet for 2 s, answered at that moment rather than a tick later', async () => {
+    const h = harness([], [online]);
+    const start = h.deps.now();
+    const f = timedFollower(h.deps.now, [
+      {
+        at: 1000,
+        out: [
+          vite('01.000', 'a.ts'),
+          vite('01.004', 'b.ts'),
+          vite('01.009', 'c.ts'),
+        ],
+      },
+      { at: 2500, out: [`${at('02.500')}GET / 200`] }, // other output wakes the follower: no marker, still waiting
+    ]);
+    const polledAt: number[] = [];
+    const deps = {
+      ...h.deps,
+      follower: () => ({
+        ...f,
+        poll: () => {
+          polledAt.push(h.deps.now() - start);
+          return f.poll();
+        },
+      }),
+      sleep: (ms: number) => h.deps.sleep(f.cut(ms)),
+    };
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), { deps });
+    expect(r).toMatchObject({
+      ok: true,
+      until: 'reloaded',
+      status: 'online',
+      waited_ms: 3000, // 2 s after the burst arrived, not at the next 1 s tick after 2.5 s
+      reloaded: { time: '2026-10-14T12:00:01.000', lines: 3 },
+    });
+    expect(r.reloaded?.line).toContain('page reload /src/a.ts');
+    expect(polledAt).toEqual([0, 0, 1000, 2000, 2500, 3000]); // position, then each tick or wake
+    expect(f.closed).toBe(true);
+  });
+  it('a marker 2 s or more later than the open burst closes it at once: the first burst is the answer', async () => {
+    const f = fakeFollower([
+      {},
+      { out: [vite('10.000', 'a.ts')] },
+      { err: [vite('12.500', 'b.ts')] },
+    ]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      waited_ms: 1000, // the poll that read the later marker, before the first burst's quiet period ended
+      reloaded: { time: '2026-10-14T12:00:10.000', lines: 1 },
+    });
+    expect(r.reloaded?.line).toContain('/src/a.ts');
+  });
+  it('a re-listen line after the call is a reload: the boot is before the call', async () => {
+    const f = fakeFollower([
+      {},
+      { out: [`${at('20.000')}api listening on 3100`] },
+    ]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: true, waited_ms: 2000 });
+  });
+  it('times out with the last line seen when no reload came', async () => {
+    const f = fakeFollower([{}, { err: ['warming up'] }]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: { ...h.deps, follower: () => f },
+      timeoutMs: 3000,
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      until: 'reloaded',
+      waited_ms: 3000,
+      observed: 'last line: warming up',
+    });
+  });
+  it('a process that dies meanwhile ends the wait as gone', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness(
+      [],
+      [online, jl(proc('api', 'errored', { exit_code: 1 }))]
+    );
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'crashed',
+      status: 'errored',
+      exit_code: 1,
+      waited_ms: 5000,
+    });
+    expect(f.closed).toBe(true);
+  });
+  it('an app with reloads: false is refused before the host is asked or a follower is made', async () => {
+    const h = harness([], [online]);
+    h.ctx.manifest.apps.api = { ...h.ctx.manifest.apps.api, reloads: null };
+    await expect(
+      waitFor(h.ctx, 'api', parseUntil('reloaded'), { deps: h.deps })
+    ).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      message: expect.stringContaining('reloads: false'),
+    });
+    expect(h.calls.jlists).toBe(0);
   });
 });
 

@@ -274,14 +274,14 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Wait',
       description:
-        "Block until an app is usable or finished. until: listening (every declared port is bound; the app must declare a port), url-ok (its url answers 2xx/3xx; the app must declare a url), exited (the process left online; for an app with autorestart off, kind task included, the answer carries exit_code and done / failed (exit N) / stopped, any other app shows pm2's stopped or errored), log:<regex> (a new log line matches; tested without pm2's time stamp and with ANSI stripped, the answer keeps the stamp), idle:<seconds> (no log output for that long: a watcher settled). log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok. listening or url-ok on an app without a declared port or url is refused with BAD_ARGUMENT. ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile; a result, not an error. A restart in progress (a watch restart, a restart delay) is waited out. Call it after start instead of sleeping or polling ls.",
+        "Block until an app is usable or finished. until: listening (every declared port is bound), url-ok (its url answers 2xx/3xx), exited (the process left online; for an app with autorestart off, kind task included, the answer carries exit_code and done / failed (exit N) / stopped, any other app shows pm2's stopped or errored), log:<regex> (a new log line matches; tested without pm2's time stamp and with ANSI stripped, the answer keeps the stamp), idle:<seconds> (no log output for that long: a watcher settled), reloaded (the next in-process reload: a tsx/nodemon restart, a Vite/Next rebuild, a repeated listening line; answered once its burst is quiet for 2 s; for a server whose reload restarts it, wait until: listening next). log:, idle: and reloaded see only output written after the call begins, so to know whether the app is up prefer listening or url-ok. An until the app cannot show (no declared port or url, reloads: false) is refused with BAD_ARGUMENT. ok false with what was last seen on timeout (default 60 s, max 600) or when the process died meanwhile; a result, not an error. A pm2 restart in progress is waited out. Call it after start instead of sleeping or polling ls.",
       inputSchema: {
         ...commonInput,
         app: z.string().describe('The app to wait for'),
         until: z
           .string()
           .describe(
-            'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+            'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded'
           ),
         timeout_s: z
           .number()

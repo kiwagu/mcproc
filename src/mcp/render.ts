@@ -9,6 +9,7 @@ import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
 import { formatLine } from '../core/logstream.js';
+import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -307,6 +308,12 @@ export function renderWait(app: string, r: WaitResult): string {
     }
     if (r.until.startsWith('log:'))
       return `${app}: log matched after ${secs(r.waited_ms)}: ${r.matched_line}`;
+    if (r.reloaded) {
+      // the time is shown once, in its own place: the line follows without pm2's stamp
+      const { time, lines, line } = r.reloaded;
+      const count = `${lines} line${lines === 1 ? '' : 's'}`;
+      return `${app}: reloaded after ${secs(r.waited_ms)} (${time ? `${count} from ${time}` : count}): ${bodyOf(line)}`;
+    }
     return `${app}: ${r.until} after ${secs(r.waited_ms)}${seen}`;
   }
   if (r.reason === 'timeout')

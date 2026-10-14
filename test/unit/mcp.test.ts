@@ -92,7 +92,11 @@ describe('mcp server', () => {
     // what an agent must know before it calls wait
     const waitDesc = byName.wait.description as string;
     expect(waitDesc).toMatch(
-      /log: and idle: see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
+      /log:, idle: and reloaded see only output written after the call begins, so to know whether the app is up prefer listening or url-ok/
+    );
+    // a reload that restarts a server ends before the server listens again
+    expect(waitDesc).toMatch(
+      /reloaded \(the next in-process reload.*quiet for 2 s.*wait until: listening next\)/
     );
     expect(waitDesc).not.toMatch(/before the action/); // a blocking call cannot precede the action it waits for
     expect(waitDesc).toMatch(/BAD_ARGUMENT/);

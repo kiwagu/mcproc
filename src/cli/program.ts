@@ -454,11 +454,11 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('wait <app>')
     .description(
-      'block until the app is listening, answers its url, exited, printed a matching line or went idle; exit 1 when it was not reached'
+      'block until the app is listening, answers its url, exited, printed a matching line, went idle or reloaded; exit 1 when it was not reached'
     )
     .requiredOption(
       '--until <cond>',
-      'listening | url-ok | exited | log:<regex> | idle:<seconds>'
+      'listening | url-ok | exited | log:<regex> | idle:<seconds> | reloaded (the next in-process reload after the call: a tsx/nodemon restart, a Vite/Next rebuild, a repeated listening line; answered once its burst is quiet for 2 s; for a server whose reload restarts it, wait until: listening next)'
     )
     .option(
       '-t, --timeout <s>',
