@@ -1,5 +1,15 @@
-import { McprocError } from './errors.js';
+import { McprocError, describeError } from './errors.js';
 import { stampOf } from './incidents/detect.js';
+import {
+  readSnippet,
+  parseRead,
+  type FileMark,
+  type Anchor,
+} from './incidents/cursor.js';
+import { findProcess } from './pm2.js';
+import type { Fleet, HostError } from './fleet.js';
+import { keepSgr, stripAnsi } from './logs.js';
+import { ensureOk } from '../transport/index.js';
 
 export type SinceSpec =
   | { kind: 'relative'; ms: number }
@@ -180,4 +190,213 @@ export function mergeLines(
     .map((x) => x.l);
   const truncated = Math.max(0, sorted.length - cap);
   return { lines: sorted.slice(truncated), truncated };
+}
+
+/** Where the merged reads of one MCP session stopped, per file; never shared with other sessions or callers. */
+export class LogMarks {
+  private readonly m = new Map<string, { out?: FileMark; err?: FileMark }>();
+  static key(manifestPath: string, host: string, app: string): string {
+    return `${manifestPath}|${host}/${app}`;
+  }
+  get(key: string): { out?: FileMark; err?: FileMark } | undefined {
+    return this.m.get(key);
+  }
+  set(key: string, stream: 'out' | 'err', mark: FileMark): void {
+    const e = this.m.get(key) ?? {};
+    e[stream] = mark;
+    this.m.set(key, e);
+  }
+}
+export const MAX_MERGED_LINES = 2000;
+export interface SinceOptions {
+  since: SinceSpec;
+  lines?: number;
+  stream?: 'out' | 'err' | 'both';
+  marks?: LogMarks;
+  keepColors?: boolean;
+}
+export interface SinceAnswer {
+  mode: SinceSpec['kind'];
+  since: Record<string, string | null>;
+  lines: SinceLine[];
+  truncated: number;
+  skipped: {
+    app: string;
+    host: string;
+    stream: 'out' | 'err';
+    bytes: number;
+  }[];
+  not_started: string[];
+  errors: HostError[];
+  apps: number;
+  hosts: number;
+}
+const STREAMS = ['out', 'err'] as const;
+
+interface HostRead {
+  host: string;
+  cutoff: string | null;
+  lines: SinceLine[];
+  skipped: SinceAnswer['skipped'];
+  notStarted: string[];
+}
+interface HostFailure {
+  host: string;
+  error: HostError;
+  cause: unknown;
+}
+
+/**
+ * The lines of the named apps since the cutoff (or since the session's marks, or the last n per file), each app read
+ * on its own host, hosts in parallel: one jlist and one read script per host, the host's clock in the same script.
+ * A host that fails is a note for its apps unless none answers.
+ */
+export async function readSince(
+  fleet: Fleet,
+  names: string[],
+  opts: SinceOptions
+): Promise<SinceAnswer> {
+  const spec = opts.since;
+  const cap = Math.min(
+    Math.max(
+      1,
+      Math.trunc(
+        opts.lines ?? (spec.kind === 'tail' ? spec.n : MAX_MERGED_LINES)
+      )
+    ),
+    MAX_MERGED_LINES
+  );
+  const clean = opts.keepColors ? keepSgr : stripAnsi;
+  const groups = fleet.groups(names);
+  const perHost = await Promise.all(
+    groups.map(async (g): Promise<HostRead | HostFailure> => {
+      try {
+        const ctx = await fleet.ctx(g.host);
+        const procs = await ctx.pm2.jlist();
+        const targets = g.apps.flatMap((app) => {
+          const p = findProcess(procs, fleet.manifest.project, app);
+          return p ? [{ app, p }] : [];
+        });
+        const notStarted = g.apps.filter(
+          (a) => !targets.some((t) => t.app === a)
+        );
+        const files = targets.flatMap((t) =>
+          STREAMS.map((stream) => {
+            const path = stream === 'out' ? t.p.out_log : t.p.err_log;
+            const key = LogMarks.key(fleet.manifest.path, g.host, t.app);
+            const mark =
+              spec.kind === 'last' ? opts.marks?.get(key)?.[stream] : undefined;
+            const same = mark !== undefined && mark.path === path;
+            const anchor: Anchor | null =
+              same && mark.at !== undefined && mark.anchor !== undefined
+                ? { at: mark.at, hex: mark.anchor }
+                : null;
+            return {
+              app: t.app,
+              stream,
+              path,
+              key,
+              offset: same ? mark.offset : null,
+              anchor,
+              hadMark: same,
+            };
+          })
+        );
+        // the clock always, so the header can say the cutoff even when nothing runs here
+        const script = [
+          CLOCK_SNIPPET,
+          ...files.map((f, i) => readSnippet(i, f.path, f.offset, f.anchor)),
+        ].join('; ');
+        const res = ensureOk(
+          await ctx.transport.exec(script),
+          ctx.host,
+          'read logs since'
+        );
+        const cutoff = cutoffFor(spec, hostClock(res.stdout));
+        const lines: SinceLine[] = [];
+        const skipped: SinceAnswer['skipped'] = [];
+        files.forEach((f, i) => {
+          const r = parseRead(res.stdout, i, f.offset, { clean });
+          if (!r) return;
+          // stamps are taken over every line read, so a slice that begins on a continuation line still knows its time
+          const sel = selectSince(r.lines, cutoff);
+          // a cutoff selects by time; without one (last, tail) every line is kept, in step with r.lines, and position
+          // selects: past a mark only the part after it, else the last n of the file
+          let kept = sel.kept;
+          if (f.hadMark) kept = kept.slice(r.contextOnly);
+          else if (spec.kind === 'tail') kept = kept.slice(-spec.n);
+          else if (spec.kind === 'last') kept = kept.slice(-FIRST_LAST_LINES);
+          // the 1 MB cap bit (the read began past byte 0) and nothing older than the cutoff was seen: lines between
+          // the cutoff and the window start may be missing
+          if (
+            cutoff !== null &&
+            r.start > 0 &&
+            sel.beforeCutoff === 0 &&
+            sel.kept.length > 0
+          )
+            skipped.push({
+              app: f.app,
+              host: g.host,
+              stream: f.stream,
+              bytes: r.start,
+            });
+          if (spec.kind === 'last' && r.skipped > 0)
+            skipped.push({
+              app: f.app,
+              host: g.host,
+              stream: f.stream,
+              bytes: r.skipped,
+            });
+          for (const k of kept)
+            lines.push({
+              app: f.app,
+              host: g.host,
+              stream: f.stream,
+              time: k.time,
+              text: k.text,
+            });
+          // a read cut short (the file changed meanwhile) keeps the old mark and is read again next time
+          if (opts.marks && !r.short)
+            opts.marks.set(f.key, f.stream, {
+              path: f.path,
+              offset: r.nextOffset,
+              ...(r.anchor ? { at: r.anchor.at, anchor: r.anchor.hex } : {}),
+            });
+        });
+        return { host: g.host, cutoff, lines, skipped, notStarted };
+      } catch (e) {
+        return {
+          host: g.host,
+          error: { host: g.host, apps: g.apps, message: describeError(e) },
+          cause: e,
+        };
+      }
+    })
+  );
+  const failed = perHost.filter((h): h is HostFailure => 'error' in h);
+  if (failed.length === perHost.length && failed.length > 0)
+    throw failed[0].cause;
+  const ok = perHost.filter((h): h is HostRead => !('error' in h));
+  const stream = opts.stream ?? 'both';
+  // the reads come back grouped by host: equal stamps follow the order of the names, then out before err, then file order
+  const rank = new Map(names.map((n, i) => [n, i]));
+  const merged = mergeLines(
+    ok
+      .flatMap((h) =>
+        h.lines.filter((l) => stream === 'both' || l.stream === stream)
+      )
+      .sort((a, b) => (rank.get(a.app) ?? 0) - (rank.get(b.app) ?? 0)),
+    cap
+  );
+  return {
+    mode: spec.kind,
+    since: Object.fromEntries(ok.map((h) => [h.host, h.cutoff])),
+    lines: merged.lines,
+    truncated: merged.truncated,
+    skipped: ok.flatMap((h) => h.skipped),
+    not_started: ok.flatMap((h) => h.notStarted),
+    errors: failed.map((f) => f.error),
+    apps: names.length,
+    hosts: groups.length,
+  };
 }
