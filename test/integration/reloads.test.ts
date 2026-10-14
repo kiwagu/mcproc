@@ -10,7 +10,12 @@ import { Fleet, actOn, listFleet } from '../../src/core/fleet.js';
 import { countReloads } from '../../src/core/reloadcount.js';
 import { RELOAD_GAP_MS } from '../../src/core/reloads.js';
 import { pollIncidents } from '../../src/core/incidents/poll.js';
-import { parseUntil, waitFor } from '../../src/core/wait.js';
+import {
+  defaultWaitDeps,
+  parseUntil,
+  waitFor,
+  type WaitDeps,
+} from '../../src/core/wait.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -62,22 +67,37 @@ describe.skipIf(process.env.MCPROC_IT !== '1')('reloads on real pm2', () => {
     expect(r.errors).toEqual([]);
     return r.rows.find((x) => x.app === 'svc')!.reloads;
   };
-  /** Waits until svc's next reload, poking it once the wait has had time to take its place at the end of the log. */
+  /**
+   * Waits until svc's next reload, poking svc right after the wait's first poll of the log: that poll takes the
+   * position at the end, so the reload's lines are all written after it, however long the wait took to get there.
+   */
   const pokeAndWait = async () => {
     const ctx = await f().ctx('local');
-    const stop = new AbortController(); // a failure below must not leave the wait running for its whole timeout
-    const p = waitFor(ctx, 'svc', parseUntil('reloaded'), {
+    const real = defaultWaitDeps();
+    let poked = false;
+    const deps: WaitDeps = {
+      ...real,
+      follower: (c, paths) => {
+        const fl = real.follower(c, paths);
+        return {
+          poll: async () => {
+            const r = await fl.poll();
+            if (!poked) {
+              poked = true;
+              fs.writeFileSync(path.join(dir, 'poke'), '');
+            }
+            return r;
+          },
+          watch: (wake) => fl.watch(wake),
+          close: () => fl.close(),
+          offsets: fl.offsets, // the follower updates it in place
+        };
+      },
+    };
+    return waitFor(ctx, 'svc', parseUntil('reloaded'), {
       timeoutMs: 20_000,
-      signal: stop.signal,
+      deps,
     });
-    p.catch(() => {}); // judged by the await below; this only keeps an early failure from going unhandled
-    try {
-      await sleep(500);
-      fs.writeFileSync(path.join(dir, 'poke'), '');
-      return await p;
-    } finally {
-      stop.abort();
-    }
   };
   beforeAll(async () => {
     base = fs.mkdtempSync('/tmp/mcproc-rl-'); // short: unix socket paths are capped at 108 bytes

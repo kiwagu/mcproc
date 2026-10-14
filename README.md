@@ -198,7 +198,7 @@ The answer is one line: `web: listening after 1.3 s (:3000 ✓)`, `libs: done af
 (default 60 s, max 600) it says what was last seen (`web: listening not reached after 60.0 s (status online, :3000 ✗
 nothing listens)`), and `ok` is false. If the process dies meanwhile, the wait ends at once with its reason and
 status and no observation, for example `web: exited (stopped) after 3.2 s while waiting for listening` (`observed`
-is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:` read the log as it grows. A process that pm2 is
+is in `--json`). Either way it is a result, not an error, and the CLI exits 1. Local apps are checked twice a second, remote ones once; `log:`/`idle:`/`reloaded` read the log as it grows. A process that pm2 is
 restarting (a watch restart, a restart delay) is not dead: the wait goes on, bounded by the timeout. `listening` and
 `url-ok` count only while the process is online or launching; a restart in progress is waited out, and a port or url that
 still answers after the process died is not ready. Claude
