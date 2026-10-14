@@ -115,12 +115,16 @@ replace it. The root `dev` script, other persistent tasks (under a commented pro
   that depends on such a library, directly or through other packages, gets `depends_on: [{ app: libs, condition: completed }]`.
 - A library live through its own `dev` watch is drafted as a `build` app and left out of `libs`, so its first build is not
   awaited: the draft leaves a note on each app that uses it saying how to wait for it.
-- Ports are also guessed (and still marked `port?`) for Next (3000), Vite (`server.port` in `vite.config.*`, or
-  `preview.port` for `vite preview`, as a literal or an env read's fallback; else 5173 or 4173) and `PORT = N` in `src/`.
-- `init --adopt-ports` (MCP: `adopt_ports`) drafts nothing: it writes the ports `ls` reports as undeclared for the running
-  apps into the existing manifest, comments and layout kept, and prints the diff. Ports from 32768 up (the ephemeral range,
-  almost always transient) and ports another app declares are reported, not adopted. It refuses a manifest that marks the
-  local host readonly, and a file that changed while the hosts were probed (`ALREADY_EXISTS`: run it again).
+- Ports are also guessed for Next (3000), Vite (`server.port` in `vite.config.*`, or `preview.port` for `vite preview`,
+  as a literal or an env read's fallback; else 5173 or 4173) and, in `src/`, `PORT = N`, `DEFAULT_PORT = N`, `PORT ?? N`,
+  `PORT || N` or `.listen(N)`. The guess shows as `port?` in each candidate's `# source:` trailer; a live app also declares
+  it as `port:` (and `url:`), so check it with `ls` (a wrong guess shows ✗) and correct it by hand: `--adopt-ports` adds
+  the real port but leaves the guess in place.
+- `init --adopt-ports` (MCP: `adopt_ports`) drafts nothing and ignores `--force`: it needs an existing manifest and writes
+  the ports `ls` reports as undeclared for the running apps into it, comments and layout kept, then prints the diff. Ports
+  from 32768 up (the ephemeral range, almost always transient) and ports another app declares are reported, not adopted.
+  It refuses a manifest that marks the local host readonly, and a file that changed while the hosts were probed
+  (`ALREADY_EXISTS`: run it again).
 
 ### Apps on several hosts
 

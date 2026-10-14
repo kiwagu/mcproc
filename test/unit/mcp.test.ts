@@ -118,6 +118,13 @@ describe('mcp server', () => {
     );
     expect(INSTRUCTIONS).toContain('since');
     expect(byName.init.description).toContain('adopt_ports');
+    // on a turbo repo the dev task's apps are drafted live: an agent must not go looking for them to uncomment
+    expect(byName.init.description).toContain(
+      'On a turbo repo with a persistent dev task'
+    );
+    expect(byName.init.description).toContain('dev profile');
+    expect(byName.init.description).not.toContain('Candidates are commented');
+    expect(byName.init.description).not.toContain('—');
     expect(INSTRUCTIONS).toContain('init adopt_ports');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
@@ -572,6 +579,71 @@ describe('mcp server', () => {
       } finally {
         fs.rmSync(empty, { recursive: true, force: true });
       }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('init adopt_ports with a host that did not answer: the reachable apps are adopted, the host is named, isError', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-adopt-'));
+    try {
+      fs.cpSync(fleet, dir, { recursive: true });
+      const jlists: Record<string, string> = {
+        local: JSON.stringify([
+          {
+            pid: 4242,
+            name: 'fleet-watch',
+            pm_id: 0,
+            pm2_env: { status: 'online', namespace: 'fleet' },
+          },
+        ]),
+        ro: '[]',
+      };
+      const spawner: Spawner = async (argv) => {
+        const host = argv[0] === 'ssh' ? argv[argv.length - 2] : 'local';
+        if (host === 'box')
+          return {
+            code: 255,
+            stdout: '',
+            stderr: 'ssh: connect to host box port 22: Connection refused',
+          };
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({
+              jlist: jlists[host],
+              ps: '4242 1\n',
+              tcp:
+                host === 'local'
+                  ? 'LISTEN 0 1 *:3005 *:* users:(("node",pid=4242,fd=1))\n'
+                  : '',
+            }),
+            stderr: '',
+          };
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected on ${host}` };
+      };
+      const cl = await client(spawner);
+      const r: any = await cl.callTool({
+        name: 'init',
+        arguments: { project: dir, adopt_ports: true },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent.written).toBe(true);
+      expect(r.structuredContent.adopted).toEqual([
+        { app: 'watch', host: 'local', ports: [3005] },
+      ]);
+      expect(r.structuredContent.errors).toHaveLength(1);
+      expect(r.structuredContent.errors[0]).toMatchObject({
+        host: 'box',
+        apps: ['web'],
+      });
+      expect(text(r)).toContain('watch: adopted 3005');
+      expect(text(r)).toMatch(/^box not read \(web\): TRANSPORT_FAILED/m);
+      expect(text(r)).toContain('+    port: 3005');
+      expect(loadManifest(dir).apps.watch.ports).toEqual([3005]);
+      expect(loadManifest(dir).apps.web.ports).toEqual([3000]); // the app on the host not read is left as it was
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

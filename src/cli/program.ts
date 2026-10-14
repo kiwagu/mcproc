@@ -195,7 +195,7 @@ export function buildProgram(io: Io = defaultIo): Command {
     .option('--force', 'overwrite an existing manifest')
     .option(
       '--adopt-ports',
-      'write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and print the diff; drafts nothing'
+      'write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and print the diff; needs that manifest, drafts nothing and ignores --force'
     )
     .action(
       wrap(async (g, o) => {

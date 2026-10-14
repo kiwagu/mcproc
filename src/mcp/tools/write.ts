@@ -66,7 +66,7 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Init manifest draft',
       description:
-        'Create .mcproc/ (gitignored) with a manifest DRAFT discovered from package.json scripts, workspaces, nx project.json, turbo.json, ecosystem.json and Procfile. Candidates are commented out: uncomment, write descriptions, then verify with start + ls. Refuses to overwrite an existing manifest without force. With adopt_ports, instead write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and return the diff; force is ignored then.',
+        'Create .mcproc/ (gitignored) with a manifest DRAFT discovered from package.json scripts, workspaces, nx project.json, turbo.json, ecosystem.json and Procfile. On a turbo repo with a persistent dev task, the packages implementing it are drafted live (TODO descriptions to replace, a dev profile, libs/libs-watch builders for libraries consumed from dist/); every other candidate is commented out: uncomment, write descriptions, then verify with start + ls. Refuses to overwrite an existing manifest without force. With adopt_ports, instead write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and return the diff; it needs that manifest, and force is ignored then.',
       inputSchema: {
         project: commonInput.project,
         force: z.boolean().optional(),

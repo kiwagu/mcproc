@@ -79,6 +79,13 @@ describe('cli', () => {
     expect(c2.err[0]).toContain('READONLY_HOST');
   });
   it('init --adopt-ports needs a manifest, and refuses a readonly local host before connecting, force or not', async () => {
+    const init = buildProgram(capture().io).commands.find(
+      (x) => x.name() === 'init'
+    )!;
+    // commander wraps the help text at the terminal's width
+    expect(init.helpInformation().replace(/\s+/g, ' ')).toContain(
+      '--adopt-ports write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and print the diff; needs that manifest, drafts nothing and ignores --force'
+    );
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));
     try {
