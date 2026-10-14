@@ -3,7 +3,15 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { McprocError } from './errors.js';
 import { defaultProject, MANIFEST_REL, type AppKind } from './manifest.js';
-import { readJson } from './turbo.js';
+import {
+  dependsOnDistLib,
+  libsFilters,
+  loadWorkspace,
+  readJson,
+  readTurbo,
+  turboBin,
+  type WsPackage,
+} from './turbo.js';
 
 export interface Candidate {
   name: string;
@@ -12,11 +20,29 @@ export interface Candidate {
   cwd: string;
   kind: AppKind | 'unknown';
   port?: number;
+  /** Written uncommented: part of the dev stack the draft starts with. */
+  live?: boolean;
+  /** Live apps: the placeholder; libs/libs-watch: their own text. */
+  description?: string;
+  depends_on?: { app: string; condition: 'completed' }[];
+  /** One comment line written under the candidate. */
+  note?: string;
+}
+/** A profile of the draft; a live one is written uncommented. */
+export interface DraftProfile {
+  name: string;
+  apps: string[];
+  live: boolean;
 }
 export interface Discovery {
   candidates: Candidate[];
   notes: string[];
+  profiles: DraftProfile[];
+  /** The package names folded into the libs builders ([] when none). */
+  libs: string[];
 }
+/** A live app needs a description to load; this one tells the human to write the real one. */
+export const LIVE_DESCRIPTION = 'TODO: what this app does';
 export interface InitResult {
   path: string;
   created: string[];
@@ -189,31 +215,70 @@ function portFor(
   return kind === 'build' || kind === 'task' ? undefined : guessPort(cmd, dir);
 }
 
+/** The app name of a package: its name without the npm scope. */
+const pkgAppName = (name: string): string =>
+  sanitizeName(name.split('/').pop()!);
+
+/** How a workspace package takes part in turbo's live dev task. */
+interface PkgTurbo {
+  liveTask: string;
+  /** A dist library live through its own dev task: a build app, no port. */
+  isLib: boolean;
+  /** Depends on a library folded into libs: waits for its first build. */
+  waitsForLibs: boolean;
+  /** Live dist libraries it depends on: their first build is not awaited. */
+  liveLibDeps: string[];
+  /** Its build script is folded into libs. */
+  dropBuild: boolean;
+  libsName: string;
+}
+
+const notAwaited = (lib: string): string => {
+  const app = pkgAppName(lib);
+  return `${app}'s first build is not awaited; uncomment ${app}-build and add depends_on: [{ app: ${app}-build, condition: completed }] to wait for it`;
+};
+
 function packageCandidates(
   root: string,
   pkgDir: string,
-  pm: string
+  pm: string,
+  turbo?: PkgTurbo
 ): Candidate[] {
   const pkg = readJson(path.join(pkgDir, 'package.json'));
   if (!pkg?.scripts) return [];
   const rel = path.relative(root, pkgDir) || '.';
-  const prefix =
-    rel === '.'
-      ? ''
-      : `${sanitizeName(
-          String(pkg.name ?? path.basename(pkgDir))
-            .split('/')
-            .pop()!
-        )}-`;
+  const appName = pkgAppName(String(pkg.name ?? path.basename(pkgDir)));
+  const prefix = rel === '.' ? '' : `${appName}-`;
+  const file = `${rel === '.' ? '' : `${rel}/`}package.json`;
   const out: Candidate[] = [];
   for (const [n, cmd] of Object.entries(
     pkg.scripts as Record<string, string>
   )) {
     if (!SCRIPT_RE.test(n)) continue;
     const kind = guessKind(n, cmd);
+    if (turbo?.dropBuild && n === 'build') continue;
+    if (turbo && n === turbo.liveTask) {
+      out.push({
+        name: appName,
+        source: `${file}:${n}`,
+        run: `${pm} ${n}`,
+        cwd: rel,
+        kind: turbo.isLib ? 'build' : kind,
+        port: turbo.isLib ? undefined : portFor(kind, cmd, pkgDir),
+        live: true,
+        description: LIVE_DESCRIPTION,
+        ...(turbo.waitsForLibs
+          ? { depends_on: [{ app: turbo.libsName, condition: 'completed' }] }
+          : {}),
+        ...(turbo.liveLibDeps.length
+          ? { note: turbo.liveLibDeps.map(notAwaited).join('; ') }
+          : {}),
+      });
+      continue;
+    }
     out.push({
       name: sanitizeName(prefix + n),
-      source: `${rel === '.' ? '' : `${rel}/`}package.json:${n}`,
+      source: `${file}:${n}`,
       run: `${pm} ${n}`,
       cwd: rel,
       kind,
@@ -234,8 +299,9 @@ function expandWorkspaces(
   for (const pat of patterns) {
     const glob = /^(.*?)\/\*\*?$/.exec(pat);
     if (glob) {
-      globParents.push(glob[1]);
       const base = path.join(root, glob[1]);
+      // relative to the root, so `./packages/*` and `packages/*` name one folder
+      globParents.push(path.relative(root, base));
       let names: string[] = [];
       try {
         names = fs.readdirSync(base);
@@ -255,11 +321,80 @@ function expandWorkspaces(
   return { dirs: [...dirs], unsupported, globParents };
 }
 
+/**
+ * The two builders that stand for every dist library without a dev script of
+ * its own: a one-shot build the live apps wait for, then a watch that keeps
+ * dist/ fresh.
+ */
+function libsBuilders(
+  folded: WsPackage[],
+  globParents: string[],
+  pm: string,
+  version: 1 | 2
+): Candidate[] {
+  const bin = turboBin(pm);
+  // turbo 2's interactive UI would hold the terminal; turbo 1 has no --ui flag
+  const ui = version === 2 ? ' --ui=stream' : '';
+  const filters = libsFilters(folded, globParents).join(' ');
+  const parents = [...new Set(folded.map((p) => path.dirname(p.dir)))].join(
+    ', '
+  );
+  return [
+    {
+      name: 'libs',
+      source: 'turbo.json:build',
+      run: `${bin} run build ${filters}${ui}`,
+      cwd: '.',
+      kind: 'task',
+      live: true,
+      description: `one-shot build of the libraries consumed from dist/ (${parents}); the apps import these builds`,
+    },
+    {
+      name: 'libs-watch',
+      source: 'turbo.json:build',
+      run: `${bin} watch build ${filters}${ui}`,
+      cwd: '.',
+      kind: 'build',
+      live: true,
+      description:
+        "rebuilds a changed library's dist/ (and its dependents) while you work",
+      depends_on: [{ app: 'libs', condition: 'completed' }],
+    },
+  ];
+}
+
+/**
+ * The live profile of the dev task's apps, and a commented one per other
+ * persistent task. A profile may not share an app's name, so the live one
+ * steps aside when a live app is called `dev`.
+ */
+function draftProfiles(
+  candidates: Candidate[],
+  persistent: string[]
+): DraftProfile[] {
+  const live = candidates.filter((c) => c.live).map((c) => c.name);
+  const out: DraftProfile[] = [
+    { name: live.includes('dev') ? 'dev-apps' : 'dev', apps: live, live: true },
+  ];
+  for (const t of persistent.filter((t) => t !== 'dev')) {
+    // a package's own script: the root one runs the task over every package
+    const apps = candidates
+      .filter(
+        (c) =>
+          !c.live &&
+          /\/package\.json:/.test(c.source) &&
+          c.source.endsWith(`:${t}`)
+      )
+      .map((c) => c.name);
+    if (apps.length) out.push({ name: t, apps, live: false });
+  }
+  return out;
+}
+
 export function discover(root: string): Discovery {
   const candidates: Candidate[] = [];
   const notes: string[] = [];
   const pm = pmFor(root);
-  candidates.push(...packageCandidates(root, root, pm));
 
   const pkg = readJson(path.join(root, 'package.json'));
   const ws: string[] = Array.isArray(pkg?.workspaces)
@@ -277,8 +412,64 @@ export function discover(root: string): Discovery {
     }
   }
   const expanded = expandWorkspaces(root, ws);
-  for (const dir of expanded.dirs)
-    candidates.push(...packageCandidates(root, dir, pm));
+
+  const turbo = readTurbo(root);
+  const turboFile = path.join(root, 'turbo.json');
+  if (!turbo && fs.existsSync(turboFile) && readJson(turboFile) === null)
+    notes.push(
+      "turbo.json could not be parsed (comments are not read); drafted without turbo's tasks"
+    );
+  // only the bare task: a package-scoped key (`web#dev`) configures one package, not the stack
+  const liveTask = turbo?.persistent.includes('dev') ? 'dev' : null;
+  const pkgs = liveTask ? loadWorkspace(root, expanded.dirs) : [];
+  // a dist library with a dev script of its own is live through it; the rest are built by libs
+  const folded = liveTask
+    ? pkgs.filter((p) => p.distLib && !p.scripts[liveTask])
+    : [];
+  const foldedNames = new Set(folded.map((p) => p.name));
+  const liveLibs = new Set(
+    liveTask
+      ? pkgs.filter((p) => p.distLib && p.scripts[liveTask]).map((p) => p.name)
+      : []
+  );
+  if (turbo && folded.length) {
+    candidates.push(
+      ...libsBuilders(folded, expanded.globParents, pm, turbo.version)
+    );
+    const one = folded.length === 1;
+    notes.push(
+      `${folded.length} librar${one ? 'y' : 'ies'} built into dist/ ${one ? 'is' : 'are'} drafted as libs and libs-watch: ${folded.map((p) => p.name).join(', ')}`
+    );
+  }
+
+  candidates.push(...packageCandidates(root, root, pm));
+  if (liveTask)
+    for (const c of candidates)
+      if (c.source === 'package.json:dev')
+        c.note =
+          'the dev profile replaces this: turbo would start every package as one process';
+  for (const dir of expanded.dirs) {
+    const p = liveTask
+      ? pkgs.find((x) => x.dir === path.relative(root, dir))
+      : undefined;
+    candidates.push(
+      ...packageCandidates(
+        root,
+        dir,
+        pm,
+        liveTask && p
+          ? {
+              liveTask,
+              isLib: p.distLib,
+              waitsForLibs: dependsOnDistLib(p, pkgs, foldedNames).length > 0,
+              liveLibDeps: dependsOnDistLib(p, pkgs, liveLibs),
+              dropBuild: foldedNames.has(p.name),
+              libsName: 'libs',
+            }
+          : undefined
+      )
+    );
+  }
   for (const pat of expanded.unsupported)
     notes.push(
       `workspace pattern "${pat}" is not expanded by init; add its packages' scripts by hand`
@@ -303,23 +494,19 @@ export function discover(root: string): Discovery {
     }
   }
 
-  const turbo = readJson(path.join(root, 'turbo.json'));
-  const tasks = turbo?.tasks ?? turbo?.pipeline;
-  if (tasks && typeof tasks === 'object') {
-    for (const t of Object.keys(tasks)) {
-      if (
-        !SCRIPT_RE.test(t) ||
-        candidates.some((c) => c.source.endsWith(`package.json:${t}`))
-      )
-        continue;
-      candidates.push({
-        name: sanitizeName(`turbo-${t}`),
-        source: `turbo.json:${t}`,
-        run: `npx turbo run ${t}`,
-        cwd: '.',
-        kind: guessKind(t, ''),
-      });
-    }
+  for (const t of turbo?.tasks ?? []) {
+    if (
+      !SCRIPT_RE.test(t) ||
+      candidates.some((c) => c.source.endsWith(`package.json:${t}`))
+    )
+      continue;
+    candidates.push({
+      name: sanitizeName(`turbo-${t}`),
+      source: `turbo.json:${t}`,
+      run: `npx turbo run ${t}`,
+      cwd: '.',
+      kind: guessKind(t, ''),
+    });
   }
 
   const eco = readJson(path.join(root, 'ecosystem.json'));
@@ -380,7 +567,14 @@ export function discover(root: string): Discovery {
     seen.set(c.name, n + 1);
     if (n) c.name = `${c.name}-${n + 1}`;
   }
-  return { candidates, notes };
+  // libs comes first, so the dedupe above never renames it and depends_on: libs holds
+  return {
+    candidates,
+    notes,
+    profiles:
+      turbo && liveTask ? draftProfiles(candidates, turbo.persistent) : [],
+    libs: folded.map((p) => p.name),
+  };
 }
 
 function yamlStr(s: string): string {

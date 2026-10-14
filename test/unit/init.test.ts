@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   discover,
   guessKind,
@@ -9,8 +10,12 @@ import {
   renderDraft,
   initProject,
   sanitizeName,
+  LIVE_DESCRIPTION,
 } from '../../src/core/init.js';
 import { parseManifest } from '../../src/core/manifest.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const turbo = path.join(here, '..', 'fixtures', 'projects', 'turbo');
 
 function write(root: string, rel: string, content: string) {
   const p = path.join(root, rel);
@@ -164,6 +169,234 @@ describe('discover', () => {
     expect(byName['migrate-2'].port).toBeUndefined();
     expect(d.candidates.some((c) => c.name.startsWith('junk'))).toBe(false);
     expect(d.notes.some((n) => n.includes('ecosystem.config.cjs'))).toBe(true);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(d.candidates.every((c) => !c.live)).toBe(true);
+  });
+});
+
+describe('discover on a turbo repo', () => {
+  const made: string[] = [];
+  afterAll(() => {
+    for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  });
+  /** A throwaway copy of the turbo fixture, removed after the suite. */
+  const copy = () => {
+    const r = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-init-'));
+    made.push(r);
+    fs.cpSync(turbo, r, { recursive: true });
+    return r;
+  };
+  const byName = (d: ReturnType<typeof discover>) =>
+    Object.fromEntries(d.candidates.map((c) => [c.name, c]));
+  it('drafts the persistent dev task live, folds dist libraries into libs/libs-watch, wires depends_on', () => {
+    const d = discover(turbo);
+    const c = byName(d);
+    expect(d.candidates.slice(0, 2).map((x) => x.name)).toEqual([
+      'libs',
+      'libs-watch',
+    ]);
+    expect(c.libs).toMatchObject({
+      live: true,
+      kind: 'task',
+      cwd: '.',
+      source: 'turbo.json:build',
+      run: "bunx turbo run build --filter='./packages/*' --ui=stream",
+    });
+    expect(c.libs.description).toContain('packages');
+    expect(c['libs-watch']).toMatchObject({
+      live: true,
+      kind: 'build',
+      run: "bunx turbo watch build --filter='./packages/*' --ui=stream",
+      depends_on: [{ app: 'libs', condition: 'completed' }],
+    });
+    expect(c.api).toMatchObject({
+      live: true,
+      source: 'apps/api/package.json:dev',
+      run: 'bun run dev',
+      cwd: 'apps/api',
+      kind: 'server',
+      port: 3020,
+      description: LIVE_DESCRIPTION,
+      depends_on: [{ app: 'libs', condition: 'completed' }],
+    });
+    expect(c.web).toMatchObject({
+      live: true,
+      cwd: 'apps/web',
+      kind: 'server',
+      port: 3002,
+      depends_on: [{ app: 'libs', condition: 'completed' }],
+    });
+    expect(c.contracts).toMatchObject({
+      live: true,
+      cwd: 'packages/contracts',
+      kind: 'build',
+      source: 'packages/contracts/package.json:dev',
+    });
+    expect(c.contracts.depends_on).toEqual([
+      { app: 'libs', condition: 'completed' },
+    ]); // contracts → domain
+    expect(c.contracts.port).toBeUndefined();
+    expect(c.api.note).toContain("contracts's first build is not awaited"); // api depends on the live library contracts
+    expect(c.web.note).toBeUndefined();
+    expect(c['domain-build']).toBeUndefined(); // folded into libs
+    expect(c['contracts-build']).toMatchObject({ kind: 'task' }); // a live library keeps its one-shot build, commented
+    expect(c['contracts-build'].live).toBeUndefined();
+    expect(c['web-start']).toMatchObject({ kind: 'server', port: 4173 });
+    expect(c['web-build']).toMatchObject({ kind: 'task' });
+    expect(c['api-build']).toMatchObject({ kind: 'task' });
+    expect(c.dev).toMatchObject({
+      source: 'package.json:dev',
+      run: 'bun run dev',
+      cwd: '.',
+    });
+    expect(c.dev.live).toBeUndefined();
+    expect(c.dev.note).toBe(
+      'the dev profile replaces this: turbo would start every package as one process'
+    );
+    expect(c.build).toMatchObject({ kind: 'task' });
+    expect(Object.keys(c).filter((n) => n.startsWith('turbo-'))).toEqual([]);
+    expect(d.profiles).toEqual([
+      {
+        name: 'dev',
+        apps: ['libs', 'libs-watch', 'api', 'web', 'contracts'],
+        live: true,
+      },
+      { name: 'start', apps: ['web-start'], live: false },
+    ]);
+    expect(d.libs).toEqual(['@t/domain']);
+    expect(d.notes).toContain(
+      '1 library built into dist/ is drafted as libs and libs-watch: @t/domain'
+    );
+    // workspace packages come in sorted directory order, whatever order readdir returns
+    expect([
+      ...new Set(d.candidates.filter((x) => x.cwd !== '.').map((x) => x.cwd)),
+    ]).toEqual(['apps/api', 'apps/web', 'packages/contracts']);
+    expect(d.notes.some((n) => n.includes('turbo.json'))).toBe(false);
+  });
+  it('a turbo repo without a persistent dev task drafts as before', () => {
+    const r = copy();
+    write(r, 'turbo.json', JSON.stringify({ tasks: { dev: {}, build: {} } }));
+    const d = discover(r);
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(d.libs).toEqual([]);
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+    expect(byName(d)['web-dev']).toMatchObject({ kind: 'server', port: 3002 });
+    // only the bare task makes the live stack, not a package-scoped one
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({
+        tasks: {
+          'web#dev': { persistent: true },
+          '//#dev': { persistent: true },
+          build: {},
+        },
+      })
+    );
+    expect(discover(r).candidates.some((c) => c.live)).toBe(false);
+  });
+  it('turbo 1 pipeline: no --ui flag; npm, yarn and pnpm binaries', () => {
+    const r = copy();
+    fs.rmSync(path.join(r, 'bun.lock'));
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ pipeline: { dev: { persistent: true }, build: {} } })
+    );
+    expect(byName(discover(r)).libs.run).toBe(
+      "npx turbo run build --filter='./packages/*'"
+    );
+    write(r, 'yarn.lock', '');
+    expect(byName(discover(r))['libs-watch'].run).toBe(
+      "yarn turbo watch build --filter='./packages/*'"
+    );
+    fs.rmSync(path.join(r, 'yarn.lock'));
+    write(r, 'pnpm-lock.yaml', '');
+    expect(byName(discover(r)).libs.run).toBe(
+      "pnpm exec turbo run build --filter='./packages/*'"
+    );
+  });
+  it('a ./-prefixed workspace pattern still filters libs by its folder', () => {
+    const r = copy();
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(r, 'package.json'), 'utf8')
+    );
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ ...pkg, workspaces: ['./apps/*', './packages/*'] })
+    );
+    expect(byName(discover(r)).libs.run).toBe(
+      "bunx turbo run build --filter='./packages/*' --ui=stream"
+    );
+  });
+  it('an unparsable turbo.json is noted and drafted the old way; one without tasks is not noted', () => {
+    const r = copy();
+    write(
+      r,
+      'turbo.json',
+      '{\n  // turbo accepts comments\n  "tasks": { "dev": { "persistent": true }, "build": {} }\n}\n'
+    );
+    const d = discover(r);
+    expect(d.notes).toContain(
+      "turbo.json could not be parsed (comments are not read); drafted without turbo's tasks"
+    );
+    expect(d.candidates.some((c) => c.live)).toBe(false);
+    expect(d.profiles).toEqual([]);
+    expect(byName(d)['domain-build']).toMatchObject({ kind: 'task' });
+    write(
+      r,
+      'turbo.json',
+      JSON.stringify({ $schema: 'https://turbo.build/schema.json' })
+    );
+    expect(discover(r).notes.some((n) => n.includes('turbo.json'))).toBe(false);
+  });
+  it('no dist libraries: no libs apps, no depends_on, no note', () => {
+    const r = copy();
+    fs.rmSync(path.join(r, 'packages', 'domain'), { recursive: true });
+    fs.rmSync(path.join(r, 'packages', 'contracts'), { recursive: true });
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.libs).toBeUndefined();
+    expect(c.api.depends_on).toBeUndefined();
+    expect(d.profiles[0]).toEqual({
+      name: 'dev',
+      apps: ['api', 'web'],
+      live: true,
+    });
+    expect(d.libs).toEqual([]);
+    expect(d.notes.some((n) => n.includes('dist/'))).toBe(false);
+  });
+  it('a live app named dev makes the profile dev-apps; a package named libs is deduplicated', () => {
+    const r = copy();
+    write(
+      r,
+      'apps/dev/package.json',
+      JSON.stringify({ name: '@t/dev', scripts: { dev: 'node s.js' } })
+    );
+    write(
+      r,
+      'apps/libs/package.json',
+      JSON.stringify({ name: 'libs', scripts: { dev: 'node s.js' } })
+    );
+    const d = discover(r);
+    const c = byName(d);
+    expect(c.dev.live).toBeUndefined(); // the root script keeps the bare name: it came first
+    expect(c['dev-2']).toMatchObject({ live: true, cwd: 'apps/dev' });
+    expect(c['libs-2']).toMatchObject({ live: true, cwd: 'apps/libs' });
+    expect(c.libs.kind).toBe('task');
+    expect(d.profiles[0].name).toBe('dev'); // no LIVE app is named dev
+    fs.rmSync(path.join(r, 'package.json'));
+    write(
+      r,
+      'package.json',
+      JSON.stringify({ workspaces: ['apps/*', 'packages/*'] })
+    ); // no root scripts: the live app takes the name dev
+    const d2 = discover(r);
+    expect(byName(d2).dev).toMatchObject({ live: true, cwd: 'apps/dev' });
+    expect(d2.profiles[0].name).toBe('dev-apps');
   });
 });
 

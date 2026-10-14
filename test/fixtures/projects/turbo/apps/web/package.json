@@ -1,0 +1,1 @@
+{ "name": "@t/web", "scripts": { "dev": "vite", "start": "vite preview", "build": "vite build" }, "dependencies": { "@t/ui": "workspace:*", "@t/domain": "workspace:*" } }

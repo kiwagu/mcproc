@@ -1,0 +1,1 @@
+{ "tasks": { "build": { "dependsOn": ["^build"] }, "dev": { "persistent": true, "cache": false }, "start": { "persistent": true }, "lint": {} } }

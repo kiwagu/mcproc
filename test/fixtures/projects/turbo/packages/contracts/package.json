@@ -1,0 +1,1 @@
+{ "name": "@t/contracts", "scripts": { "build": "tsc -p .", "dev": "tsc -w" }, "main": "./dist/index.js", "dependencies": { "@t/domain": "workspace:*" } }

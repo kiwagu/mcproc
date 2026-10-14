@@ -65,6 +65,8 @@ describe('readTurbo', () => {
     });
     write(r, 'turbo.json', { $schema: 'x' });
     expect(readTurbo(r)).toBeNull();
+    write(r, 'turbo.json', { tasks: [] });
+    expect(readTurbo(r)).toBeNull();
     write(r, 'turbo.json', '{ not json');
     expect(readTurbo(r)).toBeNull();
     expect(readTurbo(tmp())).toBeNull();

@@ -1,0 +1,1 @@
+{ "name": "@t/ui", "exports": { ".": "./src/index.ts" }, "dependencies": { "@t/domain": "workspace:*" } }
