@@ -505,6 +505,113 @@ profiles:
   });
 });
 
+describe('spliceManifest: ports shared through a YAML anchor', () => {
+  const SHARED = 'shares its ports through a YAML anchor';
+  /** api holds the anchored ports in `shape`; tool reads them through `*p`, web has a port of its own */
+  const anchored = (shape: string, alias = '    ports: *p') => `version: 1
+apps:
+  api:
+    description: api
+    run: x
+${shape}
+  tool:
+    description: tool
+    run: y
+${alias}
+  web:
+    description: web
+    run: w
+    port: 3000
+`;
+  const adopt: Adopted[] = [
+    { app: 'api', host: 'local', ports: [3312] },
+    { app: 'web', host: 'local', ports: [3001] },
+  ];
+  it('a new block item copies no anchor or tag from the item next to it: the alias keeps its port', () => {
+    const text = anchored(
+      '    ports:\n      - 3300\n      - &main !!int 3310',
+      '    port: *main'
+    );
+    const s = spliceManifest(text, [
+      { app: 'api', host: 'local', ports: [3305, 3312] },
+    ]);
+    expect(s.unedited).toEqual([]);
+    expect(s.edited).toEqual(['api']);
+    expect(s.text).toBe(
+      text.replace(
+        '      - &main !!int 3310',
+        '      - 3305\n      - &main !!int 3310\n      - 3312'
+      )
+    );
+    expect(portsOf(parse(s.text))).toEqual({
+      api: [3300, 3305, 3310, 3312],
+      tool: [3310],
+      web: [3000],
+    });
+  });
+  for (const [label, shape] of [
+    ['an anchored one-line flow list', '    ports: &p [3310]'],
+    ['an anchored block list', '    ports: &p\n      - 3310'],
+    [
+      'an anchored flow list over several lines',
+      '    ports: &p [3300,\n            3310]',
+    ],
+  ] as const)
+    it(`${label} is left alone: the app reading it through an alias would gain the port`, () => {
+      const text = anchored(shape);
+      const s = spliceManifest(text, adopt);
+      expect(s.edited).toEqual(['web']);
+      expect(s.unedited).toEqual([{ app: 'api', reason: SHARED }]);
+      expect(s.text).toBe(
+        text.replace('    port: 3000\n', '    ports: [3000, 3001]\n')
+      );
+      const before = portsOf(parse(text));
+      expect(portsOf(parse(s.text))).toEqual({ ...before, web: [3000, 3001] });
+    });
+  it('an anchored item of a one-line flow list is left alone: rewriting the list would drop the anchor its alias needs', () => {
+    const text = anchored('    ports: [&a 3310]', '    port: *a');
+    const s = spliceManifest(text, adopt);
+    expect(s.edited).toEqual(['web']);
+    expect(s.unedited).toEqual([{ app: 'api', reason: SHARED }]);
+    expect(portsOf(parse(s.text))).toEqual({
+      api: [3310],
+      tool: [3310],
+      web: [3000, 3001],
+    });
+  });
+  it('an anchored app map is left alone: a new port field would reach its alias too', () => {
+    const text = `version: 1
+apps:
+  api: &t
+    description: api
+    run: x
+  tool: *t
+`;
+    const s = spliceManifest(text, [
+      { app: 'api', host: 'local', ports: [3312] },
+    ]);
+    expect(s).toEqual({
+      text,
+      edited: [],
+      unedited: [{ app: 'api', reason: SHARED }],
+    });
+  });
+  it('when the alias holder is adopted too, its alias is replaced by its own list and both are edited', () => {
+    const text = anchored('    ports: &p [3310]');
+    const s = spliceManifest(text, [
+      { app: 'api', host: 'local', ports: [3312] },
+      { app: 'tool', host: 'local', ports: [3400] },
+    ]);
+    expect(s.unedited).toEqual([]);
+    expect(s.edited).toEqual(['api', 'tool']);
+    expect(portsOf(parse(s.text))).toEqual({
+      api: [3310, 3312],
+      tool: [3310, 3400],
+      web: [3000],
+    });
+  });
+});
+
 describe('lineDiff', () => {
   it('equal texts: no lines', () => {
     expect(lineDiff(MANIFEST, MANIFEST)).toEqual([]);
@@ -836,8 +943,7 @@ apps:
         .replace('    host: box\n', '    host: box\n    ports: [9000, 9001]\n')
     );
   });
-  it('a splice the loader would refuse is not written: MANIFEST_INVALID with the reason', async () => {
-    // spare shares web's port through an anchor; writing web's ports into that anchor turns spare's port into a list
+  it('an app whose port another app reads through an anchor is skipped with the reason; the others are adopted', async () => {
     const text = `version: 1
 project: fx
 apps:
@@ -849,12 +955,53 @@ apps:
     description: a second copy on the same port, not running
     run: npm run dev
     port: *p
+  tool:
+    description: tool
+    run: node tool.js
+`;
+    const { dir, file } = project(text);
+    const r = await adoptPorts(fakeFleet(dir).fleet);
+    expect(r).toMatchObject({
+      written: true,
+      adopted: [{ app: 'tool', host: 'local', ports: [7000] }],
+      skipped: [
+        {
+          app: 'web',
+          host: 'local',
+          ports: [3001],
+          reason: 'shares its ports through a YAML anchor',
+        },
+      ],
+    });
+    expect(fs.readFileSync(file, 'utf8')).toBe(
+      text.replace('run: node tool.js\n', 'run: node tool.js\n    port: 7000\n')
+    );
+    expect(portsOf(loadManifest(dir))).toEqual({
+      web: [3000],
+      spare: [3000],
+      tool: [7000],
+    });
+  });
+  it('a splice the loader would refuse is not written: MANIFEST_INVALID with the reason', async () => {
+    // spare reads web's port through an anchor in a field that is not a port: writing web's ports into the anchored
+    // node keeps every app's ports right, but turns spare's watch_delay into a list
+    const text = `version: 1
+project: fx
+apps:
+  web:
+    description: web
+    run: npm run dev
+    port: &p 3000
+  spare:
+    description: not running
+    run: npm run dev
+    watch_delay: *p
 `;
     const { dir, file } = project(text);
     const err = await adoptPorts(fakeFleet(dir).fleet).catch((e) => e);
     expect(err).toMatchObject({ code: 'MANIFEST_INVALID' });
     expect(err.message).toBe(
-      `adopting the ports would make ${file} invalid, so nothing was written: apps.spare.port: Expected number, received array`
+      `adopting the ports would make ${file} invalid, so nothing was written: apps.spare.watch_delay: Expected number, received array`
     );
     expect(fs.readFileSync(file, 'utf8')).toBe(text);
   });
