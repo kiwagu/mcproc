@@ -948,6 +948,54 @@ describe('waitFor: reloaded', () => {
       observed: 'last line: warming up',
     });
   });
+  it('a burst still open at the deadline is named in what was observed: a reload in progress, not none', async () => {
+    const h = harness([], [online]);
+    const f = timedFollower(h.deps.now, [
+      {
+        at: 3000,
+        out: [vite('03.000', 'a.ts'), vite('03.004', 'b.ts')],
+      },
+    ]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: {
+        ...h.deps,
+        follower: () => f,
+        sleep: (ms: number) => h.deps.sleep(f.cut(ms)),
+      },
+      timeoutMs: 4000,
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      until: 'reloaded',
+      waited_ms: 4000,
+      observed:
+        'reload in progress since 2026-10-14T12:00:03.000 (2 lines): [vite] (client) page reload /src/a.ts',
+    });
+    expect(r.reloaded).toBeUndefined();
+  });
+  it('an aborted wait with a burst open names it too', async () => {
+    const ac = new AbortController();
+    const f = fakeFollower([{}, { out: [vite('05.000', 'a.ts')] }]);
+    const h = harness([], [online]);
+    const r = await waitFor(h.ctx, 'api', parseUntil('reloaded'), {
+      deps: {
+        ...h.deps,
+        follower: () => f,
+        sleep: async (ms: number) => {
+          await h.deps.sleep(ms);
+          ac.abort();
+        },
+      },
+      signal: ac.signal,
+    });
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'aborted',
+      observed:
+        'reload in progress since 2026-10-14T12:00:05.000 (1 line): [vite] (client) page reload /src/a.ts',
+    });
+  });
   it('a process that dies meanwhile ends the wait as gone', async () => {
     const f = fakeFollower([{}]);
     const h = harness(

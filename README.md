@@ -281,7 +281,8 @@ Four places show them:
   with its time, its line count and its first restart or rebuild line, else its first line:
   `web: reloaded after 3.0 s (3 lines from 2026-10-14T12:00:01.000): [vite] (client) page reload /src/a.ts`. A server
   whose reload restarts it may print its new `listening` line more than 2 s later, after the reload was answered: wait
-  until `listening` next.
+  until `listening` next. A wait that times out or is aborted while a reload is still under way says so, with `ok`
+  false: `reload in progress since 2026-10-14T12:00:59.000 (2 lines): [tsx] change in src/a.ts Restarting...`.
 - `incidents` with `include_reloads: true` (`mcproc incidents --reloads`) adds one `reloaded` incident per app with
   the reloads since the last call: how many, the first and the last one's time, and the last one's first restart or
   rebuild line, else its first line.

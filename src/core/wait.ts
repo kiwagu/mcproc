@@ -11,7 +11,7 @@ import { createFollower, type LogFollower } from './logfollow.js';
 import { bodyOf, repeatsARepeat } from './incidents/detect.js';
 import { stripAnsi } from './logs.js';
 import type { App, Dep } from './manifest.js';
-import { compileReloadRules, ReloadTracker } from './reloads.js';
+import { compileReloadRules, type Reload, ReloadTracker } from './reloads.js';
 import { fmtPorts } from '../mcp/render.js';
 
 export type Until =
@@ -163,6 +163,10 @@ interface LogRun {
   ) => WaitResult;
 }
 
+/** What a reloaded wait saw when it ends with a burst still open: a reload under way, not the absence of one. */
+const inProgress = (r: Reload): string =>
+  `reload in progress${r.time ? ` since ${r.time}` : ''} (${r.lines} line${r.lines === 1 ? '' : 's'}): ${bodyOf(r.line)}`;
+
 /**
  * log:/idle:/reloaded sit on the log follower, which takes its position at the end of both files: nothing written
  * before that is searched, and a quiet period counts from that moment (or from the last byte since). Lines read in a
@@ -170,7 +174,7 @@ interface LogRun {
  * seconds, and once more when the quiet period of idle: ends. reloaded feeds every line to a reload tracker and
  * answers with the first reload it closes: a later marker closes a burst at once, quiet closes it RELOAD_GAP_MS after
  * its last marker arrived, so the tick's sleep is cut to that moment. A re-listen line counts from its first burst:
- * the app's boot was before the call.
+ * the app's boot was before the call. A wait that times out or is aborted with a burst open says so in `observed`.
  */
 async function waitOnLogs(
   ctx: Context,
@@ -208,6 +212,11 @@ async function waitOnLogs(
     let lastChange = lastCheck;
     let lastLine: string | undefined;
     let seen = { out: f.offsets.out, err: f.offsets.err };
+    /** what the wait ends with when the condition is unmet: the reload under way, else what was last seen */
+    const unmet = (observed: string): string => {
+      const r = tracker?.pending();
+      return r ? inProgress(r) : observed;
+    };
     for (;;) {
       const { lines, reset } = await f.poll();
       let now = deps.now();
@@ -253,7 +262,7 @@ async function waitOnLogs(
         if (!p || !notDead(p.status)) return run.gone(p, observed);
         now = deps.now(); // the check took a login shell, more over ssh: do not sleep from the time before it
       }
-      if (now >= run.deadline) return run.giveUp('timeout', p, observed);
+      if (now >= run.deadline) return run.giveUp('timeout', p, unmet(observed));
       // the next tick, cut to the deadline, the next status check and the end of the quiet period
       const sleeps = [
         LOG_TICK_MS,
@@ -272,7 +281,7 @@ async function waitOnLogs(
         tick = null;
       }
       woken = false;
-      if (signal?.aborted) return run.giveUp('aborted', p, observed);
+      if (signal?.aborted) return run.giveUp('aborted', p, unmet(observed));
     }
   } finally {
     signal?.removeEventListener('abort', onAbort);

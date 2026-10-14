@@ -328,6 +328,22 @@ describe('ReloadTracker', () => {
       }),
     ]);
   });
+  it('pending shows the open burst without closing it; null with none open or when it would be the boot', () => {
+    const t = new ReloadTracker(rules, opts);
+    expect(t.pending()).toBeNull();
+    t.push([out(`${T('10')}[vite] (client) page reload /a.js`)], 1_000);
+    const open = expect.objectContaining({
+      lines: 1,
+      time: '2026-10-14T12:00:10.000',
+    });
+    expect(t.pending()).toEqual(open);
+    expect(t.pending()).toEqual(open); // still open
+    expect(t.flush()).toEqual([open]);
+    expect(t.pending()).toBeNull();
+    const boot = new ReloadTracker(rules, { ...opts, coversStart: true });
+    boot.push([out(`${T('10')}api listening on 3010`)], 1_000);
+    expect(boot.pending()).toBeNull();
+  });
   it('drops the boot burst when it covers the start, and ignores lines before the start', () => {
     const t = new ReloadTracker(rules, {
       app: 'api',

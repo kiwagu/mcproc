@@ -407,6 +407,15 @@ export class ReloadTracker {
     return this.open ? this.openWall + RELOAD_GAP_MS : null;
   }
 
+  /**
+   * The open burst as the reload it makes once closed, without closing it: null with no burst open, or when it would
+   * be dropped as the boot.
+   */
+  pending(): Reload | null {
+    const b = this.open;
+    return b && !(this.bootPending && b.relistenOnly) ? reloadOf(b) : null;
+  }
+
   /** Whether the next burst to close is still taken for the boot when it is only `listening` lines: none has closed yet. */
   get awaitingBoot(): boolean {
     return this.bootPending;
