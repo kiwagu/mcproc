@@ -85,12 +85,18 @@ export interface FileRead {
   anchor: Anchor | null;
 }
 
-/** One file's section of the read script's output: its lines (escapes removed), how many are context, where to go on. */
+/**
+ * One file's section of the read script's output: its lines, how many are context, where to go on. `clean` turns a raw
+ * line into the text kept: by default every escape is removed (incidents match plain text); a terminal reader passes
+ * keepSgr to keep the colors.
+ */
 export function parseRead(
   stdout: string,
   id: number,
-  offset: number | null
+  offset: number | null,
+  opts: { clean?: (line: string) => string } = {}
 ): FileRead | null {
+  const clean = opts.clean ?? stripAnsi;
   const mark = `__MCPROC_INC_${id}__\n`;
   const at = stdout.indexOf(mark);
   if (at < 0) return null;
@@ -117,7 +123,7 @@ export function parseRead(
     pos += Buffer.byteLength(raw, 'utf8') + 1;
     if (lineStart === 0 && ctxStart > 0) continue; // the read began mid-line: that head is only a fragment
     if (lineStart < ctxBytes) contextOnly++;
-    lines.push(stripAnsi(raw));
+    lines.push(clean(raw));
   }
   const skipped =
     offset !== null && offset >= 0 && size >= offset

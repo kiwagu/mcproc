@@ -54,6 +54,17 @@ export interface HostClock {
   zone: string;
 }
 
+/** Asks the host for its wall clock and UTC offset in one line; `hostClock` reads it back from the script's output. */
+export const CLOCK_SNIPPET = `echo "__MCPROC_LS_CLOCK__ $(date '+%Y-%m-%dT%H:%M:%S %z' 2>/dev/null)"`;
+/** null when the marker is missing or garbled (a host whose `date` printed nothing or another shape). */
+export const hostClock = (stdout: string): HostClock | null => {
+  const m =
+    /__MCPROC_LS_CLOCK__ (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d) ([+-]\d{4})/.exec(
+      stdout
+    );
+  return m ? { now: m[1], zone: m[2] } : null;
+};
+
 /** A wall-clock instant held as if it were UTC, in pm2's millisecond stamp shape. */
 const wallStamp = (ms: number): string =>
   new Date(ms).toISOString().slice(0, 23);

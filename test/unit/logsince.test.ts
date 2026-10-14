@@ -5,6 +5,7 @@ import {
   stampMs,
   selectSince,
   mergeLines,
+  hostClock,
   MAX_RELATIVE_MS,
   type SinceLine,
 } from '../../src/core/logsince.js';
@@ -217,5 +218,15 @@ describe('mergeLines', () => {
     const c = mergeLines(r.lines, 2);
     expect(c.lines.map((l) => l.text)).toEqual(['a1-cont', 'w1']);
     expect(c.truncated).toBe(3);
+  });
+});
+
+describe('hostClock', () => {
+  it('reads now and zone from the clock marker; null when absent or garbled', () => {
+    expect(
+      hostClock('x\n__MCPROC_LS_CLOCK__ 2026-10-14T09:30:00 +0200\ny')
+    ).toEqual({ now: '2026-10-14T09:30:00', zone: '+0200' });
+    expect(hostClock('__MCPROC_LS_CLOCK__ \n')).toBeNull();
+    expect(hostClock('nothing')).toBeNull();
   });
 });

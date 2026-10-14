@@ -12,6 +12,7 @@ import {
   windowStart,
   type CursorState,
 } from '../../src/core/incidents/cursor.js';
+import { keepSgr } from '../../src/core/logs.js';
 
 /** Runs the real read snippet with sh against a temp file: what the host would print. */
 function read(content: string | Buffer, offset: number | null) {
@@ -122,6 +123,14 @@ describe('read snippet + parseRead', () => {
   it('colors and other escapes are removed from the lines', () => {
     const r = read('\x1b[31mERROR: red\x1b[0m\n', 0);
     expect(r.lines).toEqual(['ERROR: red']);
+  });
+  it('parseRead strips every escape by default and keeps colors with a clean option', () => {
+    const body = '\x1b[32mgreen\x1b[0m \x1b]0;title\x07x\n';
+    const out = `__MCPROC_INC_0__\n${Buffer.byteLength(body)} 0 0 ${'a'.repeat(32)}\n${body}`;
+    expect(parseRead(out, 0, null)!.lines).toEqual(['green x']);
+    expect(parseRead(out, 0, null, { clean: keepSgr })!.lines).toEqual([
+      '\x1b[32mgreen\x1b[0m x',
+    ]);
   });
   it('an empty or missing file is no lines and no error', () => {
     expect(read('', 0)).toMatchObject({ lines: [], nextOffset: 0 });
