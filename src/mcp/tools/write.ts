@@ -10,6 +10,7 @@ import { Fleet, defaultConnector, actOn, type Act } from '../../core/fleet.js';
 import type { WaitRecord } from '../../core/actions.js';
 import { clearLogs } from '../../core/incidents/store.js';
 import { initProject } from '../../core/init.js';
+import { adoptPorts } from '../../core/adopt.js';
 import type { LsRow } from '../../core/list.js';
 import { createTransport } from '../../transport/index.js';
 import { unpack, defaultUnpackDeps } from '../../runtime/unpack.js';
@@ -17,6 +18,7 @@ import {
   renderUnpack,
   renderFlushed,
   renderMutation,
+  renderAdopted,
   hostsOf,
 } from '../render.js';
 
@@ -64,15 +66,25 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Init manifest draft',
       description:
-        'Create .mcproc/ (gitignored) with a manifest DRAFT discovered from package.json scripts, workspaces, nx project.json, turbo.json, ecosystem.json and Procfile. Candidates are commented out: uncomment, write descriptions, then verify with start + ls. Refuses to overwrite an existing manifest without force.',
+        'Create .mcproc/ (gitignored) with a manifest DRAFT discovered from package.json scripts, workspaces, nx project.json, turbo.json, ecosystem.json and Procfile. Candidates are commented out: uncomment, write descriptions, then verify with start + ls. Refuses to overwrite an existing manifest without force. With adopt_ports, instead write the ports ls reports as undeclared for the running apps into the existing manifest (comments kept) and return the diff; force is ignored then.',
       inputSchema: {
         project: commonInput.project,
         force: z.boolean().optional(),
+        adopt_ports: z.boolean().optional(),
       },
       annotations: MUT(true, true), // with force it replaces the manifest
     },
     (args) =>
       runTool(async () => {
+        if (args.adopt_ports) {
+          const r = await adoptPorts(await fleetOf(args));
+          const { text, failed } = renderAdopted(r);
+          return {
+            text,
+            data: r as unknown as Record<string, unknown>,
+            isError: failed,
+          };
+        }
         const root = resolveProjectDir(
           args.project ?? deps.project,
           await deps.roots()

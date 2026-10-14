@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer, INSTRUCTIONS } from '../../src/mcp/server.js';
+import { loadManifest } from '../../src/core/manifest.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { probeOut } from '../helpers/probe.js';
 import { S, answerReads } from '../helpers/incidents.js';
@@ -116,6 +117,8 @@ describe('mcp server', () => {
       'since your previous logs call over those apps in this session'
     );
     expect(INSTRUCTIONS).toContain('since');
+    expect(byName.init.description).toContain('adopt_ports');
+    expect(INSTRUCTIONS).toContain('init adopt_ports');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -502,6 +505,76 @@ describe('mcp server', () => {
       fs.readFileSync(path.join(dir, '.mcproc', '.gitignore'), 'utf8')
     ).toBe('*\n');
     expect(r.structuredContent.candidates).toBe(1);
+  });
+  it('init adopt_ports writes the undeclared ports of the running apps into the manifest, ignores force, and skips ephemeral ones', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-adopt-'));
+    try {
+      fs.cpSync(basic, dir, { recursive: true });
+      const file = path.join(dir, '.mcproc', 'mcproc.yaml');
+      const before = fs.readFileSync(file, 'utf8');
+      const fx = (f: string) =>
+        fs.readFileSync(path.join(here, '..', 'fixtures', 'probe', f), 'utf8');
+      const jlist = JSON.stringify([
+        {
+          pid: 69265,
+          name: 'demo-api',
+          pm_id: 0,
+          pm2_env: { status: 'online', namespace: 'demo' },
+        },
+      ]);
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes(MARK.JLIST))
+          return {
+            code: 0,
+            stdout: probeOut({
+              jlist,
+              ps: fx('ps.txt'),
+              // api holds its declared 3310, an undeclared 3311, and (in ss-udp.txt) the ephemeral 41234
+              tcp: `${fx('ss-tcp.txt')}LISTEN 0      511                *:3311        *:*    users:(("node",pid=69265,fd=23))\n`,
+              udp: fx('ss-udp.txt'),
+            }),
+            stderr: '',
+          };
+        if (cmd.includes('bin/pm2'))
+          return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+        return { code: 1, stdout: '', stderr: 'unexpected' };
+      };
+      const cl = await client(spawner);
+      const r: any = await cl.callTool({
+        name: 'init',
+        arguments: { project: dir, adopt_ports: true, force: true },
+      });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent.written).toBe(true);
+      expect(r.structuredContent.adopted).toEqual([
+        { app: 'api', host: 'local', ports: [3311] },
+      ]);
+      expect(r.structuredContent.skipped).toEqual([
+        { app: 'api', host: 'local', ports: [41234], reason: 'ephemeral' },
+      ]);
+      expect(text(r)).toContain('api: adopted 3311');
+      expect(text(r)).toContain('api: skipped 41234 (ephemeral)');
+      expect(text(r)).toContain('+    ports: [3310, 3311]');
+      expect(loadManifest(dir).apps.api.ports).toEqual([3310, 3311]);
+      // force is ignored: the hand-written manifest was edited, not replaced by a draft
+      expect(fs.readFileSync(file, 'utf8')).toBe(
+        before.replace('    port: 3310\n', '    ports: [3310, 3311]\n')
+      );
+      const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-empty-'));
+      try {
+        const n: any = await cl.callTool({
+          name: 'init',
+          arguments: { project: empty, adopt_ports: true },
+        });
+        expect(n.isError).toBe(true);
+        expect(text(n)).toContain('MANIFEST_NOT_FOUND');
+      } finally {
+        fs.rmSync(empty, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('unpack refuses readonly hosts first and runs end to end over a fake ssh host', async () => {
     const ro = await (await client(neverSpawn)).callTool({

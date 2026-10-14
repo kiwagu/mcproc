@@ -27,10 +27,11 @@ Every tool also accepts an explicit `project` path.
 
 ```bash
 cd my-project
-mcproc init          # writes .mcproc/ (gitignored) with a manifest DRAFT discovered from your scripts
-$EDITOR .mcproc/mcproc.yaml   # uncomment the apps you need, write a description for each
+mcproc init          # writes .mcproc/ (gitignored) with a manifest draft: on a turbo repo the dev task's apps are live, the rest commented out
+$EDITOR .mcproc/mcproc.yaml   # write a description for each app; uncomment what else you need
 mcproc start base    # or an app name, or "all"
 mcproc ls            # status, pid, uptime and real vs declared ports
+mcproc init --adopt-ports   # write the ports ls shows as undeclared into the manifest
 mcproc logs api -n 200
 mcproc logs base --since 2m    # every app of a profile, merged by time stamp
 mcproc doctor        # why a host cannot be driven, and what to do
@@ -100,6 +101,26 @@ than pm2's kill timeout (1.6 s by default) to exit after SIGINT, whether it igno
 slowly, is killed with SIGKILL and also reads `done`. The host shell must be POSIX (`bash` or `sh`): the default shell and the
 documented `/bin/sh -c` both are. pm2 keeps no exit time, so UPTIME stays `-`. `start` on a done or failed task runs
 it again. `init` drafts `build`, `migrate`, `seed` and `once` scripts as tasks and watch-style commands as `build`.
+
+### Monorepos
+
+On a turbo repo whose `turbo.json` has a persistent `dev` task, `init` drafts the dev stack live: each workspace package
+with a `dev` script becomes an uncommented app named after the package, and together they form the `dev` profile, so
+`start dev` runs them. Their placeholder description, `TODO: what this app does`, lets the manifest load as is until you
+replace it. The root `dev` script, other persistent tasks (under a commented profile) and every other script stay commented.
+
+- Libraries consumed from `dist/` (a `build` script plus `main`, `module`, `types` or an `exports` target under `dist/`)
+  share two apps instead of a `<pkg>-build` each: `libs`, one `turbo run build` over them (`kind: task`), and `libs-watch`,
+  `turbo watch build` once `libs` has completed (turbo 1 has no `turbo watch`, so there `libs` comes alone). A live app
+  that depends on such a library, directly or through other packages, gets `depends_on: [{ app: libs, condition: completed }]`.
+- A library live through its own `dev` watch is drafted as a `build` app and left out of `libs`, so its first build is not
+  awaited: the draft leaves a note on each app that uses it saying how to wait for it.
+- Ports are also guessed (and still marked `port?`) for Next (3000), Vite (`server.port` in `vite.config.*`, or
+  `preview.port` for `vite preview`, as a literal or an env read's fallback; else 5173 or 4173) and `PORT = N` in `src/`.
+- `init --adopt-ports` (MCP: `adopt_ports`) drafts nothing: it writes the ports `ls` reports as undeclared for the running
+  apps into the existing manifest, comments and layout kept, and prints the diff. Ports from 32768 up (the ephemeral range,
+  almost always transient) and ports another app declares are reported, not adopted. It refuses a manifest that marks the
+  local host readonly, and a file that changed while the hosts were probed (`ALREADY_EXISTS`: run it again).
 
 ### Apps on several hosts
 
@@ -218,7 +239,7 @@ needs the session that keeps the marks, so the CLI refuses it.
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking) |
 | `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
-| `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json`, `ecosystem.json`, `Procfile` |
+| `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json` (a turbo repo's dev task drafts live, with a `dev` profile and `libs` / `libs-watch` builders for dist-built libraries), `ecosystem.json`, `Procfile`; `adopt_ports` writes the ports `ls` reports as undeclared into the existing manifest |
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason |
 | `restart`, `stop`, `delete <target>` | by app or profile |
 | `flush [app]` | truncate pm2 log files; incidents start over from there |

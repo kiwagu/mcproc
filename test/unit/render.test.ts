@@ -17,6 +17,7 @@ import {
   fmtDeps,
   renderLogsSince,
   sinceNotes,
+  renderAdopted,
 } from '../../src/mcp/render.js';
 import type { LsRow } from '../../src/core/list.js';
 import type { PortCheck } from '../../src/core/ports.js';
@@ -689,5 +690,65 @@ describe('renderLogsSince', () => {
     expect(renderLogsSince({ ...empty, not_started: ['api', 'web'] })).toBe(
       'no log lines since 2026-10-14T09:28:30.000 (local time) (2 apps on 1 host)\nnot started: api, web'
     );
+  });
+});
+
+describe('renderAdopted', () => {
+  const r = {
+    path: '/p/.mcproc/mcproc.yaml',
+    written: true,
+    adopted: [
+      { app: 'web', host: 'local', ports: [3001] },
+      { app: 'remote', host: 'box', ports: [9000, 9001] },
+    ],
+    skipped: [
+      { app: 'api', host: 'local', ports: [45000], reason: 'ephemeral' },
+      { app: 'tool', host: 'local', ports: [3000], reason: 'declared by web' },
+      { app: 'far', host: 'box', ports: [40000], reason: 'ephemeral' },
+    ],
+    errors: [
+      {
+        host: 'stand',
+        apps: ['svc'],
+        message: 'TRANSPORT_FAILED: ssh stand: Connection refused',
+      },
+    ],
+    diff: [' apps:', '-    port: 3000', '+    ports: [3000, 3001]', '   api:'],
+  };
+  it('adopted and skipped lines, host errors, then the diff', () => {
+    const { text, failed } = renderAdopted(r);
+    expect(text.split('\n')).toEqual([
+      'web: adopted 3001',
+      'remote: adopted 9000, 9001 (box)',
+      'api: skipped 45000 (ephemeral)',
+      'tool: skipped 3000 (declared by web)',
+      'far: skipped 40000 (ephemeral) (box)',
+      'stand not read (svc): TRANSPORT_FAILED: ssh stand: Connection refused',
+      'written /p/.mcproc/mcproc.yaml:',
+      ' apps:',
+      '-    port: 3000',
+      '+    ports: [3000, 3001]',
+      '   api:',
+    ]);
+    expect(failed).toBe(true);
+  });
+  it('nothing written: the skipped lines and host errors alone; the nothing-to-adopt line only when there is nothing at all', () => {
+    const none = { ...r, written: false, adopted: [], diff: [] };
+    expect(renderAdopted({ ...none, errors: [] })).toEqual({
+      text: [
+        'api: skipped 45000 (ephemeral)',
+        'tool: skipped 3000 (declared by web)',
+        'far: skipped 40000 (ephemeral) (box)',
+      ].join('\n'),
+      failed: false,
+    });
+    expect(renderAdopted({ ...none, skipped: [] })).toEqual({
+      text: 'stand not read (svc): TRANSPORT_FAILED: ssh stand: Connection refused',
+      failed: true,
+    });
+    expect(renderAdopted({ ...none, skipped: [], errors: [] })).toEqual({
+      text: 'nothing to adopt: every port the running apps hold is declared',
+      failed: false,
+    });
   });
 });

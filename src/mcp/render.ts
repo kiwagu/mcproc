@@ -7,6 +7,7 @@ import type { Cleared, TakenAnswer } from '../core/incidents/store.js';
 import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
+import type { AdoptResult } from '../core/adopt.js';
 import { formatLine } from '../core/logstream.js';
 import { shq } from '../transport/quote.js';
 
@@ -443,4 +444,30 @@ export function renderMutation(
     text: head + renderLs(rows, fallback) + notes.map((n) => `\n${n}`).join(''),
     failed: bad.length > 0,
   };
+}
+
+/** One line per adopted or skipped app, the hosts not read, then the written file and its diff; `failed` when a host was not read. */
+export function renderAdopted(r: AdoptResult): {
+  text: string;
+  failed: boolean;
+} {
+  const at = (h: string) => (h === 'local' ? '' : ` (${h})`);
+  const lines = [
+    ...r.adopted.map(
+      (a) => `${a.app}: adopted ${a.ports.join(', ')}${at(a.host)}`
+    ),
+    ...r.skipped.map(
+      (s) =>
+        `${s.app}: skipped ${s.ports.join(', ')} (${s.reason})${at(s.host)}`
+    ),
+    ...r.errors.map(
+      (e) => `${e.host} not read (${e.apps.join(', ')}): ${e.message}`
+    ),
+  ];
+  if (r.written) lines.push(`written ${r.path}:`, ...r.diff);
+  else if (lines.length === 0)
+    lines.push(
+      'nothing to adopt: every port the running apps hold is declared'
+    );
+  return { text: lines.join('\n'), failed: r.errors.length > 0 };
 }
