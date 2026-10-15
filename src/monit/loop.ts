@@ -8,6 +8,7 @@ import {
 import { findProcess } from '../core/pm2.js';
 import { assertWritable, pickHost, type Context } from '../core/resolve.js';
 import {
+  actOn,
   assertWritableRuns,
   type Fleet,
   type HostApps,
@@ -73,6 +74,15 @@ export interface LoopDeps {
 }
 
 export { describeError };
+
+/**
+ * What `R` twice runs (the screen's `reloadAll` dep): `start all --reload` over the view's fleet, so every app in
+ * dependency order with its waits; running apps restart, stopped ones start, tasks run again. `signal` ends the waits.
+ */
+export const reloadView = (
+  fleet: Fleet,
+  signal: AbortSignal
+): Promise<LsRow[]> => actOn(fleet, 'all', 'start', { reload: true, signal });
 
 /** One followed app's reloads since its pm2 start: the run it counts (its start and restarts) and the count so far. */
 interface Counter {
@@ -487,33 +497,54 @@ export class MonitLoop {
     }
   }
 
-  async runCommand(cmd: Cmd, app: string): Promise<void> {
+  /**
+   * One change made from the screen. While it runs: busy, and `<label>…` in the footer. The guard runs first, so a
+   * refusal touches nothing. Then the change, then a refresh of `hosts`, and only then how it ended, together with busy
+   * off: the footer never says done while keys are still refused. When the screen goes away meanwhile, nothing is shown
+   * or refreshed.
+   */
+  private async step(o: {
+    label: string;
+    guard: () => void;
+    act: () => Promise<LsRow[] | undefined>;
+    /** the hosts the change touched */
+    hosts: () => string[];
+  }): Promise<void> {
     this.dispatch({ type: 'busy', busy: true });
-    this.dispatch({ type: 'notice', message: `${cmd} ${app}…` });
+    this.dispatch({ type: 'notice', message: `${o.label}…` });
     try {
-      // the actions do not check by themselves: the CLI and the MCP tools guard, so must the screen — on the app's own host
-      const host = this.fleet.hostOf(app);
-      assertWritable(pickHost(this.fleet.manifest, host));
-      const bad = (
-        (await this.deps.command(this.fleet, cmd, app)) ?? []
-      ).filter((r) => r.error);
+      o.guard();
+      const bad = ((await o.act()) ?? []).filter((r) => r.error);
+      if (this.closed) return;
+      await this.refreshAfterCurrent(o.hosts());
       // a dependency may have started on one host while the app itself failed on another: never report that as done
       this.dispatch({
         type: 'notice',
         message: bad.length
-          ? `${cmd} ${app} partly failed: ${bad[0].app} (${bad[0].host}): ${bad[0].error}`
-          : `${cmd} ${app}: done`,
+          ? `${o.label} partly failed: ${bad[0].app} (${bad[0].host}): ${bad[0].error}`
+          : `${o.label}: done`,
       });
-      await this.refreshAfterCurrent([host]);
     } catch (e) {
-      // a notice, not an `error`: the next good refresh clears errors within the interval, but a failed command must stay readable
+      if (this.closed) return;
+      // a notice, not an `error`: the next good refresh clears errors within the interval, but a failed change must stay readable
       this.dispatch({
         type: 'notice',
-        message: `${cmd} ${app} failed: ${describeError(e)}`,
+        message: `${o.label} failed: ${describeError(e)}`,
       });
     } finally {
       this.dispatch({ type: 'busy', busy: false });
     }
+  }
+
+  runCommand(cmd: Cmd, app: string): Promise<void> {
+    return this.step({
+      label: `${cmd} ${app}`,
+      // the actions do not check by themselves: the CLI and the MCP tools guard, so must the screen — on the app's own host
+      guard: () =>
+        assertWritable(pickHost(this.fleet.manifest, this.fleet.hostOf(app))),
+      act: () => this.deps.command(this.fleet, cmd, app),
+      hosts: () => [this.fleet.hostOf(app)],
+    });
   }
 
   /**
@@ -528,31 +559,15 @@ export class MonitLoop {
     const hosts = this.groups.map((g) => g.host);
     const abort = new AbortController();
     this.reloading = abort;
-    this.dispatch({ type: 'busy', busy: true });
-    this.dispatch({ type: 'notice', message: 'reload all…' });
     try {
-      assertWritableRuns(fleet, fleet.runs(names), names);
-      const bad = (
-        (await this.deps.reloadAll(fleet, abort.signal)) ?? []
-      ).filter((r) => r.error);
-      if (this.closed) return; // the screen is gone: nothing to show, nothing to refresh
-      this.dispatch({
-        type: 'notice',
-        message: bad.length
-          ? `reload all partly failed: ${bad[0].app} (${bad[0].host}): ${bad[0].error}`
-          : 'reload all: done',
-      });
-      await this.refreshAfterCurrent(hosts);
-    } catch (e) {
-      if (this.closed) return;
-      // a notice, as for one app's command: the next good refresh clears errors, a failed reload must stay readable
-      this.dispatch({
-        type: 'notice',
-        message: `reload all failed: ${describeError(e)}`,
+      await this.step({
+        label: 'reload all',
+        guard: () => assertWritableRuns(fleet, fleet.runs(names), names),
+        act: () => this.deps.reloadAll(fleet, abort.signal),
+        hosts: () => hosts,
       });
     } finally {
       if (this.reloading === abort) this.reloading = null;
-      this.dispatch({ type: 'busy', busy: false });
     }
   }
 
@@ -614,14 +629,15 @@ export class MonitLoop {
       const kept = failed.length
         ? `; could not truncate ${failed.join(', ')} (its incidents go on from before)`
         : '';
-      this.dispatch({
-        type: 'notice',
-        message: `cleared logs of ${go.join(', ')} (${fmtBytes(freed)}); incidents start here${skipped}${kept}`,
-      });
       this.readCleared(); // the store counted the clear: the apps whose files emptied start over
       await this.refreshAfterCurrent([
         ...new Set(go.map((a) => this.fleet.hostOf(a))),
       ]);
+      // shown once the refresh is done, together with busy off: never "cleared" while keys are still refused
+      this.dispatch({
+        type: 'notice',
+        message: `cleared logs of ${go.join(', ')} (${fmtBytes(freed)}); incidents start here${skipped}${kept}`,
+      });
     } catch (e) {
       this.dispatch({
         type: 'notice',

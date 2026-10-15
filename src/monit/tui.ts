@@ -21,7 +21,7 @@ import {
   type Frame,
 } from './frame.js';
 import { colorFor } from '../core/logstream.js';
-import { MonitLoop, type LoopDeps } from './loop.js';
+import { MonitLoop, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 
@@ -31,8 +31,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   rows: rowsFor,
   follower: createFollower,
   command: (fleet, cmd, app) => actOn(fleet, app, cmd),
-  reloadAll: (fleet, signal) =>
-    actOn(fleet, 'all', 'start', { reload: true, signal }),
+  reloadAll: reloadView,
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
     const s = readStore(storePath(fleet.manifest.path));

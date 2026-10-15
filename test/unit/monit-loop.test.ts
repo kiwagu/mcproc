@@ -1401,6 +1401,62 @@ describe('MonitLoop reload all', () => {
     expect(notices(h)).toEqual(['reload all…', 'reload all: done']);
   });
 
+  it('a reload, a command or a clear says how it ended only once the refresh after it is done, together with busy off', async () => {
+    let gate: ReturnType<typeof deferred<void>> | null = null;
+    const acted: string[] = [];
+    const h = harness(undefined, {
+      reloadAll: async () => {
+        acted.push('reload');
+        return [];
+      },
+      command: async (_f, cmd, app) => {
+        acted.push(`${cmd} ${app}`);
+        return [];
+      },
+      clear: async (_f, apps) => {
+        acted.push(`clear ${apps.join(',')}`);
+        return apps.map((app) => ({
+          app,
+          host: 'local',
+          out_bytes: 0,
+          err_bytes: 0,
+        }));
+      },
+      snapshot: async () => {
+        if (gate) await gate.promise; // the refresh after the change hangs, as on a slow host
+        return snap();
+      },
+    });
+    await h.loop.refresh();
+    const cases: [() => Promise<void>, string, string, string][] = [
+      [() => h.loop.reloadAll(), 'reload', 'reload all…', 'reload all: done'],
+      [
+        () => h.loop.runCommand('restart', 'api'),
+        'restart api',
+        'restart api…',
+        'restart api: done',
+      ],
+      [
+        () => h.loop.runClear(['api']),
+        'clear api',
+        'clearing logs of api…',
+        'cleared logs of api (0B); incidents start here',
+      ],
+    ];
+    for (const [run, act, during, after] of cases) {
+      gate = deferred<void>();
+      const p = run();
+      for (let i = 0; i < 5; i++) await tick();
+      expect(acted.at(-1)).toBe(act); // the change itself is over; its refresh is not
+      expect(h.state.notice).toBe(during); // so keys are still refused, and the footer says why
+      expect(h.state.busy).toBe(true);
+      gate.resolve();
+      await p;
+      expect(h.state.notice).toBe(after);
+      expect(h.state.busy).toBe(false);
+    }
+  });
+
   it('in the all-hosts view every app is reloaded at its own host; narrowed with h, only the apps of that host', async () => {
     const asked: (string | undefined)[] = [];
     const probes: string[] = [];
