@@ -164,6 +164,8 @@ describe('renderLs with tree metrics', () => {
       ['on box site.test does not resolve', 'not resolved'],
       ['on box: timeout', 'timeout'],
       ['on box: tls', 'tls'],
+      ['on box: reset', 'reset'],
+      ['on box: refused; here: no answer', 'no answer'],
       ['on box site.test resolves to 127.0.1.1, the host itself', 'itself'],
       [
         'on box site.test resolves to 127.0.1.1, the host itself; here: not resolved',
@@ -506,6 +508,57 @@ describe('renderDoctor', () => {
     );
     expect(fmtEnv({ container: 'none', hostname: 'dev', self: [] })).toBe(
       'no container, hostname dev'
+    );
+  });
+  it('a url that resolves to the host itself and answers from this machine says "the host itself" once', () => {
+    const site = (app: string, reason: string) => ({
+      app,
+      url: 'http://site.test/',
+      name: 'site.test',
+      addr: '127.0.1.1',
+      itself: true,
+      check: {
+        status: 'ok' as const,
+        code: 200,
+        from: 'here' as const,
+        reason,
+      },
+    });
+    const t = renderDoctor([
+      {
+        host: 'box',
+        transport: 'ssh box',
+        reachable: true,
+        error: null,
+        node: 'v22.1.0',
+        pm2: null,
+        tools: { ps: true, ss: true, tar: true },
+        pm2_home: null,
+        runtime_dir: '/opt/rt',
+        runtime_present: false,
+        runtime_pm2: null,
+        runtime_node: null,
+        daemon: 'answers',
+        processes: 0,
+        in_namespace: 0,
+        recommendations: [],
+        environment: null,
+        urls: [
+          site(
+            'web',
+            'on box site.test resolves to 127.0.1.1, the host itself'
+          ),
+          site('bare', 'on box: no curl or wget'),
+        ],
+      },
+    ]);
+    const lines = t.split('\n');
+    expect(lines).toContain(
+      '  url web: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200)'
+    );
+    // another reason the host had no answer is still said
+    expect(lines).toContain(
+      '  url bare: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200); on box: no curl or wget'
     );
   });
 });

@@ -220,19 +220,26 @@ export function fmtEnv(e: HostEnv): string {
     e.container === 'none' ? 'no container' : `container (${e.container})`;
   return e.hostname ? `${kind}, hostname ${e.hostname}` : kind;
 }
-/** `localhost → ::1 on box; answers from this machine (200); on box: refused`: after an answer from here, why the host had none */
+/**
+ * `localhost → ::1 on box; answers from this machine (200); on box: refused`: after an answer from here, why the host
+ * had none, unless that reason is the host itself, which the first part already says.
+ */
 function fmtDoctorUrl(host: string, u: DoctorUrl): string {
   const name = u.name ?? u.url;
   const where = `${name} → ${u.addr ?? 'no address'} on ${host}${u.itself ? ', the host itself' : ''}`;
   const c = u.check;
   const code = c.code ?? 'error';
+  const why =
+    c.reason && !(u.itself && reasonWord(c.reason) === 'itself')
+      ? `; ${c.reason}`
+      : '';
   const answers =
     c.status === 'unchecked'
       ? `not checked (${c.reason ?? 'not asked'})`
       : c.status === 'down'
         ? `answers nowhere (${c.reason})`
         : c.from === 'here'
-          ? `answers from this machine (${code})${c.reason ? `; ${c.reason}` : ''}`
+          ? `answers from this machine (${code})${why}`
           : `answers on ${host} (${code})`;
   return `${where}; ${answers}`;
 }

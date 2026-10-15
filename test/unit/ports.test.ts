@@ -214,7 +214,9 @@ describe('probe stats, shared sockets and docker ports', () => {
     expect(u).toContain(
       "curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' 'http://localhost:3100/'"
     ); // -k: a liveness check, self-signed dev certs must not read as down
-    expect(u).toContain('wget -q --no-check-certificate -T 2');
+    expect(u).toContain(
+      "wget -q --no-check-certificate -t 1 -T 2 -O /dev/null 'http://localhost:3100/'"
+    ); // -t 1: GNU wget retries a timed-out request up to 20 times; BusyBox accepts -t and makes one try anyway
     expect(u).toContain("'http://h/it'\\''s'");
   });
   it('probe sections survive a hung docker and a process that exits mid-pass', () => {

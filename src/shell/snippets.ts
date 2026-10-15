@@ -61,7 +61,8 @@ export const ENV_SNIPPET = [
  * and `w<status>:<its stderr on one line>` (BusyBox wget exits 1 for every failure and says why only there); "-" and an
  * empty exit when the host has neither. addr: the first address the url's name resolves to there (an IP literal is
  * itself), empty when it does not resolve or getent is missing. A liveness check, not a trust check: self-signed dev
- * certificates (-k / --no-check-certificate) must not read as down.
+ * certificates (-k / --no-check-certificate) must not read as down. wget makes one try (-t 1): GNU wget otherwise retries
+ * a timed-out request up to 20 times, past the probe's own timeout; BusyBox wget accepts -t and makes one try anyway.
  */
 export function urlCheck(url: string): string {
   const q = shq(url);
@@ -75,7 +76,7 @@ export function urlCheck(url: string): string {
   return [
     `printf '%s\\t' ${q}`,
     `if command -v curl >/dev/null 2>&1; then curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' ${q} 2>/dev/null; printf '\\t%s' "$?"`,
-    `elif command -v wget >/dev/null 2>&1; then e=$(wget -q --no-check-certificate -T 2 -O /dev/null ${q} 2>&1); r=$?; if [ "$r" = 0 ]; then printf '200\\tw0'; else printf '000\\tw%s:%s' "$r" "$(printf '%s' "$e" | tr '\\t\\n\\r' '   ' | cut -c1-200)"; fi`,
+    `elif command -v wget >/dev/null 2>&1; then e=$(wget -q --no-check-certificate -t 1 -T 2 -O /dev/null ${q} 2>&1); r=$?; if [ "$r" = 0 ]; then printf '200\\tw0'; else printf '000\\tw%s:%s' "$r" "$(printf '%s' "$e" | tr '\\t\\n\\r' '   ' | cut -c1-200)"; fi`,
     `else printf '%s\\t' -; fi`,
     `printf '\\t%s\\n' ${addr}`,
   ].join('; ');
