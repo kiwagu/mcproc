@@ -173,6 +173,8 @@ function wgetAttempt(x: string): Attempt {
   const no = (fail: UrlFail): Attempt => ({ answered: false, fail });
   const answer = /HTTP\/[\d.]+ (\d{3})\b/.exec(msg);
   if (answer) return { answered: true, code: Number(answer[1]) };
+  // cut as a whole by `timeout`: 124 from coreutils, 143 (SIGTERM) from BusyBox's, which execs wget in place
+  if (status === 124 || status === 143) return no('timeout');
   // refused and resolve failures before tls: a resolve failure quotes the name, which may itself contain ssl or tls
   if (/refused/i.test(msg)) return no('refused');
   if (/bad address|resolve|not known|name resolution/i.test(msg))

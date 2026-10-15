@@ -463,6 +463,15 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
   };
   const api = async (ctx: Context) => (await listApps(ctx, 'api'))[0];
 
+  it("the probe's time budget grows with the urls it checks: 30 s without, 39 s with one", async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', `${URL}\t200\t0\t::1\n`, r.here);
+    await api(ctx);
+    await snapshot(ctx, { urls: 'none' });
+    expect(ctx.fake.calls.map((c) => c.opts.timeoutMs)).toEqual([
+      39_000, 30_000,
+    ]);
+  });
   it('a url the host answers costs one request there and none from here', async () => {
     const r = recorder({ answered: true, code: 200 });
     const ctx = on('stand', `${URL}\t200\t0\t::1\n`, r.here);

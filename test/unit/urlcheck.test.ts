@@ -253,6 +253,12 @@ describe('hostAttempt', () => {
     expect(hostAttempt(H(0, 'w1:wget: download timed out'))).toEqual(
       no('timeout')
     );
+    // cut as a whole by `timeout 3`: coreutils exits 124; BusyBox's timeout execs wget in place, so it dies by SIGTERM
+    // (143, measured on alpine: `w143:`, the shell's "Terminated" going to the probe's stderr), whatever it said before
+    expect(hostAttempt(H(0, 'w124:'))).toEqual(no('timeout'));
+    expect(hostAttempt(H(0, 'w124'))).toEqual(no('timeout'));
+    expect(hostAttempt(H(0, 'w143:'))).toEqual(no('timeout'));
+    expect(hostAttempt(H(0, 'w143:Terminated'))).toEqual(no('timeout'));
     expect(
       hostAttempt(
         H(0, 'w1:wget: server returned error: HTTP/1.0 404 Not Found')

@@ -11,7 +11,7 @@ import {
   settleUrls,
   type UrlResult,
 } from './urlcheck.js';
-import { MARK, urlName, urlSection } from '../shell/snippets.js';
+import { MARK, urlBudgetMs, urlName, urlSection } from '../shell/snippets.js';
 import { shq } from '../transport/quote.js';
 import { createTransport, ensureOk } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
@@ -194,11 +194,10 @@ export async function doctorHost(
 }
 
 /**
- * The bound on doctor's url round trip: its base, plus each url's own bounds (a 2 s lookup, a 2 s request), so a host
- * whose resolver hangs, which is what doctor is there to show, still answers; never more than two minutes.
+ * The bound on doctor's url round trip: its base, plus the bounds of the environment section and of each url, so a
+ * host whose resolver hangs, which is what doctor is there to show, still answers; never more than two minutes.
  */
-const urlStepMs = (urls: number): number =>
-  Math.min(15_000 + 4_000 * urls, 120_000);
+const urlStepMs = (urls: number): number => urlBudgetMs(15_000, urls, true);
 
 /**
  * The host's environment and where the urls of its apps answer: those bound to it, plus on local the unbound ones,

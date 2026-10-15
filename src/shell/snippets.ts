@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { shq } from '../transport/quote.js';
+import { DEFAULT_TIMEOUT_MS } from '../transport/index.js';
 
 /** The host name of a url, as a host resolves it (IPv6 brackets removed); null when the url does not parse. */
 export function urlName(url: string): string | null {
@@ -45,6 +46,41 @@ export const RSS_AWK = `awk '/^Pid:/{ p=$2 } /^VmRSS:/{ print p, $2 }'`;
 const bounded = (secs: number, cmd: string): string =>
   `if command -v timeout >/dev/null 2>&1; then timeout ${secs} ${cmd}; else ${cmd}; fi`;
 
+/** Seconds each of the environment section's two lookups (its own name, `hostname -i`) may take on the host. */
+const ENV_LOOKUP_S = 2;
+/** Seconds a url's name lookup may take on the host. */
+const URL_LOOKUP_S = 2;
+/** Seconds curl may take for a url (-m). */
+const URL_CURL_S = 2;
+/** Seconds wget may take for a url, as a whole: its -T bounds each phase, not a body that streams on or its own resolver. */
+const URL_WGET_S = 3;
+/** The most one url check adds to a round trip: its lookup, then curl or wget, whichever may take longer. */
+const URL_CHECK_MS = (URL_LOOKUP_S + Math.max(URL_CURL_S, URL_WGET_S)) * 1000;
+/** The most the environment section adds to a round trip: its two lookups. */
+const ENV_MS = 2 * ENV_LOOKUP_S * 1000;
+/** No round trip that checks urls waits longer than this, however many urls it checks. */
+const URL_BUDGET_CAP_MS = 120_000;
+
+/**
+ * The time budget of a round trip that checks `urls` urls on the host: `base`, plus the bounds of the environment
+ * section (asked with any url, or always with `env`) and of each url, so a host whose resolver drops packets still
+ * answers; never more than URL_BUDGET_CAP_MS. These bounds hold where the host has `timeout`.
+ */
+export function urlBudgetMs(
+  base: number,
+  urls: number,
+  env = urls > 0
+): number {
+  return Math.min(
+    base + (env ? ENV_MS : 0) + URL_CHECK_MS * urls,
+    URL_BUDGET_CAP_MS
+  );
+}
+
+/** The probe's time budget: the transport's default, grown by the urls it checks. */
+export const probeTimeoutMs = (urls: number): number =>
+  urlBudgetMs(DEFAULT_TIMEOUT_MS, urls);
+
 /**
  * The host about itself, next to its url checks: whether it is a container, its hostname, and the addresses its own
  * name resolves to (127.0.0.1 and ::1 always), so a url whose name resolves to one of them reads "the host itself".
@@ -53,7 +89,7 @@ export const ENV_SNIPPET = [
   `echo ${MARK.ENV}`,
   `c=none; if [ -f /.dockerenv ]; then c=docker; elif [ -f /run/.containerenv ]; then c=podman; elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || grep -q '/lxc' /proc/1/cgroup 2>/dev/null; then c=lxc; elif grep -q '/docker' /proc/1/cgroup 2>/dev/null; then c=docker; fi; echo "container $c"`,
   `h=$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null); echo "hostname $h"`,
-  `echo "self $(${bounded(2, 'getent hosts "$h" 2>/dev/null')} | awk '{print $1}' | tr '\\n' ' ')$(${bounded(2, 'hostname -i 2>/dev/null')}) 127.0.0.1 ::1"`,
+  `echo "self $(${bounded(ENV_LOOKUP_S, 'getent hosts "$h" 2>/dev/null')} | awk '{print $1}' | tr '\\n' ' ')$(${bounded(ENV_LOOKUP_S, 'hostname -i 2>/dev/null')}) 127.0.0.1 ::1"`,
 ].join('\n');
 
 /**
@@ -62,7 +98,8 @@ export const ENV_SNIPPET = [
  * empty exit when the host has neither. addr: the first address the url's name resolves to there (an IP literal is
  * itself), empty when it does not resolve or getent is missing. A liveness check, not a trust check: self-signed dev
  * certificates (-k / --no-check-certificate) must not read as down. wget makes one try (-t 1): GNU wget otherwise retries
- * a timed-out request up to 20 times, past the probe's own timeout; BusyBox wget accepts -t and makes one try anyway.
+ * a timed-out request up to 20 times; BusyBox wget accepts -t and makes one try anyway. It is also cut as a whole after
+ * URL_WGET_S, which exits 124 (coreutils timeout) or 143 (BusyBox's, by SIGTERM).
  */
 export function urlCheck(url: string): string {
   const q = shq(url);
@@ -72,11 +109,11 @@ export function urlCheck(url: string): string {
       ? "''"
       : isIP(name) !== 0
         ? shq(name)
-        : `"$(${bounded(2, `getent hosts ${shq(name)} 2>/dev/null`)} | awk 'NR==1{print $1}')"`;
+        : `"$(${bounded(URL_LOOKUP_S, `getent hosts ${shq(name)} 2>/dev/null`)} | awk 'NR==1{print $1}')"`;
   return [
     `printf '%s\\t' ${q}`,
-    `if command -v curl >/dev/null 2>&1; then curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' ${q} 2>/dev/null; printf '\\t%s' "$?"`,
-    `elif command -v wget >/dev/null 2>&1; then e=$(wget -q --no-check-certificate -t 1 -T 2 -O /dev/null ${q} 2>&1); r=$?; if [ "$r" = 0 ]; then printf '200\\tw0'; else printf '000\\tw%s:%s' "$r" "$(printf '%s' "$e" | tr '\\t\\n\\r' '   ' | cut -c1-200)"; fi`,
+    `if command -v curl >/dev/null 2>&1; then curl -s -k -o /dev/null --connect-timeout 1 -m ${URL_CURL_S} -w '%{http_code}' ${q} 2>/dev/null; printf '\\t%s' "$?"`,
+    `elif command -v wget >/dev/null 2>&1; then e=$(${bounded(URL_WGET_S, `wget -q --no-check-certificate -t 1 -T 2 -O /dev/null ${q} 2>&1`)}); r=$?; if [ "$r" = 0 ]; then printf '200\\tw0'; else printf '000\\tw%s:%s' "$r" "$(printf '%s' "$e" | tr '\\t\\n\\r' '   ' | cut -c1-200)"; fi`,
     `else printf '%s\\t' -; fi`,
     `printf '\\t%s\\n' ${addr}`,
   ].join('; ');

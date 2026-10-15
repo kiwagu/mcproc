@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import {
   MARK,
   probeScript,
+  probeTimeoutMs,
+  urlBudgetMs,
   STAT_AWK,
   RSS_AWK,
   urlCheck,
@@ -67,6 +69,23 @@ describe('probeScript', () => {
       expect(at).toBeLessThan(s.indexOf('echo __MCPROC_PS__'));
       expect(s).toContain("echo __MCPROC_CLOCK__\ndate '+%z' 2>/dev/null");
     }
+  });
+});
+
+describe('the time budget of a round trip that checks urls', () => {
+  it('the probe keeps the transport default without urls, adds the environment and 5 s per url with them, and stops at 120 s', () => {
+    expect(probeTimeoutMs(0)).toBe(30_000);
+    // each url: a 2 s lookup, then curl's 2 s (-m 2) or wget's 3 s, whichever is longer; the environment: two 2 s lookups
+    expect(probeTimeoutMs(1)).toBe(30_000 + 4_000 + 5_000);
+    expect(probeTimeoutMs(11)).toBe(30_000 + 4_000 + 11 * 5_000);
+    expect(probeTimeoutMs(17)).toBe(119_000);
+    expect(probeTimeoutMs(18)).toBe(120_000);
+    expect(probeTimeoutMs(500)).toBe(120_000);
+  });
+  it("doctor's url step: its base, the environment it always asks, 5 s per url, at most 120 s", () => {
+    expect(urlBudgetMs(15_000, 0, true)).toBe(19_000);
+    expect(urlBudgetMs(15_000, 3, true)).toBe(34_000);
+    expect(urlBudgetMs(15_000, 40, true)).toBe(120_000);
   });
 });
 
@@ -214,9 +233,14 @@ describe('probe stats, shared sockets and docker ports', () => {
     expect(u).toContain(
       "curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' 'http://localhost:3100/'"
     ); // -k: a liveness check, self-signed dev certs must not read as down
+    // -t 1: GNU wget retries a timed-out request up to 20 times; BusyBox accepts -t and makes one try anyway. timeout 3:
+    // -T bounds each phase only, so a body that streams on, or a resolver inside wget that hangs, is cut as a whole
     expect(u).toContain(
-      "wget -q --no-check-certificate -t 1 -T 2 -O /dev/null 'http://localhost:3100/'"
-    ); // -t 1: GNU wget retries a timed-out request up to 20 times; BusyBox accepts -t and makes one try anyway
+      "then timeout 3 wget -q --no-check-certificate -t 1 -T 2 -O /dev/null 'http://localhost:3100/' 2>&1"
+    );
+    expect(u).toContain(
+      "else wget -q --no-check-certificate -t 1 -T 2 -O /dev/null 'http://localhost:3100/' 2>&1"
+    );
     expect(u).toContain("'http://h/it'\\''s'");
   });
   it('probe sections survive a hung docker and a process that exits mid-pass', () => {

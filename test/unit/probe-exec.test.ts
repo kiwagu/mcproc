@@ -18,6 +18,7 @@ import {
   parseUrlProbe,
 } from '../../src/core/ports.js';
 import { parseStat, parseRss } from '../../src/core/stats.js';
+import { hostAttempt } from '../../src/core/urlcheck.js';
 import { createTransport } from '../../src/transport/index.js';
 import type { Host } from '../../src/core/manifest.js';
 
@@ -230,6 +231,37 @@ describe('probe script executed on this host', () => {
         exit: null,
         addr: null,
       });
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
+  it('a wget that never finishes is cut as a whole after 3 s where the host has timeout, and reads timeout', () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wget-hang-'));
+    const which = (t: string) =>
+      execFileSync('/bin/sh', ['-c', `command -v ${t}`], {
+        encoding: 'utf8',
+      }).trim();
+    try {
+      for (const t of ['tr', 'cut', 'timeout'])
+        fs.symlinkSync(which(t), path.join(bin, t));
+      // a body that streams on, or a resolver inside wget that hangs: -T 2 bounds neither as a whole
+      fs.writeFileSync(
+        path.join(bin, 'wget'),
+        `#!/bin/sh\nexec ${which('sleep')} 30\n`,
+        { mode: 0o755 }
+      );
+      const t0 = Date.now();
+      const out = execFileSync(
+        '/bin/sh',
+        ['-c', `PATH=${bin}; ${urlCheck('http://127.0.0.1:1/')}`],
+        { encoding: 'utf8', timeout: 25_000 }
+      );
+      const took = Date.now() - t0;
+      expect(took).toBeGreaterThanOrEqual(2_500);
+      expect(took).toBeLessThan(10_000);
+      const line = parseUrlChecks(out).get('http://127.0.0.1:1/')!;
+      expect(line.exit).toMatch(/^w124\b/); // coreutils timeout here; BusyBox's reads w143 (see urlcheck tests)
+      expect(hostAttempt(line)).toEqual({ answered: false, fail: 'timeout' });
     } finally {
       fs.rmSync(bin, { recursive: true, force: true });
     }

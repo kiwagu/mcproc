@@ -438,8 +438,10 @@ Where it is requested from is set per app with `url_check`:
 
 On the `local` host this machine is the host: the url is requested once, whatever `url_check` says. A url the
 host answers costs one request, on the host; the second request is made only for a url the host could not reach.
-On the host each url's name lookup is bounded at 2 s and the host's environment lookups at about 4 s (where it
-has `timeout`), so a host whose resolver drops packets makes `ls` and each poll of `wait until: url-ok` that much slower.
+On the host each url's name lookup is bounded at 2 s, its request at 2 s (3 s with `wget`), and the host's
+environment lookups at about 4 s (where it has `timeout`), so a host whose resolver drops packets makes `ls` and
+each poll of `wait until: url-ok` that much slower. The probe's time budget grows with the number of urls it checks
+to match (30 s, plus 4 s and 5 s per url), up to 120 s.
 
 One catch of `auto`: a `localhost` (or loopback-address) url of an app on a remote host can read `✓ 200 (here)`
 when this machine happens to serve the same port, even while that app is down. `wait` and a `ready` dependency

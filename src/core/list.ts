@@ -24,7 +24,7 @@ import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
-import { MARK, probeScript } from '../shell/snippets.js';
+import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
 export interface LsRow {
@@ -153,6 +153,8 @@ export async function snapshot(
       probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
       {
         env: ctx.pm2.env(),
+        // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
+        timeoutMs: probeTimeoutMs(urls.length),
       }
     ),
     ctx.host,
