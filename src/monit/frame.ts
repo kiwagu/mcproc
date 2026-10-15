@@ -6,8 +6,11 @@ import {
   fmtPorts,
   fmtUptime,
   fmtUrl,
+  incidentLines,
   table,
 } from '../mcp/render.js';
+import type { Incident } from '../core/incidents/detect.js';
+import { DEFAULT_SINCE_MIN } from '../core/incidents/poll.js';
 import {
   selectedRow,
   visibleFlat,
@@ -85,6 +88,13 @@ function paneSpec(
   size: { width: number; height: number }
 ): { entries: object[]; logH: number; rowsOf: (e: object) => string[] } {
   const w = Math.max(40, size.width);
+  if (s.view === 'incidents')
+    return {
+      entries: s.incidents,
+      // header, the pane title, footer, and one line per thing the last read could not do
+      logH: Math.max(3, size.height - 3 - s.incidentsErrors.length),
+      rowsOf: (e) => incidentRows(e as Incident, w),
+    };
   if (s.view === 'flat') {
     const label = Math.max(1, ...Object.keys(s.apps).map((a) => a.length));
     return {
@@ -186,6 +196,19 @@ function cachedRows(
   const rows = make();
   cache.set(entry, { key, rows });
   return rows;
+}
+
+const incidentCache: RowCache = new WeakMap();
+/** An incident's rows as the incidents tool writes it, wrapped to the width; its own line red, each row closing its color. */
+function incidentRows(i: Incident, w: number): string[] {
+  return cachedRows(incidentCache, i, `${w}`, () =>
+    incidentLines(i).flatMap((line) => {
+      const rows = wrapText(screenText(line), w, 4);
+      return line.startsWith('  ▶ ')
+        ? rows.map((r) => `\x1b[31m${r}${RESET}`)
+        : rows;
+    })
+  );
 }
 
 const PM2_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?: /; // seconds, or milliseconds
@@ -295,6 +318,34 @@ export function renderFrame(
   const right = screenText(
     s.error ? `ERROR: ${s.error}` : (s.notice ?? (s.busy ? 'working…' : ''))
   );
+  if (s.view === 'incidents') {
+    // the incidents of the apps in view, oldest first, the newest at the bottom; what a read could not do under them
+    const spec = paneSpec(s, size);
+    const p = pane(
+      spec.entries,
+      s.logScroll,
+      s.logRowShift,
+      spec.logH,
+      spec.rowsOf
+    );
+    const empty = s.incidentsPolled
+      ? `no incidents in the last ${DEFAULT_SINCE_MIN} min`
+      : 'reading incidents…';
+    const keys =
+      '↑↓ scroll  i back  f flat  c clear  R reload all  h host  q quit';
+    return {
+      header,
+      table: [],
+      logs: [
+        ...(p.rows.length ? p.rows : [empty]),
+        ...s.incidentsErrors.map((e) => cut(screenText(e), w)),
+      ],
+      details: [],
+      footer: cut(right ? `${right}  │ ${keys}` : keys, w),
+      scroll: p.scroll,
+      maxScroll: p.maxScroll,
+    };
+  }
   if (s.view === 'flat') {
     // compose style: every app, label padded to the longest name, `|` stdout / `!` stderr, continuations under the text
     const spec = paneSpec(s, size);
@@ -306,7 +357,7 @@ export function renderFrame(
       spec.rowsOf
     );
     const keys =
-      '↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  h host  q quit';
+      '↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit';
     return {
       header,
       table: [],
@@ -380,7 +431,7 @@ export function renderFrame(
         ]
       : ['no app selected'];
   const keys =
-    'j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  h host  q quit';
+    'j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit';
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return {
     header,
@@ -393,12 +444,29 @@ export function renderFrame(
   };
 }
 
-/** The log pane's title: whose logs, which stream, the last clear of the apps shown, how far it is scrolled. */
+/** A clear's time for a title: the time when it was today, the date too otherwise. */
+function clearedAt(at: string, now: Date): string {
+  return at.slice(0, 10) === localStamp(now).slice(0, 10)
+    ? at.slice(11, 16)
+    : `${at.slice(0, 10)} ${at.slice(11, 16)}`;
+}
+
+/**
+ * The pane's title: whose logs, which stream, the last clear of the apps shown, how far it is scrolled; in the incidents
+ * view the window it reads, the last clear and how many incidents it shows.
+ */
 export function logsTitle(
   s: MonitState,
   scroll: number,
   now = new Date()
 ): string {
+  const up = scroll ? ` · ↑${scroll} (End: tail)` : '';
+  if (s.view === 'incidents') {
+    const since = s.incidentsCleared
+      ? ` · since the clear ${clearedAt(s.incidentsCleared, now)}`
+      : '';
+    return `incidents · last ${DEFAULT_SINCE_MIN} min${since} · ${s.incidents.length} shown${up}`;
+  }
   const shown =
     s.view === 'flat'
       ? s.rows
@@ -408,11 +476,9 @@ export function logsTitle(
     .filter(Boolean)
     .sort()
     .at(-1);
-  const when = at
-    ? ` · cleared ${at.slice(0, 10) === localStamp(now).slice(0, 10) ? at.slice(11, 16) : `${at.slice(0, 10)} ${at.slice(11, 16)}`}`
-    : '';
+  const when = at ? ` · cleared ${clearedAt(at, now)}` : '';
   const who = s.view === 'flat' ? 'all apps' : (selectedRow(s)?.app ?? '-');
-  return `logs · ${who} · ${s.stream}${when}${scroll ? ` · ↑${scroll} (End: tail)` : ''}`;
+  return `logs · ${who} · ${s.stream}${when}${up}`;
 }
 
 /** A pane's one-line title rule: `── label ─────…` cut to the width. Panes have no frames, so a terminal selection copies text only. */

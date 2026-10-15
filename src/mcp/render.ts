@@ -15,7 +15,7 @@ import {
   withoutItselfNote,
 } from '../core/urlcheck.js';
 import { formatLine } from '../core/logstream.js';
-import { bodyOf } from '../core/incidents/detect.js';
+import { bodyOf, type Incident } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
 
 export function fmtUptime(ms: number | null): string {
@@ -437,6 +437,32 @@ export function renderProject(d: {
  * Incidents newest first: a header, context lines `│`, the error line `▶`; an app's reloads are one line with the last
  * reload's line; then how to go on. Nothing new is one short line.
  */
+/**
+ * One incident as text: its head (app@host, time, kind, ×count, first time, stream), the lines before it, its own line
+ * (red with `color`) and the lines after; a reload is one plain line (both streams, no context, not an error).
+ */
+export function incidentLines(
+  i: Incident,
+  opts: { color?: boolean } = {}
+): string[] {
+  const count = i.count > 1 ? ` ×${i.count}` : '';
+  const first =
+    i.count > 1 && i.first_time && i.first_time !== i.time
+      ? i.first_time
+      : null;
+  if (i.kind === 'reloaded')
+    return [
+      `${i.app}@${i.host} ${i.time ?? '-'} reloaded${count}${first ? ` (first ${first})` : ''}: ${i.line}`,
+    ];
+  const red = (s: string) => (opts.color ? `\x1b[31m${s}\x1b[0m` : s);
+  return [
+    `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first ? `first ${first}, ` : ''}${i.stream})`,
+    ...i.before.map((b) => `  │ ${b}`),
+    red(`  ▶ ${i.line}`),
+    ...i.after.map((x) => `  │ ${x}`),
+  ];
+}
+
 export function renderIncidents(
   a: TakenAnswer,
   opts: { color?: boolean } = {}
@@ -460,27 +486,7 @@ export function renderIncidents(
       ...tail,
     ].join('\n');
   }
-  const red = (s: string) => (opts.color ? `\x1b[31m${s}\x1b[0m` : s);
-  const L: string[] = [];
-  for (const i of a.incidents) {
-    const count = i.count > 1 ? ` ×${i.count}` : '';
-    const first =
-      i.count > 1 && i.first_time && i.first_time !== i.time
-        ? i.first_time
-        : null;
-    if (i.kind === 'reloaded') {
-      L.push(
-        `${i.app}@${i.host} ${i.time ?? '-'} reloaded${count}${first ? ` (first ${first})` : ''}: ${i.line}`
-      ); // both streams and no context, and not an error: one plain line
-      continue;
-    }
-    L.push(
-      `${i.app}@${i.host} ${i.time ?? '-'} ${i.kind}${count} (${first ? `first ${first}, ` : ''}${i.stream})`
-    );
-    for (const b of i.before) L.push(`  │ ${b}`);
-    L.push(red(`  ▶ ${i.line}`));
-    for (const x of i.after) L.push(`  │ ${x}`);
-  }
+  const L = a.incidents.flatMap((i) => incidentLines(i, opts));
   L.push(
     ...tail,
     `next: call incidents again later (${a.taken ? 'these are taken now' : 'peeked: nothing taken'}); full logs with logs app=${a.incidents[0].app}`

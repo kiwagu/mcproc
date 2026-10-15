@@ -52,6 +52,8 @@ export interface PollOptions {
   includeReloads?: boolean;
 }
 
+/** How far back a first call looks, in minutes, when it names no window of its own. */
+export const DEFAULT_SINCE_MIN = 15;
 const EVENT_TAIL = 10;
 const STREAMS: Stream[] = ['out', 'err'];
 
@@ -61,7 +63,7 @@ export async function pollIncidents(
   names: string[],
   opts: PollOptions = {}
 ): Promise<{ answer: IncidentsAnswer; next: CursorState }> {
-  const sinceMin = opts.sinceMin ?? 15;
+  const sinceMin = opts.sinceMin ?? DEFAULT_SINCE_MIN;
   const groups = fleet.groups(names);
   const next: CursorState = { v: 1, apps: {} };
   const skipped: IncidentsAnswer['skipped'] = [];

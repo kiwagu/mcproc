@@ -21,7 +21,7 @@ import {
   type Frame,
 } from './frame.js';
 import { colorFor } from '../core/logstream.js';
-import { MonitLoop, reloadView, type LoopDeps } from './loop.js';
+import { MonitLoop, peekView, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 
@@ -37,6 +37,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
     const s = readStore(storePath(fleet.manifest.path));
     return { at: s.cleared, gen: s.clears };
   },
+  peekIncidents: (fleet, names, cursor) => peekView(fleet, names, cursor),
 });
 
 /** The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. */
@@ -112,13 +113,16 @@ export async function runMonit(opts: {
     const { width: w, height: h } = size();
     header.setContent(f.header);
     footer.setContent(f.footer);
-    if (state.view === 'flat') {
+    if (state.view !== 'dashboard') {
+      // the flat view and the incidents view: one pane across the screen
       for (const b of [appsTitle, tableBox, detailsTitle, detailsBox]) b.hide();
       logsHead.top = 1;
       logsHead.setContent(paneTitle(logsTitle(state, f.scroll), w));
       logBox.top = 2;
       logBox.height = Math.max(3, h - 3);
-      logBox.setContent(f.logs.map(colorLabel).join('\n'));
+      logBox.setContent(
+        (state.view === 'flat' ? f.logs.map(colorLabel) : f.logs).join('\n')
+      );
     } else {
       for (const b of [appsTitle, tableBox, detailsTitle, detailsBox]) b.show();
       appsTitle.setContent(paneTitle('apps', w));

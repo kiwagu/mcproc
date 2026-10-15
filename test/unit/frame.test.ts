@@ -10,6 +10,7 @@ import {
 } from '../../src/monit/frame.js';
 import { displayWidth } from '../../src/monit/screentext.js';
 import type { LsRow } from '../../src/core/list.js';
+import type { Incident } from '../../src/core/incidents/detect.js';
 
 const web: LsRow = {
   app: 'web',
@@ -597,5 +598,109 @@ describe('logsTitle', () => {
         height: 30,
       }).footer
     ).toMatch(/^reload all… {2}│ /);
+  });
+});
+
+describe('the incidents view', () => {
+  const inc = (n: number, extra: Partial<Incident> = {}): Incident => ({
+    app: 'web',
+    host: 'local',
+    kind: 'error',
+    stream: 'err',
+    time: `2026-10-15T10:00:0${n}`,
+    first_time: null,
+    count: 1,
+    line: `TypeError: boom ${n}`,
+    before: [`before ${n}`],
+    after: [],
+    fingerprint: `f${n}`,
+    ...extra,
+  });
+  const open = (
+    incidents: Incident[] | null,
+    cleared: string | null = null
+  ) => {
+    const s = reduce(base(), { type: 'view', view: 'incidents' });
+    return incidents === null
+      ? s
+      : reduce(s, {
+          type: 'incidents',
+          incidents,
+          cleared_at: cleared,
+          errors: [],
+        });
+  };
+  it('shows each incident as the incidents tool does, oldest at the top, its line in red', () => {
+    const f = renderFrame(
+      open([inc(2, { count: 3, first_time: '2026-10-15T09:59:00' }), inc(1)]),
+      {
+        width: 120,
+        height: 30,
+      }
+    );
+    expect(f.table).toEqual([]);
+    expect(f.details).toEqual([]);
+    expect(f.logs).toEqual([
+      'web@local 2026-10-15T10:00:01 error (err)',
+      '  │ before 1',
+      '\x1b[31m  ▶ TypeError: boom 1\x1b[0m',
+      'web@local 2026-10-15T10:00:02 error ×3 (first 2026-10-15T09:59:00, err)',
+      '  │ before 2',
+      '\x1b[31m  ▶ TypeError: boom 2\x1b[0m',
+    ]);
+    expect(frameToText(f)).toContain('  ▶ TypeError: boom 1'); // text for agents: no escapes
+  });
+  it('says when nothing happened, and while the first read is still under way', () => {
+    expect(renderFrame(open(null), { width: 120, height: 30 }).logs).toEqual([
+      'reading incidents…',
+    ]);
+    expect(renderFrame(open([]), { width: 120, height: 30 }).logs).toEqual([
+      'no incidents in the last 15 min',
+    ]);
+  });
+  it('names a host that could not be read, under the incidents', () => {
+    const s = reduce(open([inc(1)]), {
+      type: 'incidents',
+      incidents: [],
+      cleared_at: null,
+      errors: ['stand: ssh: Connection refused'],
+    });
+    expect(renderFrame(s, { width: 120, height: 30 }).logs.at(-1)).toBe(
+      'stand: ssh: Connection refused'
+    );
+  });
+  it('its title says the window, the clear and how many are shown; its legend goes back with i', () => {
+    expect(logsTitle(open([inc(1), inc(2)]), 0)).toBe(
+      'incidents · last 15 min · 2 shown'
+    );
+    expect(
+      logsTitle(
+        open([inc(1)], '2026-10-15T09:30:00'),
+        1,
+        new Date(2026, 9, 15, 11, 0)
+      )
+    ).toBe(
+      'incidents · last 15 min · since the clear 09:30 · 1 shown · ↑1 (End: tail)'
+    );
+    expect(renderFrame(open([]), { width: 200, height: 30 }).footer).toContain(
+      '↑↓ scroll  i back  f flat'
+    );
+  });
+  it('the other views offer it', () => {
+    expect(renderFrame(base(), { width: 220, height: 30 }).footer).toContain(
+      'f flat  i incidents  h host'
+    );
+    expect(
+      renderFrame(reduce(base(), { type: 'view', view: 'flat' }), {
+        width: 220,
+        height: 30,
+      }).footer
+    ).toContain('o/e/b logs  i incidents  h host');
+  });
+  it('scrolls by the rows the incidents take', () => {
+    const s = open([inc(3), inc(2), inc(1)]);
+    const size = { width: 120, height: 6 }; // a pane of 3 rows: one incident at a time
+    expect(scrollTo(s, size, Infinity)).toEqual({ entries: 2, rows: 0 });
+    expect(scrollTo(s, size, 1)).toEqual({ entries: 0, rows: 1 }); // by rows, as the log pane does
   });
 });

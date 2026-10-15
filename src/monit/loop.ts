@@ -15,7 +15,12 @@ import {
 } from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
 import type { FollowPoll, LogLine } from '../core/logfollow.js';
-import type { Cleared } from '../core/incidents/store.js';
+import {
+  takeIncidents,
+  type Cleared,
+  type TakenAnswer,
+} from '../core/incidents/store.js';
+import type { CursorState } from '../core/incidents/cursor.js';
 import {
   compileReloadRules,
   historyReaches,
@@ -25,6 +30,7 @@ import {
 } from '../core/reloads.js';
 import { fmtBytes } from '../mcp/render.js';
 import {
+  MAX_INCIDENTS,
   monitViews,
   selectedRow,
   viewLabel,
@@ -71,6 +77,12 @@ export interface LoopDeps {
     at: Record<string, string>;
     gen: Record<string, number>;
   };
+  /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
+  peekIncidents(
+    fleet: Fleet,
+    names: string[],
+    cursor: CursorState
+  ): Promise<{ answer: TakenAnswer; next: CursorState }>;
 }
 
 export { describeError };
@@ -83,6 +95,22 @@ export const reloadView = (
   fleet: Fleet,
   signal: AbortSignal
 ): Promise<LsRow[]> => actOn(fleet, 'all', 'start', { reload: true, signal });
+
+/** The incidents view reads again at most this often while it is open (and not at all while it is closed). */
+export const INCIDENTS_POLL_MS = 5000;
+
+/**
+ * What the incidents view reads (the screen's `peekIncidents` dep): the apps' new incidents since `cursor` through the
+ * peek path, so the pick-up point the agent takes from is neither the start nor moved. An empty cursor reads the window a
+ * first call reads. `file`: the store, for the last clear only (default: next to the manifest).
+ */
+export const peekView = (
+  fleet: Fleet,
+  names: string[],
+  cursor: CursorState,
+  file?: string
+): Promise<{ answer: TakenAnswer; next: CursorState }> =>
+  takeIncidents(fleet, names, { peek: true, cursor, max: MAX_INCIDENTS }, file);
 
 /** One followed app's reloads since its pm2 start: the run it counts (its start and restarts) and the count so far. */
 interface Counter {
@@ -129,6 +157,9 @@ export class MonitLoop {
   private reloading: AbortController | null = null; // the running reload of the view: quitting ends its dependency waits
   private names: string[];
   private groups: HostApps[];
+  /** the incidents view's own position (null: not read yet in this view), when it last read, and whether a read runs */
+  private inc: { cursor: CursorState | null; last: number; running: boolean } =
+    { cursor: null, last: 0, running: false };
 
   constructor(
     public fleet: Fleet,
@@ -147,8 +178,13 @@ export class MonitLoop {
     this.readCleared();
     this.syncWatches();
     const gen = this.gen;
-    return Promise.all(
-      this.groups
+    // the incidents view reads with the periodic refresh of the whole view, not with one that follows a command
+    const incidents =
+      !hosts && this.getState().view === 'incidents'
+        ? this.pollIncidents()
+        : undefined;
+    return Promise.all([
+      ...this.groups
         .filter((g) => !hosts || hosts.includes(g.host))
         .map((g) => {
           const cur = this.inflight.get(g.host);
@@ -159,8 +195,55 @@ export class MonitLoop {
           });
           this.inflight.set(g.host, { gen, done });
           return done;
-        })
-    ).then(() => undefined);
+        }),
+      incidents,
+    ]).then(() => undefined);
+  }
+
+  /**
+   * One read of the incidents view: from its own position (the first one from an empty position, so the window a first
+   * call reads), at most every INCIDENTS_POLL_MS, one at a time. What it could not read is shown in the view; a failed
+   * read keeps the position, so the next one tries the same lines again. A read of a view that has changed meanwhile,
+   * or of a screen that went away, is dropped.
+   */
+  private async pollIncidents(): Promise<void> {
+    const st = this.inc;
+    if (this.closed || st.running) return;
+    if (st.cursor && Date.now() - st.last < INCIDENTS_POLL_MS) return;
+    st.running = true;
+    const gen = this.gen;
+    try {
+      const { answer, next } = await this.deps.peekIncidents(
+        this.fleet,
+        this.names,
+        st.cursor ?? { v: 1, apps: {} }
+      );
+      if (this.closed || gen !== this.gen) return;
+      st.cursor = next;
+      st.last = Date.now();
+      this.dispatch({
+        type: 'incidents',
+        incidents: answer.incidents,
+        cleared_at: answer.cleared_at,
+        errors: [
+          ...answer.errors.map((e) => `${e.host}: ${e.message}`),
+          ...(answer.more > 0
+            ? [`+${answer.more} older incidents not shown`]
+            : []),
+        ],
+      });
+    } catch (e) {
+      if (this.closed || gen !== this.gen) return;
+      st.last = Date.now();
+      this.dispatch({
+        type: 'incidents',
+        incidents: [],
+        cleared_at: this.getState().incidentsCleared,
+        errors: [`incidents: ${describeError(e)}`],
+      });
+    } finally {
+      st.running = false;
+    }
   }
 
   /** A refresh that reflects a change just made on `hosts`: waits for their current refresh, then runs again. */
@@ -488,6 +571,7 @@ export class MonitLoop {
       this.prev.clear();
       this.latest.clear();
       this.errors.clear();
+      this.inc = { cursor: null, last: 0, running: false }; // the incidents of the new view are read afresh
       this.dispatch({ type: 'host', host: viewLabel(requested) });
       await this.refresh(); // a new generation: starts at once, the old view's pending probes are dropped when they return
     } catch (e) {
