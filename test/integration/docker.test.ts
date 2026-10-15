@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import {
   prepare,
@@ -16,10 +18,18 @@ import { loadManifest } from '../../src/core/manifest.js';
 import { Fleet, actOn, listFleet } from '../../src/core/fleet.js';
 import { streamLogs, defaultStreamDeps } from '../../src/core/logstream.js';
 import { monitOnce } from '../../src/monit/once.js';
+import { doctor } from '../../src/core/doctor.js';
+import { renderLs, renderDoctor } from '../../src/mcp/render.js';
 
 const RUN = process.env.MCPROC_IT_DOCKER === '1';
 const SERVER = `require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, () => console.log('listening', process.env.PORT));`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Listens on every interface, so localhost answers whether it resolves to ::1 or 127.0.0.1; a taken port fails at once. */
+const listenOn = (srv: net.Server, port: number) =>
+  new Promise<void>((ok, fail) => {
+    srv.once('error', fail);
+    srv.listen(port, () => ok());
+  });
 
 describe.skipIf(!RUN)(
   'unpack into a bare alpine container (docker transport, network for the Node download)',
@@ -177,6 +187,85 @@ describe.skipIf(!RUN)(
         await (await fleet.ctx('local')).pm2
           .run(['kill'])
           .catch(() => undefined);
+      }
+    }, 120_000);
+
+    it('url checks: a url the container refuses but this machine answers reads ✓ 200 (here); host-only and nowhere read down with their reasons', async () => {
+      // below the ephemeral range (32768+): no other integration file binds them, and no OS-assigned port lands on them
+      const port = 28414;
+      const closed = 28415;
+      const server = http.createServer((_q, s) => s.end('ok'));
+      try {
+        await listenOn(server, port);
+        const spare = net.createServer();
+        await listenOn(spare, closed); // proves nothing on this machine holds it
+        await new Promise((r) => spare.close(r)); // nothing answers there, here or in the container
+        fs.writeFileSync(
+          path.join(proj, '.mcproc', 'mcproc.yaml'),
+          [
+            'version: 1',
+            'project: itdk',
+            'apps:',
+            '  seen:',
+            '    description: answers only on this machine',
+            '    run: "true"',
+            `    url: http://localhost:${port}/`,
+            '    host: box',
+            '  strict:',
+            '    description: the same url, checked only in the container',
+            '    run: "true"',
+            `    url: http://localhost:${port}/`,
+            '    url_check: host',
+            '    host: box',
+            '  nowhere:',
+            '    description: nothing answers anywhere',
+            '    run: "true"',
+            `    url: http://localhost:${closed}/`,
+            '    host: box',
+            'hosts:',
+            '  box:',
+            `    docker: { container: ${name} }`,
+            '    cwd: /srv/p',
+            '    shell: /bin/sh -c',
+            '',
+          ].join('\n')
+        );
+        clearResolutionCache();
+        const fleet = new Fleet(loadManifest(proj), undefined);
+        const { rows, errors } = await listFleet(fleet, fleet.select(['all']));
+        expect(errors).toEqual([]);
+        const by = Object.fromEntries(rows.map((r) => [r.app, r]));
+        // the bare alpine has BusyBox wget, no curl: its stderr says "Connection refused"
+        expect(by.seen).toMatchObject({
+          url_status: 'ok',
+          url_code: 200,
+          url_from: 'here',
+          url_reason: 'on box: refused',
+        });
+        expect(by.strict).toMatchObject({
+          url_status: 'down',
+          url_from: 'host',
+          url_reason: 'on box: refused',
+        });
+        expect(by.nowhere).toMatchObject({
+          url_status: 'down',
+          url_from: 'here',
+          url_reason: 'on box: refused; here: refused',
+        });
+        const text = renderLs(rows, 'local');
+        expect(text).toContain(`http://localhost:${port}/ ✓ 200 (here)`);
+        expect(text).toContain(`http://localhost:${port}/ ✗ down (refused)`);
+        expect(text).toContain(`http://localhost:${closed}/ ✗ down (refused)`);
+        const [doc] = await doctor(loadManifest(proj), 'box');
+        expect(doc.environment).toMatchObject({ container: 'docker' });
+        expect(renderDoctor([doc])).toMatch(
+          /environment: container \(docker\), hostname \S+/
+        );
+        expect(doc.recommendations.join('\n')).toContain(
+          'apps.strict.url_check is host'
+        );
+      } finally {
+        server.close();
       }
     }, 120_000);
   }

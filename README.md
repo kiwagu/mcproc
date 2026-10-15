@@ -74,7 +74,7 @@ hosts:                         # "local" is implicit
     cwd: /home/node/demo
     readonly: true             # every mutating tool is refused here
 ```
-Other app fields: `host` (see below), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
+Other app fields: `host` (see below), `url_check` (see *URLs*), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
 Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
 `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
 
@@ -177,13 +177,13 @@ instead of sleeping and polling:
 | `until` | met when |
 |---|---|
 | `listening` | every declared port is bound (needs `port`/`ports`) |
-| `url-ok` | the `url` answers 2xx/3xx (requested from the host, as `ls` does) |
+| `url-ok` | the `url` answers 2xx/3xx, checked as `ls` checks it (on the host, and from this machine when the host gets no answer; see *URLs*) |
 | `exited` | the process left `online`; with autorestart off the answer carries `exit_code` and `done` / `failed (exit N)` / `stopped`, otherwise pm2's `stopped` or `errored` |
 | `log:<regex>` | a new line of its out or err log matches (ANSI stripped, matched against the line without pm2's time stamp; the answer keeps the stamp; history is not searched) |
 | `idle:<seconds>` | no log output for that long: a watcher settled |
 | `reloaded` | the app's next in-process reload (see *Reloads*) has been quiet for 2 s; the answer carries its time, its line count and its first restart or rebuild line, else its first line |
 
-`url-ok` needs `curl` or `wget` on the host: without either it runs to the timeout and reports `unchecked`.
+Without `curl` or `wget` on the host, `url-ok` under `url_check: auto` asks from this machine; under `url_check: host` it runs to the timeout and reports `unchecked`.
 `log:`, `idle:` and `reloaded` see only output written after the call begins, and notice a dead process only every 5 s; for
 "is it up" prefer `listening` or `url-ok`. `wait --until exited` succeeds (exit code 0) once the process has exited,
 whatever its exit code; scripts read `exit_code` in `--json` or the `(exit N)` in the line. A wait on an app that
@@ -313,12 +313,12 @@ one before it counts as a reload. Put that server's line in the app's `reloads.i
 | tool | what it does |
 |------|--------------|
 | `describe [app]` | project summary with descriptions, URL, profiles, hosts and the notes file; or one app in detail |
-| `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer, the real runtime command; `reloads` (`--reloads`) adds each running app's in-process reloads since its pm2 start to RESTARTS, `0 (+2)` |
+| `ls [app]` | one row per app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, ports with `✓`/`✗` against the declared ones, the URL with its HTTP answer (`(here)` when it answered from this machine, a short reason when down), the real runtime command; `reloads` (`--reloads`) adds each running app's in-process reloads since its pm2 start to RESTARTS, `0 (+2)` |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs [app \| targets, since]` | tail of one app's out/err (ANSI stripped), or the merged, time-ordered lines of several apps: the latest lines, or since a span (`2m`), a host-local time, or `last` (since your previous `logs` call over those apps in this MCP session); `app \| line`, `app ! line` for stderr |
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts (cheap to poll; `peek` looks without taking); `include_reloads` (`--reloads`) adds each app's in-process reloads since the last call |
 | `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle / reloaded, with a timeout; ok false with what was last seen |
-| `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon) |
+| `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon; the host's environment and where each url answers) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json` (a turbo repo's dev task drafts live, with a `dev` profile and `libs` / `libs-watch` builders for dist-built libraries), `ecosystem.json`, `Procfile`; `adopt_ports` writes the ports `ls` reports as undeclared into the existing manifest |
 | `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason |
 | `restart`, `stop`, `delete <target>` | by app or profile |
@@ -419,12 +419,49 @@ reports an error and keeps its place until they are fixed, the other apps are no
 ## URLs
 
 An app may declare `url`, the address you open in a browser; `init` drafts `http://localhost:<port>`
-for every server it finds a port for. `ls`, `describe` and `monit --once` request it from the host
-(`curl`, or `wget` when there is no curl, which only tells answered from not) and report `ok` (2xx/3xx),
-`error` (4xx/5xx: up but refusing), `down` (nothing answered) or `unchecked` (the host has neither tool).
-It is a liveness check, not a trust check: self-signed development certificates are accepted.
+for every server it finds a port for. `ls`, `describe`, `monit --once`, `wait until: url-ok` and a `ready`
+dependency on a url all check it the same way and report `ok` (2xx/3xx), `error` (4xx/5xx: up but refusing),
+`down` (nothing answered) or `unchecked`. It is a liveness check, not a trust check: self-signed development
+certificates are accepted, and a redirect is an answer (it is not followed, except by `wget` on a host without curl).
 The interactive `monit` shows the URL but never requests it, so your dev servers' request logs stay yours.
-The request is made on the host, so on a remote host declare an address the host can reach itself.
+
+Where it is requested from is set per app with `url_check`:
+
+- `auto` (the default): on the app's host first (`curl`, or `wget` when there is no curl). An HTTP answer
+  there is the result. When the host gets none, mcproc requests the url from this machine, where mcproc
+  and usually your browser run, so a dev container whose name for the site points at itself, or whose
+  `localhost` is not where the port is published, still reads `✓ 200 (here)`. When neither answers it is `down`.
+- `host`: only on the app's host.
+- `here`: only from this machine. `ls`, `wait` and `ready` never request it on the host; `doctor` may, to show
+  where it answers.
+
+On the `local` host this machine is the host: the url is requested once, whatever `url_check` says. A url the
+host answers costs one request, on the host; the second request is made only for a url the host could not reach.
+On the host each url's name lookup is bounded at 2 s and the host's environment lookups at about 4 s (where it
+has `timeout`), so a host whose resolver drops packets makes `ls` and each poll of `wait until: url-ok` that much slower.
+
+One catch of `auto`: a `localhost` url of an app on a remote host can read `✓ 200 (here)` when this machine
+happens to serve the same port, even while that app is down. `wait` and a `ready` dependency still require the
+app's process to be online; `url_check: host` rules the catch out.
+
+`ls` marks an answer from this machine with `(here)`, and a `down` url with a short reason: `refused`,
+`not resolved`, `timeout`, `tls`, `reset`, `no answer`, or `itself` (on the host the url's name resolves to the
+host itself, for instance through a hostname line in its `/etc/hosts`). The JSON rows carry `url_from` (`host`,
+`here`, or null when unchecked) and `url_reason` with both sides (`on box: refused; here: refused`), which
+`describe` prints too. `doctor` shows each host's environment (container or not, hostname) and where each of
+its apps' urls answers, and suggests `url_check: auto` for an app pinned to its host whose url answers only
+from here.
+
+```yaml
+apps:
+  web:
+    description: dev server in the container
+    run: yarn dev
+    port: 3000
+    url: https://site.test/
+    url_check: here   # checked only from this machine: ls, wait and ready never request it in the container
+    host: box
+```
 
 ## Process names
 
@@ -450,7 +487,7 @@ Ports published by Docker containers show the container name instead of a pid.
 `tail`, `head`, `od`). pm2 comes from the host's login-shell PATH (Node 18 or newer)
 or from `unpack`. mcproc itself is only installed where the agent runs; locally it ships its own
 pm2. `doctor` tells you which pm2 a host would use and why, or why none is usable.
-`curl` or `wget` for URL checks (optional: without them `ls` reports `unchecked`); `url-ok` waits and a `ready` dependency on a url need one of them too.
+`curl` or `wget` for URL checks on the host (optional: without them a url is checked from this machine under `url_check: auto`, and reads `unchecked` under `url_check: host`), and `getent` to report where a url's name resolves there.
 
 ## Hosts without pm2: `unpack`
 
