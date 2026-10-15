@@ -5,7 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
+import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import type { Context } from '../../src/core/resolve.js';
+import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
 import {
   listApps,
   portsReport,
@@ -423,6 +426,263 @@ describe('statusWord', () => {
       status: 'done',
       exit_code: 0,
       uptime_ms: null,
+    });
+  });
+});
+
+describe('url checks: on the host first, then from this machine (url_check)', () => {
+  const URL = 'http://localhost:3310/health';
+  // `check` is the check from this machine; omitted, fakeCtx's default fails the test when it is called
+  const on = (host: string, line: string, check?: HereCheck, env?: string) =>
+    fakeCtx(
+      basic,
+      host,
+      [
+        {
+          match: MARK.JLIST,
+          result: {
+            stdout: probeOut({
+              jlist,
+              ps: fx('ps.txt'),
+              tcp: fx('ss-tcp.txt'),
+              urls: line,
+              env,
+            }),
+          },
+        },
+      ],
+      host,
+      check
+    );
+  const recorder = (answer: Attempt) => {
+    const asked: string[] = [];
+    const here: HereCheck = async (u) => {
+      asked.push(u);
+      return answer;
+    };
+    return { asked, here };
+  };
+  const api = async (ctx: Context) => (await listApps(ctx, 'api'))[0];
+
+  it("the probe's time budget grows with the urls it checks: 30 s without, 39 s with one", async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', `${URL}\t200\t0\t::1\n`, r.here);
+    await api(ctx);
+    await snapshot(ctx, { urls: 'none' });
+    expect(ctx.fake.calls.map((c) => c.opts.timeoutMs)).toEqual([
+      39_000, 30_000,
+    ]);
+  });
+  it('a url the host answers costs one request there and none from here', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', `${URL}\t200\t0\t::1\n`, r.here);
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'ok',
+      url_code: 200,
+      url_from: 'host',
+      url_reason: null,
+    });
+    expect(r.asked).toEqual([]);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(
+      ctx.fake.calls[0].cmd.split(`-w '%{http_code}' '${URL}'`)
+    ).toHaveLength(2); // requested once on the host
+  });
+  it('no answer on the host: checked from here, and the row says why the host could not', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    expect(
+      await api(on('stand', `${URL}\t000\t7\t::1\n`, r.here))
+    ).toMatchObject({
+      url_status: 'ok',
+      url_code: 200,
+      url_from: 'here',
+      url_reason: 'on stand: refused',
+    });
+    expect(r.asked).toEqual([URL]);
+  });
+  it('neither answers: down, from here, with both reasons', async () => {
+    const r = recorder({ answered: false, fail: 'refused' });
+    expect(
+      await api(on('stand', `${URL}\t000\t7\t::1\n`, r.here))
+    ).toMatchObject({
+      url_status: 'down',
+      url_code: null,
+      url_from: 'here',
+      url_reason: 'on stand: refused; here: refused',
+    });
+  });
+  it('url_check: host never asks from here', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`); // the default check from here fails the test if called
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'host' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: 'on stand: refused',
+    });
+  });
+  it('url_check: here: the host never requests it, and prints no environment for it', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', '', r.here);
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'here' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'url_check: here',
+    });
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.ENV);
+    expect(r.asked).toEqual([URL]);
+  });
+  it('a name that resolves to the host itself is named as such: by a loopback address, or by one the environment calls its own', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const env =
+      'container docker\nhostname ws-01\nself 172.17.0.2 127.0.0.1 ::1';
+    const site = async (addr: string) => {
+      const ctx = on(
+        'stand',
+        `https://site.test/\t000\t7\t${addr}\n`,
+        r.here,
+        env
+      );
+      ctx.manifest.apps.api = {
+        ...ctx.manifest.apps.api,
+        url: 'https://site.test/',
+      };
+      return api(ctx);
+    };
+    const devContainer = await site('127.0.1.1');
+    expect(devContainer).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'on stand site.test resolves to 127.0.1.1, the host itself',
+    });
+    expect(fmtUrl(devContainer)).toBe('https://site.test/ ✓ 200 (here)');
+    // only the host's environment section says 172.17.0.2 is the host's own address
+    expect(await site('172.17.0.2')).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'on stand site.test resolves to 172.17.0.2, the host itself',
+    });
+    expect(r.asked).toEqual(['https://site.test/', 'https://site.test/']);
+  });
+  it("a box whose own name resolves to 127.0.1.1, its app dead: the host's own failure, never itself", async () => {
+    const DEV = 'http://devbox:3000/';
+    const env = 'container none\nhostname devbox\nself 127.0.1.1 127.0.0.1 ::1';
+    const row = async (mode: 'host' | 'auto') => {
+      const r = recorder({ answered: false, fail: 'refused' });
+      const ctx = on('stand', `${DEV}\t000\t7\t127.0.1.1\n`, r.here, env);
+      ctx.manifest.apps.api = {
+        ...ctx.manifest.apps.api,
+        url: DEV,
+        url_check: mode,
+      };
+      return api(ctx);
+    };
+    const note = '(devbox resolves to 127.0.1.1, the host itself)';
+    const host = await row('host');
+    expect(host).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: `on stand: refused ${note}`,
+    });
+    expect(fmtUrl(host)).toBe(`${DEV} ✗ down (refused)`);
+    const auto = await row('auto');
+    expect(auto).toMatchObject({
+      url_status: 'down',
+      url_from: 'here',
+      url_reason: `on stand: refused ${note}; here: refused`,
+    });
+    expect(fmtUrl(auto)).toBe(`${DEV} ✗ down (refused)`);
+  });
+  it('on local nothing is ever checked twice, whatever url_check says', async () => {
+    const ctx = on('local', `${URL}\t000\t7\t127.0.0.1\n`); // the default check from here fails the test if called
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'here' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: 'on local: refused',
+    });
+    expect(ctx.fake.calls[0].cmd).toContain(`'${URL}'`);
+  });
+  it('two apps sharing a url: one request on the host, one from here, a row each', async () => {
+    const r = recorder({ answered: true, code: 204 });
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`, r.here);
+    ctx.manifest.apps['api-build'] = {
+      ...ctx.manifest.apps['api-build'],
+      url: URL,
+    };
+    const rows = await listApps(ctx);
+    expect(rows.filter((x) => x.url_from === 'here').map((x) => x.app)).toEqual(
+      ['api-build', 'api']
+    );
+    expect(r.asked).toEqual([URL]);
+    expect(
+      ctx.fake.calls[0].cmd.split(`-w '%{http_code}' '${URL}'`)
+    ).toHaveLength(2);
+  });
+  it('urls not asked: unchecked, nothing requested anywhere; an unreachable row carries no url facts', async () => {
+    const ctx = on('stand', '');
+    const snap = await snapshot(ctx, { urls: 'none' });
+    expect(snap.urlChecks).toEqual({});
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(rowsFor(ctx, snap, ['api'])[0]).toMatchObject({
+      url_status: 'unchecked',
+      url_from: null,
+      url_reason: null,
+    });
+    expect(unreachableRow(ctx.manifest.apps.api, 'stand', 'x')).toMatchObject({
+      url_status: 'unchecked',
+      url_from: null,
+      url_reason: null,
+    });
+  });
+  it('ports asks no url, on the host or from here, and keeps the full probe', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`); // the default check from here fails the test if called
+    await portsReport(ctx);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.ENV);
+    expect(ctx.fake.calls[0].cmd).toContain('docker ps'); // the CONTAINER column
+  });
+  it('a read of one app asks only its url; a read of all asks every url', async () => {
+    const OTHER = 'http://localhost:3000/';
+    const ctx = on('local', `${URL}\t200\t0\t127.0.0.1\n`);
+    ctx.manifest.apps['api-build'] = {
+      ...ctx.manifest.apps['api-build'],
+      url: OTHER,
+    };
+    await listApps(ctx, 'api');
+    await describeApp(ctx, 'api');
+    expect(ctx.fake.calls).toHaveLength(2);
+    for (const c of ctx.fake.calls) {
+      expect(c.cmd).toContain(`'${URL}'`);
+      expect(c.cmd).not.toContain(OTHER);
+    }
+    await listApps(ctx);
+    expect(ctx.fake.calls[2].cmd).toContain(`'${URL}'`);
+    expect(ctx.fake.calls[2].cmd).toContain(`'${OTHER}'`);
+  });
+  it('an app named constructor keeps its url fields when its url was not asked', async () => {
+    const ctx = on('stand', '');
+    const name = 'constructor';
+    ctx.manifest.apps[name] = { ...ctx.manifest.apps.api, name };
+    const snap = await snapshot(ctx, { urls: 'none' });
+    expect(rowsFor(ctx, snap, [name])[0]).toMatchObject({
+      url_status: 'unchecked',
+      url_code: null,
+      url_from: null,
+      url_reason: null,
+    });
+  });
+  it('a check from here that rejects reads as no answer for its url, and the snapshot still answers', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`, async () => {
+      throw new Error('socket exploded');
+    });
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_code: null,
+      url_from: 'here',
+      url_reason: 'on stand: refused; here: no answer',
     });
   });
 });

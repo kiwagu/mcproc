@@ -9,6 +9,7 @@ import {
 import { Pm2Client, resolvePm2Bin, type Pm2Resolution } from './pm2.js';
 import { createTransport } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
+import { checkHere, type HereCheck } from './urlcheck.js';
 
 export const MAX_PM2_HOME = 90;
 
@@ -34,6 +35,8 @@ export interface Context extends Prepared {
   transport: Transport;
   pm2: Pm2Client;
   resolution: Pm2Resolution;
+  /** checks a url from this machine when url_check asks for it; tests pass a fake */
+  hereCheck: HereCheck;
 }
 
 export function pickHost(m: Manifest, name = 'local'): Host {
@@ -89,11 +92,17 @@ export function clearResolutionCache(): void {
 /**
  * A context for one host. Its manifest is the host's view (scopeManifest): the apps bound to it plus the unbound ones
  * when it is the fallback — by default the host itself, i.e. what `--host <it>` means; a whole-project command reaching
- * a host it does not name passes `fallback` (local), so that host sees only its bound apps.
+ * a host it does not name passes `fallback` (local), so that host sees only its bound apps. `hereCheck` is the check of
+ * a url from this machine; every context gets the real one unless a caller (a test) passes another.
  */
 export async function connect(
   prep: Prepared,
-  opts: { spawner?: Spawner; fresh?: boolean; fallback?: string } = {}
+  opts: {
+    spawner?: Spawner;
+    fresh?: boolean;
+    fallback?: string;
+    hereCheck?: HereCheck;
+  } = {}
 ): Promise<Context> {
   const transport = createTransport(prep.host, opts.spawner);
   const key = `${prep.manifest.path}|${prep.host.name}`;
@@ -118,6 +127,7 @@ export async function connect(
     transport,
     pm2,
     resolution,
+    hereCheck: opts.hereCheck ?? checkHere,
   };
 }
 

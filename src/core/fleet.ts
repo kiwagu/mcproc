@@ -22,6 +22,7 @@ import {
   type SnapshotOptions,
 } from './list.js';
 import type { Spawner } from '../transport/types.js';
+import type { HereCheck } from './urlcheck.js';
 
 /** Opens a context for `host`; `fallback` is where the unbound apps run for this command (see connect). */
 export type Connector = (
@@ -35,9 +36,12 @@ export interface HostApps {
 }
 
 export const defaultConnector =
-  (spawner?: Spawner): Connector =>
+  (spawner?: Spawner, hereCheck?: HereCheck): Connector =>
   (m, host, fallback) =>
-    connect({ manifest: m, host: pickHost(m, host) }, { spawner, fallback });
+    connect(
+      { manifest: m, host: pickHost(m, host) },
+      { spawner, fallback, hereCheck }
+    );
 
 /**
  * The hosts one command acts on. An app with `host:` always runs there; an app without one runs on the host the command
@@ -331,13 +335,18 @@ export function probeFleet(
   );
 }
 
-/** Rows of the named apps in their order, each from its own host. A host that does not answer leaves unreachable rows, unless none answers. */
+/**
+ * Rows of the named apps in their order, each from its own host. A host that does not answer leaves unreachable rows,
+ * unless none answers. Only the named apps' urls are asked, unless `opts.urls` says otherwise.
+ */
 export async function listFleet(
   fleet: Fleet,
   names: string[],
   opts: SnapshotOptions = {}
 ): Promise<{ rows: LsRow[]; errors: HostError[]; probes: HostProbe[] }> {
-  const probes = await probeFleet(fleet, names, (ctx) => snapshot(ctx, opts));
+  const probes = await probeFleet(fleet, names, (ctx) =>
+    snapshot(ctx, { urls: names, ...opts })
+  );
   const failed = probes.filter((p) => p.error !== undefined);
   if (failed.length === probes.length && failed.length > 0)
     throw failed[0].error;

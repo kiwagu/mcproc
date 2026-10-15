@@ -1,6 +1,9 @@
 import { MARK } from '../../src/shell/snippets.js';
 
-/** Assemble the stdout of probeScript() from parts, for tests. `clock` is the host's `date +%z` (default +0000). */
+/**
+ * Assemble the stdout of probeScript() from parts, for tests. `clock` is the host's `date +%z` (default +0000); `env`
+ * is the environment section, written only when given.
+ */
 export function probeOut(parts: {
   jlist?: string;
   rc?: number;
@@ -14,6 +17,7 @@ export function probeOut(parts: {
   rss?: string;
   args?: string;
   docker?: string;
+  env?: string;
   urls?: string;
 }): string {
   const out = [
@@ -40,9 +44,9 @@ export function probeOut(parts: {
     MARK.ARGS,
     parts.args ?? '',
     MARK.DOCKER,
-    parts.docker ?? '',
-    MARK.URL,
-    parts.urls ?? ''
+    parts.docker ?? ''
   );
+  if (parts.env !== undefined) out.push(MARK.ENV, parts.env); // the probe prints it only when it checks a url
+  out.push(MARK.URL, parts.urls ?? '');
   return out.join('\n');
 }

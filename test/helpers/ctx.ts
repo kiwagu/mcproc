@@ -1,15 +1,33 @@
 import { prepare } from '../../src/core/resolve.js';
+import { onTestFinished } from 'vitest';
 import type { Context } from '../../src/core/resolve.js';
 import { scopeManifest } from '../../src/core/manifest.js';
 import { Pm2Client } from '../../src/core/pm2.js';
+import type { HereCheck } from '../../src/core/urlcheck.js';
 import { FakeTransport, type Rule } from './fake-transport.js';
 
-/** A context on a fake transport, scoped to the host like connect() does (fallback: where unbound apps run, default the host). */
+/**
+ * The default check from here fails the test: a test that expects one passes its own. snapshot reads a rejecting check
+ * as no answer, so the failure is raised when the test finishes, not only as the rejection.
+ */
+const noHere: HereCheck = async (url) => {
+  const err = new Error(`unexpected check from this machine of ${url}`);
+  onTestFinished(() => {
+    throw err;
+  });
+  throw err;
+};
+
+/**
+ * A context on a fake transport, scoped to the host like connect() does (fallback: where unbound apps run, default the
+ * host). `hereCheck` is the check of a url from this machine; by default any such check fails the test.
+ */
 export function fakeCtx(
   project: string,
   host: string,
   rules: Rule[],
-  fallback = host
+  fallback = host,
+  hereCheck: HereCheck = noHere
 ): Context & { fake: FakeTransport } {
   const prep = prepare({ project, host });
   const fake = new FakeTransport(rules, host);
@@ -26,6 +44,7 @@ export function fakeCtx(
       pm2Version: '7.0.4',
       reason: 'test',
     },
+    hereCheck,
     fake,
   };
 }

@@ -36,6 +36,8 @@ const row = (app: string): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: { actual: [], declared: [], checks: [], undeclared: [] },
 });
 const apps = Object.fromEntries(

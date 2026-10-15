@@ -94,4 +94,21 @@ describe('monitOnce', () => {
     const text = await frame([`${S(1)}Starting compilation in watch mode...`]);
     expect(text).toMatch(/restarts 0 {2}procs/);
   });
+  it("the url cell says when the url answered from this machine rather than from the app's host", async () => {
+    const h = fakeHosts({
+      files: {},
+      procs: { local: [proc('watch', 0)], box: [proc('web', 2)] },
+      urls: { box: 'http://localhost:3000/\t000\t7\t::1' },
+      here: { 'http://localhost:3000/': { answered: true, code: 200 } },
+    });
+    const text = await monitOnce(
+      { lines: 10, width: 200 },
+      {
+        manifest: fleetManifest,
+        fleet: () => h.fleet,
+        follower: () => ({ poll: async () => ({ lines: [], reset: false }) }),
+      }
+    );
+    expect(text).toContain('http://localhost:3000/ ✓ 200 (here)');
+  });
 });

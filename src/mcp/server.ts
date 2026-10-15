@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { VERSION } from '../version.js';
 import type { Spawner } from '../transport/types.js';
 import type { UnpackDeps } from '../runtime/unpack.js';
+import type { HereCheck } from '../core/urlcheck.js';
 import { registerReadTools } from './tools/read.js';
 import { registerWriteTools } from './tools/write.js';
 
@@ -19,7 +20,12 @@ export const INSTRUCTIONS = [
 ].join(' ');
 
 export function createServer(
-  deps: { spawner?: Spawner; unpack?: UnpackDeps; project?: string } = {}
+  deps: {
+    spawner?: Spawner;
+    unpack?: UnpackDeps;
+    project?: string;
+    hereCheck?: HereCheck;
+  } = {}
 ): McpServer {
   const server = new McpServer(
     { name: 'mcproc', version: VERSION },
@@ -41,12 +47,14 @@ export function createServer(
     spawner: deps.spawner,
     unpack: deps.unpack,
     project: deps.project,
+    hereCheck: deps.hereCheck,
   });
   registerWriteTools(server, {
     roots,
     spawner: deps.spawner,
     unpack: deps.unpack,
     project: deps.project,
+    hereCheck: deps.hereCheck,
   });
   return server;
 }

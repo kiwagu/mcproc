@@ -52,6 +52,8 @@ const row = (app: string, host = 'local'): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: { actual: [], declared: [], checks: [], undeclared: [] },
 });
 const jlistOf = (project: string, apps: string[], base = 11) =>
@@ -80,7 +82,7 @@ const snap = (p = procs): Snapshot => ({
   stats: { ...EMPTY_STATS, samples: [sample] },
   metrics: {},
   sampledAt: Date.now(),
-  urls: new Map(),
+  urlChecks: {},
   zone: null,
 });
 const deferred = <T>() => {
@@ -177,6 +179,18 @@ describe('MonitLoop', () => {
     expect(h.actions.map((a) => a.type)).toEqual(['rows', 'logs']);
     expect(h.state.logPaths).toEqual({ out: '/l/api-out', err: '/l/api-err' });
     expect(h.state.logs.api.map((l) => l.text)).toEqual(['line']);
+  });
+  it('the live screen never requests a url: every refresh probes with urls none', async () => {
+    const seen: unknown[] = [];
+    const h = harness(undefined, {
+      snapshot: async (_ctx, opts) => {
+        seen.push(opts.urls);
+        return snap();
+      },
+    });
+    await h.loop.refresh();
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((u) => u === 'none')).toBe(true);
   });
 
   it("flat view: a refresh polls every running app and dispatches labeled flat lines instead of the selected app's logs", async () => {

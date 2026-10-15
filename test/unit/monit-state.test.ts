@@ -35,6 +35,8 @@ const row = (app: string, status = 'online'): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: { actual: [], declared: [], checks: [], undeclared: [] },
 });
 const apps = {

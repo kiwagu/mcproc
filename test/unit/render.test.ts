@@ -14,6 +14,8 @@ import {
   renderMutation,
   fmtCpu,
   fmtUrl,
+  fmtEnv,
+  urlNote,
   fmtDeps,
   renderLogsSince,
   sinceNotes,
@@ -45,6 +47,8 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: {
     actual: [],
     declared: checks.map((c) => c.port),
@@ -125,6 +129,113 @@ describe('renderLs with tree metrics', () => {
     expect(
       renderLs([{ ...u, url_status: 'ok', url_code: 200 }], 'local')
     ).toContain('http://localhost:3000/ ✓ 200');
+  });
+  it('fmtUrl: (here) for an answer from this machine, the reason word for a url that is down', () => {
+    const u = { ...base, url: 'http://localhost:3000/' };
+    expect(
+      fmtUrl({
+        ...u,
+        url_status: 'ok',
+        url_code: 200,
+        url_from: 'here',
+        url_reason: 'on box: refused',
+      })
+    ).toBe('http://localhost:3000/ ✓ 200 (here)');
+    expect(
+      fmtUrl({
+        ...u,
+        url_status: 'error',
+        url_code: 503,
+        url_from: 'here',
+        url_reason: 'on box: refused',
+      })
+    ).toBe('http://localhost:3000/ ✗ 503 (here)');
+    expect(
+      fmtUrl({
+        ...u,
+        url_status: 'error',
+        url_code: null,
+        url_from: 'host',
+        url_reason: null,
+      })
+    ).toBe('http://localhost:3000/ ✗ error');
+    for (const [reason, word] of [
+      ['on box: refused', 'refused'],
+      ['on box site.test does not resolve', 'not resolved'],
+      ['on box: timeout', 'timeout'],
+      ['on box: tls', 'tls'],
+      ['on box: reset', 'reset'],
+      ['on box: refused; here: no answer', 'no answer'],
+      // the host's own failure, whatever its name resolves to: never `itself` on a down url
+      [
+        'on box: refused (site.test resolves to 127.0.1.1, the host itself)',
+        'refused',
+      ],
+      [
+        'on box: refused (site.test resolves to 127.0.1.1, the host itself); here: not resolved',
+        'not resolved',
+      ],
+    ])
+      expect(
+        fmtUrl({
+          ...u,
+          url_status: 'down',
+          url_from: 'host',
+          url_reason: reason,
+        })
+      ).toBe(`http://localhost:3000/ ✗ down (${word})`);
+    expect(
+      renderLs(
+        [
+          {
+            ...u,
+            url_status: 'ok',
+            url_code: 200,
+            url_from: 'here',
+            url_reason: 'on box: refused',
+          },
+        ],
+        'local'
+      )
+    ).toContain('http://localhost:3000/ ✓ 200 (here)');
+  });
+  it('urlNote: describe says where the url answered and why, only when there is a reason', () => {
+    const u = { ...base, url: 'http://localhost:3000/' };
+    expect(
+      urlNote({
+        ...u,
+        url_status: 'ok',
+        url_code: 200,
+        url_from: 'host',
+        url_reason: null,
+      })
+    ).toBe('');
+    expect(urlNote(base)).toBe('');
+    expect(
+      urlNote({
+        ...u,
+        url_status: 'ok',
+        url_code: 200,
+        url_from: 'here',
+        url_reason: 'on box: refused',
+      })
+    ).toBe('url: answered from this machine (on box: refused)');
+    expect(
+      urlNote({
+        ...u,
+        url_status: 'down',
+        url_from: 'here',
+        url_reason: 'on box: refused; here: refused',
+      })
+    ).toBe('url: down (on box: refused; here: refused)');
+    expect(
+      urlNote({
+        ...u,
+        url_status: 'unchecked',
+        url_from: null,
+        url_reason: 'on box: no curl or wget',
+      })
+    ).toBe('url: unchecked (on box: no curl or wget)');
   });
   it('fmtPorts names the container holding a declared port', () => {
     const r = row('online', [
@@ -294,10 +405,209 @@ describe('renderDoctor', () => {
         processes: 0,
         in_namespace: 0,
         recommendations: [],
+        environment: null,
+        urls: [],
       },
     ]);
     expect(t).toContain('/opt/rt (pm2 7.0.4)');
     expect(t).toContain("PM2_HOME='/h' '/opt/rt/bin/pm2' monit");
+  });
+  it('prints the environment line and where each url answers', () => {
+    const rep = {
+      host: 'box',
+      transport: 'ssh box',
+      reachable: true,
+      error: null,
+      node: 'v22.1.0',
+      pm2: null,
+      tools: { ps: true, ss: true, tar: true },
+      pm2_home: null,
+      runtime_dir: '/opt/rt',
+      runtime_present: false,
+      runtime_pm2: null,
+      runtime_node: null,
+      daemon: 'answers' as const,
+      processes: 0,
+      in_namespace: 0,
+      recommendations: [],
+      environment: {
+        container: 'docker' as const,
+        hostname: 'ws-01',
+        self: ['172.17.0.2'],
+      },
+      urls: [
+        {
+          app: 'web',
+          url: 'http://localhost:3000/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'ok' as const,
+            code: 200,
+            from: 'here' as const,
+            reason: 'on box: refused',
+          },
+        },
+        {
+          app: 'api',
+          url: 'http://localhost:3100/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'ok' as const,
+            code: 200,
+            from: 'host' as const,
+            reason: null,
+          },
+        },
+        {
+          app: 'gone',
+          url: 'http://gone.test/',
+          name: 'gone.test',
+          addr: null,
+          itself: false,
+          check: {
+            status: 'down' as const,
+            code: null,
+            from: 'here' as const,
+            reason: 'on box gone.test does not resolve; here: not resolved',
+          },
+        },
+        {
+          app: 'bare',
+          url: 'http://localhost:3200/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'unchecked' as const,
+            code: null,
+            from: null,
+            reason: 'on box: no curl or wget',
+          },
+        },
+      ],
+    };
+    const t = renderDoctor([rep]);
+    expect(t).toContain('  environment: container (docker), hostname ws-01');
+    expect(t).toContain(
+      '  url web: localhost → ::1 on box; answers from this machine (200)'
+    );
+    expect(t).toContain(
+      '  url web: localhost → ::1 on box; answers from this machine (200); on box: refused\n'
+    );
+    expect(t).toContain(
+      '  url api: localhost → ::1 on box; answers on box (200)\n'
+    );
+    expect(t).toContain(
+      '  url gone: gone.test → no address on box; answers nowhere (on box gone.test does not resolve; here: not resolved)'
+    );
+    expect(t).toContain(
+      '  url bare: localhost → ::1 on box; not checked (on box: no curl or wget)'
+    );
+    expect(fmtEnv({ container: 'none', hostname: null, self: [] })).toBe(
+      'no container'
+    );
+    expect(fmtEnv({ container: 'none', hostname: 'dev', self: [] })).toBe(
+      'no container, hostname dev'
+    );
+  });
+  it('a url that resolves to the host itself and answers from this machine says "the host itself" once', () => {
+    const site = (app: string, reason: string) => ({
+      app,
+      url: 'http://site.test/',
+      name: 'site.test',
+      addr: '127.0.1.1',
+      itself: true,
+      check: {
+        status: 'ok' as const,
+        code: 200,
+        from: 'here' as const,
+        reason,
+      },
+    });
+    const t = renderDoctor([
+      {
+        host: 'box',
+        transport: 'ssh box',
+        reachable: true,
+        error: null,
+        node: 'v22.1.0',
+        pm2: null,
+        tools: { ps: true, ss: true, tar: true },
+        pm2_home: null,
+        runtime_dir: '/opt/rt',
+        runtime_present: false,
+        runtime_pm2: null,
+        runtime_node: null,
+        daemon: 'answers',
+        processes: 0,
+        in_namespace: 0,
+        recommendations: [],
+        environment: null,
+        urls: [
+          site(
+            'web',
+            'on box site.test resolves to 127.0.1.1, the host itself'
+          ),
+          site('bare', 'on box: no curl or wget'),
+        ],
+      },
+    ]);
+    const lines = t.split('\n');
+    expect(lines).toContain(
+      '  url web: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200)'
+    );
+    // another reason the host had no answer is still said
+    expect(lines).toContain(
+      '  url bare: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200); on box: no curl or wget'
+    );
+  });
+  it('a url that resolves to the host itself and answers nowhere says "the host itself" once, and the host\'s own failure', () => {
+    const t = renderDoctor([
+      {
+        host: 'box',
+        transport: 'ssh box',
+        reachable: true,
+        error: null,
+        node: 'v22.1.0',
+        pm2: null,
+        tools: { ps: true, ss: true, tar: true },
+        pm2_home: null,
+        runtime_dir: '/opt/rt',
+        runtime_present: false,
+        runtime_pm2: null,
+        runtime_node: null,
+        daemon: 'answers',
+        processes: 0,
+        in_namespace: 0,
+        recommendations: [],
+        environment: null,
+        urls: [
+          {
+            app: 'web',
+            url: 'http://devbox:3000/',
+            name: 'devbox',
+            addr: '127.0.1.1',
+            itself: true,
+            check: {
+              status: 'down',
+              code: null,
+              from: 'here',
+              reason:
+                'on box: refused (devbox resolves to 127.0.1.1, the host itself); here: refused',
+            },
+          },
+        ],
+      },
+    ]);
+    const line = t.split('\n').find((l) => l.startsWith('  url web:'))!;
+    expect(line).toBe(
+      '  url web: devbox → 127.0.1.1 on box, the host itself; answers nowhere (on box: refused; here: refused)'
+    );
+    expect(line.split('the host itself')).toHaveLength(2);
   });
 });
 

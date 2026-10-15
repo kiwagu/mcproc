@@ -4,6 +4,7 @@ import { loadManifest } from '../../src/core/manifest.js';
 import { Fleet } from '../../src/core/fleet.js';
 import { McprocError } from '../../src/core/errors.js';
 import { MARK } from '../../src/shell/snippets.js';
+import type { Attempt } from '../../src/core/urlcheck.js';
 import { fakeCtx } from './ctx.js';
 import { probeOut } from './probe.js';
 
@@ -29,6 +30,12 @@ export interface FakeState {
   short?: string[];
   failReads?: string[];
   unreadable?: string[];
+  /** per host: the URL section lines its probe prints */
+  urls?: Record<string, string>;
+  /** per host: its environment section */
+  env?: Record<string, string>;
+  /** per url: what this machine gets (refused when not listed); without it a check from here fails the test */
+  here?: Record<string, Attempt>;
 }
 
 /**
@@ -69,6 +76,8 @@ export function fakeHosts(
             stdout: probeOut({
               jlist: JSON.stringify(state.procs[host] ?? []),
               clock: clockOf(host).zone ?? '+0000',
+              urls: state.urls?.[host],
+              env: state.env?.[host],
             }),
           }),
         },
@@ -114,7 +123,11 @@ export function fakeHosts(
           }),
         },
       ],
-      fallback
+      fallback,
+      state.here
+        ? async (u) =>
+            state.here?.[u] ?? { answered: false, fail: 'refused' as const }
+        : undefined
     );
   });
   return { fleet, reads, scripts };

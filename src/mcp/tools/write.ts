@@ -32,7 +32,7 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
         roots: await deps.roots(),
       }).manifest,
       args.host,
-      defaultConnector(deps.spawner)
+      defaultConnector(deps.spawner, deps.hereCheck)
     );
   const targetInput = {
     ...commonInput,

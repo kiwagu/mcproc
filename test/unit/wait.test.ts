@@ -17,6 +17,7 @@ import {
 } from '../../src/core/wait.js';
 import { snapshot } from '../../src/core/list.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import type { HereCheck } from '../../src/core/urlcheck.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
@@ -1118,4 +1119,112 @@ describe('untilFor / waitDependency / depFailure', () => {
       )
     ).toBe('api not completed in 60 s (status online)');
   });
+});
+
+describe('waitFor: url-ok follows the url_check decision', () => {
+  const fleetDir = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+  const web = (status: string) => ({
+    pid: status === 'online' ? 100 : 0,
+    name: 'fleet-web',
+    pm_id: 3,
+    pm2_env: {
+      status,
+      namespace: 'fleet',
+      pm_out_log_path: '/l/o',
+      pm_err_log_path: '/l/e',
+    },
+  });
+  const boxProbe = (line: string, status: string) =>
+    probeOut({ jlist: JSON.stringify([web(status)]), ps: PS, urls: line });
+  const mk = (line: string, check: HereCheck, status = 'online') => {
+    let t = 1_000_000;
+    const ctx = fakeCtx(
+      fleetDir,
+      'box',
+      [
+        {
+          match: MARK.JLIST,
+          result: () => ({ stdout: boxProbe(line, status) }),
+        },
+      ],
+      'local',
+      check
+    );
+    const deps: WaitDeps = {
+      jlist: (c) => c.pm2.jlist(),
+      snapshot: (c, o) => snapshot(c, o),
+      follower: () => {
+        throw new Error('not used here');
+      },
+      sleep: async (ms) => {
+        t += ms;
+      },
+      now: () => t,
+    };
+    return { ctx, deps };
+  };
+  it('a url the box cannot reach but this machine can is ok, and observed says where and why', async () => {
+    const asked: string[] = [];
+    const { ctx, deps } = mk(
+      'http://localhost:3000/\t000\t7\t::1\n',
+      async (u) => {
+        asked.push(u);
+        return { answered: true, code: 200 };
+      }
+    );
+    const r = await waitFor(ctx, 'web', { kind: 'url-ok' }, { deps });
+    expect(r).toMatchObject({ ok: true, waited_ms: 0 });
+    expect(r.observed).toBe(
+      'http://localhost:3000/ 200 from this machine (on box: refused)'
+    );
+    expect(asked).toEqual(['http://localhost:3000/']);
+  });
+  it('neither answers: the timeout names both reasons', async () => {
+    const { ctx, deps } = mk(
+      'http://localhost:3000/\t000\t7\t::1\n',
+      async () => ({ answered: false, fail: 'refused' })
+    );
+    const r = await waitFor(
+      ctx,
+      'web',
+      { kind: 'url-ok' },
+      { deps, timeoutMs: 1500 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.observed).toBe(
+      'http://localhost:3000/ down (on box: refused; here: refused)'
+    );
+  });
+  it('a ready dependency with only a url is ready once it answers from this machine', async () => {
+    const { ctx, deps } = mk(
+      'http://localhost:3000/\t000\t7\t::1\n',
+      async () => ({ answered: true, code: 204 })
+    );
+    ctx.manifest.apps.web = { ...ctx.manifest.apps.web, ports: [] }; // no port: ready is the url
+    const r = await waitDependency(
+      ctx,
+      { app: 'web', condition: 'ready', timeoutMs: 5000 },
+      { deps }
+    );
+    expect(r).toMatchObject({ ok: true, until: 'url-ok' });
+  });
+  // the accepted risk of a localhost url: this machine may serve the same port while the box's app is down
+  it.each([
+    ['stopped', 'exited'],
+    ['errored', 'crashed'],
+  ])(
+    'a url this machine answers while the box process is %s is not ready: %s',
+    async (status, reason) => {
+      const { ctx, deps } = mk(
+        'http://localhost:3000/\t000\t7\t::1\n',
+        async () => ({ answered: true, code: 200 }),
+        status
+      );
+      const r = await waitFor(ctx, 'web', { kind: 'url-ok' }, { deps });
+      expect(r).toMatchObject({ ok: false, reason, status });
+      expect(r.observed).toBe(
+        'http://localhost:3000/ 200 from this machine (on box: refused)'
+      );
+    }
+  );
 });

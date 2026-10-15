@@ -41,7 +41,7 @@ const snap = (apps: string[]): Snapshot => ({
   stats: EMPTY_STATS,
   metrics: {},
   sampledAt: 0,
-  urls: new Map(),
+  urlChecks: {},
   zone: null,
 });
 

@@ -9,6 +9,7 @@ import {
   describeFleetApp,
 } from '../../src/core/fleet.js';
 import { describeProject } from '../../src/core/list.js';
+import { listWithReloads } from '../../src/core/reloadcount.js';
 import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
@@ -278,6 +279,52 @@ describe('listFleet', () => {
     await expect(
       listFleet(h.fleet, h.fleet.select(['all']))
     ).rejects.toMatchObject({ code: 'TRANSPORT_FAILED' });
+  });
+  it("ls of one app asks only that app's url: another url on the same host is asked neither there nor from here", async () => {
+    const WEB = 'http://localhost:3000/';
+    const TOOL = 'http://localhost:3001/';
+    const asked: string[] = [];
+    const ctxs: ReturnType<typeof fakeCtx>[] = [];
+    // with --host box, tool runs on box beside web; the host answers neither url, so each one asked goes on to here
+    const fleet = new Fleet(m, 'box', async (_m, host, fallback) => {
+      const ctx = fakeCtx(
+        dir,
+        host,
+        [
+          {
+            match: MARK.JLIST,
+            result: {
+              stdout: probeOut({
+                urls: `${WEB}\t000\t7\t::1\n${TOOL}\t000\t7\t::1\n`,
+              }),
+            },
+          },
+        ],
+        fallback,
+        async (u) => {
+          asked.push(u);
+          return { answered: true, code: 200 };
+        }
+      );
+      ctx.manifest.apps.tool = { ...ctx.manifest.apps.tool, url: TOOL };
+      ctxs.push(ctx);
+      return ctx;
+    });
+    const { rows } = await listWithReloads(fleet, fleet.select(['web']), false);
+    expect(rows).toMatchObject([
+      { app: 'web', url_status: 'ok', url_from: 'here' },
+    ]);
+    const cmds = ctxs.flatMap((c) => c.fake.calls.map((x) => x.cmd));
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0]).toContain(`'${WEB}'`);
+    expect(cmds[0]).not.toContain(TOOL);
+    expect(asked).toEqual([WEB]);
+  });
+  it('an explicit urls option still wins over the named apps (adopt asks none)', async () => {
+    const h = fakeFleet(undefined, procs);
+    await listFleet(h.fleet, ['web'], { urls: 'none' });
+    const probe = h.log.find((l) => l.includes(MARK.JLIST))!;
+    expect(probe).not.toContain('http://localhost:3000/');
   });
 });
 

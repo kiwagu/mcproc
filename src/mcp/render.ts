@@ -1,6 +1,6 @@
 import type { LsRow, HostInfo } from '../core/list.js';
 import type { HostError } from '../core/fleet.js';
-import type { DoctorReport } from '../core/doctor.js';
+import type { DoctorReport, DoctorUrl } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
@@ -9,6 +9,11 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
+import {
+  type HostEnv,
+  reasonWord,
+  withoutItselfNote,
+} from '../core/urlcheck.js';
 import { formatLine } from '../core/logstream.js';
 import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
@@ -66,13 +71,26 @@ export function fmtCpu(c: number | null): string {
 export function cut(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
-/** The declared url with its HTTP answer when one was requested; the bare url when not (monit's live screen never asks). */
+/**
+ * The declared url with its HTTP answer when one was requested, `(here)` when that answer came from this machine, and
+ * the short reason of a url that answered nowhere; the bare url when not requested (monit's live screen never asks).
+ */
 export function fmtUrl(r: LsRow): string {
   if (!r.url) return '-';
-  if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}`;
-  if (r.url_status === 'error') return `${r.url} ✗ ${r.url_code}`;
-  if (r.url_status === 'down') return `${r.url} ✗ down`;
+  const here = r.url_from === 'here' ? ' (here)' : '';
+  if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}${here}`;
+  if (r.url_status === 'error')
+    return `${r.url} ✗ ${r.url_code ?? 'error'}${here}`;
+  if (r.url_status === 'down')
+    return `${r.url} ✗ down${r.url_reason ? ` (${reasonWord(r.url_reason)})` : ''}`;
   return r.url;
+}
+/** describe's line for the url when the table cell does not say it all: where it answered and why, or why it did not. */
+export function urlNote(r: LsRow): string {
+  if (!r.url || !r.url_reason) return '';
+  if (r.url_status === 'ok' || r.url_status === 'error')
+    return `url: answered ${r.url_from === 'here' ? 'from this machine' : `on ${r.host}`} (${r.url_reason})`;
+  return `url: ${r.url_status} (${r.url_reason})`;
 }
 /** pm2's restarts, then the in-process reloads counted since the start when there are any: `0 (+3)`, `0 (+≥3)` when partial. */
 function fmtRestarts(r: LsRow): string {
@@ -200,6 +218,36 @@ export function renderHosts(info: HostInfo[]): string {
     ]),
   ]);
 }
+/** `container (docker), hostname ws-01`, or `no container, hostname dev-box` */
+export function fmtEnv(e: HostEnv): string {
+  const kind =
+    e.container === 'none' ? 'no container' : `container (${e.container})`;
+  return e.hostname ? `${kind}, hostname ${e.hostname}` : kind;
+}
+/**
+ * `localhost → ::1 on box; answers from this machine (200); on box: refused`: after an answer from here, why the host
+ * had none, unless that reason is the host itself, which the first part already says; for the same reason a url that
+ * answers nowhere drops the address note from its reason.
+ */
+function fmtDoctorUrl(host: string, u: DoctorUrl): string {
+  const name = u.name ?? u.url;
+  const where = `${name} → ${u.addr ?? 'no address'} on ${host}${u.itself ? ', the host itself' : ''}`;
+  const c = u.check;
+  const code = c.code ?? 'error';
+  const why =
+    c.reason && !(u.itself && reasonWord(c.reason) === 'itself')
+      ? `; ${c.reason}`
+      : '';
+  const answers =
+    c.status === 'unchecked'
+      ? `not checked (${c.reason ?? 'not asked'})`
+      : c.status === 'down'
+        ? `answers nowhere (${u.itself && c.reason ? withoutItselfNote(c.reason) : c.reason})`
+        : c.from === 'here'
+          ? `answers from this machine (${code})${why}`
+          : `answers on ${host} (${code})`;
+  return `${where}; ${answers}`;
+}
 export function renderDoctor(reps: DoctorReport[]): string {
   return reps
     .map((r) => {
@@ -220,6 +268,9 @@ export function renderDoctor(reps: DoctorReport[]): string {
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`
           );
+        if (r.environment) L.push(`  environment: ${fmtEnv(r.environment)}`);
+        for (const u of r.urls)
+          L.push(`  url ${u.app}: ${fmtDoctorUrl(r.host, u)}`);
       }
       for (const rec of r.recommendations) L.push(`  → ${rec}`);
       return L.join('\n');

@@ -28,6 +28,7 @@ import {
   renderIncidents,
   renderWait,
   hostsOf,
+  urlNote,
 } from '../render.js';
 
 export function registerReadTools(server: McpServer, deps: ToolDeps): void {
@@ -45,7 +46,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         roots: await deps.roots(),
       }).manifest,
       args.host,
-      defaultConnector(deps.spawner)
+      defaultConnector(deps.spawner, deps.hereCheck)
     );
 
   server.registerTool(
@@ -73,14 +74,19 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Doctor',
       description:
-        'Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state. Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable.',
+        "Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state, the host's environment (container, hostname) and where each app's url answers (on the host or from this machine). Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable, and url_check: auto for an app with url_check: host whose url answers only from this machine.",
       inputSchema: commonInput,
       annotations: RO,
     },
     (args) =>
       runTool(async () => {
         const { manifest } = await prep({ project: args.project });
-        const reports = await doctor(manifest, args.host, deps.spawner);
+        const reports = await doctor(
+          manifest,
+          args.host,
+          deps.spawner,
+          deps.hereCheck
+        );
         return {
           text: renderDoctor(reports),
           data: { project: manifest.project, reports },
@@ -93,7 +99,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'List apps',
       description:
-        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open". reloads: true also counts each running app\'s in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2\'s restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.',
+        "One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down), requested on the app's host and, when the host gets no answer, from this machine: ✓ 200 (here), or ✗ down (refused) with the reason (url_check in the manifest pins one side). Answers \"is it up, on which port, which address do I open\". reloads: true also counts each running app's in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2's restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.",
       inputSchema: {
         ...commonInput,
         app: z.string().optional().describe('Only this app'),
@@ -154,6 +160,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
             ? `depends_on: ${fmtDeps(d.app.depends_on)}`
             : '',
           renderLs([d.row], d.host),
+          urlNote(d.row),
           `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
           `pm2: ${JSON.stringify(d.pm2)}`,
         ]
@@ -263,7 +270,10 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     },
     (args) =>
       runTool(async () => {
-        const ctx = await connect(await prep(args), { spawner: deps.spawner });
+        const ctx = await connect(await prep(args), {
+          spawner: deps.spawner,
+          hereCheck: deps.hereCheck,
+        });
         const r = await portsReport(ctx, args.port);
         return {
           text: renderPorts(r, ctx.host.name),

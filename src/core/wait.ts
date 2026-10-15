@@ -4,6 +4,7 @@ import type { Context } from './resolve.js';
 import {
   snapshot as probeSnapshot,
   statusWord,
+  urlCheckOf,
   type Snapshot,
   type SnapshotOptions,
 } from './list.js';
@@ -13,6 +14,7 @@ import { stripAnsi } from './logs.js';
 import type { App, Dep } from './manifest.js';
 import { compileReloadRules, type Reload, ReloadTracker } from './reloads.js';
 import { fmtPorts } from '../mcp/render.js';
+import type { UrlResult } from './urlcheck.js';
 
 export type Until =
   | { kind: 'listening' }
@@ -129,6 +131,15 @@ export function defaultWaitDeps(): WaitDeps {
       }),
     now: () => Date.now(),
   };
+}
+
+/** What a url-ok wait saw: `<url> 200`, `<url> 200 from this machine (<why>)`, `<url> down (<why>)`, `<url> unchecked`. */
+function urlSeen(url: string, u: UrlResult | undefined): string {
+  if (!u || u.status === 'unchecked')
+    return `${url} unchecked${u?.reason ? ` (${u.reason})` : ''}`;
+  if (u.status === 'down')
+    return `${url} down${u.reason ? ` (${u.reason})` : ''}`;
+  return `${url} ${u.code ?? 'error'}${u.from === 'here' ? ` from this machine (${u.reason})` : ''}`;
 }
 
 const unknownApp = (ctx: Context, app: string) =>
@@ -398,10 +409,10 @@ export async function waitFor(
           ? fmtPorts(ports)
           : `status ${p?.status ?? 'not-started'}, ${fmtPorts(ports)}`;
       } else {
-        // 0: nothing answered; null: the host has neither curl nor wget, or the url was not asked for
-        const code = snap.urls.get(a.url!) ?? null;
-        met = code !== null && code > 0 && code < 400;
-        observed = `${a.url} ${code === null ? 'unchecked' : code === 0 ? 'down' : code}`;
+        // the same decision as ls: the host's answer, else the check from here (url_check)
+        const u = urlCheckOf(snap, app);
+        met = u?.status === 'ok';
+        observed = urlSeen(a.url as string, u);
       }
       // the process is judged before the condition: a port or url that answers while it is dead or gone (a proxy,
       // another process) is not a ready app, and one that pm2 is restarting is not ready yet, whatever answers
