@@ -1874,11 +1874,12 @@ describe('MonitLoop incidents view and log clears', () => {
       err: { path: '/l/worker-err', offset: 500 },
     },
   });
-  const setup = (store: {
+  type ClearStore = {
     at: Record<string, string>;
     gen: Record<string, number>;
-    apps: CursorState['apps'];
-  }) => {
+    emptied: Record<string, { out?: number; err?: number }>;
+  };
+  const setup = (store: ClearStore) => {
     const cursors: CursorState[] = [];
     const h = harness(undefined, {
       cleared: () => store,
@@ -1889,22 +1890,16 @@ describe('MonitLoop incidents view and log clears', () => {
     });
     return { h, cursors };
   };
+  const fresh = (): ClearStore => ({ at: {}, gen: {}, emptied: {} });
   it('a clear restarts the files it emptied at their start; the other apps keep their places', async () => {
     let now = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const store = fresh();
     const { h, cursors } = setup(store);
     h.loop.dispatch({ type: 'view', view: 'incidents' });
     await h.loop.refresh();
     store.gen = { 'local/api': 1 }; // `c` (or the flush tool) emptied both of api's files
-    store.apps = {
-      'local/api': {
-        restarts: 2,
-        status: 'online',
-        out: { path: '/l/api-out', offset: 0 },
-        err: { path: '/l/api-err', offset: 0 },
-      },
-    };
+    store.emptied = { 'local/api': { out: 1, err: 1 } };
     now += INCIDENTS_POLL_MS;
     await h.loop.refresh();
     expect(cursors[1].apps['local/api']).toEqual({
@@ -1918,19 +1913,12 @@ describe('MonitLoop incidents view and log clears', () => {
   it('a file the clear could not empty keeps its place, so nothing in it is shown twice', async () => {
     let now = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const store = fresh();
     const { h, cursors } = setup(store);
     h.loop.dispatch({ type: 'view', view: 'incidents' });
     await h.loop.refresh();
     store.gen = { 'local/api': 1 };
-    store.apps = {
-      'local/api': {
-        restarts: 2,
-        status: 'online',
-        out: { path: '/l/api-out', offset: 0 },
-        err: { path: '/l/api-err', offset: 4096 }, // the store kept its own place: this file was not emptied
-      },
-    };
+    store.emptied = { 'local/api': { out: 1, err: 0 } }; // err could not be truncated
     now += INCIDENTS_POLL_MS;
     await h.loop.refresh();
     expect(cursors[1].apps['local/api']?.out).toEqual({
@@ -1942,20 +1930,13 @@ describe('MonitLoop incidents view and log clears', () => {
   it('reopened long after a clear, it goes on from the start of the emptied file, not from a time window', async () => {
     let now = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const store = fresh();
     const { h, cursors } = setup(store);
     h.loop.dispatch({ type: 'view', view: 'incidents' });
     await h.loop.refresh();
     h.loop.dispatch({ type: 'view', view: 'dashboard' });
     store.gen = { 'local/api': 1 };
-    store.apps = {
-      'local/api': {
-        restarts: 2,
-        status: 'online',
-        out: { path: '/l/api-out', offset: 0 },
-        err: { path: '/l/api-err', offset: 0 },
-      },
-    };
+    store.emptied = { 'local/api': { out: 1, err: 1 } };
     await h.loop.refresh(); // the clear is seen while the view is closed
     now += 20 * 60_000;
     h.loop.dispatch({ type: 'view', view: 'incidents' });
@@ -1969,7 +1950,7 @@ describe('MonitLoop incidents view and log clears', () => {
   it('a read that spans a clear in view is dropped: its position is from before the clear', async () => {
     let now = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const store = fresh();
     const cursors: CursorState[] = [];
     let release: () => void = () => {};
     let hold = false;
@@ -2001,13 +1982,7 @@ describe('MonitLoop incidents view and log clears', () => {
     await new Promise((r) => setTimeout(r, 0));
     hold = false;
     store.gen = { 'local/api': 1 };
-    store.apps = {
-      'local/api': {
-        restarts: 2,
-        status: 'online',
-        err: { path: '/l/api-err', offset: 0 },
-      },
-    };
+    store.emptied = { 'local/api': { out: 1, err: 1 } };
     await h.loop.refresh(); // reads the clear while the earlier read still runs
     release();
     await spanning;
@@ -2022,7 +1997,7 @@ describe('MonitLoop incidents view and log clears', () => {
   it('a clear of an app outside the view drops nothing', async () => {
     let now = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const store = fresh();
     let release: () => void = () => {};
     let hold = false;
     const h = harness(undefined, {
@@ -2049,6 +2024,7 @@ describe('MonitLoop incidents view and log clears', () => {
     await new Promise((r) => setTimeout(r, 0));
     hold = false;
     store.gen = { 'prod/elsewhere': 1 };
+    store.emptied = { 'prod/elsewhere': { out: 1, err: 1 } };
     await h.loop.refresh();
     release();
     await reading;

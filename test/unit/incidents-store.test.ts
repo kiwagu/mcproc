@@ -241,6 +241,7 @@ describe('the pick-up point', () => {
       apps: {},
       cleared: {},
       clears: {},
+      emptied: {},
     });
   });
 });
@@ -291,6 +292,7 @@ describe('clearLogs', () => {
     expect(readStore(file)).toMatchObject({
       cleared: { 'local/watch': '2026-10-12T15:04:05' },
       clears: { 'local/watch': 2 },
+      emptied: { 'local/watch': { out: 2, err: 2 } }, // per file, kept by the take between the clears
     });
   });
   it('a file that could not be truncated keeps its point and is named; the app is not marked cleared', async () => {
@@ -318,6 +320,9 @@ describe('clearLogs', () => {
     ]); // what stayed is not counted as freed
     expect(readStore(file).cleared).toEqual({});
     expect(readStore(file).clears).toEqual({ 'local/watch': 1 }); // out was emptied: a screen showing it starts over
+    expect(readStore(file).emptied).toEqual({
+      'local/watch': { out: 1, err: 0 },
+    }); // per file: a reader with its own position restarts out only
     state.files['/l/watch-out'] = `${S(30)}ERROR: after the clear\n`;
     expect(
       (await takeIncidents(h.fleet, ['watch'], {}, file)).answer.incidents.map(

@@ -25,6 +25,11 @@ import {
 export interface Store extends CursorState {
   cleared: Record<string, string>;
   clears: Record<string, number>;
+  /**
+   * per host/app, how many clears emptied each of its files: a reader with its own position (the monit incidents view)
+   * restarts a file exactly when its count moves, whatever the shared point has done since
+   */
+  emptied: Record<string, { out?: number; err?: number }>;
 }
 export interface TakenAnswer extends IncidentsAnswer {
   taken: boolean;
@@ -63,11 +68,12 @@ export function readStore(file: string): Store {
         apps: s.apps,
         cleared: obj(s.cleared),
         clears: obj(s.clears),
+        emptied: obj(s.emptied),
       };
   } catch {
     /* a fresh start */
   }
-  return { v: 1, apps: {}, cleared: {}, clears: {} };
+  return { v: 1, apps: {}, cleared: {}, clears: {}, emptied: {} };
 }
 
 /**
@@ -176,6 +182,7 @@ export async function takeIncidents(
       ...mergeCursor(s, next),
       cleared: s.cleared,
       clears: s.clears,
+      emptied: s.emptied,
     };
     return {
       result: {
@@ -227,6 +234,7 @@ export async function clearLogs(
       apps: { ...s.apps },
       cleared: { ...s.cleared },
       clears: { ...s.clears },
+      emptied: { ...s.emptied },
     };
     const out: Cleared[] = [];
     for (const g of groups) {
@@ -247,6 +255,13 @@ export async function clearLogs(
           };
           if (f.failed.length === 0) next.cleared[key] = at;
           if (f.failed.length < 2) next.clears[key] = (s.clears[key] ?? 0) + 1; // a file of it was emptied
+          const was = s.emptied[key] ?? {};
+          const count = (path: string, n: number | undefined) =>
+            (n ?? 0) + (f.failed.includes(path) ? 0 : 1);
+          next.emptied[key] = {
+            out: count(f.proc.out_log, was.out),
+            err: count(f.proc.err_log, was.err),
+          };
           const freed = (path: string, bytes: number) =>
             f.failed.includes(path) ? 0 : bytes;
           out.push({

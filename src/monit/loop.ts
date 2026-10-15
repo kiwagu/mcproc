@@ -76,8 +76,8 @@ export interface LoopDeps {
   cleared(fleet: Fleet): {
     at: Record<string, string>;
     gen: Record<string, number>;
-    /** the store's marks: right after a clear, a file it emptied is at offset 0 there and one it could not keeps its place */
-    apps?: CursorState['apps'];
+    /** per host/app, how many clears emptied each file: a file whose count moved restarts the incidents view there */
+    emptied?: Record<string, { out?: number; err?: number }>;
   };
   /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
   peekIncidents(
@@ -163,6 +163,8 @@ export class MonitLoop {
    * the incidents view's own position (null: not read yet in this view), when it last read, whether a read runs, and how
    * many log clears it has seen (a read that spans one is dropped: its position is from before the clear)
    */
+  /** how many clears had emptied each file when the incidents view last looked, per host/app */
+  private seenEmptied: Record<string, { out?: number; err?: number }> = {};
   private inc: {
     cursor: CursorState | null;
     last: number;
@@ -674,32 +676,35 @@ export class MonitLoop {
 
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
-    const { at, gen, apps = {} } = this.deps.cleared(this.fleet);
+    const { at, gen, emptied = {} } = this.deps.cleared(this.fleet);
     const changed = Object.keys(gen).filter(
       (key) => gen[key] !== this.seen[key]
     );
     const again = changed.map((key) => key.slice(key.indexOf('/') + 1));
     this.seen = { ...gen };
     this.restart(again.filter((a) => this.names.includes(a)));
-    const inView = new Set(
-      this.names.map((a) => markKey(this.fleet.hostOf(a), a))
-    );
-    this.clearIncidents(
-      changed.filter((k) => inView.has(k)),
-      apps
-    );
+    const files: Record<string, ('out' | 'err')[]> = {};
+    for (const key of this.names.map((a) => markKey(this.fleet.hostOf(a), a))) {
+      const moved = (['out', 'err'] as const).filter(
+        (s) => (emptied[key]?.[s] ?? 0) !== (this.seenEmptied[key]?.[s] ?? 0)
+      );
+      if (moved.length) files[key] = moved;
+    }
+    this.seenEmptied = { ...emptied };
+    this.clearIncidents(files);
     if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared))
       this.dispatch({ type: 'cleared', cleared: at });
   }
 
   /**
-   * Cleared logs of apps in view (keys host/app) move the incidents view's own position the way the clear moved the
-   * store's: each file the clear emptied is read again from its start (an old offset would skip a file that regrew to the
-   * same size, and a missing one would read only the last minutes); a file it could not empty keeps its place, so nothing
-   * is shown twice. The store's marks tell which is which right after the clear; they are read, never taken from or
-   * moved. A read under way is dropped, as its position is from before the clear.
+   * Files of apps in view that a clear emptied (per host/app, as the store counts them) are read again from their start
+   * by the incidents view: an old offset would skip a file that regrew past it, and a missing one would read only the
+   * last minutes. A file the clear could not empty keeps its place, so nothing is shown twice. The counts are the
+   * clear's own record, never the shared point (an agent may take before the view looks). A read under way is dropped,
+   * as its position is from before the clear.
    */
-  private clearIncidents(keys: string[], store: CursorState['apps']): void {
+  private clearIncidents(files: Record<string, ('out' | 'err')[]>): void {
+    const keys = Object.keys(files);
     if (keys.length === 0) return;
     const st = this.inc;
     st.clears++;
@@ -707,12 +712,13 @@ export class MonitLoop {
     const apps = { ...st.cursor.apps };
     for (const k of keys) {
       const own = apps[k];
-      if (!own) continue; // not read yet: its first read is from the emptied file
-      const restart = (s: 'out' | 'err') => {
-        const m = store[k]?.[s];
-        return m && m.offset === 0 ? { path: m.path, offset: 0 } : own[s];
-      };
-      apps[k] = { ...own, out: restart('out'), err: restart('err') };
+      if (!own) continue; // not read yet: its first read sees the emptied files
+      const next = { ...own };
+      for (const s of files[k]) {
+        const m = own[s];
+        if (m) next[s] = { path: m.path, offset: 0 };
+      }
+      apps[k] = next;
     }
     st.cursor = { ...st.cursor, apps };
   }
