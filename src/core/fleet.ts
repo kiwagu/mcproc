@@ -335,13 +335,18 @@ export function probeFleet(
   );
 }
 
-/** Rows of the named apps in their order, each from its own host. A host that does not answer leaves unreachable rows, unless none answers. */
+/**
+ * Rows of the named apps in their order, each from its own host. A host that does not answer leaves unreachable rows,
+ * unless none answers. Only the named apps' urls are asked, unless `opts.urls` says otherwise.
+ */
 export async function listFleet(
   fleet: Fleet,
   names: string[],
   opts: SnapshotOptions = {}
 ): Promise<{ rows: LsRow[]; errors: HostError[]; probes: HostProbe[] }> {
-  const probes = await probeFleet(fleet, names, (ctx) => snapshot(ctx, opts));
+  const probes = await probeFleet(fleet, names, (ctx) =>
+    snapshot(ctx, { urls: names, ...opts })
+  );
   const failed = probes.filter((p) => p.error !== undefined);
   if (failed.length === probes.length && failed.length > 0)
     throw failed[0].error;
