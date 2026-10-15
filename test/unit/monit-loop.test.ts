@@ -180,6 +180,18 @@ describe('MonitLoop', () => {
     expect(h.state.logPaths).toEqual({ out: '/l/api-out', err: '/l/api-err' });
     expect(h.state.logs.api.map((l) => l.text)).toEqual(['line']);
   });
+  it('the live screen never requests a url: every refresh probes with urls none', async () => {
+    const seen: unknown[] = [];
+    const h = harness(undefined, {
+      snapshot: async (_ctx, opts) => {
+        seen.push(opts.urls);
+        return snap();
+      },
+    });
+    await h.loop.refresh();
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((u) => u === 'none')).toBe(true);
+  });
 
   it("flat view: a refresh polls every running app and dispatches labeled flat lines instead of the selected app's logs", async () => {
     const polled: string[] = [];

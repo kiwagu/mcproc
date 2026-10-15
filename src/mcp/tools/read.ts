@@ -28,6 +28,7 @@ import {
   renderIncidents,
   renderWait,
   hostsOf,
+  urlNote,
 } from '../render.js';
 
 export function registerReadTools(server: McpServer, deps: ToolDeps): void {
@@ -93,7 +94,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'List apps',
       description:
-        'One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down). Answers "is it up, on which port, which address do I open". reloads: true also counts each running app\'s in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2\'s restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.',
+        "One row per manifest app, each from the host it runs on: pm2 status, pid, uptime, restarts, memory and CPU of the whole process tree, the runtime command, the ports it really listens on compared with the declared ones, and its URL with the HTTP answer (ok/error/down), requested on the app's host and, when the host gets no answer, from this machine: ✓ 200 (here), or ✗ down (refused) with the reason (url_check in the manifest pins one side). Answers \"is it up, on which port, which address do I open\". reloads: true also counts each running app's in-process reloads since its pm2 start (tsx/nodemon restarts, Vite/Next rebuilds, a repeated listening line), which pm2's restarts never show: RESTARTS 0 (+3), or 0 (+≥3) when the logs read did not reach back to the start.",
       inputSchema: {
         ...commonInput,
         app: z.string().optional().describe('Only this app'),
@@ -154,6 +155,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
             ? `depends_on: ${fmtDeps(d.app.depends_on)}`
             : '',
           renderLs([d.row], d.host),
+          urlNote(d.row),
           `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
           `pm2: ${JSON.stringify(d.pm2)}`,
         ]

@@ -12,6 +12,7 @@ import { probeOut } from '../helpers/probe.js';
 import { S, answerReads } from '../helpers/incidents.js';
 import type { Spawner } from '../../src/transport/types.js';
 import type { UnpackDeps } from '../../src/runtime/unpack.js';
+import type { HereCheck } from '../../src/core/urlcheck.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -21,9 +22,15 @@ const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
 async function client(
   spawner?: Spawner,
   unpackDeps?: UnpackDeps,
-  project?: string
+  project?: string,
+  hereCheck?: HereCheck
 ) {
-  const server = createServer({ spawner, unpack: unpackDeps, project });
+  const server = createServer({
+    spawner,
+    unpack: unpackDeps,
+    project,
+    hereCheck,
+  });
   const [c, s] = InMemoryTransport.createLinkedPair();
   await server.connect(s);
   const cl = new Client({ name: 'test', version: '0.0.0' });
@@ -32,6 +39,9 @@ async function client(
 }
 const neverSpawn: Spawner = async (argv) => {
   throw new Error(`spawner must not be called: ${argv.join(' ')}`);
+};
+const neverHere: HereCheck = async (u) => {
+  throw new Error(`no check from this machine expected: ${u}`);
 };
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
@@ -114,6 +124,9 @@ describe('mcp server', () => {
     );
     expect(waitDesc).not.toContain('—');
     expect(waitDesc.length).toBeLessThan(1200);
+    const lsDesc = byName.ls.description as string;
+    expect(lsDesc).toMatch(/from this machine.*\(here\)/);
+    expect(lsDesc.length).toBeLessThan(1200);
     const waitProps = byName.wait.inputSchema.properties as Record<
       string,
       { description?: string }
@@ -163,7 +176,7 @@ describe('mcp server', () => {
     expect(text(r)).toContain('Hint: Run init');
   });
   it('hosts and describe (project) work without touching a transport', async () => {
-    const cl = await client(neverSpawn);
+    const cl = await client(neverSpawn, undefined, undefined, neverHere);
     const h: any = await cl.callTool({
       name: 'hosts',
       arguments: { project: basic },
@@ -228,6 +241,61 @@ describe('mcp server', () => {
     expect(r.structuredContent.rows).toHaveLength(3);
     expect(text(r)).toMatch(/api\s+server\s+online\s+4242/);
     expect(text(r)).toContain(':3310 ✓');
+  });
+  it('ls and describe: a url the box cannot reach answers from this machine, and both say so', async () => {
+    const jl: Record<string, string> = {
+      local: '[]',
+      box: JSON.stringify([
+        {
+          pid: 77,
+          name: 'fleet-web',
+          pm_id: 3,
+          pm2_env: { status: 'online', namespace: 'fleet' },
+        },
+      ]),
+    };
+    const spawner: Spawner = async (argv) => {
+      const host = argv[0] === 'ssh' ? argv[argv.length - 2] : 'local';
+      const cmd = argv[argv.length - 1];
+      if (cmd.includes(MARK.JLIST))
+        return {
+          code: 0,
+          stdout: probeOut({
+            jlist: jl[host] ?? '[]',
+            urls: host === 'box' ? 'http://localhost:3000/\t000\t7\t::1' : '',
+          }),
+          stderr: '',
+        };
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected on ${host}` };
+    };
+    const asked: string[] = [];
+    const cl = await client(spawner, undefined, undefined, async (u) => {
+      asked.push(u);
+      return { answered: true, code: 200 };
+    });
+    const r: any = await cl.callTool({
+      name: 'ls',
+      arguments: { project: fleet, host: 'box' },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(text(r)).toContain('http://localhost:3000/ ✓ 200 (here)');
+    expect(r.structuredContent.rows[0]).toMatchObject({
+      app: 'web',
+      url_status: 'ok',
+      url_code: 200,
+      url_from: 'here',
+      url_reason: 'on box: refused',
+    });
+    expect(asked).toEqual(['http://localhost:3000/']);
+    const d: any = await cl.callTool({
+      name: 'describe',
+      arguments: { project: fleet, app: 'web' },
+    });
+    expect(text(d)).toContain(
+      'url: answered from this machine (on box: refused)'
+    );
   });
   it("ls reloads: true counts each running app's in-process reloads into its row and RESTARTS cell; without it ls reads no log", async () => {
     const jlist = JSON.stringify([

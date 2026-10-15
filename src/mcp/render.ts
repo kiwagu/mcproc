@@ -9,6 +9,7 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
+import { reasonWord } from '../core/urlcheck.js';
 import { formatLine } from '../core/logstream.js';
 import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
@@ -66,13 +67,26 @@ export function fmtCpu(c: number | null): string {
 export function cut(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
-/** The declared url with its HTTP answer when one was requested; the bare url when not (monit's live screen never asks). */
+/**
+ * The declared url with its HTTP answer when one was requested, `(here)` when that answer came from this machine, and
+ * the short reason of a url that answered nowhere; the bare url when not requested (monit's live screen never asks).
+ */
 export function fmtUrl(r: LsRow): string {
   if (!r.url) return '-';
-  if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}`;
-  if (r.url_status === 'error') return `${r.url} ✗ ${r.url_code}`;
-  if (r.url_status === 'down') return `${r.url} ✗ down`;
+  const here = r.url_from === 'here' ? ' (here)' : '';
+  if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}${here}`;
+  if (r.url_status === 'error')
+    return `${r.url} ✗ ${r.url_code ?? 'error'}${here}`;
+  if (r.url_status === 'down')
+    return `${r.url} ✗ down${r.url_reason ? ` (${reasonWord(r.url_reason)})` : ''}`;
   return r.url;
+}
+/** describe's line for the url when the table cell does not say it all: where it answered and why, or why it did not. */
+export function urlNote(r: LsRow): string {
+  if (!r.url || !r.url_reason) return '';
+  if (r.url_status === 'ok' || r.url_status === 'error')
+    return `url: answered ${r.url_from === 'here' ? 'from this machine' : `on ${r.host}`} (${r.url_reason})`;
+  return `url: ${r.url_status} (${r.url_reason})`;
 }
 /** pm2's restarts, then the in-process reloads counted since the start when there are any: `0 (+3)`, `0 (+≥3)` when partial. */
 function fmtRestarts(r: LsRow): string {

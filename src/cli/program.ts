@@ -49,6 +49,7 @@ import {
   renderAdopted,
   hostsOf,
   sinceNotes,
+  urlNote,
 } from '../mcp/render.js';
 import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
@@ -285,7 +286,16 @@ export function buildProgram(io: Io = defaultIo): Command {
         const d = await describeFleetApp(fleet, app);
         emit(
           g,
-          `${d.app.name} [${d.app.kind}]: ${d.app.description}\nrun: ${d.app.run}\ncwd: ${d.app.cwd}\n${renderLs([d.row], d.host)}\nlogs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
+          [
+            `${d.app.name} [${d.app.kind}]: ${d.app.description}`,
+            `run: ${d.app.run}`,
+            `cwd: ${d.app.cwd}`,
+            renderLs([d.row], d.host),
+            urlNote(d.row),
+            `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
+          ]
+            .filter(Boolean)
+            .join('\n'),
           d
         );
       })

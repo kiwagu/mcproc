@@ -1,10 +1,11 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildProgram, printLs, printSince } from '../../src/cli/program.js';
 import { parseSince } from '../../src/core/logsince.js';
+import { Fleet } from '../../src/core/fleet.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -420,6 +421,63 @@ describe('printLs (ls)', () => {
       /^box: reloads not counted: TRANSPORT_FAILED/
     );
     expect(process.exitCode).toBe(1);
+  });
+  it('a url the box cannot reach answers from this machine: the cell says (here), the JSON says why', async () => {
+    const st = {
+      ...state(),
+      urls: { box: 'http://localhost:3000/\t000\t7\t::1' },
+      here: {
+        'http://localhost:3000/': { answered: true as const, code: 200 },
+      },
+    };
+    const c = capture();
+    await printLs(
+      fakeHosts(st).fleet,
+      ['web'],
+      { reloads: false, json: false },
+      c.io
+    );
+    expect(c.out.join('\n')).toContain('http://localhost:3000/ ✓ 200 (here)');
+    const j = capture();
+    await printLs(
+      fakeHosts(st).fleet,
+      ['web'],
+      { reloads: false, json: true },
+      j.io
+    );
+    expect(JSON.parse(j.out.join(''))[0]).toMatchObject({
+      url_from: 'here',
+      url_reason: 'on box: refused',
+    });
+  });
+});
+
+describe('describe <app>', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  it('says where the url answered and why, under the table', async () => {
+    const h = fakeHosts({
+      files: {},
+      procs: { local: [proc('watch', 0)], box: [proc('web', 2)] },
+      urls: { box: 'http://localhost:3000/\t000\t7\t::1' },
+      here: { 'http://localhost:3000/': { answered: true, code: 200 } },
+    });
+    // the command builds its own fleet: its hosts are answered by the fake ones
+    const real = Fleet.prototype.ctx;
+    vi.spyOn(Fleet.prototype, 'ctx').mockImplementation((host: string) =>
+      real.call(h.fleet, host)
+    );
+    const c = capture();
+    await buildProgram(c.io).parseAsync(
+      ['describe', 'web', '--project', fleet],
+      { from: 'user' }
+    );
+    expect(c.err).toEqual([]);
+    const out = c.out.join('\n');
+    expect(out).toContain('http://localhost:3000/ ✓ 200 (here)');
+    expect(out).toContain('url: answered from this machine (on box: refused)');
+    expect(out.split('\n').at(-1)).toMatch(/^logs: /);
   });
 });
 
