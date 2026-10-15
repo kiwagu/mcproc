@@ -24,12 +24,28 @@ import {
  */
 export interface Store extends CursorState {
   cleared: Record<string, string>;
-  clears: Record<string, number>;
   /**
-   * per host/app, how many clears emptied each of its files: a reader with its own position (the monit incidents view)
-   * restarts a file exactly when its count moves, whatever the shared point has done since
+   * how many clears emptied a file of each host/app, and, under `fileClearKey` keys, how many emptied each file itself:
+   * a reader with its own position (the monit incidents view) restarts a file exactly when its count moves, whatever the
+   * shared point has done since. Every writer copies this map as it found it, so the counts only ever grow.
    */
-  emptied: Record<string, { out?: number; err?: number }>;
+  clears: Record<string, number>;
+}
+
+/** The key under which `clears` counts the clears that emptied one file of an app: host/app, stream and path, NUL-separated. */
+export const fileClearKey = (
+  key: string,
+  stream: 'out' | 'err',
+  path: string
+): string => `${key}\u0000${stream}\u0000${path}`;
+
+/** A `fileClearKey` read back, or null for an app's own key. */
+export function parseFileClearKey(
+  k: string
+): { key: string; stream: 'out' | 'err'; path: string } | null {
+  const [key, stream, ...rest] = k.split('\u0000');
+  if (rest.length === 0 || (stream !== 'out' && stream !== 'err')) return null;
+  return { key, stream, path: rest.join('\u0000') };
 }
 export interface TakenAnswer extends IncidentsAnswer {
   taken: boolean;
@@ -68,12 +84,11 @@ export function readStore(file: string): Store {
         apps: s.apps,
         cleared: obj(s.cleared),
         clears: obj(s.clears),
-        emptied: obj(s.emptied),
       };
   } catch {
     /* a fresh start */
   }
-  return { v: 1, apps: {}, cleared: {}, clears: {}, emptied: {} };
+  return { v: 1, apps: {}, cleared: {}, clears: {} };
 }
 
 /**
@@ -182,7 +197,6 @@ export async function takeIncidents(
       ...mergeCursor(s, next),
       cleared: s.cleared,
       clears: s.clears,
-      emptied: s.emptied,
     };
     return {
       result: {
@@ -234,7 +248,6 @@ export async function clearLogs(
       apps: { ...s.apps },
       cleared: { ...s.cleared },
       clears: { ...s.clears },
-      emptied: { ...s.emptied },
     };
     const out: Cleared[] = [];
     for (const g of groups) {
@@ -255,13 +268,14 @@ export async function clearLogs(
           };
           if (f.failed.length === 0) next.cleared[key] = at;
           if (f.failed.length < 2) next.clears[key] = (s.clears[key] ?? 0) + 1; // a file of it was emptied
-          const was = s.emptied[key] ?? {};
-          const count = (path: string, n: number | undefined) =>
-            (n ?? 0) + (f.failed.includes(path) ? 0 : 1);
-          next.emptied[key] = {
-            out: count(f.proc.out_log, was.out),
-            err: count(f.proc.err_log, was.err),
-          };
+          for (const [stream, path] of [
+            ['out', f.proc.out_log],
+            ['err', f.proc.err_log],
+          ] as const) {
+            if (f.failed.includes(path)) continue; // this file was not emptied
+            const fk = fileClearKey(key, stream, path);
+            next.clears[fk] = (s.clears[fk] ?? 0) + 1;
+          }
           const freed = (path: string, bytes: number) =>
             f.failed.includes(path) ? 0 : bytes;
           out.push({

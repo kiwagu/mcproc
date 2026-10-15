@@ -16,6 +16,7 @@ import {
 import type { StatSample } from '../core/stats.js';
 import type { FollowPoll, LogLine } from '../core/logfollow.js';
 import {
+  parseFileClearKey,
   takeIncidents,
   type Cleared,
   type TakenAnswer,
@@ -76,8 +77,6 @@ export interface LoopDeps {
   cleared(fleet: Fleet): {
     at: Record<string, string>;
     gen: Record<string, number>;
-    /** per host/app, how many clears emptied each file: a file whose count moved restarts the incidents view there */
-    emptied?: Record<string, { out?: number; err?: number }>;
   };
   /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
   peekIncidents(
@@ -97,6 +96,9 @@ export const reloadView = (
   fleet: Fleet,
   signal: AbortSignal
 ): Promise<LsRow[]> => actOn(fleet, 'all', 'start', { reload: true, signal });
+
+/** The files a clear emptied, per host/app: each with its stream and path, or both of them when the clear did not say. */
+type Emptied = { stream: 'out' | 'err'; path: string }[] | 'both';
 
 /** The incidents view reads again at most this often while it is open (and not at all while it is closed). */
 export const INCIDENTS_POLL_MS = 5000;
@@ -163,8 +165,6 @@ export class MonitLoop {
    * the incidents view's own position (null: not read yet in this view), when it last read, whether a read runs, and how
    * many log clears it has seen (a read that spans one is dropped: its position is from before the clear)
    */
-  /** how many clears had emptied each file when the incidents view last looked, per host/app */
-  private seenEmptied: Record<string, { out?: number; err?: number }> = {};
   private inc: {
     cursor: CursorState | null;
     last: number;
@@ -676,34 +676,43 @@ export class MonitLoop {
 
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
-    const { at, gen, emptied = {} } = this.deps.cleared(this.fleet);
+    const { at, gen } = this.deps.cleared(this.fleet);
+    // a count that appears or grows is a clear; one that vanished (the store was removed) is none
     const changed = Object.keys(gen).filter(
       (key) => gen[key] !== this.seen[key]
     );
-    const again = changed.map((key) => key.slice(key.indexOf('/') + 1));
+    const apps = changed.filter((k) => parseFileClearKey(k) === null);
     this.seen = { ...gen };
-    this.restart(again.filter((a) => this.names.includes(a)));
-    const files: Record<string, ('out' | 'err')[]> = {};
-    for (const key of this.names.map((a) => markKey(this.fleet.hostOf(a), a))) {
-      const moved = (['out', 'err'] as const).filter(
-        (s) => (emptied[key]?.[s] ?? 0) !== (this.seenEmptied[key]?.[s] ?? 0)
-      );
-      if (moved.length) files[key] = moved;
+    this.restart(
+      apps
+        .map((key) => key.slice(key.indexOf('/') + 1))
+        .filter((a) => this.names.includes(a))
+    );
+    const inView = new Set(
+      this.names.map((a) => markKey(this.fleet.hostOf(a), a))
+    );
+    const files: Record<string, Emptied> = {};
+    for (const k of changed) {
+      const f = parseFileClearKey(k);
+      if (!f || !inView.has(f.key)) continue;
+      const e = files[f.key];
+      files[f.key] = [...(e === 'both' || !e ? [] : e), f];
     }
-    this.seenEmptied = { ...emptied };
+    // a clear by an mcproc that counts no files: it emptied both of them unless it said otherwise
+    for (const k of apps) if (inView.has(k) && !files[k]) files[k] = 'both';
     this.clearIncidents(files);
     if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared))
       this.dispatch({ type: 'cleared', cleared: at });
   }
 
   /**
-   * Files of apps in view that a clear emptied (per host/app, as the store counts them) are read again from their start
-   * by the incidents view: an old offset would skip a file that regrew past it, and a missing one would read only the
-   * last minutes. A file the clear could not empty keeps its place, so nothing is shown twice. The counts are the
-   * clear's own record, never the shared point (an agent may take before the view looks). A read under way is dropped,
-   * as its position is from before the clear.
+   * Files of apps in view that a clear emptied, as the store counts them per file (its path included), are read again
+   * from their start by the incidents view: an old offset would skip a file that regrew past it, and a missing one would
+   * read only the last minutes. A file the clear could not empty keeps its place, so nothing is shown twice. The counts
+   * are the clear's own record, never the shared point (an agent may take before the view looks). A read under way is
+   * dropped, as its position is from before the clear.
    */
-  private clearIncidents(files: Record<string, ('out' | 'err')[]>): void {
+  private clearIncidents(files: Record<string, Emptied>): void {
     const keys = Object.keys(files);
     if (keys.length === 0) return;
     const st = this.inc;
@@ -714,10 +723,20 @@ export class MonitLoop {
       const own = apps[k];
       if (!own) continue; // not read yet: its first read sees the emptied files
       const next = { ...own };
-      for (const s of files[k]) {
-        const m = own[s];
-        if (m) next[s] = { path: m.path, offset: 0 };
-      }
+      const emptied = files[k];
+      if (emptied === 'both') {
+        for (const s of ['out', 'err'] as const) {
+          const m = own[s];
+          if (m) next[s] = { path: m.path, offset: 0 };
+        }
+      } else
+        for (const s of ['out', 'err'] as const) {
+          const mine = emptied.filter((f) => f.stream === s);
+          // the file this view reads, when the clear emptied it; else the one the clear emptied (a new path)
+          const f =
+            mine.find((x) => x.path === own[s]?.path) ?? mine.at(-1) ?? null;
+          if (f) next[s] = { path: f.path, offset: 0 };
+        }
       apps[k] = next;
     }
     st.cursor = { ...st.cursor, apps };

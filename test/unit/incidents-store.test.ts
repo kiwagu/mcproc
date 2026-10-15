@@ -8,6 +8,8 @@ import net from 'node:net';
 import {
   clearLogs,
   lockAddress,
+  fileClearKey,
+  parseFileClearKey,
   readStore,
   storePath,
   takeIncidents,
@@ -241,8 +243,19 @@ describe('the pick-up point', () => {
       apps: {},
       cleared: {},
       clears: {},
-      emptied: {},
     });
+  });
+});
+
+describe('fileClearKey', () => {
+  it('reads back what it wrote, a path with odd characters included; an app key is not one', () => {
+    const k = fileClearKey('box/web', 'err', '/home/a b/web|err.log');
+    expect(parseFileClearKey(k)).toEqual({
+      key: 'box/web',
+      stream: 'err',
+      path: '/home/a b/web|err.log',
+    });
+    expect(parseFileClearKey('box/web')).toBeNull();
   });
 });
 
@@ -291,8 +304,11 @@ describe('clearLogs', () => {
     await clearLogs(h.fleet, ['watch'], file, at);
     expect(readStore(file)).toMatchObject({
       cleared: { 'local/watch': '2026-10-12T15:04:05' },
-      clears: { 'local/watch': 2 },
-      emptied: { 'local/watch': { out: 2, err: 2 } }, // per file, kept by the take between the clears
+      clears: {
+        'local/watch': 2,
+        [fileClearKey('local/watch', 'out', '/l/watch-out')]: 2,
+        [fileClearKey('local/watch', 'err', '/l/watch-err')]: 2,
+      }, // per app and per file, kept by the take between the clears
     });
   });
   it('a file that could not be truncated keeps its point and is named; the app is not marked cleared', async () => {
@@ -319,10 +335,10 @@ describe('clearLogs', () => {
       { app: 'watch', err_bytes: 0, failed: ['/l/watch-err'] },
     ]); // what stayed is not counted as freed
     expect(readStore(file).cleared).toEqual({});
-    expect(readStore(file).clears).toEqual({ 'local/watch': 1 }); // out was emptied: a screen showing it starts over
-    expect(readStore(file).emptied).toEqual({
-      'local/watch': { out: 1, err: 0 },
-    }); // per file: a reader with its own position restarts out only
+    expect(readStore(file).clears).toEqual({
+      'local/watch': 1,
+      [fileClearKey('local/watch', 'out', '/l/watch-out')]: 1,
+    }); // out was emptied: a screen showing it starts over; err, which was not, is not counted
     state.files['/l/watch-out'] = `${S(30)}ERROR: after the clear\n`;
     expect(
       (await takeIncidents(h.fleet, ['watch'], {}, file)).answer.incidents.map(

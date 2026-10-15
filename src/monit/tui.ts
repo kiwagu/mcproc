@@ -35,7 +35,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
     const s = readStore(storePath(fleet.manifest.path));
-    return { at: s.cleared, gen: s.clears, emptied: s.emptied };
+    return { at: s.cleared, gen: s.clears };
   },
   peekIncidents: (fleet, names, cursor) => peekView(fleet, names, cursor),
 });
