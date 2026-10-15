@@ -142,6 +142,9 @@ function harness(
     command: async (f, cmd, app) => {
       commands.push(`${cmd} ${app} via ${f.requested ?? 'all'}`);
     },
+    reloadAll: async (f) => {
+      commands.push(`reload all via ${f.requested ?? 'all'}`);
+    },
     clear: async (_f, apps) =>
       apps.map((app) => ({ app, host: 'local', out_bytes: 0, err_bytes: 0 })),
     cleared: () => ({ at: {}, gen: {} }),
@@ -1340,5 +1343,180 @@ describe('MonitLoop reloads', () => {
     expect(h.state.reloads).toEqual({});
     expect(h.state.logs.api).toHaveLength(2);
     h.loop.close();
+  });
+});
+
+describe('MonitLoop reload all', () => {
+  const fleetProcs: Record<string, ReturnType<typeof jlistOf>> = {
+    local: jlistOf('fleet', ['watch', 'tool']),
+    box: jlistOf('fleet', ['web'], 50),
+    ro: jlistOf('fleet', ['audit'], 70),
+  };
+  const multi = (requested: string | undefined, over: Partial<LoopDeps>) =>
+    harness(
+      requested,
+      {
+        snapshot: async (ctx) => snap(fleetProcs[ctx.host.name]),
+        rows: (ctx, _s, apps) => apps.map((a) => row(a, ctx.host.name)),
+        ...over,
+      },
+      { dir: fleetDir }
+    );
+  const notices = (h: { actions: MonitAction[] }) =>
+    h.actions
+      .filter((a) => a.type === 'notice')
+      .map((a) => (a as { message: string | null }).message);
+
+  it("reloads through the view's fleet with a signal, busy while it runs, says done, then refreshes every host of the view", async () => {
+    const d = deferred<LsRow[] | undefined>();
+    const seen: { requested: string | undefined; signal: AbortSignal }[] = [];
+    const probes: string[] = [];
+    const h = harness(undefined, {
+      reloadAll: (f, signal) => {
+        seen.push({ requested: f.requested, signal });
+        return d.promise;
+      },
+      snapshot: async (ctx) => {
+        probes.push(ctx.host.name);
+        return snap();
+      },
+    });
+    await h.loop.refresh();
+    const run = h.loop.reloadAll();
+    await tick();
+    expect(seen).toHaveLength(1);
+    expect(seen[0].requested).toBe('local');
+    expect(seen[0].signal.aborted).toBe(false);
+    expect(h.state.busy).toBe(true);
+    expect(h.state.notice).toBe('reload all…');
+    const before = h.actions.filter((a) => a.type === 'rows').length;
+    await h.loop.refresh(); // the screen keeps refreshing while the reload runs
+    expect(h.actions.filter((a) => a.type === 'rows').length).toBe(before + 1);
+    probes.length = 0;
+    d.resolve([row('api'), row('worker')]);
+    await run;
+    expect(h.state.notice).toBe('reload all: done');
+    expect(h.state.busy).toBe(false);
+    expect(probes).toEqual(['local']);
+    expect(notices(h)).toEqual(['reload all…', 'reload all: done']);
+  });
+
+  it('in the all-hosts view every app is reloaded at its own host; narrowed with h, only the apps of that host', async () => {
+    const asked: (string | undefined)[] = [];
+    const probes: string[] = [];
+    const deps: Partial<LoopDeps> = {
+      reloadAll: async (f) => {
+        asked.push(f.requested);
+        return [];
+      },
+      snapshot: async (ctx) => {
+        probes.push(ctx.host.name);
+        return snap(fleetProcs[ctx.host.name]);
+      },
+    };
+    const all = multi(undefined, deps);
+    all.loop.fleet.manifest.hosts.ro.readonly = false; // this test only: every host of the view writable
+    await all.loop.reloadAll();
+    expect(asked).toEqual([undefined]);
+    expect(probes.sort()).toEqual(['box', 'local', 'ro']);
+    expect(all.state.notice).toBe('reload all: done');
+    const h = multi('local', deps);
+    asked.length = 0;
+    probes.length = 0;
+    await h.loop.reloadAll();
+    expect(asked).toEqual(['local']);
+    expect(probes).toEqual(['local']);
+    await h.loop.switchView('box');
+    probes.length = 0;
+    await h.loop.reloadAll();
+    expect(asked).toEqual(['local', 'box']);
+    expect(probes).toEqual(['box']); // tool runs where the view points (box); watch, bound to local, is not in this view
+  });
+
+  it('a view with an app on a readonly host refuses the whole reload before anything runs, and says so in the footer', async () => {
+    const called: string[] = [];
+    const probes: string[] = [];
+    const h = multi(undefined, {
+      reloadAll: async (f) => {
+        called.push(f.requested ?? 'all');
+        return [];
+      },
+      snapshot: async (ctx) => {
+        probes.push(ctx.host.name);
+        return snap(fleetProcs[ctx.host.name]);
+      },
+    });
+    await h.loop.reloadAll();
+    expect(called).toEqual([]);
+    expect(probes).toEqual([]);
+    expect(h.state.notice).toMatch(
+      /^reload all failed: READONLY_HOST: Host "ro" is readonly: .*"audit" runs there; nothing was changed$/
+    );
+    expect(h.state.busy).toBe(false);
+    await h.loop.refresh(); // a good refresh does not wipe the refusal
+    expect(h.state.notice).toMatch(/^reload all failed: READONLY_HOST/);
+    const prod = harness('prod', {
+      reloadAll: async () => {
+        called.push('prod');
+        return [];
+      },
+    });
+    await prod.loop.reloadAll();
+    expect(called).toEqual([]);
+    expect(prod.state.notice).toMatch(/^reload all failed: READONLY_HOST/);
+  });
+
+  it('a reload whose rows carry a failure says partly failed with the first one; one that throws says failed', async () => {
+    const h = harness(undefined, {
+      reloadAll: async () => [
+        row('api-build'),
+        {
+          ...row('api'),
+          status: 'skipped',
+          error: 'api-build: wait timed out after 60s',
+        },
+        { ...row('worker'), status: 'failed', error: 'PM2_FAILED: boom' },
+      ],
+    });
+    await h.loop.reloadAll();
+    expect(h.state.notice).toBe(
+      'reload all partly failed: api (local): api-build: wait timed out after 60s'
+    );
+    expect(h.state.busy).toBe(false);
+    const t = harness(undefined, {
+      reloadAll: async () => {
+        throw new McprocError('TRANSPORT_FAILED', 'ssh stand: down');
+      },
+    });
+    await t.loop.reloadAll();
+    expect(t.state.notice).toBe(
+      'reload all failed: TRANSPORT_FAILED: ssh stand: down'
+    );
+    expect(t.state.busy).toBe(false);
+  });
+
+  it('quitting the screen aborts the dependency waits of a running reload; nothing is refreshed after it', async () => {
+    let signal: AbortSignal | undefined;
+    const probes: string[] = [];
+    const h = harness(undefined, {
+      reloadAll: (_f, s) => {
+        signal = s;
+        return new Promise((resolve) =>
+          s.addEventListener('abort', () => resolve([]), { once: true })
+        );
+      },
+      snapshot: async (ctx) => {
+        probes.push(ctx.host.name);
+        return snap();
+      },
+    });
+    const run = h.loop.reloadAll();
+    await tick();
+    expect(signal?.aborted).toBe(false);
+    h.loop.close();
+    expect(signal?.aborted).toBe(true);
+    await run;
+    expect(probes).toEqual([]);
+    expect(h.state.notice).toBe('reload all…');
   });
 });

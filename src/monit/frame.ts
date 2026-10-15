@@ -290,9 +290,10 @@ export function renderFrame(
     `mcproc · ${s.project} · ${s.host}${s.hosts.length > 1 ? ` (h: ${s.hosts.join('/')})` : ''}  ${clock}`,
     w
   );
-  // everything that comes from outside (logs, descriptions, commands, errors) is shown as screen text: see screentext.ts
+  // everything that comes from outside (logs, descriptions, commands, errors) is shown as screen text: see screentext.ts.
+  // While busy: what the step under way says it is doing (busy drops the notice before it), or working… when it says nothing
   const right = screenText(
-    s.error ? `ERROR: ${s.error}` : s.busy ? 'working…' : (s.notice ?? '')
+    s.error ? `ERROR: ${s.error}` : (s.notice ?? (s.busy ? 'working…' : ''))
   );
   if (s.view === 'flat') {
     // compose style: every app, label padded to the longest name, `|` stdout / `!` stderr, continuations under the text
@@ -304,7 +305,8 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const keys = '↑↓ scroll  c clear  f dashboard  o/e/b logs  h host  q quit';
+    const keys =
+      '↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  h host  q quit';
     return {
       header,
       table: [],
@@ -378,7 +380,7 @@ export function renderFrame(
         ]
       : ['no app selected'];
   const keys =
-    'j/k app  ↑↓ scroll  r restart  s start  x stop  c clear  o/e/b logs  f flat  h host  q quit';
+    'j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  h host  q quit';
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return {
     header,

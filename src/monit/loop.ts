@@ -7,7 +7,11 @@ import {
 } from '../core/list.js';
 import { findProcess } from '../core/pm2.js';
 import { assertWritable, pickHost, type Context } from '../core/resolve.js';
-import type { Fleet, HostApps } from '../core/fleet.js';
+import {
+  assertWritableRuns,
+  type Fleet,
+  type HostApps,
+} from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
 import type { FollowPoll, LogLine } from '../core/logfollow.js';
 import type { Cleared } from '../core/incidents/store.js';
@@ -57,6 +61,8 @@ export interface LoopDeps {
   ): Follower;
   /** the rows of what the command touched (a dependency on another host included), or nothing */
   command(fleet: Fleet, cmd: Cmd, app: string): Promise<LsRow[] | undefined>;
+  /** `start all --reload` over the fleet: every app in dependency order with its waits; `signal` ends those waits as aborted */
+  reloadAll(fleet: Fleet, signal: AbortSignal): Promise<LsRow[] | undefined>;
   /** truncate the apps' logs and record the clear in the project's store (incidents start there) */
   clear(fleet: Fleet, apps: string[]): Promise<Cleared[]>;
   /** the clears recorded in the project's store, keyed host/app: when (shown in the title) and how many (a new one restarts that app's logs) */
@@ -110,6 +116,7 @@ export class MonitLoop {
   private gaps = new Map<string, number>();
   private losses = 0;
   private uncounted = new Set<string>(); // apps whose own reloads patterns ran away: not counted again in this view
+  private reloading: AbortController | null = null; // the running reload of the view: quitting ends its dependency waits
   private names: string[];
   private groups: HostApps[];
 
@@ -412,9 +419,10 @@ export class MonitLoop {
     }
   }
 
-  /** The screen is going away: no follower wakes it any more. */
+  /** The screen is going away: no follower wakes it any more, and a running reload stops waiting for dependencies. */
   close(): void {
     this.closed = true;
+    this.reloading?.abort();
     for (const q of this.wakes.values()) {
       if (q.timer) clearTimeout(q.timer);
       q.timer = null;
@@ -504,6 +512,46 @@ export class MonitLoop {
         message: `${cmd} ${app} failed: ${describeError(e)}`,
       });
     } finally {
+      this.dispatch({ type: 'busy', busy: false });
+    }
+  }
+
+  /**
+   * `R` twice: `start all --reload` over the view — every app at its own host, or only those of the host `h` narrowed
+   * to — in dependency order with their waits; running apps restart, stopped ones start, tasks run again. A view with an
+   * app on a readonly host is refused whole before anything runs: reloading only the writable hosts could stop halfway on
+   * a dependency there. Then every host of the view is refreshed.
+   */
+  async reloadAll(): Promise<void> {
+    const fleet = this.fleet;
+    const names = this.names;
+    const hosts = this.groups.map((g) => g.host);
+    const abort = new AbortController();
+    this.reloading = abort;
+    this.dispatch({ type: 'busy', busy: true });
+    this.dispatch({ type: 'notice', message: 'reload all…' });
+    try {
+      assertWritableRuns(fleet, fleet.runs(names), names);
+      const bad = (
+        (await this.deps.reloadAll(fleet, abort.signal)) ?? []
+      ).filter((r) => r.error);
+      if (this.closed) return; // the screen is gone: nothing to show, nothing to refresh
+      this.dispatch({
+        type: 'notice',
+        message: bad.length
+          ? `reload all partly failed: ${bad[0].app} (${bad[0].host}): ${bad[0].error}`
+          : 'reload all: done',
+      });
+      await this.refreshAfterCurrent(hosts);
+    } catch (e) {
+      if (this.closed) return;
+      // a notice, as for one app's command: the next good refresh clears errors, a failed reload must stay readable
+      this.dispatch({
+        type: 'notice',
+        message: `reload all failed: ${describeError(e)}`,
+      });
+    } finally {
+      if (this.reloading === abort) this.reloading = null;
       this.dispatch({ type: 'busy', busy: false });
     }
   }

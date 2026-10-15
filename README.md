@@ -336,7 +336,10 @@ app's process tree, which is what `bun run dev` or `next dev` hide behind their 
 with ✓/✗, the runtime command, a live log tail with history, and the selected app's details.
 `j`/`k` (or Tab) select an app, `↑`/`↓`, PageUp/PageDown and the mouse wheel scroll the log pane (End
 returns to the tail), `r`/`s`/`x` restart/start/stop, `c` twice clears the logs of the running apps in view
-(the log pane title then shows `cleared HH:MM`, and `incidents` starts over there), `o`/`e`/`b` switch the log stream, `f` switches to the
+(the log pane title then shows `cleared HH:MM`, and `incidents` starts over there), `R` twice reloads every app in view
+the way `mcproc start all --reload` does (in dependency order with their `depends_on` waits: running apps restart,
+stopped ones start, and `kind: task` apps run again; a view with an app on a readonly host is refused whole, so narrow
+it with `h`), `o`/`e`/`b` switch the log stream, `f` switches to the
 flat view (every app's logs merged into one labeled stream, `app | line`, `app ! line` for stderr, one
 color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. With host-bound
 apps the screen opens on every app at its own host, with a HOST column, and reads each app's logs where
