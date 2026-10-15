@@ -74,7 +74,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Doctor',
       description:
-        "Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state, the host's environment (container, hostname) and where each app's url answers (on the host or from this machine). Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable, and url_check: auto for a url pinned to its host that answers only from this machine.",
+        "Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state, the host's environment (container, hostname) and where each app's url answers (on the host or from this machine). Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable, and url_check: auto for an app with url_check: host whose url answers only from this machine.",
       inputSchema: commonInput,
       annotations: RO,
     },

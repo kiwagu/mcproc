@@ -191,6 +191,7 @@ describe.skipIf(!RUN)(
     }, 120_000);
 
     it('url checks: a url the container refuses but this machine answers reads ✓ 200 (here); host-only and nowhere read down with their reasons', async () => {
+      // like the test before it, this drives the pm2 that the first test unpacked into the container: it does not run alone
       // below the ephemeral range (32768+): no other integration file binds them, and no OS-assigned port lands on them
       const port = 28414;
       const closed = 28415;

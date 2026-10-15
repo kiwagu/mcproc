@@ -203,7 +203,7 @@ const urlStepMs = (urls: number): number =>
 /**
  * The host's environment and where the urls of its apps answer: those bound to it, plus on local the unbound ones,
  * which run there by default. Each url is decided as url_check: auto decides it, whatever the app declares: doctor says
- * where a url works, and recommends auto for an app pinned to its host whose url answers only from this machine. Its
+ * where a url works, and recommends auto for an app with url_check: host whose url answers only from this machine. Its
  * own round trip, judged by the exit status and the markers, never by stderr: BusyBox timeout prints "Terminated"
  * there each time it cuts a hung lookup, and the answer is still whole.
  */

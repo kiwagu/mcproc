@@ -421,8 +421,9 @@ reports an error and keeps its place until they are fixed, the other apps are no
 An app may declare `url`, the address you open in a browser; `init` drafts `http://localhost:<port>`
 for every server it finds a port for. `ls`, `describe`, `monit --once`, `wait until: url-ok` and a `ready`
 dependency on a url all check it the same way and report `ok` (2xx/3xx), `error` (4xx/5xx: up but refusing),
-`down` (nothing answered) or `unchecked`. It is a liveness check, not a trust check: self-signed development
-certificates are accepted, and a redirect is an answer (it is not followed, except by `wget` on a host without curl).
+`down` (nothing answered) or `unchecked` (not requested, or `url_check: host` on a host with neither curl nor
+wget). It is a liveness check, not a trust check: self-signed development certificates are accepted, and a
+redirect is an answer (it is not followed, except by `wget` on a host without curl).
 The interactive `monit` shows the URL but never requests it, so your dev servers' request logs stay yours.
 
 Where it is requested from is set per app with `url_check`:
@@ -440,17 +441,17 @@ host answers costs one request, on the host; the second request is made only for
 On the host each url's name lookup is bounded at 2 s and the host's environment lookups at about 4 s (where it
 has `timeout`), so a host whose resolver drops packets makes `ls` and each poll of `wait until: url-ok` that much slower.
 
-One catch of `auto`: a `localhost` url of an app on a remote host can read `✓ 200 (here)` when this machine
-happens to serve the same port, even while that app is down. `wait` and a `ready` dependency still require the
-app's process to be online; `url_check: host` rules the catch out.
+One catch of `auto`: a `localhost` (or loopback-address) url of an app on a remote host can read `✓ 200 (here)`
+when this machine happens to serve the same port, even while that app is down. `wait` and a `ready` dependency
+still require the app's process to be online; `url_check: host` rules the catch out.
 
 `ls` marks an answer from this machine with `(here)`, and a `down` url with a short reason: `refused`,
 `not resolved`, `timeout`, `tls`, `reset`, `no answer`, or `itself` (on the host the url's name resolves to the
 host itself, for instance through a hostname line in its `/etc/hosts`). The JSON rows carry `url_from` (`host`,
-`here`, or null when unchecked) and `url_reason` with both sides (`on box: refused; here: refused`), which
-`describe` prints too. `doctor` shows each host's environment (container or not, hostname) and where each of
-its apps' urls answers, and suggests `url_check: auto` for an app pinned to its host whose url answers only
-from here.
+`here`, or null when unchecked) and `url_reason` (why it is down, with both sides when neither answered, as in
+`on box: refused; here: refused`, or why it was taken from this machine), which `describe` prints too. `doctor`
+shows each host's environment (container or not, hostname) and where each of its apps' urls answers, and suggests
+`url_check: auto` for an app with `url_check: host` whose url answers only from here.
 
 ```yaml
 apps:

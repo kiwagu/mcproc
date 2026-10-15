@@ -199,7 +199,7 @@ describe('doctor: environment and urls', () => {
     };
   const failed = (recs: string[]) =>
     recs.filter((x) => x.startsWith('the environment and url checks failed'));
-  it('reports the environment, where each url of the host answers, and recommends auto for a url pinned to its host that answers only from here', async () => {
+  it('reports the environment, where each url of the host answers, and recommends auto for an app with url_check: host whose url answers only from here', async () => {
     const base = loadManifest(fleetDir);
     const m: Manifest = {
       ...base,
