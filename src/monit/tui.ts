@@ -37,7 +37,8 @@ const deps = (manifest: Manifest): LoopDeps => ({
     const s = readStore(storePath(fleet.manifest.path));
     return { at: s.cleared, gen: s.clears };
   },
-  peekIncidents: (fleet, names, cursor) => peekView(fleet, names, cursor),
+  peekIncidents: (fleet, names, cursor, restart) =>
+    peekView(fleet, names, cursor, restart),
 });
 
 /** The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. */
