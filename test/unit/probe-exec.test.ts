@@ -177,6 +177,13 @@ describe('probe script executed on this host', () => {
           'http://127.0.0.1:1/'
         )
       ).toEqual({ code: null, exit: null, addr: '127.0.0.1' });
+      // no timeout on this PATH: the lookup runs unguarded and still answers
+      expect(run('command -v timeout || true')).toBe('');
+      expect(
+        parseUrlChecks(run(urlCheck('http://localhost:1/'))).get(
+          'http://localhost:1/'
+        )?.addr
+      ).toMatch(/^(::1|127\.)/);
     } finally {
       fs.rmSync(bin, { recursive: true, force: true });
     }
@@ -190,18 +197,15 @@ describe('probe script executed on this host', () => {
     try {
       for (const t of ['tr', 'awk', 'timeout'])
         fs.symlinkSync(which(t), path.join(bin, t));
-      const sleep = which('sleep');
-      // a dead resolver: getent and `hostname -i` never answer
+      // a resolver that never answers for the url's name, and answers at once for the host's own
       fs.writeFileSync(
         path.join(bin, 'getent'),
-        `#!/bin/sh\nexec ${sleep} 30\n`,
-        {
-          mode: 0o755,
-        }
+        `#!/bin/sh\n[ "$2" = ws.local ] && exec ${which('sleep')} 30\necho "10.0.0.7 $2"\n`,
+        { mode: 0o755 }
       );
       fs.writeFileSync(
         path.join(bin, 'hostname'),
-        `#!/bin/sh\n[ "$1" = -i ] && exec ${sleep} 30\necho ws-01\n`,
+        `#!/bin/sh\n[ "$1" = -i ] && { echo 10.0.0.7; exit 0; }\necho ws-01\n`,
         { mode: 0o755 }
       );
       const t0 = Date.now();
@@ -213,11 +217,13 @@ describe('probe script executed on this host', () => {
         ],
         { encoding: 'utf8', timeout: 25_000 }
       );
-      expect(Date.now() - t0).toBeLessThan(15_000); // three lookups, 2 s each at most
+      const took = Date.now() - t0;
+      expect(took).toBeGreaterThanOrEqual(1_500); // the url's lookup hung and was cut...
+      expect(took).toBeLessThan(10_000); // ...at 2 s, not after the fake's 30
       const d = parseUrlProbe(out);
       expect(d.env).toMatchObject({
         hostname: 'ws-01',
-        self: ['127.0.0.1', '::1'],
+        self: ['10.0.0.7', '127.0.0.1', '::1'],
       });
       expect(d.urls.get('http://ws.local:1/')).toEqual({
         code: null,
