@@ -341,7 +341,10 @@ the way `mcproc start all --reload` does (in dependency order with their `depend
 stopped ones start, and `kind: task` apps run again; a view with an app on a readonly host is refused whole, so narrow
 it with `h`), `o`/`e`/`b` switch the log stream, `f` switches to the
 flat view (every app's logs merged into one labeled stream, `app | line`, `app ! line` for stderr, one
-color per app, like `mcproc logs -f`; `f` again returns), `h` cycles hosts, `q` quits. With host-bound
+color per app, like `mcproc logs -f`; `f` again returns), `i` opens the incidents of the apps in view (errors, crashes
+and restarts with their context, as the `incidents` tool shows them: the last 15 minutes, or since the last clear, then
+new ones as they happen; `i` again goes back), `h` cycles hosts, `q` quits. The incidents screen is for you: it reads
+from its own position and never takes anything, so the agent's next `incidents` call returns exactly what it would have. With host-bound
 apps the screen opens on every app at its own host, with a HOST column, and reads each app's logs where
 it runs. `h` then cycles from `all` to each host, narrowing the screen the way `--host` narrows a command. Long log lines
 wrap with indented continuations. `mcproc monit --once` prints one frame as text, which is what an

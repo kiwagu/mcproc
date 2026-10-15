@@ -162,6 +162,91 @@ describe('pollIncidents', () => {
       `${S(5)}TypeError: right after the rotation`,
     ]);
   });
+  describe('restart: files a caller with its own position knows were emptied', () => {
+    const tail = 'tail-0123456789\n';
+    const old = `${S(1)}${'x'.repeat(80)}${tail}`;
+    /** a file emptied and regrown to the same size with the same last bytes: offset and anchor still match */
+    const regrown = () => {
+      const head = `${S(2)}TypeError: after the clear\n${S(3)}`;
+      return `${head}${'y'.repeat(old.length - head.length - tail.length)}${tail}`;
+    };
+    const setup = () => {
+      const state = {
+        files: { '/l/watch-out': old },
+        procs: { local: [proc('watch', 0)] },
+        short: [] as string[],
+      };
+      return { state, h: fakeHosts(state) };
+    };
+    it('without it, a file that regrew to the same size and tail looks unchanged', async () => {
+      const { state, h } = setup();
+      const first = await pollIncidents(h.fleet, ['watch']);
+      state.files['/l/watch-out'] = regrown();
+      expect(regrown().length).toBe(old.length);
+      const second = await pollIncidents(h.fleet, ['watch'], {
+        cursor: first.next,
+      });
+      expect(second.answer.incidents).toEqual([]);
+    });
+    it('the file pm2 writes is read from its start when its path, or *, is named', async () => {
+      for (const named of ['/l/watch-out', '*']) {
+        const { state, h } = setup();
+        const first = await pollIncidents(h.fleet, ['watch']);
+        state.files['/l/watch-out'] = regrown();
+        const second = await pollIncidents(h.fleet, ['watch'], {
+          cursor: first.next,
+          restart: { 'local/watch': { out: [named] } },
+        });
+        expect(second.answer.incidents.map((i) => i.line)).toEqual([
+          `${S(2)}TypeError: after the clear`,
+        ]);
+      }
+    });
+    it('another path named (a file pm2 no longer writes) changes nothing', async () => {
+      const { state, h } = setup();
+      const first = await pollIncidents(h.fleet, ['watch']);
+      state.files['/l/watch-out'] = regrown();
+      const second = await pollIncidents(h.fleet, ['watch'], {
+        cursor: first.next,
+        restart: { 'local/watch': { out: ['/l/watch-out.old'] } },
+      });
+      expect(second.answer.incidents).toEqual([]);
+    });
+    it('says which files it positioned, only to a caller that passed restart; a stalled app is not among them', async () => {
+      const { state, h } = setup();
+      const plain = await pollIncidents(h.fleet, ['watch']);
+      expect(plain.answer.positioned).toBeUndefined(); // the agent's answer is unchanged
+      state.files['/l/watch-out'] = regrown();
+      const asked = await pollIncidents(h.fleet, ['watch', 'web'], {
+        cursor: plain.next,
+        restart: { 'local/watch': { out: ['/l/watch-out'] } },
+      });
+      expect(asked.answer.positioned).toEqual({
+        'local/watch': ['out', 'err'], // a missing err log reads as empty: positioned at its start
+      }); // web is not running: nothing of it is positioned
+    });
+    it('a short read of a restarted file leaves its start as the place to read again from', async () => {
+      const { state, h } = setup();
+      const first = await pollIncidents(h.fleet, ['watch']);
+      state.files['/l/watch-out'] = regrown();
+      state.short = ['/l/watch-out'];
+      const second = await pollIncidents(h.fleet, ['watch'], {
+        cursor: first.next,
+        restart: { 'local/watch': { out: ['/l/watch-out'] } },
+      });
+      expect(second.next.apps['local/watch'].out).toEqual({
+        path: '/l/watch-out',
+        offset: 0,
+      });
+      state.short = [];
+      const third = await pollIncidents(h.fleet, ['watch'], {
+        cursor: second.next,
+      });
+      expect(third.answer.incidents.map((i) => i.line)).toEqual([
+        `${S(2)}TypeError: after the clear`,
+      ]);
+    });
+  });
   it('process events: errored is reported once; a restart since the last poll is reported with the count; none on a first call', async () => {
     const state = {
       files: { '/l/watch-err': `${S(1)}Error: listen EADDRINUSE :::3000\n` },

@@ -2,10 +2,16 @@ import type { Manifest } from '../core/manifest.js';
 import type { LsRow } from '../core/list.js';
 import { pm2Name } from '../core/pm2.js';
 import { sortByStamp, type LogLine } from '../core/logfollow.js';
+import type { Incident } from '../core/incidents/detect.js';
 
 export type Stream = 'out' | 'err' | 'both';
-/** dashboard: table + the selected app's logs + details; flat: every app's logs merged into one labeled stream, compose style */
-export type View = 'dashboard' | 'flat';
+/**
+ * dashboard: table + the selected app's logs + details; flat: every app's logs merged into one labeled stream, compose
+ * style; incidents: the errors, crashes and restarts of the apps in view, read for a person (never taken from the agent)
+ */
+export type View = 'dashboard' | 'flat' | 'incidents';
+/** The incidents view keeps this many, the newest. */
+export const MAX_INCIDENTS = 200;
 export interface FlatLine {
   app: string;
   stream: 'out' | 'err';
@@ -60,6 +66,16 @@ export interface MonitState {
   cleared: Record<string, string>;
   /** per app whose logs this screen follows with reloads on and a known start: its reloads since that start */
   reloads: Record<string, ReloadInfo>;
+  /** the view `i` returns to from the incidents view */
+  back: 'dashboard' | 'flat';
+  /** what the incidents view has read, oldest first, at most MAX_INCIDENTS */
+  incidents: Incident[];
+  /** the incidents view has had its first answer (until then it says it is reading) */
+  incidentsPolled: boolean;
+  /** the latest clear of the apps the incidents view reads, as their store records it */
+  incidentsCleared: string | null;
+  /** what the last read could not do: hosts that did not answer, incidents left out */
+  incidentsErrors: string[];
 }
 /** a key that asks twice: c clears the logs of the running apps in view, R reloads every app in view */
 export type Armed = 'clear' | 'reload';
@@ -88,7 +104,13 @@ export type MonitAction =
   | { type: 'arm'; at: null }
   | { type: 'arm'; at: number; what: Armed; apps: string[] }
   | { type: 'cleared'; cleared: Record<string, string> }
-  | { type: 'reloads'; app: string; info: ReloadInfo | null }; // null: the app is no longer counted
+  | { type: 'reloads'; app: string; info: ReloadInfo | null } // null: the app is no longer counted
+  | {
+      type: 'incidents';
+      incidents: Incident[]; // one read's, newest first as the read answers
+      cleared_at: string | null;
+      errors: string[];
+    };
 
 export function appInfos(m: Manifest): Record<string, AppInfo> {
   return Object.fromEntries(
@@ -149,6 +171,11 @@ export function initialState(p: {
     armed: null,
     cleared: {},
     reloads: {},
+    back: 'dashboard',
+    incidents: [],
+    incidentsPolled: false,
+    incidentsCleared: null,
+    incidentsErrors: [],
   };
 }
 
@@ -189,7 +216,9 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
       const buffer = (
         a.reset ? batch : [...(s.logs[a.app] ?? []), ...batch]
       ).slice(-s.maxLogs);
-      const inView = s.view === 'flat' || a.app === selectedApp(s);
+      const inView =
+        s.view === 'flat' ||
+        (s.view === 'dashboard' && a.app === selectedApp(s)); // the incidents view shows no logs: its scroll is its own
       // a scrolled view stays on the same lines while new ones arrive below it; a reset (rotation, flush) jumps to the tail
       const scrolled = s.logScroll > 0 || s.logRowShift > 0;
       const logScroll = !inView
@@ -231,14 +260,40 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
           }; // buffers are kept: the next selection shows its history at once
     }
     case 'view':
-      return { ...s, view: a.view, logScroll: 0, logRowShift: 0 };
+      return {
+        ...s,
+        view: a.view,
+        back: s.view === 'incidents' ? s.back : s.view, // where the incidents view returns to
+        logScroll: 0,
+        logRowShift: 0,
+      };
+    case 'incidents': {
+      const added = [...a.incidents].reverse();
+      const shown = s.view === 'incidents';
+      const scrolled = s.logScroll > 0 || s.logRowShift > 0;
+      return {
+        ...s,
+        incidents: [...s.incidents, ...added].slice(-MAX_INCIDENTS),
+        incidentsPolled: true,
+        incidentsCleared: a.cleared_at,
+        incidentsErrors: a.errors,
+        // a scrolled view stays on the same incidents while new ones arrive below; at the tail it follows them
+        logScroll: !shown
+          ? s.logScroll
+          : scrolled
+            ? s.logScroll + added.length
+            : 0,
+      };
+    }
     case 'scroll': {
       if (a.to)
         return { ...s, logScroll: a.to.entries, logRowShift: a.to.rows };
       const n =
         s.view === 'flat'
           ? Object.values(s.logs).reduce((t, l) => t + l.length, 0)
-          : (s.logs[selectedApp(s) ?? ''] ?? []).length;
+          : s.view === 'incidents'
+            ? s.incidents.length
+            : (s.logs[selectedApp(s) ?? ''] ?? []).length;
       const max = a.max ?? Math.max(0, n - 1); // without the pane's ceiling, at least never beyond the oldest entry
       return {
         ...s,
@@ -290,6 +345,10 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
         rows: [],
         logs: {},
         reloads: {},
+        incidents: [],
+        incidentsPolled: false,
+        incidentsCleared: null,
+        incidentsErrors: [],
         logScroll: 0,
         logRowShift: 0,
         logPaths: null,
@@ -341,10 +400,23 @@ export function keyIntent(
       return { kind: 'action', action: { type: 'scroll', delta: -Infinity } };
     case 'k':
     case 'S-tab':
-      return { kind: 'action', action: { type: 'select', delta: -1 } };
+      // the incidents view selects no app (and a new selection would reset its scroll)
+      return s.view === 'incidents'
+        ? null
+        : { kind: 'action', action: { type: 'select', delta: -1 } };
     case 'j':
     case 'tab':
-      return { kind: 'action', action: { type: 'select', delta: 1 } };
+      return s.view === 'incidents'
+        ? null
+        : { kind: 'action', action: { type: 'select', delta: 1 } };
+    case 'i':
+      return {
+        kind: 'action',
+        action: {
+          type: 'view',
+          view: s.view === 'incidents' ? s.back : 'incidents',
+        },
+      };
     case 'o':
       return { kind: 'action', action: { type: 'stream', stream: 'out' } };
     case 'e':

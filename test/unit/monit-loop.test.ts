@@ -12,10 +12,21 @@ import type { LsRow, Snapshot } from '../../src/core/list.js';
 import { EMPTY_STATS, type StatSample } from '../../src/core/stats.js';
 import { LogFollower } from '../../src/core/logfollow.js';
 import {
+  INCIDENTS_POLL_MS,
   MonitLoop,
+  peekView,
   type Follower,
   type LoopDeps,
+  type Restarts,
 } from '../../src/monit/loop.js';
+import {
+  countedClearKey,
+  fileClearKey,
+  takeIncidents,
+  type TakenAnswer,
+} from '../../src/core/incidents/store.js';
+import type { CursorState } from '../../src/core/incidents/cursor.js';
+import { fakeHosts, proc, S } from '../helpers/incidents.js';
 import {
   appInfos,
   initialState,
@@ -150,6 +161,20 @@ function harness(
     clear: async (_f, apps) =>
       apps.map((app) => ({ app, host: 'local', out_bytes: 0, err_bytes: 0 })),
     cleared: () => ({ at: {}, gen: {} }),
+    peekIncidents: async () => ({
+      answer: {
+        incidents: [],
+        skipped: [],
+        errors: [],
+        more: 0,
+        apps: 0,
+        hosts: 0,
+        latest: null,
+        taken: false,
+        cleared_at: null,
+      },
+      next: { v: 1, apps: {} },
+    }),
     ...over,
   };
   const loop = new MonitLoop(
@@ -1632,5 +1657,503 @@ describe('MonitLoop reload all', () => {
           .filter((a) => a.type === 'notice' || a.type === 'busy')
       ).toEqual([]);
     }
+  });
+});
+
+describe('MonitLoop incidents view', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const answer = (
+    lines: string[],
+    extra: Partial<TakenAnswer> = {}
+  ): TakenAnswer => ({
+    incidents: lines.map((line, k) => ({
+      app: 'api',
+      host: 'local',
+      kind: 'error',
+      stream: 'err',
+      time: `2026-10-15T10:00:0${k}`,
+      first_time: null,
+      count: 1,
+      line,
+      before: [],
+      after: [],
+      fingerprint: line,
+    })),
+    skipped: [],
+    errors: [],
+    more: 0,
+    apps: 3,
+    hosts: 1,
+    latest: null,
+    taken: false,
+    cleared_at: null,
+    ...extra,
+  });
+  const recorder = (answers: TakenAnswer[]) => {
+    const cursors: CursorState[] = [];
+    let n = 0;
+    const peekIncidents: LoopDeps['peekIncidents'] = async (
+      _f,
+      names,
+      cursor
+    ) => {
+      cursors.push(cursor);
+      n++;
+      return {
+        answer: answers[Math.min(n - 1, answers.length - 1)],
+        next: {
+          v: 1,
+          apps: { [`local/${names[0]}`]: { restarts: n, status: 'online' } },
+        },
+      };
+    };
+    return { cursors, peekIncidents };
+  };
+  it('reads nothing while the view is closed; opened, it starts from an empty position, then goes on from its own', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const r = recorder([
+      answer(['TypeError: one']),
+      answer(['TypeError: two']),
+    ]);
+    const h = harness(undefined, { peekIncidents: r.peekIncidents });
+    await h.loop.refresh();
+    expect(r.cursors).toEqual([]);
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(r.cursors).toEqual([{ v: 1, apps: {} }]); // the agent's pick-up point is never the start
+    expect(h.state.incidents.map((i) => i.line)).toEqual(['TypeError: one']);
+    await h.loop.refresh(); // within the poll gap: no new read
+    expect(r.cursors).toHaveLength(1);
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(r.cursors[1]).toEqual({
+      v: 1,
+      apps: { 'local/api-build': { restarts: 1, status: 'online' } },
+    });
+    expect(h.state.incidents.map((i) => i.line)).toEqual([
+      'TypeError: one',
+      'TypeError: two',
+    ]);
+    h.loop.dispatch({ type: 'view', view: 'dashboard' });
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(r.cursors).toHaveLength(2); // closed again: no reads
+  });
+  it('a host switch starts the view over: an empty position and an empty list', async () => {
+    const now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const r = recorder([answer(['TypeError: one'])]);
+    const h = harness(undefined, { peekIncidents: r.peekIncidents });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(h.state.incidents).toHaveLength(1);
+    await h.loop.nextView();
+    expect(r.cursors.at(-1)).toEqual({ v: 1, apps: {} });
+    expect(h.state.host).not.toBe('local');
+  });
+  it('a read that fails is shown in the view, and the next poll tries again from the same place', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const cursors: CursorState[] = [];
+    let fail = true;
+    const h = harness(undefined, {
+      peekIncidents: async (_f, _n, cursor) => {
+        cursors.push(cursor);
+        if (fail)
+          throw new McprocError(
+            'TRANSPORT_FAILED',
+            'ssh stand: Connection refused'
+          );
+        return {
+          answer: answer(['TypeError: later']),
+          next: { v: 1, apps: {} },
+        };
+      },
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(h.state.incidentsPolled).toBe(true);
+    expect(h.state.incidentsErrors.join(' ')).toContain('Connection refused');
+    fail = false;
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(cursors).toEqual([
+      { v: 1, apps: {} },
+      { v: 1, apps: {} },
+    ]);
+    expect(h.state.incidents.map((i) => i.line)).toEqual(['TypeError: later']);
+    expect(h.state.incidentsErrors).toEqual([]);
+  });
+  it('an answer that arrives after the screen closed is dropped', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const h = harness(undefined, {
+      peekIncidents: async () => {
+        await gate;
+        return {
+          answer: answer(['TypeError: late']),
+          next: { v: 1, apps: {} },
+        };
+      },
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    const done = h.loop.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    h.loop.close();
+    release();
+    await done;
+    expect(h.state.incidents).toEqual([]);
+  });
+});
+
+describe('peekView, the screen read', () => {
+  it('reads the window through the peek path and never touches the stored pick-up point', async () => {
+    const state = {
+      files: { '/l/watch-out': `${S(2)}TypeError: x is undefined\n` },
+      procs: { local: [proc('watch', 0)] },
+    };
+    const h = fakeHosts(state);
+    const file = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-mi-')),
+      'incidents.json'
+    );
+    await takeIncidents(h.fleet, ['watch'], {}, file); // the agent takes it: its point moves past the error
+    const before = fs.readFileSync(file);
+    const seen = await peekView(
+      h.fleet,
+      ['watch'],
+      { v: 1, apps: {} },
+      {},
+      file
+    );
+    expect(seen.answer.incidents.map((i) => i.line)).toEqual([
+      `${S(2)}TypeError: x is undefined`,
+    ]); // the screen's own window still shows it
+    expect(fs.readFileSync(file).equals(before)).toBe(true);
+    const again = await peekView(h.fleet, ['watch'], seen.next, {}, file);
+    expect(again.answer.incidents).toEqual([]); // from its own position: nothing new
+    expect(
+      (await takeIncidents(h.fleet, ['watch'], {}, file)).answer.incidents
+    ).toEqual([]); // the agent's queue is exactly as it was: empty after its own take
+  });
+});
+
+describe('MonitLoop incidents view and log clears', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const empty = (): TakenAnswer => ({
+    incidents: [],
+    skipped: [],
+    errors: [],
+    more: 0,
+    apps: 3,
+    hosts: 1,
+    latest: null,
+    taken: false,
+    cleared_at: null,
+    positioned: { 'local/api': ['out', 'err'], 'local/worker': ['err'] }, // a read that reached every file
+  });
+  const answer = (line: string) => [
+    {
+      app: 'api',
+      host: 'local',
+      kind: 'error' as const,
+      stream: 'err' as const,
+      time: '2026-10-15T10:00:00',
+      first_time: null,
+      count: 1,
+      line,
+      before: [],
+      after: [],
+      fingerprint: line,
+    },
+  ];
+  /** the screen's position after a read: api read to 300 / 900, worker to 500 */
+  const marks = (): CursorState['apps'] => ({
+    'local/api': {
+      restarts: 2,
+      status: 'online',
+      out: { path: '/l/api-out', offset: 300, at: 284, anchor: 'aa' },
+      err: { path: '/l/api-err', offset: 900, at: 884, anchor: 'bb' },
+    },
+    'local/worker': {
+      restarts: 0,
+      status: 'online',
+      err: { path: '/l/worker-err', offset: 500 },
+    },
+  });
+  type ClearStore = { at: Record<string, string>; gen: Record<string, number> };
+  /** what `clearLogs` of this version counts for one clear of api that emptied these files (each by its path) */
+  const counted = (
+    gen: Record<string, number>,
+    files: Partial<Record<'out' | 'err', string>>
+  ): Record<string, number> => {
+    const g = { ...gen };
+    g['local/api'] = (g['local/api'] ?? 0) + 1;
+    const ck = countedClearKey('local/api');
+    g[ck] = (g[ck] ?? 0) + 1;
+    for (const [stream, path] of Object.entries(files) as [
+      'out' | 'err',
+      string,
+    ][]) {
+      const fk = fileClearKey('local/api', stream, path);
+      g[fk] = (g[fk] ?? 0) + 1;
+    }
+    return g;
+  };
+  const setup = (store: ClearStore) => {
+    const restarts: Restarts[] = [];
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, _cursor, restart) => {
+        restarts.push(structuredClone(restart));
+        return { answer: empty(), next: { v: 1, apps: marks() } };
+      },
+    });
+    return { h, restarts };
+  };
+  const fresh = (): ClearStore => ({ at: {}, gen: {} });
+  const start = async (h: ReturnType<typeof harness>) => {
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+  };
+  it('a clear makes the next read start each file it emptied at its beginning, named by path; other apps are left alone', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const { h, restarts } = setup(store);
+    await start(h);
+    expect(restarts[0]).toEqual({});
+    store.gen = counted(store.gen, { out: '/l/api-out', err: '/l/api-err' });
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[2]).toEqual({}); // that read began them over: nothing left to restart
+  });
+  it('a file the clear could not empty is not restarted', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const { h, restarts } = setup(store);
+    await start(h);
+    store.gen = counted(store.gen, { out: '/l/api-out' }); // err could not be truncated
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]).toEqual({ 'local/api': { out: ['/l/api-out'] } });
+  });
+  it('every path cleared since the last read is passed on, so the read starts the one pm2 writes now', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const { h, restarts } = setup(store);
+    await start(h);
+    store.gen = counted(store.gen, { err: '/l/api-err' }); // cleared at its old path…
+    store.gen = counted(store.gen, { err: '/l/api-err-2' }); // …then recreated elsewhere and cleared again
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]['local/api']?.err?.sort()).toEqual([
+      '/l/api-err',
+      '/l/api-err-2',
+    ]);
+  });
+  it('a clear by an mcproc that counts no files restarts either file, even when a counted clear came with it', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const { h, restarts } = setup(store);
+    await start(h);
+    store.gen = { 'local/api': 1 }; // an older mcproc cleared api: only the app's own count moved
+    store.gen = counted(store.gen, { out: '/l/api-out' }); // then this version cleared out (err failed)
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]['local/api']?.out?.sort()).toEqual(['*', '/l/api-out']);
+    expect(restarts[1]['local/api']?.err).toEqual(['*']);
+  });
+  it('counts that vanish (the store was removed) are no clear; a clear after that is one, at the same count', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    store.gen = counted({}, { out: '/l/api-out', err: '/l/api-err' }); // a clear from before the screen
+    const { h, restarts } = setup(store);
+    await start(h);
+    expect(restarts[0]).toEqual({}); // what was cleared before the view read anything is not restarted
+    store.gen = {};
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]).toEqual({});
+    store.gen = counted({}, { err: '/l/api-err' }); // the same counts as before the removal, but a new clear
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[2]).toEqual({ 'local/api': { err: ['/l/api-err'] } });
+  });
+  it('reopened long after a clear, its first read starts the emptied files at their beginning', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const { h, restarts } = setup(store);
+    await start(h);
+    h.loop.dispatch({ type: 'view', view: 'dashboard' });
+    store.gen = counted(store.gen, { out: '/l/api-out', err: '/l/api-err' });
+    await h.loop.refresh(); // the clear is seen while the view is closed
+    now += 20 * 60_000;
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(restarts).toHaveLength(2);
+    expect(restarts[1]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+  });
+  it('a read that spans a clear in view is dropped and its restarts stay for the next one', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const restarts: Restarts[] = [];
+    let release: () => void = () => {};
+    let hold = false;
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, _cursor, restart) => {
+        restarts.push(structuredClone(restart));
+        const held = hold; // what this read answers is fixed when it starts
+        if (held)
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        return {
+          answer: held
+            ? {
+                ...empty(),
+                incidents: answer('TypeError: from before the clear'),
+              }
+            : empty(),
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    await start(h);
+    hold = true;
+    now += INCIDENTS_POLL_MS;
+    const spanning = h.loop.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    hold = false;
+    store.gen = counted(store.gen, { err: '/l/api-err' });
+    await h.loop.refresh(); // reads the clear while the earlier read still runs
+    release();
+    await spanning;
+    expect(h.state.incidents).toEqual([]); // the spanning read's answer was dropped, its incident with it
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts.at(-1)).toEqual({ 'local/api': { err: ['/l/api-err'] } });
+  });
+  it('a clear of an app outside the view drops nothing and restarts nothing', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const restarts: Restarts[] = [];
+    let release: () => void = () => {};
+    let hold = false;
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, _c, restart) => {
+        restarts.push(structuredClone(restart));
+        const held = hold;
+        if (held)
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        return {
+          answer: held
+            ? { ...empty(), incidents: answer('TypeError: kept') }
+            : empty(),
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    await start(h);
+    hold = true;
+    now += INCIDENTS_POLL_MS;
+    const reading = h.loop.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    hold = false;
+    store.gen = {
+      'prod/elsewhere': 1,
+      [countedClearKey('prod/elsewhere')]: 1,
+      [fileClearKey('prod/elsewhere', 'err', '/x/err')]: 1,
+    };
+    await h.loop.refresh();
+    release();
+    await reading;
+    expect(h.state.incidents.map((i) => i.line)).toEqual(['TypeError: kept']);
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts.at(-1)).toEqual({});
+  });
+  it('a restart the read did not apply (its host failed, its app stalled) waits for the next read', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const restarts: Restarts[] = [];
+    let reach: TakenAnswer['positioned'] = {};
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, _c, restart) => {
+        restarts.push(structuredClone(restart));
+        return {
+          answer: { ...empty(), positioned: reach },
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    reach = { 'local/api': ['out', 'err'], 'local/worker': ['err'] };
+    await start(h);
+    store.gen = counted(store.gen, { out: '/l/api-out', err: '/l/api-err' });
+    reach = { 'local/worker': ['err'] }; // api's host did not answer this time
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+    reach = { 'local/api': ['out'] }; // back, but err stalled
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[2]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+    reach = { 'local/api': ['out', 'err'] };
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[3]).toEqual({ 'local/api': { err: ['/l/api-err'] } }); // out was applied by the read before
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[4]).toEqual({});
+  });
+  it('says when a read skipped log it could not keep up with', async () => {
+    const h = harness(undefined, {
+      peekIncidents: async () => ({
+        answer: {
+          ...empty(),
+          skipped: [
+            {
+              app: 'api',
+              host: 'local',
+              stream: 'err',
+              bytes: 3 * 1024 * 1024,
+            },
+          ],
+        },
+        next: { v: 1, apps: {} },
+      }),
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(h.state.incidentsErrors.join(' ')).toMatch(
+      /skipped .+ of api err on local/
+    );
   });
 });

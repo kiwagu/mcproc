@@ -38,6 +38,12 @@ export interface IncidentsAnswer {
   apps: number;
   hosts: number;
   latest: string | null;
+  /**
+   * Only for a caller that passed `restart`: per host/app, the files this poll positioned (read, or left to read again
+   * from where it began). A restart of any other file was not applied (its host failed, its app stalled or is not
+   * running), so the caller keeps it for its next poll.
+   */
+  positioned?: Record<string, Stream[]>;
 }
 /**
  * `budgetMs`: how long an app's own patterns may take on one file (default MATCH_BUDGET_MS). `includeReloads`: also
@@ -50,8 +56,17 @@ export interface PollOptions {
   context?: [number, number];
   budgetMs?: number;
   includeReloads?: boolean;
+  /**
+   * Files a caller with its own position knows were emptied since it last read them, per host/app and stream: their
+   * paths, or `*` for whichever file the stream writes now. The file pm2 writes is read from its start when it is one of
+   * them, whatever the cursor says (an old offset would skip a file that regrew past it, and a new path would read only
+   * the last minutes).
+   */
+  restart?: Record<string, Partial<Record<Stream, string[]>>>;
 }
 
+/** How far back a first call looks, in minutes, when it names no window of its own. */
+export const DEFAULT_SINCE_MIN = 15;
 const EVENT_TAIL = 10;
 const STREAMS: Stream[] = ['out', 'err'];
 
@@ -61,7 +76,7 @@ export async function pollIncidents(
   names: string[],
   opts: PollOptions = {}
 ): Promise<{ answer: IncidentsAnswer; next: CursorState }> {
-  const sinceMin = opts.sinceMin ?? 15;
+  const sinceMin = opts.sinceMin ?? DEFAULT_SINCE_MIN;
   const groups = fleet.groups(names);
   const next: CursorState = { v: 1, apps: {} };
   const skipped: IncidentsAnswer['skipped'] = [];
@@ -99,16 +114,23 @@ export async function pollIncidents(
             const path = stream === 'out' ? t.p.out_log : t.p.err_log;
             const mark = t.prev?.[stream];
             const same = mark && mark.path === path;
+            const emptied = opts.restart?.[markKey(g.host, t.app)]?.[stream];
+            const restarted =
+              !!emptied && (emptied.includes(path) || emptied.includes('*'));
             const anchor: Anchor | null =
-              same && mark.at !== undefined && mark.anchor !== undefined
+              !restarted &&
+              same &&
+              mark.at !== undefined &&
+              mark.anchor !== undefined
                 ? { at: mark.at, hex: mark.anchor }
                 : null;
             return {
               t,
               stream,
               path,
-              offset: same ? mark.offset : null,
+              offset: restarted ? 0 : same ? mark.offset : null,
               anchor,
+              restarted,
             };
           })
         );
@@ -152,9 +174,11 @@ export async function pollIncidents(
           perApp.set(f.t.app, entry);
           if (!r) return;
           if (r.short) {
-            if (f.t.prev?.[f.stream]) entry.mark[f.stream] = f.t.prev[f.stream];
+            if (f.restarted) entry.mark[f.stream] = { path: f.path, offset: 0 };
+            else if (f.t.prev?.[f.stream])
+              entry.mark[f.stream] = f.t.prev[f.stream];
             return;
-          } // read again next poll: nothing analysed, nothing taken
+          } // read again next poll from where this one began: nothing analysed, nothing taken
           entry.mark[f.stream] = {
             path: f.path,
             offset: r.nextOffset,
@@ -285,6 +309,16 @@ export async function pollIncidents(
       apps: names.length,
       hosts: groups.length,
       latest,
+      ...(opts.restart
+        ? {
+            positioned: Object.fromEntries(
+              Object.entries(next.apps).map(([k, m]) => [
+                k,
+                STREAMS.filter((st) => m[st] !== undefined),
+              ])
+            ),
+          }
+        : {}),
     },
     next,
   };

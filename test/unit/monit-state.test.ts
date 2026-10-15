@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   CONFIRM_MS,
+  MAX_INCIDENTS,
   initialState,
   reduce,
   keyIntent,
@@ -641,5 +642,125 @@ describe('flat view order', () => {
       'a2',
       'w2',
     ]);
+  });
+});
+
+describe('incidents view', () => {
+  const inc = (n: number, app = 'api') => ({
+    app,
+    host: 'local',
+    kind: 'error' as const,
+    stream: 'err' as const,
+    time: `2026-10-15T10:00:${String(n).padStart(2, '0')}`,
+    first_time: null,
+    count: 1,
+    line: `TypeError ${n}`,
+    before: [],
+    after: [],
+    fingerprint: `f${n}`,
+  });
+  it('i opens it from the dashboard and from the flat view, and i again goes back where it came from', () => {
+    let s = s0();
+    const press = (key: string) => {
+      const i = keyIntent(key, s);
+      if (i?.kind === 'action') s = reduce(s, i.action);
+    };
+    press('i');
+    expect(s.view).toBe('incidents');
+    press('i');
+    expect(s.view).toBe('dashboard');
+    press('f');
+    press('i');
+    expect(s.view).toBe('incidents');
+    press('i');
+    expect(s.view).toBe('flat');
+  });
+  it('r, s and x do nothing there: no app is selected on that screen', () => {
+    const s = reduce(s0(), { type: 'view', view: 'incidents' });
+    for (const k of ['r', 's', 'x']) expect(keyIntent(k, s)).toBeNull();
+  });
+  it('keeps what each poll found oldest first (a poll answers newest first), up to MAX_INCIDENTS', () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(2), inc(1)],
+      cleared_at: null,
+      errors: [],
+    });
+    expect(s.incidents.map((i) => i.line)).toEqual([
+      'TypeError 1',
+      'TypeError 2',
+    ]);
+    expect(s.incidentsPolled).toBe(true);
+    const many = Array.from({ length: MAX_INCIDENTS + 5 }, (_, k) =>
+      inc(k % 60)
+    ).reverse();
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: many,
+      cleared_at: '2026-10-15T09:00:00',
+      errors: ['stand: ssh: Connection refused'],
+    });
+    expect(s.incidents).toHaveLength(MAX_INCIDENTS);
+    expect(s.incidentsCleared).toBe('2026-10-15T09:00:00');
+    expect(s.incidentsErrors).toEqual(['stand: ssh: Connection refused']);
+  });
+  it('a scrolled pane stays on the same incidents while new ones arrive; at the tail it follows', () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(3), inc(2), inc(1)],
+      cleared_at: null,
+      errors: [],
+    });
+    s = reduce(s, { type: 'scroll', delta: 1 });
+    expect(s.logScroll).toBe(1);
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(5), inc(4)],
+      cleared_at: null,
+      errors: [],
+    });
+    expect(s.logScroll).toBe(3);
+    s = reduce(s, { type: 'scroll', delta: -Infinity });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(6)],
+      cleared_at: null,
+      errors: [],
+    });
+    expect(s.logScroll).toBe(0);
+  });
+  it('scrolling counts the incidents, and log lines arriving meanwhile do not move it', () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(3), inc(2), inc(1)],
+      cleared_at: null,
+      errors: [],
+    });
+    s = reduce(s, { type: 'scroll', delta: Infinity });
+    expect(s.logScroll).toBe(2);
+    s = reduce(s, {
+      type: 'logs',
+      app: 'api',
+      lines: [{ stream: 'out', text: 'a log line' }],
+    });
+    expect(s.logScroll).toBe(2);
+  });
+  it('a host switch starts the list over', () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(1)],
+      cleared_at: '2026-10-15T09:00:00',
+      errors: ['x'],
+    });
+    s = reduce(s, { type: 'host', host: 'stand' });
+    expect(s.view).toBe('incidents');
+    expect(s.incidents).toEqual([]);
+    expect(s.incidentsPolled).toBe(false);
+    expect(s.incidentsCleared).toBeNull();
+    expect(s.incidentsErrors).toEqual([]);
   });
 });

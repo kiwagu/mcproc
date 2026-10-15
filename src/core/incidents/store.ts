@@ -24,7 +24,37 @@ import {
  */
 export interface Store extends CursorState {
   cleared: Record<string, string>;
+  /**
+   * how many clears emptied a file of each host/app, and, under `fileClearKey` keys, how many emptied each file itself:
+   * a reader with its own position (the monit incidents view) restarts a file exactly when its count moves, whatever the
+   * shared point has done since. Every writer copies this map as it found it, so the counts only ever grow.
+   */
   clears: Record<string, number>;
+}
+
+/** The key under which `clears` counts the clears that emptied one file of an app: host/app, stream and path, NUL-separated. */
+export const fileClearKey = (
+  key: string,
+  stream: 'out' | 'err',
+  path: string
+): string => `${key}\u0000${stream}\u0000${path}`;
+
+/**
+ * The key under which `clears` counts the clears of an app that also counted its files: an app count that grew more than
+ * this one was cleared by an mcproc that counts no files, which could have emptied either of them.
+ */
+export const countedClearKey = (key: string): string => `${key}\u0000counted`;
+
+/** An app's own count in `clears` (host/app), as opposed to one of the counts kept beside it. */
+export const isAppClearKey = (k: string): boolean => !k.includes('\u0000');
+
+/** A `fileClearKey` read back, or null for any other key. */
+export function parseFileClearKey(
+  k: string
+): { key: string; stream: 'out' | 'err'; path: string } | null {
+  const [key, stream, ...rest] = k.split('\u0000');
+  if (rest.length === 0 || (stream !== 'out' && stream !== 'err')) return null;
+  return { key, stream, path: rest.join('\u0000') };
 }
 export interface TakenAnswer extends IncidentsAnswer {
   taken: boolean;
@@ -246,7 +276,19 @@ export async function clearLogs(
               : {}), // a clear ends no run: the boot state stays with the start it was taken for
           };
           if (f.failed.length === 0) next.cleared[key] = at;
-          if (f.failed.length < 2) next.clears[key] = (s.clears[key] ?? 0) + 1; // a file of it was emptied
+          if (f.failed.length < 2) {
+            next.clears[key] = (s.clears[key] ?? 0) + 1; // a file of it was emptied
+            const ck = countedClearKey(key);
+            next.clears[ck] = (s.clears[ck] ?? 0) + 1; // ... and this clear says which
+          }
+          for (const [stream, path] of [
+            ['out', f.proc.out_log],
+            ['err', f.proc.err_log],
+          ] as const) {
+            if (f.failed.includes(path)) continue; // this file was not emptied
+            const fk = fileClearKey(key, stream, path);
+            next.clears[fk] = (s.clears[fk] ?? 0) + 1;
+          }
           const freed = (path: string, bytes: number) =>
             f.failed.includes(path) ? 0 : bytes;
           out.push({

@@ -15,7 +15,15 @@ import {
 } from '../core/fleet.js';
 import type { StatSample } from '../core/stats.js';
 import type { FollowPoll, LogLine } from '../core/logfollow.js';
-import type { Cleared } from '../core/incidents/store.js';
+import {
+  countedClearKey,
+  isAppClearKey,
+  parseFileClearKey,
+  takeIncidents,
+  type Cleared,
+  type TakenAnswer,
+} from '../core/incidents/store.js';
+import { markKey, type CursorState } from '../core/incidents/cursor.js';
 import {
   compileReloadRules,
   historyReaches,
@@ -25,6 +33,7 @@ import {
 } from '../core/reloads.js';
 import { fmtBytes } from '../mcp/render.js';
 import {
+  MAX_INCIDENTS,
   monitViews,
   selectedRow,
   viewLabel,
@@ -71,6 +80,13 @@ export interface LoopDeps {
     at: Record<string, string>;
     gen: Record<string, number>;
   };
+  /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
+  peekIncidents(
+    fleet: Fleet,
+    names: string[],
+    cursor: CursorState,
+    restart: Restarts
+  ): Promise<{ answer: TakenAnswer; next: CursorState }>;
 }
 
 export { describeError };
@@ -83,6 +99,46 @@ export const reloadView = (
   fleet: Fleet,
   signal: AbortSignal
 ): Promise<LsRow[]> => actOn(fleet, 'all', 'start', { reload: true, signal });
+
+/** Files emptied since the incidents view last read them, per host/app and stream: their paths, or `*` for either. */
+export type Restarts = Record<string, Partial<Record<'out' | 'err', string[]>>>;
+
+interface IncidentsView {
+  cursor: CursorState | null;
+  last: number;
+  running: boolean;
+  clears: number;
+  pending: Record<string, Partial<Record<'out' | 'err', Set<string>>>>;
+}
+const freshView = (): IncidentsView => ({
+  cursor: null,
+  last: 0,
+  running: false,
+  clears: 0,
+  pending: {},
+});
+
+/** The incidents view reads again at most this often while it is open (and not at all while it is closed). */
+export const INCIDENTS_POLL_MS = 5000;
+
+/**
+ * What the incidents view reads (the screen's `peekIncidents` dep): the apps' new incidents since `cursor` through the
+ * peek path, so the pick-up point the agent takes from is neither the start nor moved. An empty cursor reads the window a
+ * first call reads. `file`: the store, for the last clear only (default: next to the manifest).
+ */
+export const peekView = (
+  fleet: Fleet,
+  names: string[],
+  cursor: CursorState,
+  restart: Restarts = {},
+  file?: string
+): Promise<{ answer: TakenAnswer; next: CursorState }> =>
+  takeIncidents(
+    fleet,
+    names,
+    { peek: true, cursor, restart, max: MAX_INCIDENTS },
+    file
+  );
 
 /** One followed app's reloads since its pm2 start: the run it counts (its start and restarts) and the count so far. */
 interface Counter {
@@ -129,6 +185,12 @@ export class MonitLoop {
   private reloading: AbortController | null = null; // the running reload of the view: quitting ends its dependency waits
   private names: string[];
   private groups: HostApps[];
+  /**
+   * the incidents view's own position (null: not read yet in this view), when it last read, whether a read runs, how
+   * many log clears it has seen (a read that spans one is dropped: its position is from before the clear), and the files
+   * emptied since it last read them, which its next read starts at their beginning when pm2 still writes them
+   */
+  private inc: IncidentsView = freshView();
 
   constructor(
     public fleet: Fleet,
@@ -147,8 +209,13 @@ export class MonitLoop {
     this.readCleared();
     this.syncWatches();
     const gen = this.gen;
-    return Promise.all(
-      this.groups
+    // the incidents view reads with the periodic refresh of the whole view, not with one that follows a command
+    const incidents =
+      !hosts && this.getState().view === 'incidents'
+        ? this.pollIncidents()
+        : undefined;
+    return Promise.all([
+      ...this.groups
         .filter((g) => !hosts || hosts.includes(g.host))
         .map((g) => {
           const cur = this.inflight.get(g.host);
@@ -159,8 +226,78 @@ export class MonitLoop {
           });
           this.inflight.set(g.host, { gen, done });
           return done;
-        })
-    ).then(() => undefined);
+        }),
+      incidents,
+    ]).then(() => undefined);
+  }
+
+  /**
+   * One read of the incidents view: from its own position (the first one from an empty position, so the window a first
+   * call reads), at most every INCIDENTS_POLL_MS, one at a time. What it could not read is shown in the view; a failed
+   * read keeps the position, so the next one tries the same lines again. A read of a view that has changed meanwhile,
+   * or of a screen that went away, is dropped.
+   */
+  private async pollIncidents(): Promise<void> {
+    const st = this.inc;
+    if (this.closed || st.running) return;
+    if (st.cursor && Date.now() - st.last < INCIDENTS_POLL_MS) return;
+    st.running = true;
+    const gen = this.gen;
+    const clears = st.clears;
+    const stale = () => this.closed || gen !== this.gen || st.clears !== clears;
+    const restart: Restarts = Object.fromEntries(
+      Object.entries(st.pending).map(([k, by]) => [
+        k,
+        Object.fromEntries(
+          Object.entries(by).map(([stream, paths]) => [stream, [...paths]])
+        ),
+      ])
+    );
+    try {
+      const { answer, next } = await this.deps.peekIncidents(
+        this.fleet,
+        this.names,
+        st.cursor ?? { v: 1, apps: {} },
+        restart
+      );
+      if (stale()) return;
+      st.cursor = next;
+      st.last = Date.now();
+      // a file this read positioned began at its start if it was emptied, or pm2 no longer writes the emptied path; a
+      // restart of a file it did not reach (a host that failed, an app that stalled or is not running) waits for the next
+      for (const [key, streams] of Object.entries(answer.positioned ?? {})) {
+        const by = st.pending[key];
+        if (!by) continue;
+        for (const s of streams) delete by[s];
+        if (!by.out && !by.err) delete st.pending[key];
+      }
+      this.dispatch({
+        type: 'incidents',
+        incidents: answer.incidents,
+        cleared_at: answer.cleared_at,
+        errors: [
+          ...answer.errors.map((e) => `${e.host}: ${e.message}`),
+          ...answer.skipped.map(
+            (k) =>
+              `skipped ${fmtBytes(k.bytes)} of ${k.app} ${k.stream} on ${k.host} (too much new log; the most recent 1 MB was read)`
+          ),
+          ...(answer.more > 0
+            ? [`+${answer.more} older incidents not shown`]
+            : []),
+        ],
+      });
+    } catch (e) {
+      if (stale()) return;
+      st.last = Date.now();
+      this.dispatch({
+        type: 'incidents',
+        incidents: [],
+        cleared_at: this.getState().incidentsCleared,
+        errors: [`incidents: ${describeError(e)}`],
+      });
+    } finally {
+      st.running = false;
+    }
   }
 
   /** A refresh that reflects a change just made on `hosts`: waits for their current refresh, then runs again. */
@@ -488,6 +625,7 @@ export class MonitLoop {
       this.prev.clear();
       this.latest.clear();
       this.errors.clear();
+      this.inc = freshView(); // the incidents of the new view are read afresh
       this.dispatch({ type: 'host', host: viewLabel(requested) });
       await this.refresh(); // a new generation: starts at once, the old view's pending probes are dropped when they return
     } catch (e) {
@@ -576,13 +714,64 @@ export class MonitLoop {
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
     const { at, gen } = this.deps.cleared(this.fleet);
-    const again = Object.keys(gen)
-      .filter((key) => gen[key] !== this.seen[key])
-      .map((key) => key.slice(key.indexOf('/') + 1));
+    // a count that appears or grows is a clear; one that vanished (the store was removed) is none
+    const changed = Object.keys(gen).filter(
+      (key) => gen[key] !== this.seen[key]
+    );
+    const apps = changed.filter(isAppClearKey);
+    const before = this.seen;
     this.seen = { ...gen };
-    this.restart(again.filter((a) => this.names.includes(a)));
+    this.restart(
+      apps
+        .map((key) => key.slice(key.indexOf('/') + 1))
+        .filter((a) => this.names.includes(a))
+    );
+    this.clearIncidents(changed, gen, before);
     if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared))
       this.dispatch({ type: 'cleared', cleared: at });
+  }
+
+  /**
+   * Clears of apps in view that the incidents view has read: each file they emptied (by path, as the store counts them)
+   * is started at its beginning by the view's next read when pm2 still writes it, and a clear by an mcproc that counts
+   * no files (its app count grew more than the clears that counted theirs) starts either file of the app. A file the
+   * clear could not empty keeps its place, so nothing is shown twice. The counts are the clear's own record, never the
+   * shared point (an agent may take before the view looks). A read under way is dropped: its position is from before.
+   */
+  private clearIncidents(
+    changed: string[],
+    gen: Record<string, number>,
+    before: Record<string, number>
+  ): void {
+    const inView = new Set(
+      this.names.map((a) => markKey(this.fleet.hostOf(a), a))
+    );
+    const st = this.inc;
+    const add = (key: string, stream: 'out' | 'err', path: string) => {
+      const by = st.pending[key] ?? {};
+      const paths = by[stream] ?? new Set<string>();
+      paths.add(path);
+      by[stream] = paths;
+      st.pending[key] = by;
+    };
+    let any = false;
+    for (const k of changed) {
+      const f = parseFileClearKey(k);
+      const key = f?.key ?? (isAppClearKey(k) ? k : null);
+      if (!key || !inView.has(key)) continue;
+      any = true;
+      if (!st.cursor?.apps[key]) continue; // not read yet: its first read sees the emptied files
+      if (f) add(key, f.stream, f.path);
+      else {
+        const grew = (k2: string) =>
+          Math.max(0, (gen[k2] ?? 0) - (before[k2] ?? 0));
+        if (grew(k) > grew(countedClearKey(k))) {
+          add(k, 'out', '*');
+          add(k, 'err', '*');
+        }
+      }
+    }
+    if (any) st.clears++;
   }
 
   /**
