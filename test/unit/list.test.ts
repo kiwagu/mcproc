@@ -595,4 +595,53 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
       url_reason: null,
     });
   });
+  it('ports asks no url, on the host or from here, and keeps the full probe', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`); // the default check from here fails the test if called
+    await portsReport(ctx);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.ENV);
+    expect(ctx.fake.calls[0].cmd).toContain('docker ps'); // the CONTAINER column
+  });
+  it('a read of one app asks only its url; a read of all asks every url', async () => {
+    const OTHER = 'http://localhost:3000/';
+    const ctx = on('local', `${URL}\t200\t0\t127.0.0.1\n`);
+    ctx.manifest.apps['api-build'] = {
+      ...ctx.manifest.apps['api-build'],
+      url: OTHER,
+    };
+    await listApps(ctx, 'api');
+    await describeApp(ctx, 'api');
+    expect(ctx.fake.calls).toHaveLength(2);
+    for (const c of ctx.fake.calls) {
+      expect(c.cmd).toContain(`'${URL}'`);
+      expect(c.cmd).not.toContain(OTHER);
+    }
+    await listApps(ctx);
+    expect(ctx.fake.calls[2].cmd).toContain(`'${URL}'`);
+    expect(ctx.fake.calls[2].cmd).toContain(`'${OTHER}'`);
+  });
+  it('an app named constructor keeps its url fields when its url was not asked', async () => {
+    const ctx = on('stand', '');
+    const name = 'constructor';
+    ctx.manifest.apps[name] = { ...ctx.manifest.apps.api, name };
+    const snap = await snapshot(ctx, { urls: 'none' });
+    expect(rowsFor(ctx, snap, [name])[0]).toMatchObject({
+      url_status: 'unchecked',
+      url_code: null,
+      url_from: null,
+      url_reason: null,
+    });
+  });
+  it('a check from here that rejects reads as no answer for its url, and the snapshot still answers', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`, async () => {
+      throw new Error('socket exploded');
+    });
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_code: null,
+      url_from: 'here',
+      url_reason: 'on stand: refused; here: no answer',
+    });
+  });
 });

@@ -41,7 +41,10 @@ export interface UrlResult {
   from: 'host' | 'here' | null;
   reason: string | null;
 }
-/** The check made on the machine mcproc runs on; a dependency, so tests never open sockets they do not mean to. */
+/**
+ * The check made on the machine mcproc runs on; a dependency, so tests never open sockets they do not mean to. It never
+ * rejects: a failure is an Attempt without an answer (settleUrls still reads a rejection as no answer).
+ */
 export type HereCheck = (url: string) => Promise<Attempt>;
 /** What the decision needs of an app. */
 export interface UrlApp {
@@ -305,8 +308,16 @@ export async function settleUrls(
         .map((a) => a.url)
     ),
   ];
+  // a check that breaks its contract and rejects (or throws) is no answer for its url, not a failed snapshot
+  const ask = async (u: string): Promise<Attempt> => {
+    try {
+      return await here(u);
+    } catch {
+      return { answered: false, fail: 'no answer' };
+    }
+  };
   const answers = new Map(
-    await Promise.all(want.map(async (u) => [u, await here(u)] as const))
+    await Promise.all(want.map(async (u) => [u, await ask(u)] as const))
   );
   return Object.fromEntries(
     apps.map((a) => [

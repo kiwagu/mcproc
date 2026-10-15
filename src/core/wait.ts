@@ -4,6 +4,7 @@ import type { Context } from './resolve.js';
 import {
   snapshot as probeSnapshot,
   statusWord,
+  urlCheckOf,
   type Snapshot,
   type SnapshotOptions,
 } from './list.js';
@@ -409,7 +410,7 @@ export async function waitFor(
           : `status ${p?.status ?? 'not-started'}, ${fmtPorts(ports)}`;
       } else {
         // the same decision as ls: the host's answer, else the check from here (url_check)
-        const u = snap.urlChecks[app];
+        const u = urlCheckOf(snap, app);
         met = u?.status === 'ok';
         observed = urlSeen(a.url as string, u);
       }

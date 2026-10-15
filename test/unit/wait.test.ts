@@ -1123,25 +1123,30 @@ describe('untilFor / waitDependency / depFailure', () => {
 
 describe('waitFor: url-ok follows the url_check decision', () => {
   const fleetDir = path.join(here, '..', 'fixtures', 'projects', 'fleet');
-  const web = {
-    pid: 100,
+  const web = (status: string) => ({
+    pid: status === 'online' ? 100 : 0,
     name: 'fleet-web',
     pm_id: 3,
     pm2_env: {
-      status: 'online',
+      status,
       namespace: 'fleet',
       pm_out_log_path: '/l/o',
       pm_err_log_path: '/l/e',
     },
-  };
-  const boxProbe = (line: string) =>
-    probeOut({ jlist: JSON.stringify([web]), ps: PS, urls: line });
-  const mk = (line: string, check: HereCheck) => {
+  });
+  const boxProbe = (line: string, status: string) =>
+    probeOut({ jlist: JSON.stringify([web(status)]), ps: PS, urls: line });
+  const mk = (line: string, check: HereCheck, status = 'online') => {
     let t = 1_000_000;
     const ctx = fakeCtx(
       fleetDir,
       'box',
-      [{ match: MARK.JLIST, result: () => ({ stdout: boxProbe(line) }) }],
+      [
+        {
+          match: MARK.JLIST,
+          result: () => ({ stdout: boxProbe(line, status) }),
+        },
+      ],
       'local',
       check
     );
@@ -1203,4 +1208,23 @@ describe('waitFor: url-ok follows the url_check decision', () => {
     );
     expect(r).toMatchObject({ ok: true, until: 'url-ok' });
   });
+  // the accepted risk of a localhost url: this machine may serve the same port while the box's app is down
+  it.each([
+    ['stopped', 'exited'],
+    ['errored', 'crashed'],
+  ])(
+    'a url this machine answers while the box process is %s is not ready: %s',
+    async (status, reason) => {
+      const { ctx, deps } = mk(
+        'http://localhost:3000/\t000\t7\t::1\n',
+        async () => ({ answered: true, code: 200 }),
+        status
+      );
+      const r = await waitFor(ctx, 'web', { kind: 'url-ok' }, { deps });
+      expect(r).toMatchObject({ ok: false, reason, status });
+      expect(r.observed).toBe(
+        'http://localhost:3000/ 200 from this machine (on box: refused)'
+      );
+    }
+  );
 });

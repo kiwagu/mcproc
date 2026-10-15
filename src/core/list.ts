@@ -99,6 +99,13 @@ export interface HostInfo {
   apps: string[];
 }
 
+/** An app's decided url check; undefined when its url was not asked for (own keys only: an app may be named constructor). */
+export const urlCheckOf = (
+  snap: Snapshot,
+  app: string
+): UrlResult | undefined =>
+  Object.hasOwn(snap.urlChecks, app) ? snap.urlChecks[app] : undefined;
+
 /** The row's url fields from the decided check; unchecked when the url was not asked for. */
 function urlFields(
   u: UrlResult | undefined
@@ -262,7 +269,7 @@ export function rowsFor(
       pm2_memory: p?.memory ?? 0,
       metrics_source: m ? 'tree' : 'pm2-root',
       url: app.url,
-      ...urlFields(snap.urlChecks[name]),
+      ...urlFields(urlCheckOf(snap, name)),
       ports: snap.ports[name],
     };
   });
@@ -306,7 +313,12 @@ export function unreachableRow(
 
 export async function listApps(ctx: Context, app?: string): Promise<LsRow[]> {
   const names = app ? [app] : Object.keys(ctx.manifest.apps);
-  return rowsFor(ctx, await snapshot(ctx), names);
+  // one app's read asks only its own url
+  return rowsFor(
+    ctx,
+    await snapshot(ctx, { urls: app ? [app] : 'check' }),
+    names
+  );
 }
 
 export async function portsReport(
@@ -316,7 +328,8 @@ export async function portsReport(
   port: number | null;
   listeners: Array<Listener & { app: string | null }>;
 }> {
-  const snap = await snapshot(ctx);
+  // no url is shown, so none is asked; the full probe stays for the docker-published ports
+  const snap = await snapshot(ctx, { urls: 'none' });
   const pidToApp = new Map<number, string>();
   for (const [name, ap] of Object.entries(snap.ports))
     for (const l of ap.actual)
@@ -360,7 +373,7 @@ export async function describeApp(
   pm2: Pm2AppConfig;
 }> {
   const app = ctx.manifest.apps[name];
-  const snap = await snapshot(ctx);
+  const snap = await snapshot(ctx, { urls: [name] });
   const [row] = rowsFor(ctx, snap, [name]);
   const p = findProcess(snap.procs, ctx.manifest.project, name);
   const pm2 = buildEcosystem(ctx.manifest, ctx.host).apps.find(
