@@ -74,14 +74,19 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Doctor',
       description:
-        'Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state. Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable.',
+        "Check hosts: reachable, Node version, which pm2 would run and why, ps/ss/tar availability, the unpacked runtime, daemon state, the host's environment (container, hostname) and where each app's url answers (on the host or from this machine). Recommends unpack, hosts.<host>.pm2 or pm2_home when pm2 is missing or unusable, and url_check: auto for a url pinned to its host that answers only from this machine.",
       inputSchema: commonInput,
       annotations: RO,
     },
     (args) =>
       runTool(async () => {
         const { manifest } = await prep({ project: args.project });
-        const reports = await doctor(manifest, args.host, deps.spawner);
+        const reports = await doctor(
+          manifest,
+          args.host,
+          deps.spawner,
+          deps.hereCheck
+        );
         return {
           text: renderDoctor(reports),
           data: { project: manifest.project, reports },

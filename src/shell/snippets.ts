@@ -81,6 +81,18 @@ export function urlCheck(url: string): string {
   ].join('; ');
 }
 
+/**
+ * The url part of a host's answer, which parseUrlProbe reads back: the host's environment (when `env`; by default only
+ * with a url to check, where it explains why one does not answer there), the URL marker, one check per url.
+ */
+export function urlSection(urls: string[], env = urls.length > 0): string[] {
+  return [
+    ...(env ? [ENV_SNIPPET] : []),
+    `echo ${MARK.URL}`,
+    ...urls.map(urlCheck),
+  ];
+}
+
 /** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP
  * request per declared url, with the host's environment (container, hostname, own addresses) when there is one. `metrics: false` is the light form
  * for polling: pm2 state, offset, tree, listeners and urls only, no /proc stat, RSS, args or docker passes. */
@@ -125,10 +137,7 @@ export function probeScript(
           `echo ${MARK.DOCKER}`,
           `if command -v docker >/dev/null 2>&1; then ${bounded(3, "docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null")}; fi`,
         ]),
-    // the environment rides along only when a url is checked: it explains why a url does not answer there
-    ...((opts.urls ?? []).length ? [ENV_SNIPPET] : []),
-    `echo ${MARK.URL}`,
-    ...(opts.urls ?? []).map(urlCheck),
+    ...urlSection(opts.urls ?? []),
   ].join('\n');
 }
 

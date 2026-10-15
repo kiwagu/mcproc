@@ -124,6 +124,9 @@ describe('mcp server', () => {
     );
     expect(waitDesc).not.toContain('—');
     expect(waitDesc.length).toBeLessThan(1200);
+    const doctorDesc = byName.doctor.description as string;
+    expect(doctorDesc).toMatch(/environment.*where each app's url answers/);
+    expect(doctorDesc.length).toBeLessThan(1200);
     const lsDesc = byName.ls.description as string;
     expect(lsDesc).toMatch(/from this machine.*\(here\)/);
     expect(lsDesc.length).toBeLessThan(1200);
@@ -296,6 +299,51 @@ describe('mcp server', () => {
     expect(text(d)).toContain(
       'url: answered from this machine (on box: refused)'
     );
+  });
+  it("doctor checks a url the box cannot reach with the server's check from this machine", async () => {
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (!argv.includes('box'))
+        return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+      if (cmd.includes(MARK.ENV))
+        return {
+          code: 0,
+          stdout: `${MARK.ENV}\ncontainer docker\nhostname ws-01\nself 172.17.0.2\n${MARK.URL}\nhttp://localhost:3000/\t000\t7\t::1\n`,
+          stderr: '',
+        };
+      if (cmd.includes('__MCPROC_DOCTOR__'))
+        return {
+          code: 0,
+          stdout:
+            '__MCPROC_DOCTOR__\nv22.3.0\ntool ps yes\ntool ss yes\ntool tar yes\npm2home \nRUNTIME no\n',
+          stderr: '',
+        };
+      if (cmd.includes('jlist')) return { code: 0, stdout: '[]', stderr: '' };
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+    };
+    const asked: string[] = [];
+    const cl = await client(spawner, undefined, undefined, async (u) => {
+      asked.push(u);
+      return { answered: true, code: 204 };
+    });
+    const r: any = await cl.callTool({
+      name: 'doctor',
+      arguments: { project: fleet, host: 'box' },
+    });
+    expect(r.isError).toBeFalsy();
+    expect(asked).toEqual(['http://localhost:3000/']);
+    expect(text(r)).toContain(
+      '  environment: container (docker), hostname ws-01'
+    );
+    expect(text(r)).toContain(
+      '  url web: localhost → ::1 on box; answers from this machine (204)'
+    );
+    expect(r.structuredContent.reports[0].urls[0]).toMatchObject({
+      app: 'web',
+      check: { from: 'here', reason: 'on box: refused' },
+    });
   });
   it("ls reloads: true counts each running app's in-process reloads into its row and RESTARTS cell; without it ls reads no log", async () => {
     const jlist = JSON.stringify([

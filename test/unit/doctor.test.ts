@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadManifest } from '../../src/core/manifest.js';
+import { loadManifest, type Manifest } from '../../src/core/manifest.js';
 import { doctor } from '../../src/core/doctor.js';
+import type { HereCheck } from '../../src/core/urlcheck.js';
+import { renderDoctor } from '../../src/mcp/render.js';
 import type { Spawner } from '../../src/transport/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +18,13 @@ const spawner: Spawner = async (argv) => {
       code: 255,
       stdout: '',
       stderr: 'ssh: connect to host stand port 22: Connection refused',
+    };
+  if (cmd.includes('__MCPROC_ENV__'))
+    return {
+      code: 0,
+      stdout:
+        '__MCPROC_ENV__\ncontainer none\nhostname dev\nself 127.0.1.1 127.0.0.1 ::1\n__MCPROC_URL__\nhttp://localhost:3310/health\t200\t0\t::1\n',
+      stderr: '',
     };
   if (argv[0] === 'ssh' && argv.includes('prod')) {
     if (cmd.includes('__MCPROC_DOCTOR__'))
@@ -84,6 +93,23 @@ describe('doctor', () => {
     expect(prod.tools.ss).toBe(false);
     expect(prod.recommendations.join('\n')).toMatch(/pm2_home/);
     expect(prod.recommendations.join('\n')).toMatch(/no ss/);
+    expect(local.environment).toEqual({
+      container: 'none',
+      hostname: 'dev',
+      self: ['127.0.1.1', '127.0.0.1', '::1'],
+    });
+    expect(local.urls).toEqual([
+      {
+        app: 'api',
+        url: 'http://localhost:3310/health',
+        name: 'localhost',
+        addr: '::1',
+        itself: false,
+        check: { status: 'ok', code: 200, from: 'host', reason: null },
+      },
+    ]);
+    expect(prod.urls).toEqual([]); // no app runs there
+    expect(stand).toMatchObject({ environment: null, urls: [] }); // unreachable: no url step
   });
   it('limits to one host when asked', async () => {
     const reps = await doctor(loadManifest(basic), 'prod', spawner);
@@ -133,5 +159,168 @@ describe('doctor', () => {
       runtime_node: 'v24.21.0',
       pm2: { source: 'runtime' },
     });
+  });
+});
+
+const fleetDir = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+describe('doctor: environment and urls', () => {
+  const boxSpawner =
+    (
+      urlLines: string,
+      step: { code?: number; stdout?: string; stderr?: string } = {}
+    ): Spawner =>
+    async (argv) => {
+      const cmd = argv[argv.length - 1];
+      if (!argv.includes('box'))
+        return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+      if (cmd.includes('__MCPROC_ENV__'))
+        return {
+          code: step.code ?? 0,
+          stdout:
+            step.stdout ??
+            `__MCPROC_ENV__\ncontainer docker\nhostname ws-01\nself 172.17.0.2 127.0.0.1 ::1\n__MCPROC_URL__\n${urlLines}`,
+          stderr: step.stderr ?? '',
+        };
+      if (cmd.includes('__MCPROC_DOCTOR__'))
+        return {
+          code: 0,
+          stdout:
+            '__MCPROC_DOCTOR__\nv22.3.0\ntool ps yes\ntool ss yes\ntool tar yes\npm2home \nRUNTIME no\n',
+          stderr: '',
+        };
+      if (cmd.includes('jlist')) return { code: 0, stdout: '[]', stderr: '' };
+      if (cmd.includes('bin/pm2'))
+        return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
+      return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+    };
+  const neverHere: HereCheck = async (u) => {
+    throw new Error(`no check from this machine expected: ${u}`);
+  };
+  const failed = (recs: string[]) =>
+    recs.filter((x) => x.startsWith('the environment and url checks failed'));
+  it('reports the environment, where each url of the host answers, and recommends auto for a url pinned to its host that answers only from here', async () => {
+    const base = loadManifest(fleetDir);
+    const m: Manifest = {
+      ...base,
+      apps: {
+        ...base.apps,
+        web: { ...base.apps.web, url_check: 'host' },
+        site: {
+          ...base.apps.web,
+          name: 'site',
+          url: 'https://site.test/',
+          url_check: 'auto',
+          depends_on: [],
+        },
+      },
+    };
+    const asked: string[] = [];
+    const [box] = await doctor(
+      m,
+      'box',
+      boxSpawner(
+        'http://localhost:3000/\t000\t7\t::1\nhttps://site.test/\t000\t7\t127.0.1.1\n'
+      ),
+      async (u) => {
+        asked.push(u);
+        return { answered: true, code: 200 };
+      }
+    );
+    expect(box.environment).toEqual({
+      container: 'docker',
+      hostname: 'ws-01',
+      self: ['172.17.0.2', '127.0.0.1', '::1'],
+    });
+    expect(box.urls).toEqual([
+      {
+        app: 'web',
+        url: 'http://localhost:3000/',
+        name: 'localhost',
+        addr: '::1',
+        itself: false,
+        check: {
+          status: 'ok',
+          code: 200,
+          from: 'here',
+          reason: 'on box: refused',
+        },
+      },
+      {
+        app: 'site',
+        url: 'https://site.test/',
+        name: 'site.test',
+        addr: '127.0.1.1',
+        itself: true,
+        check: {
+          status: 'ok',
+          code: 200,
+          from: 'here',
+          reason: 'on box site.test resolves to 127.0.1.1, the host itself',
+        },
+      },
+    ]);
+    expect(asked.sort()).toEqual([
+      'http://localhost:3000/',
+      'https://site.test/',
+    ]);
+    expect(box.recommendations.filter((x) => x.includes('url_check'))).toEqual([
+      'apps.web.url_check is host, but its url answers only from this machine: set url_check: auto (or drop the line)',
+    ]);
+    const t = renderDoctor([box]);
+    expect(t).toContain('  environment: container (docker), hostname ws-01');
+    expect(t).toContain(
+      '  url site: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200)'
+    );
+  });
+  it('a url the host answers is not asked from here', async () => {
+    const [box] = await doctor(
+      loadManifest(fleetDir),
+      'box',
+      boxSpawner('http://localhost:3000/\t200\t0\t::1\n'),
+      neverHere
+    );
+    expect(box.urls).toEqual([
+      {
+        app: 'web',
+        url: 'http://localhost:3000/',
+        name: 'localhost',
+        addr: '::1',
+        itself: false,
+        check: { status: 'ok', code: 200, from: 'host', reason: null },
+      },
+    ]);
+    expect(box.recommendations.join('\n')).not.toContain('url_check');
+  });
+  it('reads past the "Terminated" BusyBox timeout prints on stderr when it cuts a hung lookup: the exit status and the markers decide', async () => {
+    const [box] = await doctor(
+      loadManifest(fleetDir),
+      'box',
+      boxSpawner('http://localhost:3000/\t200\t0\t\n', {
+        stderr: 'Terminated\nTerminated\n',
+      }),
+      neverHere
+    );
+    expect(failed(box.recommendations)).toEqual([]);
+    expect(box.environment).toMatchObject({ container: 'docker' });
+    expect(box.urls).toMatchObject([
+      { app: 'web', addr: null, check: { status: 'ok', from: 'host' } },
+    ]);
+  });
+  it('a url step that fails, exits non-zero or prints no markers is a recommendation, not a url result', async () => {
+    const m = loadManifest(fleetDir);
+    for (const step of [
+      {
+        code: 255,
+        stdout: '',
+        stderr: 'ssh: connect to host box: Connection reset',
+      },
+      { code: 127, stdout: '', stderr: 'bash: not found' },
+      { code: 0, stdout: 'Welcome to box\n', stderr: '' },
+    ]) {
+      const [box] = await doctor(m, 'box', boxSpawner('', step), neverHere);
+      expect(box.reachable).toBe(true);
+      expect(box).toMatchObject({ environment: null, urls: [] });
+      expect(failed(box.recommendations)).toHaveLength(1);
+    }
   });
 });

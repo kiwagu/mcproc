@@ -1,6 +1,6 @@
 import type { LsRow, HostInfo } from '../core/list.js';
 import type { HostError } from '../core/fleet.js';
-import type { DoctorReport } from '../core/doctor.js';
+import type { DoctorReport, DoctorUrl } from '../core/doctor.js';
 import type { AppPorts, Listener } from '../core/ports.js';
 import type { LogsResult } from '../core/logs.js';
 import type { UnpackResult } from '../runtime/unpack.js';
@@ -9,7 +9,7 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
-import { reasonWord } from '../core/urlcheck.js';
+import { type HostEnv, reasonWord } from '../core/urlcheck.js';
 import { formatLine } from '../core/logstream.js';
 import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
@@ -214,6 +214,28 @@ export function renderHosts(info: HostInfo[]): string {
     ]),
   ]);
 }
+/** `container (docker), hostname ws-01`, or `no container, hostname dev-box` */
+export function fmtEnv(e: HostEnv): string {
+  const kind =
+    e.container === 'none' ? 'no container' : `container (${e.container})`;
+  return e.hostname ? `${kind}, hostname ${e.hostname}` : kind;
+}
+/** `site.test → 127.0.1.1 on box, the host itself; answers from this machine (200)` */
+function fmtDoctorUrl(host: string, u: DoctorUrl): string {
+  const name = u.name ?? u.url;
+  const where = `${name} → ${u.addr ?? 'no address'} on ${host}${u.itself ? ', the host itself' : ''}`;
+  const c = u.check;
+  const code = c.code ?? 'error';
+  const answers =
+    c.status === 'unchecked'
+      ? `not checked (${c.reason ?? 'not asked'})`
+      : c.status === 'down'
+        ? `answers nowhere (${c.reason})`
+        : c.from === 'here'
+          ? `answers from this machine (${code})`
+          : `answers on ${host} (${code})`;
+  return `${where}; ${answers}`;
+}
 export function renderDoctor(reps: DoctorReport[]): string {
   return reps
     .map((r) => {
@@ -234,6 +256,9 @@ export function renderDoctor(reps: DoctorReport[]): string {
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`
           );
+        if (r.environment) L.push(`  environment: ${fmtEnv(r.environment)}`);
+        for (const u of r.urls)
+          L.push(`  url ${u.app}: ${fmtDoctorUrl(r.host, u)}`);
       }
       for (const rec of r.recommendations) L.push(`  → ${rec}`);
       return L.join('\n');

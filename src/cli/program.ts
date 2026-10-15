@@ -244,7 +244,9 @@ export function buildProgram(io: Io = defaultIo): Command {
     );
   program
     .command('doctor')
-    .description('check hosts: reachability, node, pm2, tools, daemon')
+    .description(
+      'check hosts: reachability, node, pm2, tools, daemon, environment, where each url answers'
+    )
     .action(
       wrap(async (g) => {
         const { manifest } = prepare({ project: g.project });

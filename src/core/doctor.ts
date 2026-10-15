@@ -1,11 +1,34 @@
 import { McprocError } from './errors.js';
-import type { Host, Manifest } from './manifest.js';
+import { type Host, type Manifest, scopeManifest } from './manifest.js';
 import { Pm2Client, resolvePm2Bin, runtimeDir } from './pm2.js';
+import { parseUrlProbe } from './ports.js';
 import { pickHost } from './resolve.js';
+import {
+  checkHere,
+  type HereCheck,
+  type HostEnv,
+  isItself,
+  settleUrls,
+  type UrlResult,
+} from './urlcheck.js';
+import { MARK, urlName, urlSection } from '../shell/snippets.js';
 import { shq } from '../transport/quote.js';
 import { createTransport, ensureOk } from '../transport/index.js';
-import type { Spawner } from '../transport/types.js';
+import type { Spawner, Transport } from '../transport/types.js';
 import { LOCK_MARK } from '../runtime/probe.js';
+
+/** One url of the host's apps: its name and the address it resolves to there, and where it answers. */
+export interface DoctorUrl {
+  app: string;
+  url: string;
+  name: string | null;
+  /** the name's first address on that host; null when it does not resolve there or getent is missing */
+  addr: string | null;
+  /** the name resolves there to the host itself (see isItself) */
+  itself: boolean;
+  /** where it answers, decided as url_check: auto decides it */
+  check: UrlResult;
+}
 
 export interface DoctorReport {
   host: string;
@@ -29,6 +52,9 @@ export interface DoctorReport {
   processes: number;
   in_namespace: number;
   recommendations: string[];
+  /** the host's own account of itself (container, hostname, own addresses); null when not read */
+  environment: HostEnv | null;
+  urls: DoctorUrl[];
 }
 
 const MARKER = '__MCPROC_DOCTOR__';
@@ -36,7 +62,8 @@ const MARKER = '__MCPROC_DOCTOR__';
 export async function doctorHost(
   m: Manifest,
   host: Host,
-  spawner?: Spawner
+  spawner?: Spawner,
+  hereCheck: HereCheck = checkHere
 ): Promise<DoctorReport> {
   const transport = createTransport(host, spawner);
   const rt = runtimeDir(host);
@@ -57,6 +84,8 @@ export async function doctorHost(
     processes: 0,
     in_namespace: 0,
     recommendations: [],
+    environment: null,
+    urls: [],
   };
   const probe = [
     `echo ${MARKER}`,
@@ -160,13 +189,97 @@ export async function doctorHost(
     r.recommendations.push(
       'no tar: unpack cannot deliver a runtime bundle to this host'
     );
+  await checkUrlsOf(m, host, transport, r, hereCheck);
   return r;
+}
+
+/**
+ * The bound on doctor's url round trip: its base, plus each url's own bounds (a 2 s lookup, a 2 s request), so a host
+ * whose resolver hangs, which is what doctor is there to show, still answers.
+ */
+const urlStepMs = (urls: number): number => 15_000 + 4_000 * urls;
+
+/**
+ * The host's environment and where the urls of its apps answer: those bound to it, plus on local the unbound ones,
+ * which run there by default. Each url is decided as url_check: auto decides it, whatever the app declares: doctor says
+ * where a url works, and recommends auto for an app pinned to its host whose url answers only from this machine. Its
+ * own round trip, judged by the exit status and the markers, never by stderr: BusyBox timeout prints "Terminated"
+ * there each time it cuts a hung lookup, and the answer is still whole.
+ */
+async function checkUrlsOf(
+  m: Manifest,
+  host: Host,
+  transport: Transport,
+  r: DoctorReport,
+  here: HereCheck
+): Promise<void> {
+  const apps = Object.values(scopeManifest(m, host.name, 'local').apps).flatMap(
+    (a) => (a.url === null ? [] : [{ app: a, url: a.url }])
+  );
+  const urls = [...new Set(apps.map((x) => x.url))];
+  try {
+    const res = ensureOk(
+      await transport.exec(urlSection(urls, true).join('\n'), {
+        timeoutMs: urlStepMs(urls.length),
+      }),
+      host,
+      'doctor url check'
+    );
+    const lines = res.stdout.split('\n').map((l) => l.trim());
+    if (
+      res.code !== 0 ||
+      !lines.includes(MARK.ENV) ||
+      !lines.includes(MARK.URL)
+    )
+      throw new McprocError(
+        'TRANSPORT_FAILED',
+        `unexpected output (exit ${res.code}): ${(res.stderr || res.stdout).trim().slice(0, 200)}`
+      );
+    const probe = parseUrlProbe(res.stdout);
+    r.environment = probe.env;
+    const checks = await settleUrls(
+      apps.map((x) => ({
+        name: x.app.name,
+        url: x.url,
+        url_check: 'auto' as const,
+      })),
+      { host: host.name, local: host.local },
+      probe,
+      here
+    );
+    for (const { app, url } of apps) {
+      const name = urlName(url);
+      const addr = probe.urls.get(url)?.addr ?? null;
+      const check = checks[app.name];
+      r.urls.push({
+        app: app.name,
+        url,
+        name,
+        addr,
+        itself: !host.local && isItself(name, addr, probe.env),
+        check,
+      });
+      if (
+        app.url_check === 'host' &&
+        check.from === 'here' &&
+        check.status !== 'down'
+      )
+        r.recommendations.push(
+          `apps.${app.name}.url_check is host, but its url answers only from this machine: set url_check: auto (or drop the line)`
+        );
+    }
+  } catch (e) {
+    r.recommendations.push(
+      `the environment and url checks failed: ${(e as Error).message}`
+    );
+  }
 }
 
 export async function doctor(
   m: Manifest,
   hostName?: string,
-  spawner?: Spawner
+  spawner?: Spawner,
+  hereCheck?: HereCheck
 ): Promise<DoctorReport[]> {
   const names = hostName
     ? [hostName]
@@ -174,7 +287,7 @@ export async function doctor(
   const out: DoctorReport[] = [];
   for (const n of names) {
     try {
-      out.push(await doctorHost(m, pickHost(m, n), spawner));
+      out.push(await doctorHost(m, pickHost(m, n), spawner, hereCheck));
     } catch (e) {
       out.push({
         host: n,
@@ -193,6 +306,8 @@ export async function doctor(
         processes: 0,
         in_namespace: 0,
         recommendations: [],
+        environment: null,
+        urls: [],
       });
     }
   }

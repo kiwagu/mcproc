@@ -14,6 +14,7 @@ import {
   renderMutation,
   fmtCpu,
   fmtUrl,
+  fmtEnv,
   urlNote,
   fmtDeps,
   renderLogsSince,
@@ -398,10 +399,111 @@ describe('renderDoctor', () => {
         processes: 0,
         in_namespace: 0,
         recommendations: [],
+        environment: null,
+        urls: [],
       },
     ]);
     expect(t).toContain('/opt/rt (pm2 7.0.4)');
     expect(t).toContain("PM2_HOME='/h' '/opt/rt/bin/pm2' monit");
+  });
+  it('prints the environment line and where each url answers', () => {
+    const rep = {
+      host: 'box',
+      transport: 'ssh box',
+      reachable: true,
+      error: null,
+      node: 'v22.1.0',
+      pm2: null,
+      tools: { ps: true, ss: true, tar: true },
+      pm2_home: null,
+      runtime_dir: '/opt/rt',
+      runtime_present: false,
+      runtime_pm2: null,
+      runtime_node: null,
+      daemon: 'answers' as const,
+      processes: 0,
+      in_namespace: 0,
+      recommendations: [],
+      environment: {
+        container: 'docker' as const,
+        hostname: 'ws-01',
+        self: ['172.17.0.2'],
+      },
+      urls: [
+        {
+          app: 'web',
+          url: 'http://localhost:3000/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'ok' as const,
+            code: 200,
+            from: 'here' as const,
+            reason: 'on box: refused',
+          },
+        },
+        {
+          app: 'api',
+          url: 'http://localhost:3100/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'ok' as const,
+            code: 200,
+            from: 'host' as const,
+            reason: null,
+          },
+        },
+        {
+          app: 'gone',
+          url: 'http://gone.test/',
+          name: 'gone.test',
+          addr: null,
+          itself: false,
+          check: {
+            status: 'down' as const,
+            code: null,
+            from: 'here' as const,
+            reason: 'on box gone.test does not resolve; here: not resolved',
+          },
+        },
+        {
+          app: 'bare',
+          url: 'http://localhost:3200/',
+          name: 'localhost',
+          addr: '::1',
+          itself: false,
+          check: {
+            status: 'unchecked' as const,
+            code: null,
+            from: null,
+            reason: 'on box: no curl or wget',
+          },
+        },
+      ],
+    };
+    const t = renderDoctor([rep]);
+    expect(t).toContain('  environment: container (docker), hostname ws-01');
+    expect(t).toContain(
+      '  url web: localhost → ::1 on box; answers from this machine (200)'
+    );
+    expect(t).toContain(
+      '  url api: localhost → ::1 on box; answers on box (200)'
+    );
+    expect(t).toContain(
+      '  url gone: gone.test → no address on box; answers nowhere (on box gone.test does not resolve; here: not resolved)'
+    );
+    expect(t).toContain(
+      '  url bare: localhost → ::1 on box; not checked (on box: no curl or wget)'
+    );
+    expect(fmtEnv({ container: 'none', hostname: null, self: [] })).toBe(
+      'no container'
+    );
+    expect(fmtEnv({ container: 'none', hostname: 'dev', self: [] })).toBe(
+      'no container, hostname dev'
+    );
   });
 });
 
