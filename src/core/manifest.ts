@@ -96,6 +96,7 @@ const appSchema = z
         'url must start with http:// or https:// (it is opened in a browser and checked with one HTTP request)'
       )
       .optional(),
+    url_check: z.enum(['auto', 'host', 'here']).optional(),
     watch: z.union([z.boolean(), z.array(z.string())]).optional(),
     watch_delay: z.number().int().min(0).optional(),
     ignore_watch: z.array(z.string()).optional(),
@@ -168,6 +169,8 @@ export interface App {
   env: Record<string, string>;
   ports: number[];
   url: string | null;
+  /** where the url is requested from: auto (its host, then this machine when the host gets no answer), host, or here */
+  url_check: UrlCheckMode;
   watch?: boolean | string[];
   watch_delay?: number;
   ignore_watch?: string[];
@@ -366,6 +369,10 @@ export function parseManifest(
           `apps.${n}.depends_on: "${d.app}" declares no port or url, so ready cannot be observed`
         );
     }
+    if (a.url_check !== undefined && a.url === undefined)
+      problems.push(
+        `apps.${n}.url_check: there is no url to check; declare url or drop url_check`
+      );
     if (a.kind === 'task' && a.autorestart === true)
       problems.push(
         `apps.${n}.autorestart: a task runs once; drop autorestart or use kind: worker`
@@ -419,6 +426,7 @@ export function parseManifest(
       env: stringifyEnv(a.env),
       ports: a.ports ?? (a.port !== undefined ? [a.port] : []),
       url: a.url ?? null,
+      url_check: a.url_check ?? 'auto',
       watch: a.watch,
       watch_delay: a.watch_delay ?? (a.watch ? 1000 : undefined),
       ignore_watch: a.ignore_watch,

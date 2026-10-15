@@ -45,6 +45,8 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: {
     actual: [],
     declared: checks.map((c) => c.port),

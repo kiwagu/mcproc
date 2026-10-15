@@ -431,3 +431,37 @@ describe('kind: task and depends_on conditions', () => {
     expect(s.apps.web.depends_on.map((d) => d.app)).toEqual(['api', 'logger']);
   });
 });
+
+describe('url_check', () => {
+  const app = (extra: string) =>
+    parse(`version: 1\napps:\n  a: { description: d, run: r${extra} }\n`).apps
+      .a;
+  it('defaults to auto and takes host or here', () => {
+    expect(app(', url: http://localhost:3000/').url_check).toBe('auto');
+    expect(
+      app(', url: http://localhost:3000/, url_check: host').url_check
+    ).toBe('host');
+    expect(
+      app(', url: http://localhost:3000/, url_check: here').url_check
+    ).toBe('here');
+    expect(app('').url_check).toBe('auto'); // no url: the default stays, nothing is checked
+  });
+  it('is refused without a url, and for an unknown value', () => {
+    expect(() => app(', url_check: here')).toThrowError(
+      expect.objectContaining({
+        code: 'MANIFEST_INVALID',
+        message: expect.stringContaining(
+          'apps.a.url_check: there is no url to check; declare url or drop url_check'
+        ),
+      })
+    );
+    expect(() =>
+      app(', url: http://localhost:3000/, url_check: browser')
+    ).toThrowError(
+      expect.objectContaining({
+        code: 'MANIFEST_INVALID',
+        message: expect.stringContaining('apps.a.url_check'),
+      })
+    );
+  });
+});

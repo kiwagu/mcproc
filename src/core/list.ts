@@ -23,7 +23,7 @@ import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
-import type { HostUrl } from './urlcheck.js';
+import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
 import { MARK, probeScript } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -51,6 +51,10 @@ export interface LsRow {
   url: string | null;
   url_status: 'ok' | 'error' | 'down' | 'unchecked';
   url_code: number | null;
+  /** where the url's answer came from: its host's probe, or this machine (url_check); null when unchecked */
+  url_from: 'host' | 'here' | null;
+  /** why the url is down, or why it was taken from this machine ("on box: refused; here: refused"); null otherwise */
+  url_reason: string | null;
   ports: AppPorts;
   /**
    * only when asked (ls --reloads) and the app runs with reloads on and a known start: its in-process reloads since pm2
@@ -69,7 +73,8 @@ export interface Snapshot {
   stats: ProcStats;
   metrics: Record<string, TreeMetrics | null>;
   sampledAt: number;
-  urls: Map<string, HostUrl>;
+  /** each asked app's url as decided (its host's answer, the check from here, url_check), by app name */
+  urlChecks: Record<string, UrlResult>;
   /** the host's UTC offset ('+0200'); null when the probe could not read it */
   zone: string | null;
 }
@@ -94,16 +99,23 @@ export interface HostInfo {
   apps: string[];
 }
 
-/** 2xx/3xx = ok, 4xx/5xx = error (up but refusing), 000 = down; unchecked when not asked or when the host has neither curl nor wget. */
+/** The row's url fields from the decided check; unchecked when the url was not asked for. */
 function urlFields(
-  url: string | null,
-  urls: Map<string, HostUrl>
-): Pick<LsRow, 'url_status' | 'url_code'> {
-  const code = url ? urls.get(url)?.code : undefined;
-  if (code === undefined || code === null)
-    return { url_status: 'unchecked', url_code: null };
-  if (code === 0) return { url_status: 'down', url_code: null };
-  return { url_status: code < 400 ? 'ok' : 'error', url_code: code };
+  u: UrlResult | undefined
+): Pick<LsRow, 'url_status' | 'url_code' | 'url_from' | 'url_reason'> {
+  return u
+    ? {
+        url_status: u.status,
+        url_code: u.code,
+        url_from: u.from,
+        url_reason: u.reason,
+      }
+    : {
+        url_status: 'unchecked',
+        url_code: null,
+        url_from: null,
+        url_reason: null,
+      };
 }
 
 export async function snapshot(
@@ -113,13 +125,22 @@ export async function snapshot(
   const withMetrics = opts.metrics !== 'none';
   const cpuSample = (opts.cpu ?? 'inline') === 'inline' && withMetrics;
   const which = opts.urls ?? 'check';
-  const urls =
+  const asked: UrlApp[] =
     which === 'none'
       ? []
-      : Object.values(ctx.manifest.apps)
-          .filter((a) => which === 'check' || which.includes(a.name))
-          .map((a) => a.url)
-          .filter((u): u is string => u !== null);
+      : Object.values(ctx.manifest.apps).flatMap((a) =>
+          a.url !== null && (which === 'check' || which.includes(a.name))
+            ? [{ name: a.name, url: a.url, url_check: a.url_check }]
+            : []
+        );
+  // the host requests each asked url once, except those checked only from here (url_check: here, on a host that is not this machine)
+  const urls = [
+    ...new Set(
+      asked
+        .filter((a) => ctx.host.local || a.url_check !== 'here')
+        .map((a) => a.url)
+    ),
+  ];
   const res = ensureOk(
     await ctx.transport.exec(
       probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
@@ -171,6 +192,13 @@ export async function snapshot(
   const metrics: Record<string, TreeMetrics | null> = {};
   for (const [name, set] of pids)
     metrics[name] = treeMetrics(set, data.stats, data.listeners, metricOpts);
+  // the checks from here that url_check asks for, after the probe: a url the host answered costs nothing more
+  const urlChecks = await settleUrls(
+    asked,
+    { host: ctx.host.name, local: ctx.host.local },
+    data,
+    ctx.hereCheck
+  );
   return {
     procs,
     ports: joinPorts(ctx.manifest.apps, procs, data, ctx.manifest.project),
@@ -179,7 +207,7 @@ export async function snapshot(
     stats: data.stats,
     metrics,
     sampledAt,
-    urls: data.urls,
+    urlChecks,
     zone: data.zone,
   };
 }
@@ -234,7 +262,7 @@ export function rowsFor(
       pm2_memory: p?.memory ?? 0,
       metrics_source: m ? 'tree' : 'pm2-root',
       url: app.url,
-      ...urlFields(app.url, snap.urls),
+      ...urlFields(snap.urlChecks[name]),
       ports: snap.ports[name],
     };
   });
@@ -269,6 +297,8 @@ export function unreachableRow(
     url: app.url,
     url_status: 'unchecked',
     url_code: null,
+    url_from: null,
+    url_reason: null,
     ports: { actual: [], declared: app.ports, checks: [], undeclared: [] },
     error,
   };

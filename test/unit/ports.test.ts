@@ -39,6 +39,7 @@ const app = (name: string, ports: number[] = []): App => ({
   env: {},
   ports,
   url: null,
+  url_check: 'auto',
   depends_on: [],
   autorestart: true,
   pm2: {},

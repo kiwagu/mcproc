@@ -34,6 +34,8 @@ const web: LsRow = {
   url: 'http://localhost:3100/',
   url_status: 'ok',
   url_code: 200,
+  url_from: 'host',
+  url_reason: null,
   ports: {
     actual: [
       {
@@ -58,6 +60,8 @@ const docs: LsRow = {
   url: 'http://localhost:3200/',
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: {
     actual: [],
     declared: [3200],

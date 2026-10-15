@@ -52,6 +52,8 @@ const row = (app: string, host = 'local'): LsRow => ({
   url: null,
   url_status: 'unchecked',
   url_code: null,
+  url_from: null,
+  url_reason: null,
   ports: { actual: [], declared: [], checks: [], undeclared: [] },
 });
 const jlistOf = (project: string, apps: string[], base = 11) =>
@@ -80,7 +82,7 @@ const snap = (p = procs): Snapshot => ({
   stats: { ...EMPTY_STATS, samples: [sample] },
   metrics: {},
   sampledAt: Date.now(),
-  urls: new Map(),
+  urlChecks: {},
   zone: null,
 });
 const deferred = <T>() => {

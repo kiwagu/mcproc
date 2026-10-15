@@ -6,6 +6,8 @@ import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import type { Context } from '../../src/core/resolve.js';
+import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
 import {
   listApps,
   portsReport,
@@ -423,6 +425,174 @@ describe('statusWord', () => {
       status: 'done',
       exit_code: 0,
       uptime_ms: null,
+    });
+  });
+});
+
+describe('url checks: on the host first, then from this machine (url_check)', () => {
+  const URL = 'http://localhost:3310/health';
+  // `check` is the check from this machine; omitted, fakeCtx's default fails the test when it is called
+  const on = (host: string, line: string, check?: HereCheck, env?: string) =>
+    fakeCtx(
+      basic,
+      host,
+      [
+        {
+          match: MARK.JLIST,
+          result: {
+            stdout: probeOut({
+              jlist,
+              ps: fx('ps.txt'),
+              tcp: fx('ss-tcp.txt'),
+              urls: line,
+              env,
+            }),
+          },
+        },
+      ],
+      host,
+      check
+    );
+  const recorder = (answer: Attempt) => {
+    const asked: string[] = [];
+    const here: HereCheck = async (u) => {
+      asked.push(u);
+      return answer;
+    };
+    return { asked, here };
+  };
+  const api = async (ctx: Context) => (await listApps(ctx, 'api'))[0];
+
+  it('a url the host answers costs one request there and none from here', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', `${URL}\t200\t0\t::1\n`, r.here);
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'ok',
+      url_code: 200,
+      url_from: 'host',
+      url_reason: null,
+    });
+    expect(r.asked).toEqual([]);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(
+      ctx.fake.calls[0].cmd.split(`-w '%{http_code}' '${URL}'`)
+    ).toHaveLength(2); // requested once on the host
+  });
+  it('no answer on the host: checked from here, and the row says why the host could not', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    expect(
+      await api(on('stand', `${URL}\t000\t7\t::1\n`, r.here))
+    ).toMatchObject({
+      url_status: 'ok',
+      url_code: 200,
+      url_from: 'here',
+      url_reason: 'on stand: refused',
+    });
+    expect(r.asked).toEqual([URL]);
+  });
+  it('neither answers: down, from here, with both reasons', async () => {
+    const r = recorder({ answered: false, fail: 'refused' });
+    expect(
+      await api(on('stand', `${URL}\t000\t7\t::1\n`, r.here))
+    ).toMatchObject({
+      url_status: 'down',
+      url_code: null,
+      url_from: 'here',
+      url_reason: 'on stand: refused; here: refused',
+    });
+  });
+  it('url_check: host never asks from here', async () => {
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`); // the default check from here fails the test if called
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'host' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: 'on stand: refused',
+    });
+  });
+  it('url_check: here: the host never requests it, and prints no environment for it', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const ctx = on('stand', '', r.here);
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'here' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'url_check: here',
+    });
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.ENV);
+    expect(r.asked).toEqual([URL]);
+  });
+  it('a name that resolves to the host itself is named as such: by a loopback address, or by one the environment calls its own', async () => {
+    const r = recorder({ answered: true, code: 200 });
+    const env =
+      'container docker\nhostname ws-01\nself 172.17.0.2 127.0.0.1 ::1';
+    const site = async (addr: string) => {
+      const ctx = on(
+        'stand',
+        `https://site.test/\t000\t7\t${addr}\n`,
+        r.here,
+        env
+      );
+      ctx.manifest.apps.api = {
+        ...ctx.manifest.apps.api,
+        url: 'https://site.test/',
+      };
+      return api(ctx);
+    };
+    expect(await site('127.0.1.1')).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'on stand site.test resolves to 127.0.1.1, the host itself',
+    });
+    // only the host's environment section says 172.17.0.2 is the host's own address
+    expect(await site('172.17.0.2')).toMatchObject({
+      url_status: 'ok',
+      url_from: 'here',
+      url_reason: 'on stand site.test resolves to 172.17.0.2, the host itself',
+    });
+    expect(r.asked).toEqual(['https://site.test/', 'https://site.test/']);
+  });
+  it('on local nothing is ever checked twice, whatever url_check says', async () => {
+    const ctx = on('local', `${URL}\t000\t7\t127.0.0.1\n`); // the default check from here fails the test if called
+    ctx.manifest.apps.api = { ...ctx.manifest.apps.api, url_check: 'here' };
+    expect(await api(ctx)).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: 'on local: refused',
+    });
+    expect(ctx.fake.calls[0].cmd).toContain(`'${URL}'`);
+  });
+  it('two apps sharing a url: one request on the host, one from here, a row each', async () => {
+    const r = recorder({ answered: true, code: 204 });
+    const ctx = on('stand', `${URL}\t000\t7\t::1\n`, r.here);
+    ctx.manifest.apps['api-build'] = {
+      ...ctx.manifest.apps['api-build'],
+      url: URL,
+    };
+    const rows = await listApps(ctx);
+    expect(rows.filter((x) => x.url_from === 'here').map((x) => x.app)).toEqual(
+      ['api-build', 'api']
+    );
+    expect(r.asked).toEqual([URL]);
+    expect(
+      ctx.fake.calls[0].cmd.split(`-w '%{http_code}' '${URL}'`)
+    ).toHaveLength(2);
+  });
+  it('urls not asked: unchecked, nothing requested anywhere; an unreachable row carries no url facts', async () => {
+    const ctx = on('stand', '');
+    const snap = await snapshot(ctx, { urls: 'none' });
+    expect(snap.urlChecks).toEqual({});
+    expect(ctx.fake.calls[0].cmd).not.toContain(URL);
+    expect(rowsFor(ctx, snap, ['api'])[0]).toMatchObject({
+      url_status: 'unchecked',
+      url_from: null,
+      url_reason: null,
+    });
+    expect(unreachableRow(ctx.manifest.apps.api, 'stand', 'x')).toMatchObject({
+      url_status: 'unchecked',
+      url_from: null,
+      url_reason: null,
     });
   });
 });

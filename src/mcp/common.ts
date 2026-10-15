@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { isMcprocError, McprocError } from '../core/errors.js';
 import type { Spawner } from '../transport/types.js';
 import type { UnpackDeps } from '../runtime/unpack.js';
+import type { HereCheck } from '../core/urlcheck.js';
 
 export const commonInput = {
   project: z
@@ -24,6 +25,8 @@ export interface ToolDeps {
   spawner?: Spawner;
   unpack?: UnpackDeps;
   project?: string;
+  /** checks a url from this machine (tests pass a fake) */
+  hereCheck?: HereCheck;
 }
 
 export const RO = {

@@ -45,7 +45,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         roots: await deps.roots(),
       }).manifest,
       args.host,
-      defaultConnector(deps.spawner)
+      defaultConnector(deps.spawner, deps.hereCheck)
     );
 
   server.registerTool(
@@ -263,7 +263,10 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     },
     (args) =>
       runTool(async () => {
-        const ctx = await connect(await prep(args), { spawner: deps.spawner });
+        const ctx = await connect(await prep(args), {
+          spawner: deps.spawner,
+          hereCheck: deps.hereCheck,
+        });
         const r = await portsReport(ctx, args.port);
         return {
           text: renderPorts(r, ctx.host.name),
