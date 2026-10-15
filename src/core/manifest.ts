@@ -157,6 +157,8 @@ export interface ReloadSettings {
   ignore: string[];
   defaults: boolean;
 }
+/** Where an app's url is requested from: its host, then this machine when the host gets no answer (auto); only one side otherwise. */
+export type UrlCheckMode = 'auto' | 'host' | 'here';
 export interface App {
   name: string;
   description: string;

@@ -1,5 +1,14 @@
 import { shq } from '../transport/quote.js';
 
+/** The host name of a url, as a host resolves it (IPv6 brackets removed); null when the url does not parse. */
+export function urlName(url: string): string | null {
+  try {
+    return new URL(url).hostname.replace(/^\[|\]$/g, '') || null;
+  } catch {
+    return null;
+  }
+}
+
 export const MARK = {
   JLIST: '__MCPROC_JLIST__',
   JLIST_RC: '__MCPROC_JLIST_RC__',
