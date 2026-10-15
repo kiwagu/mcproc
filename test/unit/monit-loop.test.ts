@@ -1569,10 +1569,54 @@ describe('MonitLoop reload all', () => {
     const run = h.loop.reloadAll();
     await tick();
     expect(signal?.aborted).toBe(false);
+    const closedAt = h.actions.length;
     h.loop.close();
     expect(signal?.aborted).toBe(true);
     await run;
     expect(probes).toEqual([]);
     expect(h.state.notice).toBe('reload all…');
+    expect(
+      h.actions
+        .slice(closedAt)
+        .filter((a) => a.type === 'notice' || a.type === 'busy')
+    ).toEqual([]);
+  });
+
+  it('quitting while the refresh after a reload or a command is pending: no notice, no busy, no further probe', async () => {
+    for (const run of [
+      (h: ReturnType<typeof harness>) => h.loop.reloadAll(),
+      (h: ReturnType<typeof harness>) => h.loop.runCommand('restart', 'api'),
+    ]) {
+      let gate: ReturnType<typeof deferred<void>> | null = null;
+      let snapshots = 0;
+      const h = harness(undefined, {
+        reloadAll: async () => [],
+        command: async () => [],
+        snapshot: async () => {
+          snapshots++;
+          if (gate) await gate.promise;
+          return snap();
+        },
+      });
+      await h.loop.refresh();
+      gate = deferred<void>();
+      void h.loop.refresh(); // a timer refresh in flight: the refresh after the change waits for it, then would run again
+      await tick();
+      const p = run(h);
+      for (let i = 0; i < 5; i++) await tick();
+      expect(h.state.busy).toBe(true);
+      const probed = snapshots;
+      const closedAt = h.actions.length;
+      h.loop.close();
+      gate.resolve();
+      await p;
+      for (let i = 0; i < 5; i++) await tick();
+      expect(snapshots).toBe(probed);
+      expect(
+        h.actions
+          .slice(closedAt)
+          .filter((a) => a.type === 'notice' || a.type === 'busy')
+      ).toEqual([]);
+    }
   });
 });

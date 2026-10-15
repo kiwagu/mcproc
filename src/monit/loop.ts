@@ -169,6 +169,7 @@ export class MonitLoop {
       .map((h) => this.inflight.get(h))
       .filter((c) => c && c.gen === this.gen);
     await Promise.all(current.map((c) => c!.done.catch(() => undefined)));
+    if (this.closed) return; // the screen went away while that refresh ran: nothing to reflect any more
     return this.refresh(hosts);
   }
 
@@ -500,8 +501,8 @@ export class MonitLoop {
   /**
    * One change made from the screen. While it runs: busy, and `<label>…` in the footer. The guard runs first, so a
    * refusal touches nothing. Then the change, then a refresh of `hosts`, and only then how it ended, together with busy
-   * off: the footer never says done while keys are still refused. When the screen goes away meanwhile, nothing is shown
-   * or refreshed.
+   * off: the footer never says done while keys are still refused. Once the screen has gone away (quit, at any point of
+   * the step), it issues nothing more: no refresh, no notice, no busy.
    */
   private async step(o: {
     label: string;
@@ -517,6 +518,7 @@ export class MonitLoop {
       const bad = ((await o.act()) ?? []).filter((r) => r.error);
       if (this.closed) return;
       await this.refreshAfterCurrent(o.hosts());
+      if (this.closed) return;
       // a dependency may have started on one host while the app itself failed on another: never report that as done
       this.dispatch({
         type: 'notice',
@@ -532,7 +534,7 @@ export class MonitLoop {
         message: `${o.label} failed: ${describeError(e)}`,
       });
     } finally {
-      this.dispatch({ type: 'busy', busy: false });
+      if (!this.closed) this.dispatch({ type: 'busy', busy: false });
     }
   }
 
