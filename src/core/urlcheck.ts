@@ -221,15 +221,33 @@ export function isItself(
   );
 }
 
-/** Why the host got no answer, as url_reason says it. */
-function hostReason(i: UrlInput, h: HostUrl, fail: UrlFail): string {
+/**
+ * Why the host got no answer, as url_reason says it. A name that resolves there to the host itself is the reason only
+ * when the url answered from here (`answeredHere`): a name that means another machine where the url is opened, the
+ * dev-container case. Otherwise the host's own failure stays the reason and the address follows as a note: a host
+ * whose own name legitimately resolves to itself, its app simply down, must not point at naming.
+ */
+function hostReason(
+  i: UrlInput,
+  h: HostUrl,
+  fail: UrlFail,
+  answeredHere: boolean
+): string {
   const name = urlName(i.url);
   if (fail === 'not resolved' && name)
     return `on ${i.host} ${name} does not resolve`;
-  if (!i.local && fail !== 'no curl or wget' && isItself(name, h.addr, i.env))
-    return `on ${i.host} ${name} resolves to ${h.addr}, the host itself`;
-  return `on ${i.host}: ${fail}`;
+  const own = `on ${i.host}: ${fail}`;
+  if (i.local || fail === 'no curl or wget' || !isItself(name, h.addr, i.env))
+    return own;
+  const itself = `${name} resolves to ${h.addr}, the host itself`;
+  return answeredHere ? `on ${i.host} ${itself}` : `${own} (${itself})`;
 }
+
+/** The address note a host's failure carries when its name resolves to the host itself (see hostReason). */
+const ITSELF_NOTE = / \([^()]*, the host itself\)/g;
+/** A reason without that note, for a line that already says where the name resolves. */
+export const withoutItselfNote = (reason: string): string =>
+  reason.replace(ITSELF_NOTE, '');
 
 const UNCHECKED: UrlResult = {
   status: 'unchecked',
@@ -279,16 +297,18 @@ export function decideUrl(i: UrlInput): UrlResult {
       ? answered(here.code, 'here', 'url_check: here')
       : down('here', `here: ${here.fail}`);
   }
-  if (!i.onHost) return UNCHECKED;
-  const a = hostAttempt(i.onHost);
+  const onHost = i.onHost;
+  if (!onHost) return UNCHECKED;
+  const a = hostAttempt(onHost);
   if (a.answered) return answered(a.code, 'host', null);
-  const why = hostReason(i, i.onHost, a.fail);
+  const why = (answeredHere: boolean) =>
+    hostReason(i, onHost, a.fail, answeredHere);
   if (i.local || i.mode === 'host' || !here)
     return a.fail === 'no curl or wget'
-      ? { ...UNCHECKED, reason: why }
-      : down('host', why);
-  if (here.answered) return answered(here.code, 'here', why);
-  return down('here', `${why}; here: ${here.fail}`);
+      ? { ...UNCHECKED, reason: why(false) }
+      : down('host', why(false));
+  if (here.answered) return answered(here.code, 'here', why(true));
+  return down('here', `${why(false)}; here: ${here.fail}`);
 }
 
 /**
@@ -337,9 +357,12 @@ export async function settleUrls(
   );
 }
 
-/** The short word of a reason, for `✗ down (…)`: that of the last place tried (this machine, after the host). */
+/**
+ * The short word of a reason, for `✗ down (…)`: that of the last place tried (this machine, after the host), never the
+ * address note. `itself` only for the reason of a url that answered from here.
+ */
 export function reasonWord(reason: string): string {
-  const last = reason.split('; ').at(-1) ?? reason;
+  const last = withoutItselfNote(reason.split('; ').at(-1) ?? reason);
   if (last.endsWith(', the host itself')) return 'itself';
   if (last.endsWith(' does not resolve')) return 'not resolved';
   const i = last.lastIndexOf(': ');

@@ -166,9 +166,13 @@ describe('renderLs with tree metrics', () => {
       ['on box: tls', 'tls'],
       ['on box: reset', 'reset'],
       ['on box: refused; here: no answer', 'no answer'],
-      ['on box site.test resolves to 127.0.1.1, the host itself', 'itself'],
+      // the host's own failure, whatever its name resolves to: never `itself` on a down url
       [
-        'on box site.test resolves to 127.0.1.1, the host itself; here: not resolved',
+        'on box: refused (site.test resolves to 127.0.1.1, the host itself)',
+        'refused',
+      ],
+      [
+        'on box: refused (site.test resolves to 127.0.1.1, the host itself); here: not resolved',
         'not resolved',
       ],
     ])
@@ -560,6 +564,50 @@ describe('renderDoctor', () => {
     expect(lines).toContain(
       '  url bare: site.test → 127.0.1.1 on box, the host itself; answers from this machine (200); on box: no curl or wget'
     );
+  });
+  it('a url that resolves to the host itself and answers nowhere says "the host itself" once, and the host\'s own failure', () => {
+    const t = renderDoctor([
+      {
+        host: 'box',
+        transport: 'ssh box',
+        reachable: true,
+        error: null,
+        node: 'v22.1.0',
+        pm2: null,
+        tools: { ps: true, ss: true, tar: true },
+        pm2_home: null,
+        runtime_dir: '/opt/rt',
+        runtime_present: false,
+        runtime_pm2: null,
+        runtime_node: null,
+        daemon: 'answers',
+        processes: 0,
+        in_namespace: 0,
+        recommendations: [],
+        environment: null,
+        urls: [
+          {
+            app: 'web',
+            url: 'http://devbox:3000/',
+            name: 'devbox',
+            addr: '127.0.1.1',
+            itself: true,
+            check: {
+              status: 'down',
+              code: null,
+              from: 'here',
+              reason:
+                'on box: refused (devbox resolves to 127.0.1.1, the host itself); here: refused',
+            },
+          },
+        ],
+      },
+    ]);
+    const line = t.split('\n').find((l) => l.startsWith('  url web:'))!;
+    expect(line).toBe(
+      '  url web: devbox → 127.0.1.1 on box, the host itself; answers nowhere (on box: refused; here: refused)'
+    );
+    expect(line.split('the host itself')).toHaveLength(2);
   });
 });
 

@@ -9,7 +9,11 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
-import { type HostEnv, reasonWord } from '../core/urlcheck.js';
+import {
+  type HostEnv,
+  reasonWord,
+  withoutItselfNote,
+} from '../core/urlcheck.js';
 import { formatLine } from '../core/logstream.js';
 import { bodyOf } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
@@ -222,7 +226,8 @@ export function fmtEnv(e: HostEnv): string {
 }
 /**
  * `localhost → ::1 on box; answers from this machine (200); on box: refused`: after an answer from here, why the host
- * had none, unless that reason is the host itself, which the first part already says.
+ * had none, unless that reason is the host itself, which the first part already says; for the same reason a url that
+ * answers nowhere drops the address note from its reason.
  */
 function fmtDoctorUrl(host: string, u: DoctorUrl): string {
   const name = u.name ?? u.url;
@@ -237,7 +242,7 @@ function fmtDoctorUrl(host: string, u: DoctorUrl): string {
     c.status === 'unchecked'
       ? `not checked (${c.reason ?? 'not asked'})`
       : c.status === 'down'
-        ? `answers nowhere (${c.reason})`
+        ? `answers nowhere (${u.itself && c.reason ? withoutItselfNote(c.reason) : c.reason})`
         : c.from === 'here'
           ? `answers from this machine (${code})${why}`
           : `answers on ${host} (${code})`;

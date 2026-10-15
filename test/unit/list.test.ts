@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
+import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import type { Context } from '../../src/core/resolve.js';
 import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
@@ -549,11 +550,13 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
       };
       return api(ctx);
     };
-    expect(await site('127.0.1.1')).toMatchObject({
+    const devContainer = await site('127.0.1.1');
+    expect(devContainer).toMatchObject({
       url_status: 'ok',
       url_from: 'here',
       url_reason: 'on stand site.test resolves to 127.0.1.1, the host itself',
     });
+    expect(fmtUrl(devContainer)).toBe('https://site.test/ ✓ 200 (here)');
     // only the host's environment section says 172.17.0.2 is the host's own address
     expect(await site('172.17.0.2')).toMatchObject({
       url_status: 'ok',
@@ -561,6 +564,35 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
       url_reason: 'on stand site.test resolves to 172.17.0.2, the host itself',
     });
     expect(r.asked).toEqual(['https://site.test/', 'https://site.test/']);
+  });
+  it("a box whose own name resolves to 127.0.1.1, its app dead: the host's own failure, never itself", async () => {
+    const DEV = 'http://devbox:3000/';
+    const env = 'container none\nhostname devbox\nself 127.0.1.1 127.0.0.1 ::1';
+    const row = async (mode: 'host' | 'auto') => {
+      const r = recorder({ answered: false, fail: 'refused' });
+      const ctx = on('stand', `${DEV}\t000\t7\t127.0.1.1\n`, r.here, env);
+      ctx.manifest.apps.api = {
+        ...ctx.manifest.apps.api,
+        url: DEV,
+        url_check: mode,
+      };
+      return api(ctx);
+    };
+    const note = '(devbox resolves to 127.0.1.1, the host itself)';
+    const host = await row('host');
+    expect(host).toMatchObject({
+      url_status: 'down',
+      url_from: 'host',
+      url_reason: `on stand: refused ${note}`,
+    });
+    expect(fmtUrl(host)).toBe(`${DEV} ✗ down (refused)`);
+    const auto = await row('auto');
+    expect(auto).toMatchObject({
+      url_status: 'down',
+      url_from: 'here',
+      url_reason: `on stand: refused ${note}; here: refused`,
+    });
+    expect(fmtUrl(auto)).toBe(`${DEV} ✗ down (refused)`);
   });
   it('on local nothing is ever checked twice, whatever url_check says', async () => {
     const ctx = on('local', `${URL}\t000\t7\t127.0.0.1\n`); // the default check from here fails the test if called

@@ -276,6 +276,40 @@ describe('doctor: environment and urls', () => {
       '  url web: localhost → ::1 on box; answers from this machine (200); on box: refused\n'
     );
   });
+  it('a url whose name resolves to the host itself and answers nowhere: the host\'s own failure, and "the host itself" once', async () => {
+    const base = loadManifest(fleetDir);
+    const m: Manifest = {
+      ...base,
+      apps: {
+        ...base.apps,
+        web: { ...base.apps.web, url: 'http://devbox:3000/' },
+      },
+    };
+    const [box] = await doctor(
+      m,
+      'box',
+      boxSpawner('http://devbox:3000/\t000\t7\t127.0.1.1\n'),
+      async () => ({ answered: false, fail: 'refused' })
+    );
+    expect(box.urls).toMatchObject([
+      {
+        app: 'web',
+        itself: true,
+        check: {
+          status: 'down',
+          from: 'here',
+          reason:
+            'on box: refused (devbox resolves to 127.0.1.1, the host itself); here: refused',
+        },
+      },
+    ]);
+    const line = renderDoctor([box])
+      .split('\n')
+      .find((l) => l.startsWith('  url web:'))!;
+    expect(line).toBe(
+      '  url web: devbox → 127.0.1.1 on box, the host itself; answers nowhere (on box: refused; here: refused)'
+    );
+  });
   it('a url the host answers is not asked from here', async () => {
     const [box] = await doctor(
       loadManifest(fleetDir),

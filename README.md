@@ -447,13 +447,20 @@ One catch of `auto`: a `localhost` (or loopback-address) url of an app on a remo
 when this machine happens to serve the same port, even while that app is down. `wait` and a `ready` dependency
 still require the app's process to be online; `url_check: host` rules the catch out.
 
-`ls` marks an answer from this machine with `(here)`, and a `down` url with a short reason: `refused`,
-`not resolved`, `timeout`, `tls`, `reset`, `no answer`, or `itself` (on the host the url's name resolves to the
-host itself, for instance through a hostname line in its `/etc/hosts`). The JSON rows carry `url_from` (`host`,
+`ls` marks an answer from this machine with `(here)`, and a `down` url with the short reason of the last place
+tried: `refused`, `not resolved`, `timeout`, `tls`, `reset` or `no answer`. The JSON rows carry `url_from` (`host`,
 `here`, or null when unchecked) and `url_reason` (why it is down, with both sides when neither answered, as in
-`on box: refused; here: refused`, or why it was taken from this machine), which `describe` prints too. `doctor`
-shows each host's environment (container or not, hostname) and where each of its apps' urls answers, and suggests
-`url_check: auto` for an app with `url_check: host` whose url answers only from here.
+`on box: refused; here: refused`, or why it was taken from this machine), which `describe` prints too.
+
+When the url's name resolves on the host to the host itself (for instance through a hostname line in its
+`/etc/hosts`), that is the reason only when the url answered from this machine:
+`on box site.test resolves to 127.0.1.1, the host itself`, the dev container whose name for the site means another
+machine. Otherwise the host's own failure stays the reason and the address follows as a note, so a box whose own
+name resolves to itself and whose app is down reads `✗ down (refused)`, with the `url_reason`
+`on box: refused (devbox resolves to 127.0.1.1, the host itself)`.
+
+`doctor` shows each host's environment (container or not, hostname) and where each of its apps' urls answers, and
+suggests `url_check: auto` for an app with `url_check: host` whose url answers only from here.
 
 ```yaml
 apps:

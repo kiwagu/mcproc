@@ -379,6 +379,45 @@ describe('decideUrl (url_check)', () => {
       reason: 'on box: refused; here: refused',
     });
   });
+  it("a name that resolves to the host itself is the reason only when the url answered from here; otherwise the host's own failure, the address as a note", () => {
+    // a box whose own name is in its /etc/hosts (Debian: 127.0.1.1 devbox), its app dead
+    const devbox = {
+      ...base,
+      url: 'http://devbox:3000/',
+      onHost: H(0, '7', '127.0.1.1'),
+      env,
+    };
+    const note = '(devbox resolves to 127.0.1.1, the host itself)';
+    const auto = decideUrl({ ...devbox, here: refused });
+    expect(auto).toEqual({
+      status: 'down',
+      code: null,
+      from: 'here',
+      reason: `on box: refused ${note}; here: refused`,
+    });
+    expect(reasonWord(auto.reason!)).toBe('refused');
+    const host = decideUrl({ ...devbox, mode: 'host' });
+    expect(host).toEqual({
+      status: 'down',
+      code: null,
+      from: 'host',
+      reason: `on box: refused ${note}`,
+    });
+    expect(reasonWord(host.reason!)).toBe('refused');
+    expect(
+      reasonWord(
+        decideUrl({ ...devbox, onHost: H(0, '28', '127.0.1.1'), mode: 'host' })
+          .reason!
+      )
+    ).toBe('timeout');
+    // the dev-container case: a gateway name that means another machine, and the url answers from here
+    expect(decideUrl({ ...devbox, here: ok200 })).toEqual({
+      status: 'ok',
+      code: 200,
+      from: 'here',
+      reason: 'on box devbox resolves to 127.0.1.1, the host itself',
+    });
+  });
   it("host: only the host's line, now with a reason", () => {
     expect(
       decideUrl({ ...base, mode: 'host', onHost: H(0, '7', '::1') })
@@ -478,9 +517,14 @@ describe('reasonWord', () => {
     ).toBe('itself');
     expect(
       reasonWord(
-        'on box site.test resolves to 127.0.1.1, the host itself; here: not resolved'
+        'on box: refused (site.test resolves to 127.0.1.1, the host itself); here: not resolved'
       )
     ).toBe('not resolved');
+    expect(
+      reasonWord(
+        'on box: timeout (site.test resolves to 127.0.1.1, the host itself)'
+      )
+    ).toBe('timeout');
     expect(reasonWord('here: tls')).toBe('tls');
     const base: UrlInput = {
       host: 'box',
