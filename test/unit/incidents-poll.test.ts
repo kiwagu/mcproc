@@ -212,6 +212,19 @@ describe('pollIncidents', () => {
       });
       expect(second.answer.incidents).toEqual([]);
     });
+    it('says which files it positioned, only to a caller that passed restart; a stalled app is not among them', async () => {
+      const { state, h } = setup();
+      const plain = await pollIncidents(h.fleet, ['watch']);
+      expect(plain.answer.positioned).toBeUndefined(); // the agent's answer is unchanged
+      state.files['/l/watch-out'] = regrown();
+      const asked = await pollIncidents(h.fleet, ['watch', 'web'], {
+        cursor: plain.next,
+        restart: { 'local/watch': { out: ['/l/watch-out'] } },
+      });
+      expect(asked.answer.positioned).toEqual({
+        'local/watch': ['out', 'err'], // a missing err log reads as empty: positioned at its start
+      }); // web is not running: nothing of it is positioned
+    });
     it('a short read of a restarted file leaves its start as the place to read again from', async () => {
       const { state, h } = setup();
       const first = await pollIncidents(h.fleet, ['watch']);

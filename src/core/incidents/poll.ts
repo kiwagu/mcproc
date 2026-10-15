@@ -38,6 +38,12 @@ export interface IncidentsAnswer {
   apps: number;
   hosts: number;
   latest: string | null;
+  /**
+   * Only for a caller that passed `restart`: per host/app, the files this poll positioned (read, or left to read again
+   * from where it began). A restart of any other file was not applied (its host failed, its app stalled or is not
+   * running), so the caller keeps it for its next poll.
+   */
+  positioned?: Record<string, Stream[]>;
 }
 /**
  * `budgetMs`: how long an app's own patterns may take on one file (default MATCH_BUDGET_MS). `includeReloads`: also
@@ -303,6 +309,16 @@ export async function pollIncidents(
       apps: names.length,
       hosts: groups.length,
       latest,
+      ...(opts.restart
+        ? {
+            positioned: Object.fromEntries(
+              Object.entries(next.apps).map(([k, m]) => [
+                k,
+                STREAMS.filter((st) => m[st] !== undefined),
+              ])
+            ),
+          }
+        : {}),
     },
     next,
   };

@@ -1853,6 +1853,7 @@ describe('MonitLoop incidents view and log clears', () => {
     latest: null,
     taken: false,
     cleared_at: null,
+    positioned: { 'local/api': ['out', 'err'], 'local/worker': ['err'] }, // a read that reached every file
   });
   const answer = (line: string) => [
     {
@@ -2092,6 +2093,45 @@ describe('MonitLoop incidents view and log clears', () => {
     now += INCIDENTS_POLL_MS;
     await h.loop.refresh();
     expect(restarts.at(-1)).toEqual({});
+  });
+  it('a restart the read did not apply (its host failed, its app stalled) waits for the next read', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = fresh();
+    const restarts: Restarts[] = [];
+    let reach: TakenAnswer['positioned'] = {};
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, _c, restart) => {
+        restarts.push(structuredClone(restart));
+        return {
+          answer: { ...empty(), positioned: reach },
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    reach = { 'local/api': ['out', 'err'], 'local/worker': ['err'] };
+    await start(h);
+    store.gen = counted(store.gen, { out: '/l/api-out', err: '/l/api-err' });
+    reach = { 'local/worker': ['err'] }; // api's host did not answer this time
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[1]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+    reach = { 'local/api': ['out'] }; // back, but err stalled
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[2]).toEqual({
+      'local/api': { out: ['/l/api-out'], err: ['/l/api-err'] },
+    });
+    reach = { 'local/api': ['out', 'err'] };
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[3]).toEqual({ 'local/api': { err: ['/l/api-err'] } }); // out was applied by the read before
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(restarts[4]).toEqual({});
   });
   it('says when a read skipped log it could not keep up with', async () => {
     const h = harness(undefined, {

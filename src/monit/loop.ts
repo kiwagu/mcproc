@@ -263,7 +263,14 @@ export class MonitLoop {
       if (stale()) return;
       st.cursor = next;
       st.last = Date.now();
-      st.pending = {}; // the read began each of them at its start (a clear during it would have dropped it)
+      // a file this read positioned began at its start if it was emptied, or pm2 no longer writes the emptied path; a
+      // restart of a file it did not reach (a host that failed, an app that stalled or is not running) waits for the next
+      for (const [key, streams] of Object.entries(answer.positioned ?? {})) {
+        const by = st.pending[key];
+        if (!by) continue;
+        for (const s of streams) delete by[s];
+        if (!by.out && !by.err) delete st.pending[key];
+      }
       this.dispatch({
         type: 'incidents',
         incidents: answer.incidents,
