@@ -399,7 +399,7 @@ export async function waitFor(
           : `status ${p?.status ?? 'not-started'}, ${fmtPorts(ports)}`;
       } else {
         // 0: nothing answered; null: the host has neither curl nor wget, or the url was not asked for
-        const code = snap.urls.get(a.url!) ?? null;
+        const code = snap.urls.get(a.url!)?.code ?? null;
         met = code !== null && code > 0 && code < 400;
         observed = `${a.url} ${code === null ? 'unchecked' : code === 0 ? 'down' : code}`;
       }

@@ -7,6 +7,7 @@ import {
   probeScript,
   STAT_AWK,
   RSS_AWK,
+  urlCheck,
 } from '../../src/shell/snippets.js';
 import {
   parsePs,
@@ -18,6 +19,9 @@ import {
   joinPorts,
   hexToIp,
   splitAddr,
+  parseUrlChecks,
+  parseEnv,
+  parseUrlProbe,
 } from '../../src/core/ports.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import type { App } from '../../src/core/manifest.js';
@@ -47,7 +51,7 @@ describe('probeScript', () => {
   it('contains every marker and the pm2 command', () => {
     const s = probeScript("'/usr/bin/node' '/x/pm2'");
     for (const m of Object.values(MARK))
-      if (m !== MARK.STAT2) expect(s).toContain(m); // STAT2 only with cpuSample
+      if (m !== MARK.STAT2 && m !== MARK.ENV) expect(s).toContain(m); // STAT2 only with cpuSample, ENV only with urls
     expect(s).toContain("'/usr/bin/node' '/x/pm2' jlist");
     expect(s).toContain('ss -ltnp');
     expect(s).toContain('/proc/net/tcp');
@@ -218,20 +222,6 @@ describe('probe stats, shared sockets and docker ports', () => {
     expect(s).toContain(`cat /proc/[0-9]*/stat 2>/dev/null | ${STAT_AWK}`); // mawk/busybox awk abort at the first vanished file of a file list
     expect(s).toContain(`cat /proc/[0-9]*/status 2>/dev/null | ${RSS_AWK}`);
   });
-  it('parseUrlChecks maps each url to its HTTP code, 0 for no answer, null without curl/wget', () => {
-    const d = parseProbe(
-      probeOut({
-        ps: fx('ps.txt'),
-        tcp: fx('ss-tcp.txt'),
-        urls: 'http://localhost:3100/\t200\nhttp://localhost:3200/\t000\nhttp://localhost:3300/\t-\nnoise\n',
-      })
-    );
-    expect(d.urls.get('http://localhost:3100/')).toBe(200);
-    expect(d.urls.get('http://localhost:3200/')).toBe(0);
-    expect(d.urls.get('http://localhost:3300/')).toBeNull();
-    expect(d.urls.size).toBe(3);
-    expect(parseProbe(probeOut({})).urls.size).toBe(0);
-  });
   it('parseProbe carries stats and attributes docker-published ports', () => {
     const d = parseProbe(
       probeOut({
@@ -294,6 +284,122 @@ describe('probe stats, shared sockets and docker ports', () => {
       command: null,
       container: 'supabase_kong_zero-memory',
     });
+  });
+});
+
+describe('url facts from the host', () => {
+  it("every url line carries the code, the tool's exit and the address of its name; the environment comes first, only with urls, in both forms", () => {
+    for (const s of [
+      probeScript('pm2', { urls: ['http://localhost:3100/'] }),
+      probeScript('pm2', { metrics: false, urls: ['http://localhost:3100/'] }),
+    ]) {
+      expect(s.indexOf(MARK.ENV)).toBeGreaterThan(-1);
+      expect(s.indexOf(MARK.ENV)).toBeLessThan(s.indexOf(MARK.URL));
+      expect(s).toContain(
+        "curl -s -k -o /dev/null --connect-timeout 1 -m 2 -w '%{http_code}' 'http://localhost:3100/'"
+      );
+      expect(s).toContain(`printf '\\t%s' "$?"`);
+      expect(s).toContain(`printf '000\\tw%s:%s'`);
+      expect(s).toContain(`getent hosts 'localhost'`);
+      expect(s).toContain('echo "container $c"');
+    }
+    expect(probeScript('pm2')).not.toContain(MARK.ENV);
+    expect(probeScript('pm2', { metrics: false })).not.toContain(MARK.ENV);
+  });
+  it('every name lookup runs under timeout 2 where the host has timeout, and still runs where it has not', () => {
+    for (const s of [
+      probeScript('pm2', { urls: ['http://ws.local:3100/'] }),
+      probeScript('pm2', { metrics: false, urls: ['http://ws.local:3100/'] }),
+    ]) {
+      const guarded = [
+        ...s.matchAll(
+          /if command -v timeout >\/dev\/null 2>&1; then timeout 2 ([^;]+); else \1; fi/g
+        ),
+      ].map((m) => m[1]);
+      expect(guarded).toEqual([
+        'getent hosts "$h" 2>/dev/null',
+        'hostname -i 2>/dev/null',
+        "getent hosts 'ws.local' 2>/dev/null",
+      ]);
+      // no lookup outside its guard: each one appears twice, with timeout and without
+      expect(s.match(/getent hosts|hostname -i/g)).toHaveLength(
+        2 * guarded.length
+      );
+    }
+  });
+  it('an IP literal is its own address, IPv6 without brackets, and never goes to getent', () => {
+    const v4 = urlCheck('http://127.0.0.1:3000/');
+    expect(v4).toContain(`printf '\\t%s\\n' '127.0.0.1'`);
+    expect(v4).not.toContain('getent');
+    const v6 = urlCheck('http://[::1]:3000/');
+    expect(v6).toContain(`printf '\\t%s\\n' '::1'`);
+    expect(v6).not.toContain('getent');
+    expect(urlCheck("http://h/it's")).toContain("'http://h/it'\\''s'");
+  });
+  it('parseUrlChecks reads four fields, and a shorter line still; a line whose code is neither a status nor - is skipped', () => {
+    const m = parseUrlChecks(
+      [
+        'http://a/\t200\t0\t127.0.0.1',
+        'http://b/\t000\t7\t::1',
+        "http://c/\t000\tw1:wget: can't connect to remote host (10.0.0.9): Connection refused\t10.0.0.9",
+        'http://d/\t-\t\t',
+        'http://e/\t000',
+        'http://f/\tgarbage\t0\t',
+        'noise',
+      ].join('\n')
+    );
+    expect(m.get('http://a/')).toEqual({
+      code: 200,
+      exit: '0',
+      addr: '127.0.0.1',
+    });
+    expect(m.get('http://b/')).toEqual({ code: 0, exit: '7', addr: '::1' });
+    expect(m.get('http://c/')).toEqual({
+      code: 0,
+      exit: "w1:wget: can't connect to remote host (10.0.0.9): Connection refused",
+      addr: '10.0.0.9',
+    });
+    expect(m.get('http://d/')).toEqual({ code: null, exit: null, addr: null });
+    expect(m.get('http://e/')).toEqual({ code: 0, exit: null, addr: null });
+    expect(m.has('http://f/')).toBe(false);
+    expect(m.size).toBe(5);
+  });
+  it('parseEnv: the container kind, the hostname, each own address once; null when the section is absent', () => {
+    expect(
+      parseEnv(
+        'container docker\nhostname ws-01\nself 172.17.0.2 172.17.0.2 127.0.0.1 ::1\n'
+      )
+    ).toEqual({
+      container: 'docker',
+      hostname: 'ws-01',
+      self: ['172.17.0.2', '127.0.0.1', '::1'],
+    });
+    expect(parseEnv('container none\nhostname \nself 127.0.0.1 ::1')).toEqual({
+      container: 'none',
+      hostname: null,
+      self: ['127.0.0.1', '::1'],
+    });
+    expect(parseEnv('')).toBeNull();
+  });
+  it('parseProbe and parseUrlProbe carry the environment and the url facts', () => {
+    const out = probeOut({
+      env: 'container docker\nhostname ws-01\nself 172.17.0.2 127.0.0.1 ::1',
+      urls: 'http://localhost:3000/\t000\t7\t::1\n',
+    });
+    const d = parseProbe(out);
+    expect(d.env).toEqual({
+      container: 'docker',
+      hostname: 'ws-01',
+      self: ['172.17.0.2', '127.0.0.1', '::1'],
+    });
+    expect(d.urls.get('http://localhost:3000/')).toEqual({
+      code: 0,
+      exit: '7',
+      addr: '::1',
+    });
+    expect(parseUrlProbe(out)).toEqual({ env: d.env, urls: d.urls });
+    expect(parseProbe(probeOut({})).env).toBeNull();
+    expect(parseProbe(probeOut({})).urls.size).toBe(0);
   });
 });
 

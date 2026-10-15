@@ -3,8 +3,20 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { probeScript, STAT_AWK, RSS_AWK } from '../../src/shell/snippets.js';
-import { parseProbe } from '../../src/core/ports.js';
+import { execFileSync } from 'node:child_process';
+import {
+  ENV_SNIPPET,
+  MARK,
+  probeScript,
+  STAT_AWK,
+  RSS_AWK,
+  urlCheck,
+} from '../../src/shell/snippets.js';
+import {
+  parseProbe,
+  parseUrlChecks,
+  parseUrlProbe,
+} from '../../src/core/ports.js';
 import { parseStat, parseRss } from '../../src/core/stats.js';
 import { createTransport } from '../../src/transport/index.js';
 import type { Host } from '../../src/core/manifest.js';
@@ -113,10 +125,107 @@ describe('probe script executed on this host', () => {
         { timeoutMs: 60_000 }
       );
       const d = parseProbe(res.stdout);
-      expect(d.urls.get(`http://127.0.0.1:${port}/`)).toBe(200);
-      expect(d.urls.get('http://127.0.0.1:1/')).toBe(0);
+      expect(d.urls.get(`http://127.0.0.1:${port}/`)).toEqual({
+        code: 200,
+        exit: '0',
+        addr: '127.0.0.1',
+      });
+      expect(d.urls.get('http://127.0.0.1:1/')).toEqual({
+        code: 0,
+        exit: '7',
+        addr: '127.0.0.1',
+      });
+      expect(d.env).toMatchObject({
+        hostname: os.hostname(),
+        self: expect.arrayContaining(['127.0.0.1', '::1']),
+      });
     } finally {
       server.close();
     }
   }, 70_000);
+  it('the wget and no-tool branches print lines the parser reads', () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wget-'));
+    try {
+      for (const t of ['tr', 'cut', 'getent', 'awk']) {
+        const p = execFileSync('/bin/sh', ['-c', `command -v ${t}`], {
+          encoding: 'utf8',
+        }).trim();
+        fs.symlinkSync(p, path.join(bin, t));
+      }
+      // BusyBox wget: exit 1, the reason on stderr even under -q
+      fs.writeFileSync(
+        path.join(bin, 'wget'),
+        `#!/bin/sh\necho "wget: can't connect to remote host (127.0.0.1): Connection refused" >&2\nexit 1\n`,
+        { mode: 0o755 }
+      );
+      const run = (cmd: string) =>
+        execFileSync('/bin/sh', ['-c', `PATH=${bin}; ${cmd}`], {
+          encoding: 'utf8',
+        });
+      expect(
+        parseUrlChecks(run(urlCheck('http://127.0.0.1:1/'))).get(
+          'http://127.0.0.1:1/'
+        )
+      ).toEqual({
+        code: 0,
+        exit: "w1:wget: can't connect to remote host (127.0.0.1): Connection refused",
+        addr: '127.0.0.1',
+      });
+      fs.rmSync(path.join(bin, 'wget'));
+      expect(
+        parseUrlChecks(run(urlCheck('http://127.0.0.1:1/'))).get(
+          'http://127.0.0.1:1/'
+        )
+      ).toEqual({ code: null, exit: null, addr: '127.0.0.1' });
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  });
+  it('a name lookup that hangs is cut after 2 s where the host has timeout: the environment and the url line still come', () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-lookup-'));
+    const which = (t: string) =>
+      execFileSync('/bin/sh', ['-c', `command -v ${t}`], {
+        encoding: 'utf8',
+      }).trim();
+    try {
+      for (const t of ['tr', 'awk', 'timeout'])
+        fs.symlinkSync(which(t), path.join(bin, t));
+      const sleep = which('sleep');
+      // a dead resolver: getent and `hostname -i` never answer
+      fs.writeFileSync(
+        path.join(bin, 'getent'),
+        `#!/bin/sh\nexec ${sleep} 30\n`,
+        {
+          mode: 0o755,
+        }
+      );
+      fs.writeFileSync(
+        path.join(bin, 'hostname'),
+        `#!/bin/sh\n[ "$1" = -i ] && exec ${sleep} 30\necho ws-01\n`,
+        { mode: 0o755 }
+      );
+      const t0 = Date.now();
+      const out = execFileSync(
+        '/bin/sh',
+        [
+          '-c',
+          `PATH=${bin}; ${ENV_SNIPPET}\necho ${MARK.URL}\n${urlCheck('http://ws.local:1/')}`,
+        ],
+        { encoding: 'utf8', timeout: 25_000 }
+      );
+      expect(Date.now() - t0).toBeLessThan(15_000); // three lookups, 2 s each at most
+      const d = parseUrlProbe(out);
+      expect(d.env).toMatchObject({
+        hostname: 'ws-01',
+        self: ['127.0.0.1', '::1'],
+      });
+      expect(d.urls.get('http://ws.local:1/')).toEqual({
+        code: null,
+        exit: null,
+        addr: null,
+      });
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

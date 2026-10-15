@@ -2,6 +2,7 @@ import type { App } from './manifest.js';
 import { findProcess, type Pm2Process } from './pm2.js';
 import { MARK } from '../shell/snippets.js';
 import { isZone } from './logsince.js';
+import type { HostEnv, HostUrl } from './urlcheck.js';
 import {
   EMPTY_STATS,
   parseArgs,
@@ -26,7 +27,9 @@ export interface ProbeData {
   tree: Map<number, number>;
   listeners: Listener[];
   stats: ProcStats;
-  urls: Map<string, number | null>;
+  urls: Map<string, HostUrl>;
+  /** the host's environment section; null when the probe checked no url (or the section is missing) */
+  env: HostEnv | null;
   /** the host's UTC offset as `date +%z` prints it ('+0200', '-0330'); null when the section is absent or garbled */
   zone: string | null;
 }
@@ -138,15 +141,44 @@ export function parseFdMap(text: string): Map<number, number> {
   return m;
 }
 
-/** "<url>\t<code>" lines of the probe's URL section: the HTTP status, 0 when nothing answered, null when the host has neither curl nor wget. */
-export function parseUrlChecks(text: string): Map<string, number | null> {
-  const m = new Map<string, number | null>();
+/**
+ * "<url>\t<code>\t<exit>\t<addr>" lines of the URL section. code: the HTTP status, 0 when nothing answered, null when
+ * the host has neither curl nor wget ("-"); a line whose code is neither is skipped. exit and addr: null when empty or
+ * missing, so a shorter line still reads.
+ */
+export function parseUrlChecks(text: string): Map<string, HostUrl> {
+  const m = new Map<string, HostUrl>();
   for (const raw of text.split('\n')) {
-    const [url, code] = raw.split('\t');
+    const [url, code, exit, addr] = raw.replace(/\r$/, '').split('\t');
     if (!url || code === undefined) continue;
-    m.set(url, /^\d{3}$/.test(code.trim()) ? Number(code) : null);
+    const c = code.trim();
+    if (c !== '-' && !/^\d{3}$/.test(c)) continue;
+    m.set(url, {
+      code: c === '-' ? null : Number(c),
+      exit: exit?.trim() || null,
+      addr: addr?.trim() || null,
+    });
   }
   return m;
+}
+
+/** The environment section: `container <kind>`, `hostname <name>`, `self <addr> …` (each address once); null when absent. */
+export function parseEnv(text: string): HostEnv | null {
+  let container: HostEnv['container'] | null = null;
+  let hostname: string | null = null;
+  const self: string[] = [];
+  for (const raw of text.split('\n')) {
+    const l = raw.trim();
+    const c = /^container (docker|podman|lxc|none)$/.exec(l);
+    if (c) container = c[1] as HostEnv['container'];
+    const h = /^hostname (\S+)$/.exec(l);
+    if (h) hostname = h[1];
+    if (l === 'self' || l.startsWith('self '))
+      for (const a of l.slice(4).trim().split(/\s+/))
+        if (a && !self.includes(a)) self.push(a);
+  }
+  if (container === null && hostname === null && self.length === 0) return null;
+  return { container: container ?? 'none', hostname, self };
 }
 
 function sections(stdout: string, marks: string[]): Record<string, string> {
@@ -163,6 +195,15 @@ function sections(stdout: string, marks: string[]): Record<string, string> {
     out[m] = lines.slice(start + 1, next).join('\n');
   });
   return out;
+}
+
+/** The environment and URL sections of a probe's output, or of doctor's url check, which prints only those two. */
+export function parseUrlProbe(stdout: string): {
+  env: HostEnv | null;
+  urls: Map<string, HostUrl>;
+} {
+  const sec = sections(stdout, [MARK.ENV, MARK.URL]);
+  return { env: parseEnv(sec[MARK.ENV]), urls: parseUrlChecks(sec[MARK.URL]) };
 }
 
 /** The clock section's `date +%z`; null when it is absent or not a real offset, as logs since reads a zone. */
@@ -184,6 +225,7 @@ export function parseProbe(stdout: string): ProbeData {
     MARK.RSS,
     MARK.ARGS,
     MARK.DOCKER,
+    MARK.ENV,
     MARK.URL,
   ]);
   const rc = new RegExp(`${MARK.JLIST_RC} (\\d+)`).exec(sec[MARK.JLIST]);
@@ -237,6 +279,7 @@ export function parseProbe(stdout: string): ProbeData {
     listeners,
     stats,
     urls: parseUrlChecks(sec[MARK.URL]),
+    env: parseEnv(sec[MARK.ENV]),
     zone: zoneOf(sec[MARK.CLOCK]),
   };
 }

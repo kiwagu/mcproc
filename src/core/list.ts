@@ -23,6 +23,7 @@ import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
+import type { HostUrl } from './urlcheck.js';
 import { MARK, probeScript } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -68,7 +69,7 @@ export interface Snapshot {
   stats: ProcStats;
   metrics: Record<string, TreeMetrics | null>;
   sampledAt: number;
-  urls: Map<string, number | null>;
+  urls: Map<string, HostUrl>;
   /** the host's UTC offset ('+0200'); null when the probe could not read it */
   zone: string | null;
 }
@@ -96,9 +97,9 @@ export interface HostInfo {
 /** 2xx/3xx = ok, 4xx/5xx = error (up but refusing), 000 = down; unchecked when not asked or when the host has neither curl nor wget. */
 function urlFields(
   url: string | null,
-  urls: Map<string, number | null>
+  urls: Map<string, HostUrl>
 ): Pick<LsRow, 'url_status' | 'url_code'> {
-  const code = url ? urls.get(url) : undefined;
+  const code = url ? urls.get(url)?.code : undefined;
   if (code === undefined || code === null)
     return { url_status: 'unchecked', url_code: null };
   if (code === 0) return { url_status: 'down', url_code: null };
