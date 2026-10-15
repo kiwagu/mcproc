@@ -65,9 +65,6 @@ export interface UrlInput {
 export const HERE_CONNECT_MS = 1000;
 export const HERE_TOTAL_MS = 2000;
 
-const timedOut = () =>
-  Object.assign(new Error('timed out'), { code: 'MCPROC_TIMEOUT' });
-
 /**
  * One GET from this machine, as the host's curl makes it: connected within 1 s, answered within 2 s, any certificate
  * accepted (it asks "does it answer", not "can I trust it"), redirects not followed (a 3xx is an answer). node:http
@@ -106,16 +103,15 @@ export function checkHere(
       const req = tls
         ? https.request(u, { ...base, rejectUnauthorized: false }, onAnswer)
         : http.request(u, base, onAnswer);
-      total = setTimeout(
-        () => req.destroy(timedOut()),
-        opts.totalMs ?? HERE_TOTAL_MS
-      );
+      // a timer settles the check itself, then drops the request: the bound holds whether or not an error follows
+      const timeout = () => {
+        settle({ answered: false, fail: 'timeout' });
+        req.destroy();
+      };
+      total = setTimeout(timeout, opts.totalMs ?? HERE_TOTAL_MS);
       req.on('socket', (s) => {
         if (settled) return;
-        connect = setTimeout(
-          () => req.destroy(timedOut()),
-          opts.connectMs ?? HERE_CONNECT_MS
-        );
+        connect = setTimeout(timeout, opts.connectMs ?? HERE_CONNECT_MS);
         // TLS counts as connecting, as for curl's --connect-timeout
         s.once(tls ? 'secureConnect' : 'connect', () => clearTimeout(connect));
       });
@@ -133,7 +129,7 @@ export function hereFail(e: unknown): UrlFail {
   const err = e as { code?: unknown; message?: unknown } | null | undefined;
   const code = String(err?.code ?? '');
   const msg = String(err?.message ?? '');
-  if (code === 'MCPROC_TIMEOUT' || code === 'ETIMEDOUT') return 'timeout';
+  if (code === 'ETIMEDOUT') return 'timeout';
   if (['ENOTFOUND', 'EAI_AGAIN', 'EAI_NONAME', 'EAI_FAIL'].includes(code))
     return 'not resolved';
   if (code === 'ECONNREFUSED') return 'refused';
@@ -174,10 +170,11 @@ function wgetAttempt(x: string): Attempt {
   const no = (fail: UrlFail): Attempt => ({ answered: false, fail });
   const answer = /HTTP\/[\d.]+ (\d{3})\b/.exec(msg);
   if (answer) return { answered: true, code: Number(answer[1]) };
-  if (/ssl|tls|certificate/i.test(msg)) return no('tls'); // a failed handshake ends in a reset too: TLS first
+  // refused and resolve failures before tls: a resolve failure quotes the name, which may itself contain ssl or tls
   if (/refused/i.test(msg)) return no('refused');
   if (/bad address|resolve|not known|name resolution/i.test(msg))
     return no('not resolved');
+  if (/ssl|tls|certificate/i.test(msg)) return no('tls'); // a failed handshake ends in a reset too: TLS first
   if (/timed out/i.test(msg)) return no('timeout');
   if (/reset|error getting response|closed/i.test(msg)) return no('reset');
   if (status === 5) return no('tls');

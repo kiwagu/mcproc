@@ -49,6 +49,12 @@ const openssl = (() => {
     return false;
   }
 })();
+/* A box with IPv6 off cannot listen on ::1: the IPv6-literal test skips there instead of failing. */
+const ipv6 = await new Promise<boolean>((r) => {
+  const s = net.createServer();
+  s.once('error', () => r(false));
+  s.listen(0, '::1', () => s.close(() => r(true)));
+});
 
 describe('urlName', () => {
   it('is the host name the host resolves, IPv6 without brackets; null for a url that does not parse', () => {
@@ -92,7 +98,7 @@ describe('checkHere against servers on this machine', () => {
       code: 503,
     });
   });
-  it('an IPv6 literal answers', async () => {
+  it.skipIf(!ipv6)('an IPv6 literal answers', async () => {
     const p = await serve((_q, s) => s.end('ok'));
     expect(await checkHere(`http://[::1]:${p}/`)).toEqual({
       answered: true,
@@ -127,6 +133,19 @@ describe('checkHere against servers on this machine', () => {
       no('timeout')
     );
     expect(Date.now() - t0).toBeLessThan(1500);
+  });
+  it('a TLS handshake that never completes ends on the connect timer, long before the total one', async () => {
+    const s = net.createServer(() => {}); // accepts the TCP connection, never answers the ClientHello
+    servers.push(s);
+    const p = await listen(s);
+    const t0 = Date.now();
+    expect(
+      await checkHere(`https://127.0.0.1:${p}/`, {
+        connectMs: 200,
+        totalMs: 5000,
+      })
+    ).toEqual(no('timeout'));
+    expect(Date.now() - t0).toBeLessThan(1000);
   });
   it('https to a port that speaks plain http is tls', async () => {
     const p = await serve((_q, s) => s.end('ok'));
@@ -224,6 +243,13 @@ describe('hostAttempt', () => {
     expect(hostAttempt(H(0, "w1:wget: bad address 'nope.invalid'"))).toEqual(
       no('not resolved')
     );
+    // a name with ssl or tls in it is still a name that did not resolve
+    expect(hostAttempt(H(0, "w1:wget: bad address 'ssl.site.test'"))).toEqual(
+      no('not resolved')
+    );
+    expect(
+      hostAttempt(H(0, "w1:wget: bad address 'tls.example.test'"))
+    ).toEqual(no('not resolved'));
     expect(hostAttempt(H(0, 'w1:wget: download timed out'))).toEqual(
       no('timeout')
     );
