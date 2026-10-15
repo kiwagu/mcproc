@@ -220,7 +220,7 @@ export function fmtEnv(e: HostEnv): string {
     e.container === 'none' ? 'no container' : `container (${e.container})`;
   return e.hostname ? `${kind}, hostname ${e.hostname}` : kind;
 }
-/** `site.test → 127.0.1.1 on box, the host itself; answers from this machine (200)` */
+/** `localhost → ::1 on box; answers from this machine (200); on box: refused`: after an answer from here, why the host had none */
 function fmtDoctorUrl(host: string, u: DoctorUrl): string {
   const name = u.name ?? u.url;
   const where = `${name} → ${u.addr ?? 'no address'} on ${host}${u.itself ? ', the host itself' : ''}`;
@@ -232,7 +232,7 @@ function fmtDoctorUrl(host: string, u: DoctorUrl): string {
       : c.status === 'down'
         ? `answers nowhere (${c.reason})`
         : c.from === 'here'
-          ? `answers from this machine (${code})`
+          ? `answers from this machine (${code})${c.reason ? `; ${c.reason}` : ''}`
           : `answers on ${host} (${code})`;
   return `${where}; ${answers}`;
 }

@@ -195,9 +195,10 @@ export async function doctorHost(
 
 /**
  * The bound on doctor's url round trip: its base, plus each url's own bounds (a 2 s lookup, a 2 s request), so a host
- * whose resolver hangs, which is what doctor is there to show, still answers.
+ * whose resolver hangs, which is what doctor is there to show, still answers; never more than two minutes.
  */
-const urlStepMs = (urls: number): number => 15_000 + 4_000 * urls;
+const urlStepMs = (urls: number): number =>
+  Math.min(15_000 + 4_000 * urls, 120_000);
 
 /**
  * The host's environment and where the urls of its apps answer: those bound to it, plus on local the unbound ones,
@@ -265,7 +266,9 @@ async function checkUrlsOf(
         check.status !== 'down'
       )
         r.recommendations.push(
-          `apps.${app.name}.url_check is host, but its url answers only from this machine: set url_check: auto (or drop the line)`
+          probe.urls.get(url)?.code === null
+            ? `apps.${app.name}.url_check is host, but ${host.name} cannot check its url (no curl or wget) and it answers from this machine: set url_check: auto (or drop the line)`
+            : `apps.${app.name}.url_check is host, but its url answers only from this machine: set url_check: auto (or drop the line)`
         );
     }
   } catch (e) {

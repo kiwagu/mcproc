@@ -490,7 +490,10 @@ describe('renderDoctor', () => {
       '  url web: localhost → ::1 on box; answers from this machine (200)'
     );
     expect(t).toContain(
-      '  url api: localhost → ::1 on box; answers on box (200)'
+      '  url web: localhost → ::1 on box; answers from this machine (200); on box: refused\n'
+    );
+    expect(t).toContain(
+      '  url api: localhost → ::1 on box; answers on box (200)\n'
     );
     expect(t).toContain(
       '  url gone: gone.test → no address on box; answers nowhere (on box gone.test does not resolve; here: not resolved)'
