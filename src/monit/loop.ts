@@ -157,9 +157,16 @@ export class MonitLoop {
   private reloading: AbortController | null = null; // the running reload of the view: quitting ends its dependency waits
   private names: string[];
   private groups: HostApps[];
-  /** the incidents view's own position (null: not read yet in this view), when it last read, and whether a read runs */
-  private inc: { cursor: CursorState | null; last: number; running: boolean } =
-    { cursor: null, last: 0, running: false };
+  /**
+   * the incidents view's own position (null: not read yet in this view), when it last read, whether a read runs, and how
+   * many log clears it has seen (a read that spans one is dropped: its position is from before the clear)
+   */
+  private inc: {
+    cursor: CursorState | null;
+    last: number;
+    running: boolean;
+    clears: number;
+  } = { cursor: null, last: 0, running: false, clears: 0 };
 
   constructor(
     public fleet: Fleet,
@@ -212,13 +219,15 @@ export class MonitLoop {
     if (st.cursor && Date.now() - st.last < INCIDENTS_POLL_MS) return;
     st.running = true;
     const gen = this.gen;
+    const clears = st.clears;
+    const stale = () => this.closed || gen !== this.gen || st.clears !== clears;
     try {
       const { answer, next } = await this.deps.peekIncidents(
         this.fleet,
         this.names,
         st.cursor ?? { v: 1, apps: {} }
       );
-      if (this.closed || gen !== this.gen) return;
+      if (stale()) return;
       st.cursor = next;
       st.last = Date.now();
       this.dispatch({
@@ -227,13 +236,17 @@ export class MonitLoop {
         cleared_at: answer.cleared_at,
         errors: [
           ...answer.errors.map((e) => `${e.host}: ${e.message}`),
+          ...answer.skipped.map(
+            (k) =>
+              `skipped ${fmtBytes(k.bytes)} of ${k.app} ${k.stream} on ${k.host} (too much new log; the most recent 1 MB was read)`
+          ),
           ...(answer.more > 0
             ? [`+${answer.more} older incidents not shown`]
             : []),
         ],
       });
     } catch (e) {
-      if (this.closed || gen !== this.gen) return;
+      if (stale()) return;
       st.last = Date.now();
       this.dispatch({
         type: 'incidents',
@@ -571,7 +584,7 @@ export class MonitLoop {
       this.prev.clear();
       this.latest.clear();
       this.errors.clear();
-      this.inc = { cursor: null, last: 0, running: false }; // the incidents of the new view are read afresh
+      this.inc = { cursor: null, last: 0, running: false, clears: 0 }; // the incidents of the new view are read afresh
       this.dispatch({ type: 'host', host: viewLabel(requested) });
       await this.refresh(); // a new generation: starts at once, the old view's pending probes are dropped when they return
     } catch (e) {
@@ -660,13 +673,30 @@ export class MonitLoop {
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
     const { at, gen } = this.deps.cleared(this.fleet);
-    const again = Object.keys(gen)
-      .filter((key) => gen[key] !== this.seen[key])
-      .map((key) => key.slice(key.indexOf('/') + 1));
+    const changed = Object.keys(gen).filter(
+      (key) => gen[key] !== this.seen[key]
+    );
+    const again = changed.map((key) => key.slice(key.indexOf('/') + 1));
     this.seen = { ...gen };
     this.restart(again.filter((a) => this.names.includes(a)));
+    this.forgetIncidents(changed);
     if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared))
       this.dispatch({ type: 'cleared', cleared: at });
+  }
+
+  /**
+   * Cleared logs start the incidents view over for those apps (keys host/app): their positions are dropped, so the
+   * emptied files are read afresh (an old offset would skip a file that regrew to the same size), and a read under way
+   * is dropped, as its position is from before the clear. The agent's own point is not touched: the clear records it.
+   */
+  private forgetIncidents(keys: string[]): void {
+    if (keys.length === 0) return;
+    const st = this.inc;
+    st.clears++;
+    if (!st.cursor) return;
+    const apps = { ...st.cursor.apps };
+    for (const k of keys) delete apps[k];
+    st.cursor = { ...st.cursor, apps };
   }
 
   /**
