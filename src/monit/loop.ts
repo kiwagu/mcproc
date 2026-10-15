@@ -20,7 +20,7 @@ import {
   type Cleared,
   type TakenAnswer,
 } from '../core/incidents/store.js';
-import type { CursorState } from '../core/incidents/cursor.js';
+import { markKey, type CursorState } from '../core/incidents/cursor.js';
 import {
   compileReloadRules,
   historyReaches,
@@ -76,6 +76,8 @@ export interface LoopDeps {
   cleared(fleet: Fleet): {
     at: Record<string, string>;
     gen: Record<string, number>;
+    /** the store's marks: right after a clear, a file it emptied is at offset 0 there and one it could not keeps its place */
+    apps?: CursorState['apps'];
   };
   /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
   peekIncidents(
@@ -672,30 +674,46 @@ export class MonitLoop {
 
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
-    const { at, gen } = this.deps.cleared(this.fleet);
+    const { at, gen, apps = {} } = this.deps.cleared(this.fleet);
     const changed = Object.keys(gen).filter(
       (key) => gen[key] !== this.seen[key]
     );
     const again = changed.map((key) => key.slice(key.indexOf('/') + 1));
     this.seen = { ...gen };
     this.restart(again.filter((a) => this.names.includes(a)));
-    this.forgetIncidents(changed);
+    const inView = new Set(
+      this.names.map((a) => markKey(this.fleet.hostOf(a), a))
+    );
+    this.clearIncidents(
+      changed.filter((k) => inView.has(k)),
+      apps
+    );
     if (JSON.stringify(at) !== JSON.stringify(this.getState().cleared))
       this.dispatch({ type: 'cleared', cleared: at });
   }
 
   /**
-   * Cleared logs start the incidents view over for those apps (keys host/app): their positions are dropped, so the
-   * emptied files are read afresh (an old offset would skip a file that regrew to the same size), and a read under way
-   * is dropped, as its position is from before the clear. The agent's own point is not touched: the clear records it.
+   * Cleared logs of apps in view (keys host/app) move the incidents view's own position the way the clear moved the
+   * store's: each file the clear emptied is read again from its start (an old offset would skip a file that regrew to the
+   * same size, and a missing one would read only the last minutes); a file it could not empty keeps its place, so nothing
+   * is shown twice. The store's marks tell which is which right after the clear; they are read, never taken from or
+   * moved. A read under way is dropped, as its position is from before the clear.
    */
-  private forgetIncidents(keys: string[]): void {
+  private clearIncidents(keys: string[], store: CursorState['apps']): void {
     if (keys.length === 0) return;
     const st = this.inc;
     st.clears++;
     if (!st.cursor) return;
     const apps = { ...st.cursor.apps };
-    for (const k of keys) delete apps[k];
+    for (const k of keys) {
+      const own = apps[k];
+      if (!own) continue; // not read yet: its first read is from the emptied file
+      const restart = (s: 'out' | 'err') => {
+        const m = store[k]?.[s];
+        return m && m.offset === 0 ? { path: m.path, offset: 0 } : own[s];
+      };
+      apps[k] = { ...own, out: restart('out'), err: restart('err') };
+    }
     st.cursor = { ...st.cursor, apps };
   }
 

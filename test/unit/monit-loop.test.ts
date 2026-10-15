@@ -1845,89 +1845,6 @@ describe('MonitLoop incidents view and log clears', () => {
     taken: false,
     cleared_at: null,
   });
-  const marks = {
-    'local/api': {
-      restarts: 0,
-      status: 'online',
-      err: { path: '/l/api-err', offset: 900 },
-    },
-    'local/worker': {
-      restarts: 0,
-      status: 'online',
-      err: { path: '/l/worker-err', offset: 500 },
-    },
-  } as CursorState['apps'];
-  it("a clear forgets the cleared app's position, so its emptied log is read afresh; the others keep theirs", async () => {
-    let now = 1_000_000;
-    vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = {
-      at: {} as Record<string, string>,
-      gen: {} as Record<string, number>,
-    };
-    const cursors: CursorState[] = [];
-    const h = harness(undefined, {
-      cleared: () => store,
-      peekIncidents: async (_f, _n, cursor) => {
-        cursors.push(structuredClone(cursor));
-        return {
-          answer: empty(),
-          next: { v: 1, apps: structuredClone(marks) },
-        };
-      },
-    });
-    h.loop.dispatch({ type: 'view', view: 'incidents' });
-    await h.loop.refresh();
-    store.at = { 'local/api': '2026-10-15T12:00:00' };
-    store.gen = { 'local/api': 1 }; // `c` (or the flush tool) cleared api's logs
-    now += INCIDENTS_POLL_MS;
-    await h.loop.refresh();
-    expect(Object.keys(cursors[1].apps)).toEqual(['local/worker']); // api starts over; its old offset would skip regrown lines
-  });
-  it('a read that spans a clear is dropped: its position is from before the clear', async () => {
-    let now = 1_000_000;
-    vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const store = {
-      at: {} as Record<string, string>,
-      gen: {} as Record<string, number>,
-    };
-    const cursors: CursorState[] = [];
-    let release: () => void = () => {};
-    let hold = false;
-    const h = harness(undefined, {
-      cleared: () => store,
-      peekIncidents: async (_f, _n, cursor) => {
-        cursors.push(structuredClone(cursor));
-        if (hold)
-          await new Promise<void>((r) => {
-            release = r;
-          });
-        return {
-          answer: hold
-            ? {
-                ...empty(),
-                incidents: answer('TypeError: from before the clear'),
-              }
-            : empty(),
-          next: { v: 1, apps: structuredClone(marks) },
-        };
-      },
-    });
-    h.loop.dispatch({ type: 'view', view: 'incidents' });
-    await h.loop.refresh();
-    hold = true;
-    now += INCIDENTS_POLL_MS;
-    const spanning = h.loop.refresh();
-    await new Promise((r) => setTimeout(r, 0));
-    store.gen = { 'local/api': 1 };
-    hold = false;
-    await h.loop.refresh(); // reads the clear while the earlier read still runs
-    release();
-    await spanning;
-    expect(h.state.incidents).toEqual([]); // the spanning read's answer was dropped
-    now += INCIDENTS_POLL_MS;
-    await h.loop.refresh();
-    expect(Object.keys(cursors.at(-1)!.apps)).toEqual(['local/worker']);
-  });
   const answer = (line: string) => [
     {
       app: 'api',
@@ -1943,6 +1860,200 @@ describe('MonitLoop incidents view and log clears', () => {
       fingerprint: line,
     },
   ];
+  /** the screen's position after its first read: api read to 300 / 900, worker to 500 */
+  const marks = (): CursorState['apps'] => ({
+    'local/api': {
+      restarts: 2,
+      status: 'online',
+      out: { path: '/l/api-out', offset: 300, at: 284, anchor: 'aa' },
+      err: { path: '/l/api-err', offset: 900, at: 884, anchor: 'bb' },
+    },
+    'local/worker': {
+      restarts: 0,
+      status: 'online',
+      err: { path: '/l/worker-err', offset: 500 },
+    },
+  });
+  const setup = (store: {
+    at: Record<string, string>;
+    gen: Record<string, number>;
+    apps: CursorState['apps'];
+  }) => {
+    const cursors: CursorState[] = [];
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, cursor) => {
+        cursors.push(structuredClone(cursor));
+        return { answer: empty(), next: { v: 1, apps: marks() } };
+      },
+    });
+    return { h, cursors };
+  };
+  it('a clear restarts the files it emptied at their start; the other apps keep their places', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const { h, cursors } = setup(store);
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    store.gen = { 'local/api': 1 }; // `c` (or the flush tool) emptied both of api's files
+    store.apps = {
+      'local/api': {
+        restarts: 2,
+        status: 'online',
+        out: { path: '/l/api-out', offset: 0 },
+        err: { path: '/l/api-err', offset: 0 },
+      },
+    };
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(cursors[1].apps['local/api']).toEqual({
+      restarts: 2,
+      status: 'online',
+      out: { path: '/l/api-out', offset: 0 },
+      err: { path: '/l/api-err', offset: 0 },
+    });
+    expect(cursors[1].apps['local/worker']).toEqual(marks()['local/worker']);
+  });
+  it('a file the clear could not empty keeps its place, so nothing in it is shown twice', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const { h, cursors } = setup(store);
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    store.gen = { 'local/api': 1 };
+    store.apps = {
+      'local/api': {
+        restarts: 2,
+        status: 'online',
+        out: { path: '/l/api-out', offset: 0 },
+        err: { path: '/l/api-err', offset: 4096 }, // the store kept its own place: this file was not emptied
+      },
+    };
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(cursors[1].apps['local/api']?.out).toEqual({
+      path: '/l/api-out',
+      offset: 0,
+    });
+    expect(cursors[1].apps['local/api']?.err).toEqual(marks()['local/api'].err);
+  });
+  it('reopened long after a clear, it goes on from the start of the emptied file, not from a time window', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const { h, cursors } = setup(store);
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    h.loop.dispatch({ type: 'view', view: 'dashboard' });
+    store.gen = { 'local/api': 1 };
+    store.apps = {
+      'local/api': {
+        restarts: 2,
+        status: 'online',
+        out: { path: '/l/api-out', offset: 0 },
+        err: { path: '/l/api-err', offset: 0 },
+      },
+    };
+    await h.loop.refresh(); // the clear is seen while the view is closed
+    now += 20 * 60_000;
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(cursors).toHaveLength(2);
+    expect(cursors[1].apps['local/api']?.err).toEqual({
+      path: '/l/api-err',
+      offset: 0,
+    });
+  });
+  it('a read that spans a clear in view is dropped: its position is from before the clear', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    const cursors: CursorState[] = [];
+    let release: () => void = () => {};
+    let hold = false;
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async (_f, _n, cursor) => {
+        cursors.push(structuredClone(cursor));
+        const held = hold; // what this read answers is fixed when it starts
+        if (held)
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        return {
+          answer: held
+            ? {
+                ...empty(),
+                incidents: answer('TypeError: from before the clear'),
+              }
+            : empty(),
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    hold = true;
+    now += INCIDENTS_POLL_MS;
+    const spanning = h.loop.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    hold = false;
+    store.gen = { 'local/api': 1 };
+    store.apps = {
+      'local/api': {
+        restarts: 2,
+        status: 'online',
+        err: { path: '/l/api-err', offset: 0 },
+      },
+    };
+    await h.loop.refresh(); // reads the clear while the earlier read still runs
+    release();
+    await spanning;
+    expect(h.state.incidents).toEqual([]); // the spanning read's answer was dropped, its incident with it
+    now += INCIDENTS_POLL_MS;
+    await h.loop.refresh();
+    expect(cursors.at(-1)!.apps['local/api']?.err).toEqual({
+      path: '/l/api-err',
+      offset: 0,
+    });
+  });
+  it('a clear of an app outside the view drops nothing', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = { at: {}, gen: {}, apps: {} } as Parameters<typeof setup>[0];
+    let release: () => void = () => {};
+    let hold = false;
+    const h = harness(undefined, {
+      cleared: () => store,
+      peekIncidents: async () => {
+        const held = hold;
+        if (held)
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        return {
+          answer: held
+            ? { ...empty(), incidents: answer('TypeError: kept') }
+            : empty(),
+          next: { v: 1, apps: marks() },
+        };
+      },
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    hold = true;
+    now += INCIDENTS_POLL_MS;
+    const reading = h.loop.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    hold = false;
+    store.gen = { 'prod/elsewhere': 1 };
+    await h.loop.refresh();
+    release();
+    await reading;
+    expect(h.state.incidents.map((i) => i.line)).toEqual(['TypeError: kept']);
+  });
   it('says when a read skipped log it could not keep up with', async () => {
     const h = harness(undefined, {
       peekIncidents: async () => ({
