@@ -52,13 +52,17 @@ export interface MonitState {
   notice: string | null;
   busy: boolean;
   updatedAt: Date | null;
-  /** when c was pressed once: a second c within CONFIRM_MS clears */
+  /** when c or R was pressed once: the same key again within CONFIRM_MS does it */
   armedAt: number | null;
+  /** what the first press asked for; only its own key confirms it, the other one arms itself instead */
+  armed: Armed | null;
   /** the recorded clears, keyed host/app, as the project's store has them */
   cleared: Record<string, string>;
   /** per app whose logs this screen follows with reloads on and a known start: its reloads since that start */
   reloads: Record<string, ReloadInfo>;
 }
+/** a key that asks twice: c clears the logs of the running apps in view, R reloads every app in view */
+export type Armed = 'clear' | 'reload';
 export type MonitAction =
   | { type: 'rows'; rows: LsRow[]; at?: Date } // no `at`: nothing new was heard (a host failed), so the clock stays
   | {
@@ -81,7 +85,8 @@ export type MonitAction =
   | { type: 'notice'; message: string | null }
   | { type: 'busy'; busy: boolean }
   | { type: 'host'; host: string }
-  | { type: 'arm'; at: number | null; apps?: string[] }
+  | { type: 'arm'; at: null }
+  | { type: 'arm'; at: number; what: Armed; apps: string[] }
   | { type: 'cleared'; cleared: Record<string, string> }
   | { type: 'reloads'; app: string; info: ReloadInfo | null }; // null: the app is no longer counted
 
@@ -141,9 +146,16 @@ export function initialState(p: {
     busy: false,
     updatedAt: null,
     armedAt: null,
+    armed: null,
     cleared: {},
     reloads: {},
   };
+}
+
+/** Which view a reload covers, for its prompt: every host, the host `h` narrowed to, or nothing when there is one view only. */
+function reloadScope(s: MonitState): string {
+  if (s.hosts.length <= 1) return '';
+  return ` (${s.host === viewLabel(undefined) ? 'all hosts' : s.host})`;
 }
 
 const clamp = (i: number, n: number) =>
@@ -244,14 +256,26 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
     case 'notice':
       return { ...s, notice: a.message };
     case 'busy':
-      return { ...s, busy: a.busy };
+      // a step that starts drops the last notice: the footer then shows what this one says it is doing, or working…
+      return a.busy
+        ? { ...s, busy: true, notice: null }
+        : { ...s, busy: false };
     case 'arm':
       return a.at === null
-        ? { ...s, armedAt: null, notice: s.armedAt !== null ? null : s.notice }
+        ? {
+            ...s,
+            armedAt: null,
+            armed: null,
+            notice: s.armedAt !== null ? null : s.notice,
+          }
         : {
             ...s,
             armedAt: a.at,
-            notice: `press c again to clear the logs of ${(a.apps ?? []).join(', ')} (incidents start over there)`,
+            armed: a.what,
+            notice:
+              a.what === 'clear'
+                ? `press c again to clear the logs of ${a.apps.join(', ')} (incidents start over there)`
+                : `press R again to reload ${a.apps.length} app${a.apps.length === 1 ? '' : 's'}${reloadScope(s)}`,
           };
     case 'cleared':
       return { ...s, cleared: a.cleared };
@@ -281,11 +305,12 @@ export type KeyIntent =
   | { kind: 'action'; action: MonitAction }
   | { kind: 'command'; cmd: 'start' | 'restart' | 'stop'; app: string }
   | { kind: 'clear'; apps: string[] }
+  | { kind: 'reload-all' }
   | { kind: 'host-next' }
   | { kind: 'quit' }
   | null;
 
-/** How long a first c waits for the second one. */
+/** How long a first c or R waits for the second one. */
 export const CONFIRM_MS = 3000;
 
 export function keyIntent(
@@ -295,6 +320,9 @@ export function keyIntent(
 ): KeyIntent {
   const app = s.rows[s.selected]?.app;
   const canCommand = app && !s.busy && s.view === 'dashboard'; // commands act on the selected app, which only the dashboard shows
+  /** the second press of the key that armed `what`, in time */
+  const confirms = (what: Armed) =>
+    s.armed === what && s.armedAt !== null && now - s.armedAt <= CONFIRM_MS;
   switch (key) {
     // mouse tracking stays off so terminal drag-selection works; the wheel then arrives as ↑/↓, so those scroll the logs
     case 'up':
@@ -345,9 +373,24 @@ export function keyIntent(
         .filter((r) => r.status === 'online')
         .map((r) => r.app);
       if (s.busy || apps.length === 0) return null;
-      return s.armedAt !== null && now - s.armedAt <= CONFIRM_MS
+      return confirms('clear')
         ? { kind: 'clear', apps }
-        : { kind: 'action', action: { type: 'arm', at: now, apps } };
+        : {
+            kind: 'action',
+            action: { type: 'arm', at: now, what: 'clear', apps },
+          };
+    }
+    case 'S-r': {
+      // R (blessed: S-r) is `start all --reload` over the view: every app in dependency order with its waits, tasks re-run
+      // included, in either view, so it asks twice like c
+      const apps = s.rows.map((r) => r.app);
+      if (s.busy || apps.length === 0) return null;
+      return confirms('reload')
+        ? { kind: 'reload-all' }
+        : {
+            kind: 'action',
+            action: { type: 'arm', at: now, what: 'reload', apps },
+          };
     }
     case 'q':
     case 'C-c':

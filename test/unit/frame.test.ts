@@ -571,4 +571,27 @@ describe('logsTitle', () => {
       }).footer
     ).toContain('c clear');
   });
+  it('the key legends offer the reload of every app in view, in both views', () => {
+    expect(renderFrame(base(), { width: 200, height: 30 }).footer).toContain(
+      'r restart  R reload all  s start'
+    );
+    expect(
+      renderFrame(reduce(base(), { type: 'view', view: 'flat' }), {
+        width: 200,
+        height: 30,
+      }).footer
+    ).toContain('c clear  R reload all  f dashboard');
+  });
+  it('while busy the footer shows what is under way, or working… when nothing says', () => {
+    const busy = reduce(base(), { type: 'busy', busy: true });
+    expect(renderFrame(busy, { width: 200, height: 30 }).footer).toMatch(
+      /^working… {2}│ /
+    );
+    expect(
+      renderFrame(reduce(busy, { type: 'notice', message: 'reload all…' }), {
+        width: 200,
+        height: 30,
+      }).footer
+    ).toMatch(/^reload all… {2}│ /);
+  });
 });

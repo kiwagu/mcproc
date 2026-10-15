@@ -21,7 +21,7 @@ import {
   type Frame,
 } from './frame.js';
 import { colorFor } from '../core/logstream.js';
-import { MonitLoop, type LoopDeps } from './loop.js';
+import { MonitLoop, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 
@@ -31,6 +31,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   rows: rowsFor,
   follower: createFollower,
   command: (fleet, cmd, app) => actOn(fleet, app, cmd),
+  reloadAll: reloadView,
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
     const s = readStore(storePath(fleet.manifest.path));
@@ -166,7 +167,7 @@ export async function runMonit(opts: {
       'keypress',
       (_ch: string, key: { full?: string; name?: string }) => {
         const intent = keyIntent(key.full ?? key.name ?? '', state);
-        // a pending clear waits for its second c; any other key cancels it
+        // a pending clear or reload waits for the second press of its key; any other key cancels it (c and R arm their own)
         if (
           state.armedAt !== null &&
           !(intent?.kind === 'action' && intent.action.type === 'arm')
@@ -175,10 +176,11 @@ export async function runMonit(opts: {
         if (!intent) return;
         if (intent.kind === 'quit') return quit();
         if (intent.kind === 'action') {
-          if (intent.action.type === 'arm') {
-            const at = intent.action.at;
+          if (intent.action.type === 'arm' && intent.action.at !== null) {
+            const { at, what } = intent.action;
             setTimeout(() => {
-              if (state.armedAt === at) dispatch({ type: 'arm', at: null });
+              if (state.armedAt === at && state.armed === what)
+                dispatch({ type: 'arm', at: null });
             }, CONFIRM_MS + 50).unref();
           }
           if (intent.action.type === 'select')
@@ -191,6 +193,7 @@ export async function runMonit(opts: {
         }
         if (intent.kind === 'host-next') return void loop.nextView();
         if (intent.kind === 'clear') return void loop.runClear(intent.apps);
+        if (intent.kind === 'reload-all') return void loop.reloadAll();
         void loop.runCommand(intent.cmd, intent.app);
       }
     );

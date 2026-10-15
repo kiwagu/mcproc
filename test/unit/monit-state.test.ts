@@ -449,11 +449,12 @@ describe('the clear key', () => {
     const i1 = keyIntent('c', rows(), 1000);
     expect(i1).toEqual({
       kind: 'action',
-      action: { type: 'arm', at: 1000, apps: ['api', 'worker'] },
+      action: { type: 'arm', at: 1000, what: 'clear', apps: ['api', 'worker'] },
     });
     const s1 = reduce(rows(), {
       type: 'arm',
       at: 1000,
+      what: 'clear',
       apps: ['api', 'worker'],
     });
     expect(s1.notice).toBe(
@@ -469,9 +470,15 @@ describe('the clear key', () => {
     });
   });
   it('a cancel takes the prompt away; with nothing running, or while busy, c does nothing', () => {
-    const s1 = reduce(rows(), { type: 'arm', at: 1000, apps: ['api'] });
+    const s1 = reduce(rows(), {
+      type: 'arm',
+      at: 1000,
+      what: 'clear',
+      apps: ['api'],
+    });
     expect(reduce(s1, { type: 'arm', at: null })).toMatchObject({
       armedAt: null,
+      armed: null,
       notice: null,
     });
     expect(
@@ -492,6 +499,117 @@ describe('the clear key', () => {
         cleared: { 'local/api': '2026-10-12T15:04:05' },
       }).cleared
     ).toEqual({ 'local/api': '2026-10-12T15:04:05' });
+  });
+});
+
+describe('the reload key', () => {
+  // blessed reports Shift+r as S-r (key.full)
+  const R = 'S-r';
+  const rows = (s = s0()) =>
+    reduce(s, {
+      type: 'rows',
+      rows: [row('api'), row('web', 'stopped'), row('worker')],
+    });
+  const armed = (s: MonitState, at = 1000) => {
+    const i = keyIntent(R, s, at);
+    if (i?.kind !== 'action') throw new Error('R did not arm');
+    return reduce(s, i.action);
+  };
+  it('R arms a reload of every app in view, whatever its status, in the dashboard and in the flat view', () => {
+    const arm = {
+      kind: 'action',
+      action: {
+        type: 'arm',
+        at: 1000,
+        what: 'reload',
+        apps: ['api', 'web', 'worker'],
+      },
+    };
+    expect(keyIntent(R, rows(), 1000)).toEqual(arm);
+    expect(
+      keyIntent(R, reduce(rows(), { type: 'view', view: 'flat' }), 1000)
+    ).toEqual(arm);
+  });
+  it('the prompt counts the apps and names the view: the host narrowed to, all hosts, or nothing with one host only', () => {
+    expect(armed(rows()).notice).toBe('press R again to reload 3 apps (local)');
+    const all = initialState({
+      project: 'demo',
+      host: 'all',
+      hosts: ['all', 'local', 'box'],
+      apps,
+    });
+    expect(armed(rows(all)).notice).toBe(
+      'press R again to reload 3 apps (all hosts)'
+    );
+    const one = initialState({
+      project: 'demo',
+      host: 'local',
+      hosts: ['local'],
+      apps,
+    });
+    expect(armed(rows(one)).notice).toBe('press R again to reload 3 apps');
+    expect(
+      armed(reduce(one, { type: 'rows', rows: [row('api')] })).notice
+    ).toBe('press R again to reload 1 app');
+  });
+  it('R again within CONFIRM_MS reloads; after it the next R arms again', () => {
+    const s1 = armed(rows());
+    expect(s1).toMatchObject({ armedAt: 1000, armed: 'reload' });
+    expect(keyIntent(R, s1, 1000 + CONFIRM_MS)).toEqual({ kind: 'reload-all' });
+    expect(keyIntent(R, s1, 1001 + CONFIRM_MS)).toMatchObject({
+      kind: 'action',
+      action: { type: 'arm', at: 1001 + CONFIRM_MS, what: 'reload' },
+    });
+  });
+  it('an armed reload is not confirmed by c, nor an armed clear by R: the other key arms its own instead', () => {
+    const reload = armed(rows());
+    expect(keyIntent('c', reload, 1001)).toEqual({
+      kind: 'action',
+      action: { type: 'arm', at: 1001, what: 'clear', apps: ['api', 'worker'] },
+    });
+    const i = keyIntent('c', rows(), 1000);
+    if (i?.kind !== 'action') throw new Error('c did not arm');
+    const clear = reduce(rows(), i.action);
+    expect(clear.armed).toBe('clear');
+    expect(keyIntent(R, clear, 1001)).toMatchObject({
+      kind: 'action',
+      action: { type: 'arm', at: 1001, what: 'reload' },
+    });
+    expect(
+      reduce(clear, { type: 'arm', at: 1001, what: 'reload', apps: ['api'] })
+    ).toMatchObject({
+      armed: 'reload',
+      notice: 'press R again to reload 1 app (local)',
+    });
+  });
+  it('while busy, or with no app in view, R does nothing', () => {
+    expect(
+      keyIntent(R, reduce(rows(), { type: 'busy', busy: true }), 0)
+    ).toBeNull();
+    expect(keyIntent(R, s0(), 0)).not.toBeNull();
+    expect(
+      keyIntent(R, reduce(s0(), { type: 'rows', rows: [] }), 0)
+    ).toBeNull();
+    const s1 = armed(rows());
+    expect(
+      keyIntent(R, reduce(s1, { type: 'busy', busy: true }), 1001)
+    ).toBeNull();
+  });
+});
+
+describe('the footer notice while busy', () => {
+  it('a step that starts drops the last notice, so what it says it is doing is what shows', () => {
+    const s = reduce(s0(), { type: 'notice', message: 'restart api: done' });
+    expect(reduce(s, { type: 'busy', busy: true }).notice).toBeNull();
+    expect(
+      reduce(reduce(s, { type: 'busy', busy: true }), {
+        type: 'notice',
+        message: 'reload all…',
+      }).notice
+    ).toBe('reload all…');
+    expect(reduce(s, { type: 'busy', busy: false }).notice).toBe(
+      'restart api: done'
+    );
   });
 });
 
