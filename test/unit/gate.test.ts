@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import {
 } from '../../src/core/leases/store.js';
 import {
   cancelBefore,
+  defaultGateDeps,
   finishLeasedStart,
   freeAfter,
   freeOnFailure,
@@ -265,6 +266,24 @@ describe('gateStart', () => {
     });
     if (r.kind === 'queued')
       expect(store.get(r.lease.id)?.waiting_for).toBe(r.waiting_for);
+  });
+
+  it('the real deps make sure of the watcher in their own state directory', async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
+    try {
+      const ctx = fakeCtx(varsProj, 'local', [
+        { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+        { match: /startOrRestart/, result: {} },
+      ]);
+      expect(await defaultGateDeps(dir).ensureWatcher(ctx)).toBe('started');
+      expect(
+        JSON.parse(
+          fs.readFileSync(path.join(dir, 'watcher.ecosystem.json'), 'utf8')
+        ).apps[0].env
+      ).toEqual({ MCPROC_STATE_DIR: dir });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('admits in FIFO order without a memory reading', async () => {

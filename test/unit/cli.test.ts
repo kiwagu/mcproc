@@ -91,6 +91,12 @@ describe('cli', () => {
     expect(help).not.toContain('--lease');
     expect(start.options.map((o) => o.long)).toContain('--lease');
   });
+  it('registers the lease watcher as a hidden watch-leases', () => {
+    const p = buildProgram(capture().io);
+    const w = p.commands.find((x) => x.name() === 'watch-leases');
+    expect(w).toBeDefined();
+    expect(p.helpInformation()).not.toContain('watch-leases');
+  });
   it('leases prints the queue without a manifest; leases cancel cancels a pending lease and refuses it the second time', async () => {
     const state = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-state-'));
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));

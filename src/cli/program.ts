@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
@@ -12,6 +13,9 @@ import {
   type Context,
 } from '../core/resolve.js';
 import { cancelLease, leasesView } from '../core/leases/view.js';
+import { watcherEntry } from '../core/leases/ensure.js';
+import { defaultWatcherDeps, watchLeases } from '../core/leases/watcher.js';
+import { stateDir } from '../core/state.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
@@ -593,6 +597,29 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [id]) => {
         const l = await cancelLease(id);
         emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('watch-leases', { hidden: true })
+    .description('internal: the lease watcher the start launches under pm2')
+    .action(
+      wrap(async () => {
+        const dir = stateDir();
+        const deps = defaultWatcherDeps(dir, watcherEntry());
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+        fs.mkdirSync(deps.store.dir, { recursive: true });
+        deps.watch = (cb) => {
+          // the lock's own files (.lock, its token and stale files, .seq) churn on every change: only a lease wakes it
+          const w = fs.watch(deps.store.dir, (_e, name) => {
+            if (!name?.startsWith('.')) cb();
+          });
+          return () => w.close();
+        };
+        const r = await watchLeases(deps, { signal: ac.signal });
+        io.out(`watcher ${r}`);
       })
     );
   program

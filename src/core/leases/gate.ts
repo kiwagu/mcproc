@@ -12,6 +12,7 @@ import {
   reserveMib,
   type AppMeasure,
 } from './admission.js';
+import { ensureWatcher } from './ensure.js';
 import { listCheckout, measureSiblings, registryOf } from './siblings.js';
 import { LeaseStore, pidAlive, type Lease, type NewLease } from './store.js';
 
@@ -22,7 +23,7 @@ export interface GateDeps {
   memory(ctx: Context): Promise<HostMemory | null>;
   /** what the running sibling checkouts show per app */
   siblings(ctx: Context): Promise<Map<string, AppMeasure>>;
-  /** makes sure the watcher runs once a lease is pending (Task 8 wires the pm2 process; until then a no-op) */
+  /** makes sure the watcher runs once a lease is pending: the pm2 process mcproc-watcher on the context's daemon */
   ensureWatcher(ctx: Context): Promise<unknown>;
   /** the requester's pid kept on the lease; default this process */
   pid?: number;
@@ -42,7 +43,7 @@ export type GateResult =
 export const CANCEL_WAIT_MS = 10_000;
 const CANCEL_POLL_MS = 200;
 
-/** The real deps: the host state directory, the host's meminfo, the sibling checkouts of the registry. */
+/** The real deps: the host state directory, the host's meminfo, the sibling checkouts of the registry, the pm2 watcher. */
 export function defaultGateDeps(dir = stateDir()): GateDeps {
   return {
     store: new LeaseStore(dir),
@@ -52,7 +53,7 @@ export function defaultGateDeps(dir = stateDir()): GateDeps {
         registry: registryOf(ctx.manifest, dir),
         list: (root) => listCheckout(root),
       }),
-    ensureWatcher: async () => undefined,
+    ensureWatcher: (ctx) => ensureWatcher(ctx, dir),
   };
 }
 
