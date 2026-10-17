@@ -14,6 +14,7 @@ apps:
     host: box
     depends_on: [watch]
     reloads: { ignore: ['hmr update /src/noisy'] }
+    containers: [fleet-web-db]
   tool:
     description: helper that runs wherever the command points
     kind: worker

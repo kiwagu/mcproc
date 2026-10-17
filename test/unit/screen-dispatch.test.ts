@@ -21,6 +21,7 @@ const row = (app: string): LsRow => ({
   restarts: 0,
   cpu: 0,
   memory: 0,
+  containers_memory: 0,
   procs: 1,
   runtime: null,
   pm2_cpu: 0,

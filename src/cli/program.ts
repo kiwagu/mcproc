@@ -1,4 +1,5 @@
-import { Command } from 'commander';
+import fs from 'node:fs';
+import { Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
@@ -9,7 +10,24 @@ import {
   connect,
   assertWritable,
   resolveProjectDir,
+  type Context,
 } from '../core/resolve.js';
+import { cancelLease, leasesView } from '../core/leases/view.js';
+import { watcherEntry } from '../core/leases/ensure.js';
+import {
+  defaultWatcherDeps,
+  leaseDirWatch,
+  watchLeases,
+} from '../core/leases/watcher.js';
+import { stateDir } from '../core/state.js';
+import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
+import {
+  defaultWorktreeDeps,
+  worktreeAdd,
+  worktreeLs,
+  worktreeRemove,
+} from '../core/worktree.js';
+import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
@@ -47,6 +65,10 @@ import {
   renderMutation,
   renderWait,
   renderAdopted,
+  renderLeases,
+  renderWorktreeAdded,
+  renderWorktreeRemoved,
+  renderWorktrees,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -197,7 +219,7 @@ export function buildProgram(io: Io = defaultIo): Command {
     g: Globals,
     target: string,
     act: Act,
-    opts: { reload?: boolean } = {}
+    opts: { reload?: boolean; note?: string; lease?: string } = {}
   ) => {
     const fleet = fleetOf(g);
     const waits: WaitRecord[] = [];
@@ -542,8 +564,17 @@ export function buildProgram(io: Io = defaultIo): Command {
     .command('start <target>')
     .description('start an app or profile (dependencies first)')
     .option('--reload', 'restart apps that are already online')
+    .option('--note <text>', 'what this start is for, kept on its lease')
+    // internal: the watcher's child runs the start it admitted under this lease
+    .addOption(new Option('--lease <id>').hideHelp())
     .action(
-      wrap((g, o, [t]) => mutate(g, t, 'start', { reload: Boolean(o.reload) }))
+      wrap((g, o, [t]) =>
+        mutate(g, t, 'start', {
+          reload: Boolean(o.reload),
+          note: o.note as string | undefined,
+          lease: o.lease as string | undefined,
+        })
+      )
     );
   program
     .command('restart <target>')
@@ -557,6 +588,202 @@ export function buildProgram(io: Io = defaultIo): Command {
     .command('delete <target>')
     .description('remove app(s) from pm2')
     .action(wrap((g, _o, [t]) => mutate(g, t, 'delete')));
+  const leases = program
+    .command('leases')
+    .description(
+      "the host's lease queue: who is running, who waits and why, the memory reading and the watcher"
+    )
+    .action(
+      wrap(async (g) => {
+        let ctx: Context | undefined;
+        try {
+          ctx = await ctxOf(g);
+        } catch {
+          ctx = undefined; // no manifest here: the queue is the host's and still reads
+        }
+        const v = await leasesView(undefined, ctx);
+        emit(g, renderLeases(v), v);
+      })
+    );
+  leases
+    .command('cancel <id>')
+    .description('cancel a pending lease')
+    .action(
+      wrap(async (g, _o, [id]) => {
+        const l = await cancelLease(id);
+        emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('exec <command...>')
+    .description(
+      "run a one-off command from the project root with the manifest's exec.env; with --memory, under a lease in the host's queue (use -- before the command)"
+    )
+    // no passThroughOptions: it needs positional options on the program, which would refuse the global options written
+    // after a command (`ls --json`); `--` already ends exec's options and hands the rest over verbatim
+    .option(
+      '--memory <size>',
+      'what the command needs, e.g. 4G: it waits its turn like a start'
+    )
+    .option('--note <text>', 'what this run is for, kept on its lease')
+    .option(
+      '--timeout <s>',
+      'seconds to wait in the queue (default 600, max 3600)'
+    )
+    .action(
+      wrap(async (g, o, args) => {
+        // the variadic <command...> arrives as one array argument
+        const command = args.flat();
+        // a bad request is refused before any host is touched
+        let memoryMib: number | undefined;
+        if (o.memory !== undefined)
+          try {
+            memoryMib = parseSizeMib(String(o.memory));
+          } catch (e) {
+            throw new McprocError('BAD_ARGUMENT', (e as Error).message);
+          }
+        const timeoutS =
+          o.timeout === undefined ? undefined : Number(o.timeout);
+        if (timeoutS !== undefined && !(timeoutS > 0))
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            `--timeout is a number of seconds above 0, not "${o.timeout}"`
+          );
+        const prep = prepare({ project: g.project, host: g.host });
+        assertExecHost(prep.host);
+        const ctx = await connect(prep);
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        // on, not once: a second Ctrl-C must not fall to Node's default exit, which skips the lease's cleanup; a closed
+        // terminal (SIGHUP) ends the command and frees its lease the same way
+        const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+        for (const s of signals) process.on(s, stop);
+        try {
+          const r = await runExec(
+            ctx,
+            {
+              command,
+              memoryMib,
+              note: o.note === undefined ? undefined : String(o.note),
+              timeoutMs: timeoutS === undefined ? undefined : timeoutS * 1000,
+              capture: false,
+              signal: ac.signal,
+            },
+            defaultExecDeps()
+          );
+          if (g.json)
+            io.out(
+              JSON.stringify(
+                { code: r.code, lease: r.lease, waited_ms: r.waited_ms },
+                null,
+                2
+              )
+            );
+          process.exitCode = r.code;
+        } finally {
+          for (const s of signals) process.off(s, stop);
+        }
+      })
+    );
+  // git runs here: the worktree commands act on the local checkout; their notes go to stderr, the answer to stdout
+  const worktreeCtx = async (g: Globals) => {
+    const prep = prepare({ project: g.project, host: g.host });
+    if (!prep.host.local)
+      throw new McprocError(
+        'BAD_ARGUMENT',
+        `worktree runs on the local host only, not on ${prep.host.name}`,
+        { hint: 'Drop --host; the checkout is on this machine.' }
+      );
+    const ctx = await connect(prep);
+    return {
+      manifest: ctx.manifest,
+      deps: await defaultWorktreeDeps(ctx, { out: io.err }),
+    };
+  };
+  const worktree = program
+    .command('worktree')
+    .description(
+      'worktrees of this repository, each with its own slot, project slug and ports'
+    );
+  worktree
+    .command('add <branch>')
+    .description(
+      'a worktree in the sibling folder on that branch: copies and links from the manifest, the override with its slot, the install'
+    )
+    .option(
+      '--from <ref>',
+      "where a new branch starts (default: the main checkout's HEAD)"
+    )
+    .option('--slot <n>', 'a specific slot (default: the lowest free one)')
+    .option(
+      '--slug <slug>',
+      'the project slug this checkout runs under (default: <project>-w<slot>)'
+    )
+    .option('--no-install', 'skip the install command')
+    .action(
+      wrap(async (g, o, [branch]) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const r = await worktreeAdd(
+          manifest,
+          {
+            branch,
+            from: o.from === undefined ? undefined : String(o.from),
+            slot: o.slot === undefined ? undefined : Number(o.slot),
+            project: o.slug === undefined ? undefined : String(o.slug),
+            install: o.install !== false,
+          },
+          deps
+        );
+        emit(g, renderWorktreeAdded(r), r);
+      })
+    );
+  worktree
+    .command('ls')
+    .description(
+      'every checkout: slot, project, branch, apps online, lease, path'
+    )
+    .action(
+      wrap(async (g) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const rows = await worktreeLs(manifest, deps);
+        emit(g, renderWorktrees(rows), rows);
+      })
+    );
+  worktree
+    .command('remove <ref>')
+    .description(
+      'stop its apps, remove the worktree (by branch, path or slot) and free its slot; the branch stays'
+    )
+    .option('--force', 'remove even with uncommitted or untracked changes')
+    .action(
+      wrap(async (g, o, [ref]) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const r = await worktreeRemove(
+          manifest,
+          ref,
+          { force: Boolean(o.force) },
+          deps
+        );
+        emit(g, renderWorktreeRemoved(r), r);
+      })
+    );
+  program
+    .command('watch-leases', { hidden: true })
+    .description('internal: the lease watcher the start launches under pm2')
+    .action(
+      wrap(async () => {
+        const dir = stateDir();
+        const deps = defaultWatcherDeps(dir, watcherEntry());
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+        fs.mkdirSync(deps.store.dir, { recursive: true });
+        deps.watch = leaseDirWatch(deps.store.dir);
+        const r = await watchLeases(deps, { signal: ac.signal });
+        io.out(`watcher ${r}`);
+      })
+    );
   program
     .command('flush [app]')
     .description('truncate pm2 log files; incidents start over from there')

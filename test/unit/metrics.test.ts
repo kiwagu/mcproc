@@ -77,6 +77,7 @@ describe('treeMetrics', () => {
       cpu: expect.closeTo(80, 1),
       procs: 3,
       runtime: 'bun --watch src/index.ts',
+      containers_memory: 0,
       metrics_source: 'tree',
     });
   });
@@ -98,6 +99,7 @@ describe('treeMetrics', () => {
       cpu: 0,
       procs: 0,
       runtime: null,
+      containers_memory: 0,
       metrics_source: 'tree',
     });
   });

@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   startNote,
   waitNote,
@@ -20,10 +22,21 @@ import {
   renderLogsSince,
   sinceNotes,
   renderAdopted,
+  queuedNote,
+  renderLeases,
+  renderWorktreeAdded,
+  renderWorktrees,
+  renderWorktreeRemoved,
 } from '../../src/mcp/render.js';
-import type { LsRow } from '../../src/core/list.js';
+import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
+import type { Lease } from '../../src/core/leases/store.js';
+import type { DoctorReport } from '../../src/core/doctor.js';
+import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const fixture = (n: string) => path.join(here, '..', 'fixtures', 'projects', n);
 
 const row = (status: string, checks: PortCheck[]): LsRow => ({
   app: 'web',
@@ -39,6 +52,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   exit_code: null,
   cpu: 0,
   memory: 0,
+  containers_memory: 0,
   procs: 1,
   runtime: null,
   pm2_memory: 0,
@@ -94,6 +108,7 @@ describe('renderLs with tree metrics', () => {
     const r = {
       ...base,
       memory: 2_200_000_000,
+      containers_memory: 0,
       cpu: 84.4,
       procs: 3,
       runtime: 'next-server (v16.2.9)',
@@ -376,6 +391,9 @@ describe('several hosts', () => {
           host: null,
         },
       ],
+      vars: [],
+      override: null,
+      slot: null,
       profiles: {},
       hosts: [],
       readme: null,
@@ -404,6 +422,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [],
@@ -429,6 +450,9 @@ describe('renderDoctor', () => {
       daemon: 'answers' as const,
       processes: 0,
       in_namespace: 0,
+      state_dir: null,
+      watcher: null,
+      memory: null,
       recommendations: [],
       environment: {
         container: 'docker' as const,
@@ -545,6 +569,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [
@@ -583,6 +610,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [
@@ -884,6 +914,62 @@ describe('renderMutation', () => {
       'web: aborted after 1.3 s while waiting for listening'
     );
   });
+  it('renderWait: a wait that ends while the start is still queued names its place and why', () => {
+    const base = { until: 'listening', waited_ms: 60_000, ok: false };
+    expect(
+      renderWait('api', {
+        ...base,
+        reason: 'timeout',
+        status: 'queued #3',
+        observed: 'queued #3: 100M short',
+      })
+    ).toBe('api: listening not reached after 60.0 s (queued #3: 100M short)');
+    expect(
+      renderWait('api', {
+        ...base,
+        reason: 'aborted',
+        status: 'starting',
+        observed: 'starting',
+      })
+    ).toBe('api: aborted after 60.0 s while waiting for listening (starting)');
+  });
+  it('renderDoctor: the local host says its memory, its lease directory and the watcher', () => {
+    const rep: DoctorReport = {
+      host: 'local',
+      transport: 'local',
+      reachable: true,
+      error: null,
+      node: 'v22.1.0',
+      pm2: null,
+      tools: { ps: true, ss: true, tar: true },
+      pm2_home: null,
+      runtime_dir: '/opt/rt',
+      runtime_present: false,
+      runtime_pm2: null,
+      runtime_node: null,
+      daemon: 'answers',
+      processes: 0,
+      in_namespace: 0,
+      state_dir: '/s/mcproc',
+      watcher: { online: true, pid: 77 },
+      memory: { total_mib: 31850, available_mib: 17614 },
+      recommendations: [],
+      environment: null,
+      urls: [],
+    };
+    const lines = renderDoctor([rep]).split('\n');
+    expect(lines).toContain('  memory: 17.2G available of 31.1G');
+    expect(lines).toContain('  leases: /s/mcproc, watcher online pid 77');
+    const quiet = renderDoctor([
+      { ...rep, watcher: { online: false, pid: null }, memory: null },
+    ]).split('\n');
+    expect(quiet).toContain('  leases: /s/mcproc, watcher not running');
+    expect(quiet.some((l) => l.startsWith('  memory:'))).toBe(false);
+    // pm2 did not answer: the watcher's state is not known
+    expect(renderDoctor([{ ...rep, watcher: null }])).toContain(
+      '  leases: /s/mcproc, watcher unknown'
+    );
+  });
   it('renderWait: a reload names when it began, its line count and its first line (without the stamp shown twice)', () => {
     const ok = {
       until: 'reloaded',
@@ -1170,5 +1256,267 @@ describe('renderAdopted', () => {
       text: 'nothing to adopt: every port the running apps hold is declared',
       failed: false,
     });
+  });
+});
+
+it('renderProject shows a declared var even without an override', () => {
+  const m = parseManifest(
+    'version: 1\nvars: { x: 1 }\napps:\n  a: { description: d, run: y }\n',
+    '/proj',
+    '/proj/.mcproc/mcproc.yaml'
+  );
+  expect(renderProject(describeProject(m))).toContain('  x = 1 (manifest)');
+});
+
+it('renderProject lists the vars with their sources when there are any', () => {
+  const d = describeProject(loadManifest(fixture('vars')));
+  const text = renderProject(d);
+  expect(text).toContain('vars: (override ');
+  expect(text).toContain('slot 2');
+  expect(text).toContain('  api_port = 3510 (manifest)');
+  expect(text).toContain('  slot = 2 (override)');
+  expect(
+    renderProject(describeProject(loadManifest(fixture('basic'))))
+  ).not.toContain('vars:');
+});
+
+describe('queued starts and the lease queue', () => {
+  const vars = loadManifest(fixture('vars'));
+  const waiting = 'needs 922M, host has 476M over the reserve (446M short)';
+  const pending = {
+    id: 'l_1',
+    state: 'pending' as const,
+    waiting_for: waiting,
+  };
+  it('queuedRow: the status word is the position, the lease rides along, no error', () => {
+    const r = queuedRow(vars.apps.db, 'local', pending, 1);
+    expect(r.status).toBe('queued #1');
+    expect(r.lease).toEqual({ ...pending, position: 1 });
+    expect(r.error).toBeUndefined();
+    expect('error' in r).toBe(false);
+    expect(
+      queuedRow(
+        vars.apps.db,
+        'local',
+        { id: 'l_2', state: 'starting', waiting_for: null },
+        0
+      ).status
+    ).toBe('starting');
+  });
+  it('queuedNote: one line per lease, its apps, position and reason; starting says so; none without a lease', () => {
+    const rows = [
+      queuedRow(vars.apps.db, 'local', pending, 1),
+      queuedRow(vars.apps.api, 'local', pending, 1),
+      row('online', []),
+    ];
+    expect(queuedNote(rows)).toBe(
+      `db, api: queued #1: ${waiting} (lease l_1; wait on an app, or leases)`
+    );
+    expect(
+      queuedNote([
+        queuedRow(
+          vars.apps.db,
+          'local',
+          { id: 'l_2', state: 'starting', waiting_for: null },
+          0
+        ),
+      ])
+    ).toBe('db: starting (lease l_2)');
+    expect(queuedNote([row('online', [])])).toBe('');
+  });
+  it('a queued start is not a failure: renderMutation shows the queued rows and the note', () => {
+    const r = renderMutation(
+      [
+        queuedRow(vars.apps.db, 'local', pending, 1),
+        queuedRow(vars.apps.tool, 'local', pending, 1),
+      ],
+      'local',
+      'start'
+    );
+    expect(r.failed).toBe(false);
+    expect(r.text).not.toContain('partly failed');
+    expect(r.text).toContain('queued #1');
+    expect(r.text).toContain('db, tool: queued #1: ');
+    // an app without a url shows what its lease waits for in the URL column
+    const tool = r.text.split('\n').find((l) => l.startsWith('tool '))!;
+    expect(tool).toContain(`queued #1`);
+    expect(tool).toContain(waiting);
+    const db = r.text.split('\n').find((l) => l.startsWith('db '))!;
+    expect(db).toContain('http://127.0.0.1:5632/');
+  });
+  const lease = (over: Partial<Lease>): Lease => ({
+    id: 'l_aaaaaaaaaa',
+    seq: 1,
+    state: 'running',
+    kind: 'start',
+    project: 'demo',
+    root: '/w/demo',
+    slot: 0,
+    repo: '/w/demo',
+    target: 'dev',
+    host: null,
+    apps: ['db', 'api'],
+    reload: false,
+    estimate_mib: 768,
+    need_mib: 922,
+    margin: 0.2,
+    reserve_mib: 1024,
+    sources: {
+      db: { mib: 512, source: 'declared' },
+      api: { mib: 256, source: 'declared' },
+    },
+    note: null,
+    requester_pid: 1,
+    child_pid: null,
+    queued_at: '2026-10-17T10:00:00.000Z',
+    admitted_at: '2026-10-17T10:00:00.000Z',
+    running_at: '2026-10-17T10:00:00.000Z',
+    ended_at: null,
+    waiting_for: null,
+    error: null,
+    exit_code: null,
+    ...over,
+  });
+  it('renderLeases: the state directory, the memory and the watcher, then no leases', () => {
+    expect(
+      renderLeases({
+        state_dir: '/s',
+        memory: null,
+        watcher: null,
+        leases: [],
+      })
+    ).toBe(
+      'state: /s\nmemory: no reading on this host (leases are admitted in FIFO order without a check)\nno leases'
+    );
+  });
+  it('renderLeases: one row per lease, oldest first, with its position, estimate, source and reason', () => {
+    const text = renderLeases({
+      state_dir: '/s',
+      memory: { total_mib: 31836, available_mib: 9100 },
+      watcher: { online: true, pid: 42 },
+      leases: [
+        { ...lease({}), position: 0 },
+        {
+          ...lease({
+            id: 'l_bbbbbbbbbb',
+            seq: 2,
+            state: 'pending',
+            project: 'demo-w2',
+            root: '/w/demo.worktrees/b',
+            slot: 2,
+            estimate_mib: 812,
+            need_mib: 975,
+            sources: {
+              db: { mib: 512, source: 'declared' },
+              api: { mib: 300, source: 'measured from slot 0' },
+            },
+            admitted_at: null,
+            running_at: null,
+            waiting_for: waiting,
+          }),
+          position: 1,
+        },
+      ],
+    });
+    const lines = text.split('\n');
+    expect(lines.slice(0, 3)).toEqual([
+      'state: /s',
+      'memory: 8.9G available of 31.1G',
+      'watcher: online pid 42',
+    ]);
+    expect(lines[3]).toMatch(
+      /^POS +STATE +KIND +PROJECT +TARGET +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
+    );
+    expect(lines[4]).toMatch(
+      /^ +running +start +demo \(slot 0\) +dev +768M → 922M +declared +l_aaaaaaaaaa$/
+    );
+    expect(lines[5]).toMatch(
+      /^#1 +pending +start +demo-w2 \(slot 2\) +dev +812M → 975M +measured +needs 922M, .* short\) +l_bbbbbbbbbb$/
+    );
+    expect(
+      renderLeases({
+        state_dir: '/s',
+        memory: null,
+        watcher: { online: false, pid: null },
+        leases: [],
+      })
+    ).toContain('watcher: not running');
+  });
+});
+
+describe('worktree renderers', () => {
+  it('add: path, branch, slot and project, the copies, the install, the vars that are not built in, then next', () => {
+    expect(
+      renderWorktreeAdded({
+        path: '/w/demo.worktrees/feat/x',
+        branch: 'feat/x',
+        created_branch: true,
+        slot: 1,
+        project: 'demo-w1',
+        repo: '/w/demo',
+        copied: ['certs'],
+        linked: ['notes'],
+        missing: ['gone.txt'],
+        installed: 'bun install',
+        vars: [
+          { name: 'project', value: 'demo-w1', source: 'built-in' },
+          { name: 'slot', value: 1, source: 'override' },
+          { name: 'port', value: 3100, source: 'manifest' },
+        ],
+        next: 'cd /w/demo.worktrees/feat/x && mcproc start db',
+      })
+    ).toBe(
+      [
+        'worktree /w/demo.worktrees/feat/x',
+        'branch: feat/x (new)',
+        'slot 1, project demo-w1',
+        'copied: certs',
+        'linked: notes',
+        'missing: gone.txt',
+        'installed: bun install',
+        'vars:',
+        '  slot = 1',
+        '  port = 3100',
+        'next: cd /w/demo.worktrees/feat/x && mcproc start db',
+      ].join('\n')
+    );
+  });
+  it('ls: a table with the main checkout marked; remove: one line', () => {
+    expect(
+      renderWorktrees([
+        {
+          slot: 0,
+          project: 'demo',
+          path: '/w/demo',
+          branch: 'main',
+          online: 2,
+          lease: null,
+          main: true,
+        },
+        {
+          slot: 1,
+          project: 'demo-w1',
+          path: '/w/demo.worktrees/a',
+          branch: null,
+          online: 0,
+          lease: 'pending',
+          main: false,
+        },
+      ]).split('\n')
+    ).toEqual([
+      'SLOT      PROJECT  BRANCH      ONLINE  LEASE    PATH',
+      '0 (main)  demo     main        2       -        /w/demo',
+      '1         demo-w1  (detached)  0       pending  /w/demo.worktrees/a',
+    ]);
+    expect(
+      renderWorktreeRemoved({
+        path: '/w/demo.worktrees/a',
+        slot: 1,
+        branch: 'a',
+        stopped: ['db'],
+      })
+    ).toBe(
+      'removed /w/demo.worktrees/a: slot 1 is free, branch a kept; stopped db'
+    );
   });
 });

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,7 @@ import { S, answerReads } from '../helpers/incidents.js';
 import type { Spawner } from '../../src/transport/types.js';
 import type { UnpackDeps } from '../../src/runtime/unpack.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -46,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 15 tools with annotations and short instructions', async () => {
+  it('registers the 21 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -54,10 +56,13 @@ describe('mcp server', () => {
       'delete',
       'describe',
       'doctor',
+      'exec',
       'flush',
       'hosts',
       'incidents',
       'init',
+      'lease_cancel',
+      'leases',
       'logs',
       'ls',
       'ports',
@@ -66,6 +71,9 @@ describe('mcp server', () => {
       'stop',
       'unpack',
       'wait',
+      'worktree_add',
+      'worktree_ls',
+      'worktree_remove',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
@@ -80,8 +88,63 @@ describe('mcp server', () => {
       'logs',
       'ports',
       'wait',
+      'leases',
+      'worktree_ls',
     ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
+    // add makes a checkout and never discards anything; remove discards a worktree (with force, its changes too)
+    expect(byName.worktree_add.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(byName.worktree_remove.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_add.inputSchema.properties as object).sort()
+    ).toEqual(['branch', 'from', 'install', 'project', 'slot', 'slug']);
+    expect(byName.worktree_add.description).toMatch(
+      /<repo>\.worktrees\/<branch>/
+    );
+    expect(byName.worktree_add.description).toContain(
+      'its slug (the project slug this checkout runs under, default <project>-w<slot>)'
+    );
+    expect(
+      Object.keys(
+        byName.worktree_remove.inputSchema.properties as object
+      ).sort()
+    ).toEqual(['force', 'project', 'ref']);
+    expect(
+      Object.keys(byName.worktree_ls.inputSchema.properties as object)
+    ).toEqual(['project']);
+    expect(byName.lease_cancel.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+    // exec runs whatever argv it is given, `rm` included: destructive, not idempotent, never on another host
+    expect(byName.exec.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(byName.exec.description).toMatch(/THIS machine/);
+    expect(byName.exec.description).toMatch(/last 200 lines/);
+    expect(
+      Object.keys(byName.exec.inputSchema.properties as object).sort()
+    ).toEqual(['command', 'host', 'memory', 'note', 'project', 'timeout_s']);
+    // what this start is for rides on its lease; the lease id itself is the watcher's business
+    const startProps = byName.start.inputSchema.properties as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(startProps)).toContain('note');
+    expect(Object.keys(startProps)).not.toContain('lease');
+    expect(byName.leases.description).toMatch(
+      /pending, starting, running, freed, cancelled, failed/
+    );
     for (const n of ['stop', 'delete', 'flush', 'init'])
       expect(byName[n].annotations?.destructiveHint).toBe(true); // init with force replaces the owner's manifest
     expect(byName.start.annotations).toMatchObject({
@@ -169,6 +232,242 @@ describe('mcp server', () => {
       arguments: { project: basic },
     });
     expect(b.structuredContent.project).toBe('demo');
+  });
+  it('leases reads the host queue without a manifest, and lease_cancel cancels a pending lease once', async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-state-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-empty-'));
+    vi.stubEnv('MCPROC_STATE_DIR', state);
+    try {
+      const store = new LeaseStore(state);
+      const l = await store.create(
+        {
+          kind: 'start',
+          project: 'demo-w2',
+          root: '/w/demo.worktrees/b',
+          slot: 2,
+          repo: '/w/demo',
+          target: 'dev',
+          host: null,
+          apps: ['db', 'api'],
+          reload: false,
+          estimate_mib: 768,
+          need_mib: 922,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const cl = await client(neverSpawn, undefined, dir);
+      const r: any = await cl.callTool({ name: 'leases', arguments: {} });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        state_dir: state,
+        memory: null,
+        watcher: null,
+        leases: [{ id: l.id, state: 'pending', position: 1 }],
+      });
+      expect(text(r)).toContain(`state: ${state}`);
+      expect(text(r)).toMatch(/#1 +pending +start +demo-w2 \(slot 2\)/);
+      const c: any = await cl.callTool({
+        name: 'lease_cancel',
+        arguments: { id: l.id },
+      });
+      expect(text(c)).toBe(`cancelled ${l.id} (demo-w2 dev)`);
+      expect(c.structuredContent).toMatchObject({ state: 'cancelled' });
+      const again: any = await cl.callTool({
+        name: 'lease_cancel',
+        arguments: { id: l.id },
+      });
+      expect(again.isError).toBe(true);
+      expect(text(again)).toContain('LEASE_NOT_PENDING');
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('exec refuses another host and a bad memory size before touching any host', async () => {
+    const cl = await client(neverSpawn);
+    const remote: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, host: 'stand', command: ['echo', 'hi'] },
+    });
+    expect(remote.isError).toBe(true);
+    expect(text(remote)).toMatch(
+      /^BAD_ARGUMENT: exec runs on the local host only/
+    );
+    const ro: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, host: 'prod', command: ['echo', 'hi'] },
+    });
+    expect(text(ro)).toMatch(/^BAD_ARGUMENT/);
+    const size: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, memory: 'lots', command: ['echo', 'hi'] },
+    });
+    expect(size.isError).toBe(true);
+    expect(text(size)).toMatch(/^BAD_ARGUMENT: not a size/);
+  });
+  it('worktree_add makes a checkout with its slot and slug, the failed install in its notes; worktree_ls and worktree_remove read and refuse', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcp-'));
+    const main = path.join(base, 'wtm');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe; a plain sh runs the install
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtm',
+          'vars: { slot: 0, port: "{{ 3000 + slot }}" }',
+          'hosts:',
+          '  local: { pm2: /bin/false, shell: "/bin/sh -c" }',
+          'worktree:',
+          '  install: "echo out-line; echo err-line >&2; exit 3"',
+          'apps:',
+          '  db: { description: db, run: node db.js, port: "{{ port }}" }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const real = fs.realpathSync(main);
+      const wt = path.join(`${real}.worktrees`, 'feat', 'x');
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('jlist'))
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                pid: 7,
+                name: 'wtm-two-db',
+                pm_id: 0,
+                pm2_env: { status: 'online', namespace: 'wtm-two' },
+              },
+            ]),
+            stderr: '',
+          };
+        throw new Error(`unexpected ${cmd}`);
+      };
+      const cl = await client(spawner, undefined, main);
+      const r: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'feat/x', slot: 2, slug: 'wtm-two' },
+      });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        path: wt,
+        slot: 2,
+        project: 'wtm-two',
+        repo: real,
+        installed: 'echo out-line; echo err-line >&2; exit 3',
+      });
+      expect(
+        r.structuredContent.vars.find((v: any) => v.name === 'port').value
+      ).toBe(3002);
+      const t = text(r).split('\n');
+      expect(t.slice(0, 3)).toEqual([
+        `worktree ${wt}`,
+        'branch: feat/x (new)',
+        'slot 2, project wtm-two',
+      ]);
+      expect(t).toContain(`next: cd ${wt} && mcproc start db`);
+      // the install's output never reaches the protocol stream: its last lines come back as notes when it fails
+      expect(r.structuredContent.notes.slice().sort()).toEqual(
+        [
+          'err-line',
+          `echo out-line; echo err-line >&2; exit 3 exited 3 in ${wt}; run it by hand`,
+          'out-line',
+        ].sort()
+      );
+      expect(t.slice(-3).sort()).toEqual(
+        r.structuredContent.notes.slice().sort()
+      );
+      const ls: any = await cl.callTool({ name: 'worktree_ls', arguments: {} });
+      expect(ls.isError).toBeFalsy();
+      expect(ls.structuredContent.rows).toMatchObject([
+        { slot: 0, project: 'wtm', branch: 'main', online: 0, main: true },
+        { slot: 2, project: 'wtm-two', branch: 'feat/x', online: 1, path: wt },
+      ]);
+      expect(text(ls).split('\n')[1]).toMatch(/^0 \(main\)\s+wtm\s+main\s+0/);
+      for (const [ref, code] of [
+        ['0', 'BAD_ARGUMENT'],
+        ['nope', 'NOT_A_WORKTREE'],
+      ]) {
+        const rm: any = await cl.callTool({
+          name: 'worktree_remove',
+          arguments: { ref, force: true },
+        });
+        expect(rm.isError).toBe(true);
+        expect(rm.structuredContent.error.code).toBe(code);
+      }
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('exec runs the command from the root with exec.env and answers its code and last lines, isError when not 0', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-exec-mcp-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: exec-mcp',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'exec:',
+          '  env: { GREETING: hi }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      const cl = await client(neverSpawn, undefined, dir);
+      const r: any = await cl.callTool({
+        name: 'exec',
+        arguments: {
+          command: [
+            process.execPath,
+            '-e',
+            'console.log("said " + process.env.GREETING); console.error("in " + process.env.MCPROC_PROJECT); process.exit(2)',
+          ],
+        },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent).toMatchObject({
+        code: 2,
+        lease: null,
+        env: { GREETING: 'hi', MCPROC_PROJECT: dir },
+      });
+      expect(r.structuredContent.output.split('\n').sort()).toEqual([
+        `in ${dir}`,
+        'said hi',
+      ]);
+      expect(text(r).split('\n')[0]).toBe(
+        `exec ${process.execPath} -e console.log("said " + process.env.GREETING); console.error("in " + process.env.MCPROC_PROJECT); process.exit(2): exit 2`
+      );
+      const ok: any = await cl.callTool({
+        name: 'exec',
+        arguments: { command: [process.execPath, '-e', '0'] },
+      });
+      expect(ok.isError).toBeFalsy();
+      expect(text(ok)).toBe(`exec ${process.execPath} -e 0: exit 0`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('returns MANIFEST_NOT_FOUND with the init hint as an isError result', async () => {
     const cl = await client(neverSpawn);

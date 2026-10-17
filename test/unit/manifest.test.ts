@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -14,6 +15,7 @@ import { resolveTargets } from '../../src/core/actions.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
+const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
 
 function parse(yaml: string) {
   return parseManifest(yaml, '/proj', '/proj/.mcproc/mcproc.yaml');
@@ -463,5 +465,213 @@ describe('url_check', () => {
         message: expect.stringContaining('apps.a.url_check'),
       })
     );
+  });
+});
+
+describe('vars, override and the new sections', () => {
+  it('renders the fixture with its override: slot 2, project demo-w2, ports shifted', () => {
+    const m = loadManifest(varsProj);
+    expect(m.base_project).toBe('demo');
+    expect(m.project).toBe('demo-w2');
+    expect(m.override).toBe(
+      path.join(varsProj, '.mcproc', 'mcproc.local.yaml')
+    );
+    expect(m.slot).toBe(2);
+    expect(m.repo).toBe('/w/demo');
+    expect(m.vars).toEqual([
+      { name: 'project', value: 'demo-w2', source: 'built-in' },
+      { name: 'root', value: varsProj, source: 'built-in' },
+      { name: 'slot', value: 2, source: 'override' },
+      { name: 'api_port', value: 3510, source: 'manifest' },
+      { name: 'db_port', value: 5632, source: 'manifest' },
+    ]);
+    expect(m.apps.api.ports).toEqual([3510]);
+    expect(m.apps.api.url).toBe('http://127.0.0.1:3510/health');
+    expect(m.apps.api.env).toEqual({ PORT: '3510', NAME: 'demo-w2' });
+    expect(m.apps.api.memory_mib).toBe(256);
+    expect(m.apps.api.containers).toEqual([]);
+    expect(m.apps.db.run).toBe(
+      'docker run --rm --name demo-w2-db -p 127.0.0.1:5632:5432 pg'
+    );
+    expect(m.apps.db.description).toBe('database in docker for slot 2');
+    expect(m.apps.db.containers).toEqual(['demo-w2-db']);
+    expect(m.apps.db.memory_mib).toBe(512);
+    expect(m.apps.tool.memory_mib).toBeNull();
+    expect(m.resources).toEqual({
+      reserve: { kind: 'mib', mib: 1024 },
+      margin: 0.2,
+      settle: 5,
+    });
+    expect(m.worktree).toEqual({
+      dir: null,
+      copy: ['certs', 'snaps/**/*-snapshots'],
+      link: ['notes'],
+      install: false,
+      slots: 9,
+    });
+    expect(m.exec).toEqual({
+      env: { API_URL: 'http://127.0.0.1:3510', DB_PORT: '5632' },
+    });
+  });
+  it('without an override the same manifest is slot 0 with the base slug', () => {
+    const text = fs.readFileSync(
+      path.join(varsProj, '.mcproc', 'mcproc.yaml'),
+      'utf8'
+    );
+    const m = parseManifest(
+      text,
+      varsProj,
+      path.join(varsProj, '.mcproc', 'mcproc.yaml'),
+      null
+    );
+    expect(m.project).toBe('demo');
+    expect(m.override).toBeNull();
+    expect(m.repo).toBe(varsProj);
+    expect(m.slot).toBe(0);
+    expect(m.apps.api.ports).toEqual([3310]);
+    expect(m.apps.db.containers).toEqual(['demo-db']);
+  });
+  it('without project: a worktree takes its base slug from the main checkout the override records, not its own directory', () => {
+    const root = '/w/demo.worktrees/feature';
+    const text = 'version: 1\napps:\n  a: { description: x, run: y }\n';
+    const at = (o: { project?: string } = {}) =>
+      parseManifest(text, root, `${root}/.mcproc/mcproc.yaml`, {
+        path: `${root}/.mcproc/mcproc.local.yaml`,
+        repo: '/w/demo',
+        vars: {},
+        ...o,
+      });
+    expect(at()).toMatchObject({
+      base_project: 'demo',
+      project: 'demo',
+      repo: '/w/demo',
+    });
+    expect(at({ project: 'demo-w1' })).toMatchObject({
+      base_project: 'demo',
+      project: 'demo-w1',
+    });
+    // the main checkout itself, and a checkout without an override, keep their own directory's name
+    expect(
+      parseManifest(text, '/w/demo', '/w/demo/.mcproc/mcproc.yaml', null)
+        .base_project
+    ).toBe('demo');
+    expect(
+      parseManifest(text, root, `${root}/.mcproc/mcproc.yaml`, null)
+        .base_project
+    ).toBe('feature');
+  });
+  it('defaults: no vars, 2G reserve, 10% margin, 20 s settle, empty worktree and exec', () => {
+    const m = parse('version: 1\napps:\n  a: { description: x, run: y }\n');
+    expect(m.vars).toEqual([
+      { name: 'project', value: 'proj', source: 'built-in' },
+      { name: 'root', value: '/proj', source: 'built-in' },
+    ]);
+    expect(m.slot).toBeNull();
+    expect(m.resources).toEqual({
+      reserve: { kind: 'mib', mib: 2048 },
+      margin: 0.1,
+      settle: 20,
+    });
+    expect(m.worktree).toEqual({
+      dir: null,
+      copy: [],
+      link: [],
+      install: null,
+      slots: 9,
+    });
+    expect(m.exec).toEqual({ env: {} });
+    expect(m.apps.a.memory_mib).toBeNull();
+    expect(m.apps.a.containers).toEqual([]);
+  });
+  it('reads a percent reserve', () => {
+    const m = parse(
+      'version: 1\nresources: { reserve: 15% }\napps:\n  a: { description: x, run: y }\n'
+    );
+    expect(m.resources.reserve).toEqual({ kind: 'percent', ratio: 0.15 });
+  });
+  it('refuses an unknown var, a bad template, a cycle, a non-integer port and a template in project', () => {
+    const base =
+      'version: 1\napps:\n  a: { description: x, run: "{{ nope }}" }\n';
+    expect(() => parse(base)).toThrow(/apps\.a\.run: unknown var "nope"/);
+    expect(() => parse(base)).toThrowError(
+      expect.objectContaining({ code: 'UNKNOWN_VAR' })
+    );
+    expect(() =>
+      parse(
+        'version: 1\nvars: { p: "{{ 1 +" }\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrowError(expect.objectContaining({ code: 'BAD_TEMPLATE' }));
+    expect(() =>
+      parse(
+        'version: 1\nvars: { a: "{{ b }}", b: "{{ a }}" }\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrowError(expect.objectContaining({ code: 'VAR_CYCLE' }));
+    expect(() =>
+      parse(
+        'version: 1\nvars: { p: "{{ 3310 / 7 * 7 + 1 }}" }\napps:\n  a: { description: x, run: y, port: "{{ p }}x" }\n'
+      )
+    ).toThrow(/apps\.a\.port: must render to an integer/);
+    expect(() =>
+      parse(
+        'version: 1\nproject: "{{ x }}"\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrow(/project/);
+    expect(() =>
+      parse(
+        'version: 1\nvars: { Bad-Name: 1 }\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrow(/vars/);
+    expect(() =>
+      parse(
+        'version: 1\napps:\n  a: { description: x, run: y, memory: huge }\n'
+      )
+    ).toThrow(/apps\.a\.memory/);
+  });
+  it('names the var of a failing template, and the override file of an undeclared var', () => {
+    expect(() =>
+      parse(
+        'version: 1\nvars: { p: "{{ 1 +" }\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrow(/vars\.p: /);
+    try {
+      parse(
+        'version: 1\nvars: { p: "{{ 1 +" }\napps:\n  a: { description: x, run: y }\n'
+      );
+    } catch (e) {
+      expect((e as McprocError).hint).toContain('\\{{');
+    }
+    try {
+      parse(
+        'version: 1\nvars: { a: "{{ b }}", b: "{{ a }}" }\napps:\n  a: { description: x, run: y }\n'
+      );
+    } catch (e) {
+      expect((e as McprocError).hint).toMatch(/Break the cycle/);
+      expect((e as McprocError).hint).not.toMatch(/Templates are/);
+    }
+    expect(() =>
+      parseManifest(
+        'version: 1\nvars: { slot: 0 }\napps:\n  a: { description: x, run: y }\n',
+        '/proj',
+        '/proj/.mcproc/mcproc.yaml',
+        { path: '/proj/.mcproc/mcproc.local.yaml', vars: { slut: 1 } }
+      )
+    ).toThrow(/\/proj\/\.mcproc\/mcproc\.local\.yaml/);
+  });
+  it('takes an explicit null for worktree.install and worktree.dir as the default', () => {
+    const w = parse(
+      'version: 1\nworktree: { install: null, dir: null }\napps:\n  a: { description: x, run: y }\n'
+    ).worktree;
+    expect(w.install).toBeNull();
+    expect(w.dir).toBeNull();
+  });
+  it('refuses an override var the manifest does not declare', () => {
+    const text =
+      'version: 1\nvars: { slot: 0 }\napps:\n  a: { description: x, run: y }\n';
+    expect(() =>
+      parseManifest(text, '/proj', '/proj/.mcproc/mcproc.yaml', {
+        path: '/proj/.mcproc/mcproc.local.yaml',
+        vars: { slut: 1 },
+      })
+    ).toThrowError(expect.objectContaining({ code: 'UNKNOWN_VAR' }));
   });
 });

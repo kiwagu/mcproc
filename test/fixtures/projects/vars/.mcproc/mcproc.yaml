@@ -1,0 +1,39 @@
+version: 1
+project: demo
+vars:
+  slot: 0
+  api_port: '{{ 3310 + slot * 100 }}'
+  db_port: '{{ 5432 + slot * 100 }}'
+resources:
+  reserve: 1G
+  margin: 20%
+  settle: 5
+worktree:
+  copy: [certs, 'snaps/**/*-snapshots']
+  link: [notes]
+  install: false
+exec:
+  env:
+    API_URL: http://127.0.0.1:{{ api_port }}
+    DB_PORT: '{{ db_port }}'
+apps:
+  db:
+    description: database in docker for slot {{ slot }}
+    run: docker run --rm --name {{ project }}-db -p 127.0.0.1:{{ db_port }}:5432 pg
+    url: http://127.0.0.1:{{ db_port }}/
+    memory: 512M
+    containers: ['{{ project }}-db']
+  api:
+    description: HTTP API
+    run: node api.js
+    env: { PORT: '{{ api_port }}', NAME: '{{ project }}' }
+    port: '{{ api_port }}'
+    url: http://127.0.0.1:{{ api_port }}/health
+    memory: 256M
+    depends_on: [db]
+  tool:
+    description: a one-shot without memory
+    kind: task
+    run: echo done
+profiles:
+  dev: [db, api]

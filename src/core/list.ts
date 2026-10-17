@@ -4,6 +4,7 @@ import { McprocError } from './errors.js';
 import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
+  isRunning,
   parseJlist,
   pm2Name,
   runtimeDir,
@@ -11,6 +12,7 @@ import {
   type Pm2Process,
 } from './pm2.js';
 import { treeMetrics, type TreeMetrics } from './metrics.js';
+import type { HostMemory } from './memory.js';
 import { hostStamp } from './logsince.js';
 import {
   appPids,
@@ -24,6 +26,8 @@ import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
+import { leasesCovering, type LeaseView } from './leases/view.js';
+import { stateDir } from './state.js';
 import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -43,6 +47,8 @@ export interface LsRow {
   exit_code: number | null;
   cpu: number | null;
   memory: number;
+  /** the memory of the app's declared docker containers, inside memory */
+  containers_memory: number;
   procs: number | null;
   runtime: string | null;
   pm2_cpu: number;
@@ -62,9 +68,19 @@ export interface LsRow {
    * (the count is then a lower bound)
    */
   reloads?: ReloadCount;
+  /** the lease that covers an app that is not running yet: queued (its position) or starting */
+  lease?: {
+    id: string;
+    state: 'pending' | 'starting';
+    position: number;
+    waiting_for: string | null;
+  };
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
+  /** something the change did not finish beside the app itself, such as the leases a stop could not update */
+  note?: string;
 }
+/** One look at a host for this project: pm2's processes, the ports, the metrics, the url checks, the memory and the leases. */
 export interface Snapshot {
   procs: Pm2Process[];
   ports: Record<string, AppPorts>;
@@ -77,6 +93,10 @@ export interface Snapshot {
   urlChecks: Record<string, UrlResult>;
   /** the host's UTC offset ('+0200'); null when the probe could not read it */
   zone: string | null;
+  /** the host's /proc/meminfo numbers; null where it has none */
+  memory: HostMemory | null;
+  /** this checkout's pending and starting leases on this machine (none on another host, or when not asked) */
+  leases: LeaseView[];
 }
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
@@ -85,6 +105,10 @@ export interface SnapshotOptions {
   metrics?: 'tree' | 'none';
   prev?: { sample: StatSample; at: number };
   urls?: 'check' | 'none' | string[];
+  /** 'probe': ask docker for the declared containers' memory (about 2 s); default 'none', so a polling loop never pays it */
+  containers?: 'probe' | 'none';
+  /** 'read' (the default): read this checkout's leases from the state directory, on the local host only; 'none': skip it */
+  leases?: 'read' | 'none';
 }
 export interface HostInfo {
   name: string;
@@ -125,6 +149,7 @@ function urlFields(
       };
 }
 
+/** Probes the context's host once (see SnapshotOptions for what it asks), and on this machine reads the checkout's leases. */
 export async function snapshot(
   ctx: Context,
   opts: SnapshotOptions = {}
@@ -148,9 +173,22 @@ export async function snapshot(
         .map((a) => a.url)
     ),
   ];
+  const containers =
+    withMetrics && opts.containers === 'probe'
+      ? [
+          ...new Set(
+            Object.values(ctx.manifest.apps).flatMap((a) => a.containers)
+          ),
+        ]
+      : [];
   const res = ensureOk(
     await ctx.transport.exec(
-      probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
+      probeScript(ctx.pm2.bin, {
+        cpuSample,
+        urls,
+        metrics: withMetrics,
+        containers,
+      }),
       {
         env: ctx.pm2.env(),
         // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
@@ -201,6 +239,20 @@ export async function snapshot(
   const metrics: Record<string, TreeMetrics | null> = {};
   for (const [name, set] of pids)
     metrics[name] = treeMetrics(set, data.stats, data.listeners, metricOpts);
+  for (const app of Object.values(ctx.manifest.apps)) {
+    const m = metrics[app.name];
+    if (!m || app.containers.length === 0) continue;
+    const mib = app.containers.reduce(
+      (sum, c) => sum + (data.containers.get(c) ?? 0),
+      0
+    );
+    const bytes = mib * 1024 * 1024;
+    metrics[app.name] = {
+      ...m,
+      memory: m.memory + bytes,
+      containers_memory: bytes,
+    };
+  }
   // the checks from here that url_check asks for, after the probe: a url the host answered costs nothing more
   const urlChecks = await settleUrls(
     asked,
@@ -218,6 +270,11 @@ export async function snapshot(
     sampledAt,
     urlChecks,
     zone: data.zone,
+    memory: data.memory,
+    leases:
+      ctx.host.local && opts.leases !== 'none'
+        ? leasesCovering(stateDir(), ctx.manifest)
+        : [],
   };
 }
 
@@ -239,6 +296,7 @@ export function statusWord(p: Pm2Process | undefined, app: App): string {
   return `failed (exit ${c})`;
 }
 
+/** One row per named app, in that order: what pm2 and the probe show, or for an app not running that a lease covers, its place in the queue. */
 export function rowsFor(
   ctx: Context,
   snap: Snapshot,
@@ -247,6 +305,13 @@ export function rowsFor(
   return names.map((name) => {
     const app = ctx.manifest.apps[name];
     const p = findProcess(snap.procs, ctx.manifest.project, name);
+    // a lease speaks for an app whose process is not running (none yet, or stopped before a start that queued); a
+    // running process is shown as it is
+    const cover =
+      p && isRunning(p.status)
+        ? undefined
+        : snap.leases.find((l) => l.apps.includes(name));
+    if (cover) return queuedRow(app, ctx.host.name, cover, cover.position);
     const m = snap.metrics[name];
     return {
       app: name,
@@ -265,6 +330,7 @@ export function rowsFor(
       exit_code: p?.exit_code ?? null,
       cpu: m ? m.cpu : (p?.cpu ?? 0),
       memory: m ? m.memory : (p?.memory ?? 0),
+      containers_memory: m?.containers_memory ?? 0,
       procs: m ? m.procs : null,
       runtime: m ? m.runtime : null,
       pm2_cpu: p?.cpu ?? 0,
@@ -298,6 +364,7 @@ export function unreachableRow(
     exit_code: null,
     cpu: null,
     memory: 0,
+    containers_memory: 0,
     procs: null,
     runtime: null,
     pm2_cpu: 0,
@@ -313,12 +380,44 @@ export function unreachableRow(
   };
 }
 
+/** The row of an app whose start is queued: no runtime facts, the lease's position and reason instead. */
+export function queuedRow(
+  app: App,
+  host: string,
+  lease: {
+    id: string;
+    state: 'pending' | 'starting';
+    waiting_for: string | null;
+  },
+  position: number
+): LsRow {
+  const base = unreachableRow(
+    app,
+    host,
+    '',
+    lease.state === 'starting' ? 'starting' : `queued #${position}`
+  );
+  const { error: _dropped, ...row } = base;
+  return {
+    ...row,
+    lease: {
+      id: lease.id,
+      state: lease.state,
+      position,
+      waiting_for: lease.waiting_for,
+    },
+  };
+}
+
 export async function listApps(ctx: Context, app?: string): Promise<LsRow[]> {
   const names = app ? [app] : Object.keys(ctx.manifest.apps);
   // one app's read asks only its own url
   return rowsFor(
     ctx,
-    await snapshot(ctx, { urls: app ? [app] : 'check' }),
+    await snapshot(ctx, {
+      urls: app ? [app] : 'check',
+      containers: 'probe',
+    }),
     names
   );
 }
@@ -375,7 +474,7 @@ export async function describeApp(
   pm2: Pm2AppConfig;
 }> {
   const app = ctx.manifest.apps[name];
-  const snap = await snapshot(ctx, { urls: [name] });
+  const snap = await snapshot(ctx, { urls: [name], containers: 'probe' });
   const [row] = rowsFor(ctx, snap, [name]);
   const p = findProcess(snap.procs, ctx.manifest.project, name);
   const pm2 = buildEcosystem(ctx.manifest, ctx.host).apps.find(
@@ -400,12 +499,21 @@ export function describeProject(m: Manifest) {
     project: m.project,
     root: m.root,
     manifest_path: m.path,
+    base_project: m.base_project,
+    vars: m.vars,
+    override: m.override,
+    slot: m.slot,
+    resources: m.resources,
+    worktree: m.worktree,
+    exec: m.exec,
     apps: Object.values(m.apps).map((a) => ({
       name: a.name,
       kind: a.kind,
       description: a.description,
       ports: a.ports,
       url: a.url,
+      memory_mib: a.memory_mib,
+      containers: a.containers,
       depends_on: a.depends_on.map(depView),
       host: a.host,
     })),

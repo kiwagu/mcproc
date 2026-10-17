@@ -9,6 +9,15 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
+import type { VarInfo } from '../core/manifest.js';
+import type { LeasesView } from '../core/leases/view.js';
+import type { ExecResult } from '../core/exec.js';
+import type {
+  WorktreeAdded,
+  WorktreeRemoved,
+  WorktreeRow,
+} from '../core/worktree.js';
+import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
   reasonWord,
@@ -76,7 +85,8 @@ export function cut(s: string, n: number): string {
  * the short reason of a url that answered nowhere; the bare url when not requested (monit's live screen never asks).
  */
 export function fmtUrl(r: LsRow): string {
-  if (!r.url) return '-';
+  // a queued app without a url: the column says what its lease waits for
+  if (!r.url) return r.lease?.waiting_for ?? '-';
   const here = r.url_from === 'here' ? ' (here)' : '';
   if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}${here}`;
   if (r.url_status === 'error')
@@ -248,6 +258,7 @@ function fmtDoctorUrl(host: string, u: DoctorUrl): string {
           : `answers on ${host} (${code})`;
   return `${where}; ${answers}`;
 }
+/** Each host's report: whether it answers, its Node, pm2 and runtime, on this machine its memory and lease state, its urls and the fixes. */
 export function renderDoctor(reps: DoctorReport[]): string {
   return reps
     .map((r) => {
@@ -267,6 +278,14 @@ export function renderDoctor(reps: DoctorReport[]): string {
         if (r.runtime_present)
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`
+          );
+        if (r.memory)
+          L.push(
+            `  memory: ${fmtMib(r.memory.available_mib)} available of ${fmtMib(r.memory.total_mib)}`
+          );
+        if (r.state_dir)
+          L.push(
+            `  leases: ${r.state_dir}, watcher ${r.watcher ? (r.watcher.online ? `online pid ${r.watcher.pid}` : 'not running') : 'unknown'}`
           );
         if (r.environment) L.push(`  environment: ${fmtEnv(r.environment)}`);
         for (const u of r.urls)
@@ -361,7 +380,7 @@ export function renderLogsSince(a: SinceAnswer): string {
   ].join('\n');
 }
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
-/** One line: what was reached (or not) after how long, and what was seen. */
+/** One line: what was reached (or not) after how long, and what was seen (a start still queued says its place). */
 export function renderWait(app: string, r: WaitResult): string {
   const seen = r.observed ? ` (${r.observed})` : '';
   if (r.ok) {
@@ -386,7 +405,7 @@ export function renderWait(app: string, r: WaitResult): string {
   if (r.reason === 'timeout')
     return `${app}: ${r.until} not reached after ${secs(r.waited_ms)}${seen}`;
   if (r.reason === 'aborted')
-    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}`;
+    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}${seen}`;
   return `${app}: ${r.reason} (${r.status}) after ${secs(r.waited_ms)} while waiting for ${r.until}`;
 }
 /** `libs (completed), api (ready), logger`: a started dependency is its bare name. */
@@ -401,6 +420,9 @@ export function fmtDeps(deps: { app: string; condition: string }[]): string {
 export function renderProject(d: {
   project: string;
   root: string;
+  vars: VarInfo[];
+  override: string | null;
+  slot: number | null;
   apps: {
     name: string;
     kind: string;
@@ -414,7 +436,15 @@ export function renderProject(d: {
   hosts: HostInfo[];
   readme: string | null;
 }): string {
-  const L = [`project: ${d.project} (${d.root})`, 'apps:'];
+  const L = [`project: ${d.project} (${d.root})`];
+  if (d.vars.some((v) => v.source !== 'built-in') || d.override) {
+    L.push(
+      `vars:${d.override ? ` (override ${d.override})` : ''}${d.slot !== null ? ` slot ${d.slot}` : ''}`
+    );
+    for (const v of d.vars)
+      L.push(`  ${v.name} = ${JSON.stringify(v.value)} (${v.source})`);
+  }
+  L.push('apps:');
   for (const a of d.apps)
     L.push(
       `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${fmtDeps(a.depends_on)}` : ''}: ${a.description}`
@@ -514,7 +544,77 @@ export function waitNote(waits: WaitRecord[]): string {
     : '';
 }
 
-/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start note and the waits made. */
+/** One line per distinct note the change left on its rows, with the apps it concerns. */
+export function rowNote(rows: LsRow[]): string {
+  const by = new Map<string, string[]>();
+  for (const r of rows)
+    if (r.note) by.set(r.note, [...(by.get(r.note) ?? []), r.app]);
+  return [...by]
+    .map(([note, apps]) => `${apps.join(', ')}: ${note}`)
+    .join('\n');
+}
+
+/** One line per queued app of a start: its position and what the head of the queue waits for. */
+export function queuedNote(rows: LsRow[]): string {
+  const by = new Map<string, LsRow[]>();
+  for (const r of rows)
+    if (r.lease) by.set(r.lease.id, [...(by.get(r.lease.id) ?? []), r]);
+  return [...by.values()]
+    .map((rs) => {
+      const l = rs[0].lease!;
+      const apps = rs.map((r) => r.app).join(', ');
+      return l.state === 'starting'
+        ? `${apps}: starting (lease ${l.id})`
+        : `${apps}: queued #${l.position}${l.waiting_for ? `: ${l.waiting_for}` : ''} (lease ${l.id}; wait on an app, or leases)`;
+    })
+    .join('\n');
+}
+
+/** The queue as a table, oldest first, with the host's memory and the watcher's state above it. */
+export function renderLeases(v: LeasesView): string {
+  const head = [
+    `state: ${v.state_dir}`,
+    v.memory
+      ? `memory: ${fmtMib(v.memory.available_mib)} available of ${fmtMib(v.memory.total_mib)}`
+      : 'memory: no reading on this host (leases are admitted in FIFO order without a check)',
+    v.watcher
+      ? `watcher: ${v.watcher.online ? `online pid ${v.watcher.pid}` : 'not running'}`
+      : '',
+  ].filter(Boolean);
+  if (v.leases.length === 0) return [...head, 'no leases'].join('\n');
+  const rows = v.leases.map((l) => [
+    l.position ? `#${l.position}` : '',
+    l.state,
+    l.kind,
+    l.project + (l.slot !== null ? ` (slot ${l.slot})` : ''),
+    l.target,
+    `${fmtMib(l.estimate_mib)} → ${fmtMib(l.need_mib)}`,
+    Object.values(l.sources).some((s) => s.source.startsWith('measured'))
+      ? 'measured'
+      : 'declared',
+    l.waiting_for ?? l.error ?? '',
+    l.id,
+  ]);
+  return [
+    ...head,
+    table([
+      [
+        'POS',
+        'STATE',
+        'KIND',
+        'PROJECT',
+        'TARGET',
+        'EST → NEED',
+        'FROM',
+        'WAITING FOR / ERROR',
+        'ID',
+      ],
+      ...rows,
+    ]),
+  ].join('\n');
+}
+
+/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start and queue notes and the waits made. */
 export function renderMutation(
   rows: LsRow[],
   fallback: string,
@@ -524,7 +624,9 @@ export function renderMutation(
   const bad = rows.filter((r) => r.error);
   const notes = [
     act === 'start' || act === 'restart' ? startNote(rows) : '',
+    act === 'start' ? queuedNote(rows) : '',
     waitNote(waits),
+    rowNote(rows),
   ].filter(Boolean);
   const head = bad.length
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`
@@ -559,4 +661,50 @@ export function renderAdopted(r: AdoptResult): {
       'nothing to adopt: every port the running apps hold is declared'
     );
   return { text: lines.join('\n'), failed: r.errors.length > 0 };
+}
+
+/** An exec's answer: the command, how long it waited, its lease, the exit code, then the captured tail. */
+export function renderExec(command: string[], r: ExecResult): string {
+  const head = `exec ${command.join(' ')}: exit ${r.code}${r.waited_ms > 1000 ? ` after ${Math.round(r.waited_ms / 1000)} s in the queue` : ''}${r.lease ? ` (lease ${r.lease.id}, ${r.lease.state})` : ''}`;
+  return r.output ? `${head}\n${r.output}` : head;
+}
+
+/** A new worktree: where, its branch (new or existing), slot and project, what was copied, linked, missing and installed, its vars, then how to go on. */
+export function renderWorktreeAdded(r: WorktreeAdded): string {
+  const L = [
+    `worktree ${r.path}`,
+    `branch: ${r.branch} (${r.created_branch ? 'new' : 'existing'})`,
+    `slot ${r.slot}, project ${r.project}`,
+  ];
+  if (r.copied.length) L.push(`copied: ${r.copied.join(', ')}`);
+  if (r.linked.length) L.push(`linked: ${r.linked.join(', ')}`);
+  if (r.missing.length) L.push(`missing: ${r.missing.join(', ')}`);
+  L.push(`installed: ${r.installed ?? 'nothing'}`);
+  const vars = r.vars.filter((v) => v.source !== 'built-in');
+  if (vars.length) {
+    L.push('vars:');
+    for (const v of vars) L.push(`  ${v.name} = ${JSON.stringify(v.value)}`);
+  }
+  L.push(`next: ${r.next}`);
+  return L.join('\n');
+}
+
+/** Every checkout of the repository as a table, slot 0 marked as the main one. */
+export function renderWorktrees(rows: WorktreeRow[]): string {
+  return table([
+    ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
+    ...rows.map((r) => [
+      r.main ? `${r.slot} (main)` : String(r.slot),
+      r.project,
+      r.branch ?? '(detached)',
+      String(r.online),
+      r.lease ?? '-',
+      r.path,
+    ]),
+  ]);
+}
+
+/** A removed worktree in one line: its path, the slot it freed, the branch it kept and the apps it stopped. */
+export function renderWorktreeRemoved(r: WorktreeRemoved): string {
+  return `removed ${r.path}: slot ${r.slot} is free, branch ${r.branch ?? '(detached)'} kept; stopped ${r.stopped.length ? r.stopped.join(', ') : 'nothing'}`;
 }

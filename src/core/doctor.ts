@@ -1,8 +1,11 @@
 import { McprocError } from './errors.js';
+import { watcherIn } from './leases/view.js';
 import { type Host, type Manifest, scopeManifest } from './manifest.js';
+import { type HostMemory, parseMeminfo } from './memory.js';
 import { Pm2Client, resolvePm2Bin, runtimeDir } from './pm2.js';
 import { parseUrlProbe } from './ports.js';
 import { pickHost } from './resolve.js';
+import { stateDir } from './state.js';
 import {
   checkHere,
   type HereCheck,
@@ -11,7 +14,13 @@ import {
   settleUrls,
   type UrlResult,
 } from './urlcheck.js';
-import { MARK, urlBudgetMs, urlName, urlSection } from '../shell/snippets.js';
+import {
+  MARK,
+  MEM_SNIPPET,
+  urlBudgetMs,
+  urlName,
+  urlSection,
+} from '../shell/snippets.js';
 import { shq } from '../transport/quote.js';
 import { createTransport, ensureOk } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
@@ -30,6 +39,7 @@ export interface DoctorUrl {
   check: UrlResult;
 }
 
+/** What doctor found on one host: whether it answers, its Node, pm2 and tools, the daemon, the urls, and what to fix. */
 export interface DoctorReport {
   host: string;
   transport: string;
@@ -51,6 +61,12 @@ export interface DoctorReport {
   daemon: 'answers' | 'error' | 'unknown';
   processes: number;
   in_namespace: number;
+  /** the state directory that holds this machine's leases; null on another host */
+  state_dir: string | null;
+  /** the lease watcher's pm2 process; null on another host, or when pm2's list did not answer */
+  watcher: { online: boolean; pid: number | null } | null;
+  /** the host's memory from its probe; null on another host, or where there is no /proc/meminfo */
+  memory: HostMemory | null;
   recommendations: string[];
   /** the host's own account of itself (container, hostname, own addresses); null when not read */
   environment: HostEnv | null;
@@ -59,6 +75,7 @@ export interface DoctorReport {
 
 const MARKER = '__MCPROC_DOCTOR__';
 
+/** Diagnoses one host: its shell, Node, pm2 and tools, the daemon, the urls of its apps, and on this machine the lease state. */
 export async function doctorHost(
   m: Manifest,
   host: Host,
@@ -83,6 +100,10 @@ export async function doctorHost(
     daemon: 'unknown',
     processes: 0,
     in_namespace: 0,
+    // the leases live on this machine only
+    state_dir: host.local ? stateDir() : null,
+    watcher: null,
+    memory: null,
     recommendations: [],
     environment: null,
     urls: [],
@@ -93,6 +114,8 @@ export async function doctorHost(
     `for t in ps ss tar; do if command -v $t >/dev/null 2>&1; then echo "tool $t yes"; else echo "tool $t no"; fi; done`,
     `echo "pm2home \${PM2_HOME:-}"`,
     `if [ -x ${shq(`${rt}/bin/pm2`)} ]; then echo RUNTIME yes; else echo RUNTIME no; fi`,
+    // before the lock section, which runs to the end of the output
+    ...(host.local ? [MEM_SNIPPET] : []),
     `echo ${LOCK_MARK}; cat ${shq(`${rt}/lock.json`)} 2>/dev/null || true`,
   ].join('; ');
   try {
@@ -112,6 +135,9 @@ export async function doctorHost(
     r.reachable = true;
     const lockAt = res.stdout.indexOf(LOCK_MARK);
     const head = lockAt < 0 ? res.stdout : res.stdout.slice(0, lockAt);
+    const memAt = head.indexOf(MARK.MEM);
+    if (host.local && memAt >= 0)
+      r.memory = parseMeminfo(head.slice(memAt + MARK.MEM.length));
     if (lockAt >= 0) {
       try {
         const lock = JSON.parse(
@@ -167,6 +193,7 @@ export async function doctorHost(
       r.daemon = 'answers';
       r.processes = procs.length;
       r.in_namespace = procs.filter((p) => p.namespace === m.project).length;
+      if (host.local) r.watcher = watcherIn(procs);
       if (procs.length === 0)
         r.recommendations.push(
           `pm2 daemon is empty here: if ${m.project} should already run on this host under another user or PM2_HOME, set hosts.${host.name}.pm2_home`
@@ -277,6 +304,7 @@ async function checkUrlsOf(
   }
 }
 
+/** Diagnoses the named host, or every host of the manifest (local first), each report on its own: one that fails never stops the rest. */
 export async function doctor(
   m: Manifest,
   hostName?: string,
@@ -307,6 +335,9 @@ export async function doctor(
         daemon: 'unknown',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [],

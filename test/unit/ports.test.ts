@@ -39,6 +39,8 @@ const app = (name: string, ports: number[] = []): App => ({
   run: 'x',
   cwd: '.',
   env: {},
+  memory_mib: null,
+  containers: [],
   ports,
   url: null,
   url_check: 'auto',
@@ -54,7 +56,11 @@ describe('probeScript', () => {
   it('contains every marker and the pm2 command', () => {
     const s = probeScript("'/usr/bin/node' '/x/pm2'");
     for (const m of Object.values(MARK))
-      if (m !== MARK.STAT2 && m !== MARK.ENV) expect(s).toContain(m); // STAT2 only with cpuSample, ENV only with urls
+      if (m !== MARK.STAT2 && m !== MARK.ENV && m !== MARK.DOCKERMEM)
+        expect(s).toContain(m); // STAT2 only with cpuSample, ENV only with urls, DOCKERMEM only with containers
+    expect(probeScript('pm2', { containers: ['demo-db'] })).toContain(
+      MARK.DOCKERMEM
+    );
     expect(s).toContain("'/usr/bin/node' '/x/pm2' jlist");
     expect(s).toContain('ss -ltnp');
     expect(s).toContain('/proc/net/tcp');
@@ -152,6 +158,19 @@ describe('parsers', () => {
       { addr: '0.0.0.0', port: 3310, inode: 2171731 },
     ]);
     expect(parseFdMap(fx('proc-fd.txt')).get(2171731)).toBe(69265);
+  });
+  it('parseProbe reads the host memory and the containers memory sections', () => {
+    const d = parseProbe(
+      probeOut({
+        mem: 'MemTotal: 2048000 kB\nMemAvailable: 1024000 kB',
+        dockermem: 'demo-db\t27.06MiB / 31.09GiB',
+      })
+    );
+    expect(d.memory).toEqual({ total_mib: 2000, available_mib: 1000 });
+    expect([...d.containers]).toEqual([['demo-db', 28]]);
+    const none = parseProbe(probeOut({}));
+    expect(none.memory).toBeNull();
+    expect(none.containers.size).toBe(0);
   });
   it("parseProbe reads the host's zone; an absent or garbled clock section is null and the rest still parses", () => {
     expect(parseProbe(probeOut({ clock: '+0200' })).zone).toBe('+0200');

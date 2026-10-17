@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -7,6 +8,8 @@ import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
+import { leasesCovering } from '../../src/core/leases/view.js';
 import type { Context } from '../../src/core/resolve.js';
 import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
 import {
@@ -23,6 +26,7 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
+const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
 const fx = (p: string) =>
   fs.readFileSync(path.join(here, '..', 'fixtures', 'probe', p), 'utf8');
 const jlist = JSON.stringify([
@@ -684,5 +688,250 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
       url_from: 'here',
       url_reason: 'on stand: refused; here: no answer',
     });
+  });
+});
+
+describe('declared containers', () => {
+  it("adds the declared containers' memory to an app and keeps the host memory", async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      {
+        match: 'jlist',
+        result: (cmd) => ({
+          stdout: probeOut({
+            jlist: JSON.stringify([
+              {
+                pid: 100,
+                name: 'demo-w2-db',
+                pm_id: 0,
+                pm2_env: {
+                  status: 'online',
+                  namespace: 'demo-w2',
+                  pm_cwd: varsProj,
+                },
+              },
+            ]),
+            ps: '100 1',
+            stat: 'CLK 100\n100 1 5',
+            rss: '100 11000',
+            mem: 'MemTotal: 2048000 kB\nMemAvailable: 1024000 kB',
+            dockermem: cmd.includes('docker stats')
+              ? 'demo-w2-db\t40MiB / 2GiB'
+              : '',
+          }),
+        }),
+      },
+    ]);
+    const snap = await snapshot(ctx, { urls: 'none', containers: 'probe' });
+    expect(ctx.fake.calls[0].cmd).toContain("'demo-w2-db'");
+    expect(snap.memory).toEqual({ total_mib: 2000, available_mib: 1000 });
+    const [db] = rowsFor(ctx, snap, ['db']);
+    expect(db.containers_memory).toBe(40 * 1024 * 1024);
+    expect(db.memory).toBe(11000 * 1024 + 40 * 1024 * 1024);
+    const light = await snapshot(ctx, { urls: 'none' });
+    expect(ctx.fake.calls[1].cmd).not.toContain('docker stats');
+    expect(rowsFor(ctx, light, ['db'])[0].containers_memory).toBe(0);
+  });
+});
+
+describe('queued and starting rows', () => {
+  it('a state directory whose leases cannot be read gives no covering leases, and ls still answers', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-bad-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    const m = loadManifest(varsProj);
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: 'jlist', result: { stdout: probeOut({}) } },
+    ]);
+    try {
+      // the state directory is a file; its lease directory is a file (ENOTDIR); its lease directory has no read access (EACCES)
+      const file = path.join(base, 'state-file');
+      fs.writeFileSync(file, '');
+      const notDir = path.join(base, 'not-dir');
+      fs.mkdirSync(notDir);
+      fs.writeFileSync(path.join(notDir, 'leases'), '');
+      const noAccess = path.join(base, 'no-access');
+      fs.mkdirSync(path.join(noAccess, 'leases'), { recursive: true });
+      fs.chmodSync(path.join(noAccess, 'leases'), 0o000);
+      const bad = [file, notDir];
+      // a root run reads it all the same
+      if (process.getuid?.() !== 0) bad.push(noAccess);
+      for (const dir of bad) {
+        expect(leasesCovering(dir, m)).toEqual([]);
+        process.env.MCPROC_STATE_DIR = dir;
+        const rows = await listApps(ctx);
+        expect(rows.map((r) => r.app)).toEqual(Object.keys(m.apps));
+      }
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.chmodSync(path.join(base, 'no-access', 'leases'), 0o700);
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('an app with no process but a pending lease reads queued #N, a starting one reads starting', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const m = loadManifest(varsProj);
+      await store.create(
+        {
+          kind: 'start',
+          project: 'other',
+          root: '/o',
+          slot: null,
+          repo: '/o',
+          target: 'x',
+          host: null,
+          apps: ['x'],
+          reload: false,
+          estimate_mib: 1,
+          need_mib: 1,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const mine = await store.create(
+        {
+          kind: 'start',
+          project: m.project,
+          root: m.root,
+          slot: 2,
+          repo: m.repo,
+          target: 'dev',
+          host: null,
+          apps: ['db', 'api'],
+          reload: false,
+          estimate_mib: 768,
+          need_mib: 922,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      await store.patch(mine.id, { waiting_for: '1 ahead in the queue' });
+      const ctx = fakeCtx(varsProj, 'local', [
+        { match: 'jlist', result: { stdout: probeOut({}) } },
+      ]);
+      const snap = await snapshot(ctx, { urls: 'none' });
+      expect(snap.leases).toEqual([
+        {
+          id: mine.id,
+          state: 'pending',
+          position: 2,
+          waiting_for: '1 ahead in the queue',
+          apps: ['db', 'api'],
+        },
+      ]);
+      const rows = rowsFor(ctx, snap, ['db', 'api', 'tool']);
+      expect(rows.map((r) => r.status)).toEqual([
+        'queued #2',
+        'queued #2',
+        'not-started',
+      ]);
+      expect(rows[0].lease).toEqual({
+        id: mine.id,
+        state: 'pending',
+        position: 2,
+        waiting_for: '1 ahead in the queue',
+      });
+      await store.transition(mine.id, 'starting');
+      const snap2 = await snapshot(ctx, { urls: 'none' });
+      expect(rowsFor(ctx, snap2, ['db'])[0].status).toBe('starting');
+      expect(
+        (await snapshot(ctx, { urls: 'none', leases: 'none' })).leases
+      ).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a covering lease wins over a stopped or errored process, never over a running one; a host other than this machine reads no leases', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const lease = (m: ReturnType<typeof loadManifest>, apps: string[]) =>
+        store.create(
+          {
+            kind: 'start',
+            project: m.project,
+            root: m.root,
+            slot: m.slot,
+            repo: m.repo,
+            target: apps.join(','),
+            host: null,
+            apps,
+            reload: false,
+            estimate_mib: 1,
+            need_mib: 1,
+            margin: 0,
+            reserve_mib: 0,
+            sources: {},
+            note: null,
+            requester_pid: 1,
+          },
+          'pending'
+        );
+      const mine = await lease(loadManifest(varsProj), ['db', 'api', 'tool']);
+      const proc = (app: string, status: string) => ({
+        pid: status === 'online' ? 100 : 0,
+        name: `demo-w2-${app}`,
+        pm_id: 0,
+        pm2_env: { status, namespace: 'demo-w2' },
+      });
+      const ctx = fakeCtx(varsProj, 'local', [
+        {
+          match: 'jlist',
+          result: {
+            stdout: probeOut({
+              jlist: JSON.stringify([
+                proc('db', 'online'),
+                proc('api', 'stopped'),
+                proc('tool', 'errored'),
+              ]),
+            }),
+          },
+        },
+      ]);
+      const names = ['db', 'api', 'tool'];
+      const rows = rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), names);
+      // a stop then a start that queued: the stopped process reads as the queue, the running one as itself
+      expect(rows.map((r) => r.status)).toEqual([
+        'online',
+        'queued #1',
+        'queued #1',
+      ]);
+      expect(rows[0].lease).toBeUndefined();
+      expect(rows[1].lease).toMatchObject({ id: mine.id, position: 1 });
+      expect(rows[1].pid).toBeNull();
+      // without a covering lease a stopped process is shown as it is
+      await store.transition(mine.id, 'cancelled');
+      expect(
+        rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), names).map(
+          (r) => r.status
+        )
+      ).toEqual(['online', 'stopped', 'errored']);
+      await lease(loadManifest(basic), ['api']);
+      const prod = fakeCtx(basic, 'prod', [
+        { match: 'jlist', result: { stdout: probeOut({}) } },
+      ]);
+      expect((await snapshot(prod, { urls: 'none' })).leases).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

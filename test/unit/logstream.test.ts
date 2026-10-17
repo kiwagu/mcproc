@@ -43,6 +43,8 @@ const snap = (apps: string[]): Snapshot => ({
   sampledAt: 0,
   urlChecks: {},
   zone: null,
+  memory: null,
+  leases: [],
 });
 
 /** Fake followers: a queue of poll results per app; an exhausted queue yields no lines. */

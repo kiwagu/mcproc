@@ -26,6 +26,8 @@ export const MARK = {
   ARGS: '__MCPROC_ARGS__',
   DOCKER: '__MCPROC_DOCKER__',
   ENV: '__MCPROC_ENV__',
+  MEM: '__MCPROC_MEM__',
+  DOCKERMEM: '__MCPROC_DOCKERMEM__',
   URL: '__MCPROC_URL__',
 } as const;
 
@@ -43,7 +45,7 @@ export const RSS_AWK = `awk '/^Pid:/{ p=$2 } /^VmRSS:/{ print p, $2 }'`;
  * `cmd` cut after `secs` seconds where the host has `timeout`, and run as it is where it has not: a wedged docker daemon
  * or a dead resolver must not stall the whole probe until the transport timeout.
  */
-const bounded = (secs: number, cmd: string): string =>
+export const bounded = (secs: number, cmd: string): string =>
   `if command -v timeout >/dev/null 2>&1; then timeout ${secs} ${cmd}; else ${cmd}; fi`;
 
 /** Seconds each of the environment section's two lookups (its own name, `hostname -i`) may take on the host. */
@@ -92,6 +94,25 @@ export const ENV_SNIPPET = [
   `echo "self $(${bounded(ENV_LOOKUP_S, 'getent hosts "$h" 2>/dev/null')} | awk '{print $1}' | tr '\\n' ' ')$(${bounded(ENV_LOOKUP_S, 'hostname -i 2>/dev/null')}) 127.0.0.1 ::1"`,
 ].join('\n');
 
+/** The host's memory: the two /proc/meminfo lines the lease needs (MemTotal, MemAvailable); empty where there is no /proc. */
+export const MEM_SNIPPET = [
+  `echo ${MARK.MEM}`,
+  `awk '/^(MemTotal|MemAvailable):/' /proc/meminfo 2>/dev/null`,
+].join('\n');
+
+/**
+ * The memory of the declared containers that are running: one `docker stats --no-stream` over those names (a name
+ * that is not running fails the whole call, so `docker ps` filters first). Measured at about 2 s per call, so it
+ * is asked only where the caller passes names; empty when there are none.
+ */
+export function dockerMemSnippet(names: string[]): string {
+  if (names.length === 0) return '';
+  return [
+    `echo ${MARK.DOCKERMEM}`,
+    `if command -v docker >/dev/null 2>&1; then R=$(${bounded(3, "docker ps --format '{{.Names}}' 2>/dev/null")}); L=""; for n in ${names.map(shq).join(' ')}; do if printf '%s\\n' "$R" | grep -qxF -- "$n"; then L="$L $n"; fi; done; if [ -n "$L" ]; then ${bounded(5, "docker stats --no-stream --format '{{.Name}}\\t{{.MemUsage}}' $L 2>/dev/null")}; fi; fi`,
+  ].join('\n');
+}
+
 /**
  * "<url>\t<code>\t<exit>\t<addr>": curl's HTTP status (000 when nothing answered) and its exit status; or wget's 200/000
  * and `w<status>:<its stderr on one line>` (BusyBox wget exits 1 for every failure and says why only there); "-" and an
@@ -131,12 +152,18 @@ export function urlSection(urls: string[], env = urls.length > 0): string[] {
   ];
 }
 
-/** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, and one HTTP
+/** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, the host's
+ * memory (/proc/meminfo), the memory of the declared `containers` that run (docker stats, only when names are given), and one HTTP
  * request per declared url, with the host's environment (container, hostname, own addresses) when there is one. `metrics: false` is the light form
  * for polling: pm2 state, offset, tree, listeners and urls only, no /proc stat, RSS, args or docker passes. */
 export function probeScript(
   pm2Bin: string,
-  opts: { cpuSample?: boolean; urls?: string[]; metrics?: boolean } = {}
+  opts: {
+    cpuSample?: boolean;
+    urls?: string[];
+    metrics?: boolean;
+    containers?: string[];
+  } = {}
 ): string {
   return [
     `echo ${MARK.JLIST}`,
@@ -174,6 +201,10 @@ export function probeScript(
           `ps -eo pid=,args= 2>/dev/null || ps -o pid,args 2>/dev/null`,
           `echo ${MARK.DOCKER}`,
           `if command -v docker >/dev/null 2>&1; then ${bounded(3, "docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null")}; fi`,
+          MEM_SNIPPET,
+          ...(opts.containers?.length
+            ? [dockerMemSnippet(opts.containers)]
+            : []),
         ]),
     ...urlSection(opts.urls ?? []),
   ].join('\n');

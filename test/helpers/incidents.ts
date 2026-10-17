@@ -51,6 +51,7 @@ export function fakeHosts(
 ) {
   const reads: string[] = [];
   const scripts: string[] = [];
+  const probes: string[] = [];
   const clockOf = (host: string) => ({
     now: state.now,
     zone: state.zone,
@@ -72,14 +73,17 @@ export function fakeHosts(
       [
         {
           match: MARK.JLIST,
-          result: () => ({
-            stdout: probeOut({
-              jlist: JSON.stringify(state.procs[host] ?? []),
-              clock: clockOf(host).zone ?? '+0000',
-              urls: state.urls?.[host],
-              env: state.env?.[host],
-            }),
-          }),
+          result: (cmd: string) => {
+            probes.push(cmd);
+            return {
+              stdout: probeOut({
+                jlist: JSON.stringify(state.procs[host] ?? []),
+                clock: clockOf(host).zone ?? '+0000',
+                urls: state.urls?.[host],
+                env: state.env?.[host],
+              }),
+            };
+          },
         },
         {
           match: /pm2 'jlist'/,
@@ -130,7 +134,7 @@ export function fakeHosts(
         : undefined
     );
   });
-  return { fleet, reads, scripts };
+  return { fleet, reads, scripts, probes };
 }
 /**
  * Executes what a script runs before its reads: a readability check `[ ! -e 'f' ] || [ -r 'f' ] || echo M` prints M

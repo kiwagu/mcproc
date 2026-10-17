@@ -25,6 +25,7 @@ const web: LsRow = {
   restarts: 0,
   cpu: 84.4,
   memory: 2_200_000_000,
+  containers_memory: 0,
   procs: 3,
   runtime:
     'next-server (v16.2.9) with a very long tail of arguments that must be cut',

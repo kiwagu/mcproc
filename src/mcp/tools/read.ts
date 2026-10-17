@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
-import { prepare, connect } from '../../core/resolve.js';
+import { prepare, connect, type Context } from '../../core/resolve.js';
+import { leasesView } from '../../core/leases/view.js';
 import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
 import { Fleet, defaultConnector, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
@@ -27,6 +28,7 @@ import {
   renderProject,
   renderIncidents,
   renderWait,
+  renderLeases,
   hostsOf,
   urlNote,
 } from '../render.js';
@@ -137,7 +139,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Describe',
       description:
-        'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config.',
+        'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config. Without app it also lists the resolved vars with their sources and the override file, when the manifest declares vars.',
       inputSchema: { ...commonInput, app: z.string().optional() },
       annotations: RO,
     },
@@ -319,6 +321,34 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         return {
           text: renderWait(args.app, r),
           data: { app: args.app, host: ctx.host.name, ...r },
+        };
+      })
+  );
+
+  server.registerTool(
+    'leases',
+    {
+      title: 'Leases',
+      description:
+        "The host's memory lease queue: every lease with its state (pending, starting, running, freed, cancelled, failed), position, project and slot, target, estimate and need, where the estimate came from, what the head waits for; plus the host's memory reading and whether the watcher runs. A start that answered queued shows up here; wait on one of its apps to block until it is up.",
+      inputSchema: { project: commonInput.project },
+      annotations: RO,
+    },
+    (args) =>
+      runTool(async () => {
+        let ctx: Context | undefined;
+        try {
+          ctx = await connect(await prep({ project: args.project }), {
+            spawner: deps.spawner,
+            hereCheck: deps.hereCheck,
+          });
+        } catch {
+          ctx = undefined; // no manifest here: the queue is the host's and still reads
+        }
+        const v = await leasesView(undefined, ctx);
+        return {
+          text: renderLeases(v),
+          data: v as unknown as Record<string, unknown>,
         };
       })
   );

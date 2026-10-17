@@ -1,6 +1,6 @@
 {
   "name": "mcproc",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "pm2 process control for agents over MCP: local and remote hosts, per-app ports, one manifest per project",
   "type": "module",
   "license": "MIT",

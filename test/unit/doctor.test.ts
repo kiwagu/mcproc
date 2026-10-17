@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest, type Manifest } from '../../src/core/manifest.js';
@@ -114,6 +116,77 @@ describe('doctor', () => {
     expect(prod.urls).toEqual([]); // no app runs there
     expect(stand).toMatchObject({ environment: null, urls: [] }); // unreachable: no url step
     expect(stand.recommendations).toHaveLength(1); // the ssh one; no failed url step
+  });
+  it('on the local host reports the state directory, the watcher and the memory from its own probe; elsewhere none of them', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-doctor-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    const probes: string[] = [];
+    // the local probe answers its MEM section; the local jlist shows the watcher when `watcher` is set
+    const withState =
+      (watcher: boolean): Spawner =>
+      async (argv, o) => {
+        const cmd = argv[argv.length - 1];
+        const r = await spawner(argv, o);
+        if (argv[0] === 'ssh') return r;
+        if (cmd.includes('__MCPROC_DOCTOR__')) {
+          probes.push(cmd);
+          return {
+            ...r,
+            stdout: `${r.stdout}__MCPROC_MEM__\nMemTotal:       32614400 kB\nMemAvailable:   18036736 kB\n`,
+          };
+        }
+        if (watcher && cmd.includes('jlist'))
+          return {
+            ...r,
+            stdout: JSON.stringify([
+              ...JSON.parse(r.stdout),
+              {
+                pid: 77,
+                name: 'mcproc-watcher',
+                pm_id: 9,
+                pm2_env: { status: 'online', namespace: 'mcproc' },
+              },
+            ]),
+          };
+        return r;
+      };
+    try {
+      const m = loadManifest(basic);
+      const [local, stand, prod] = await doctor(
+        m,
+        undefined,
+        withState(false),
+        neverHere
+      );
+      expect(probes[0]).toContain('__MCPROC_MEM__');
+      expect(local).toMatchObject({
+        state_dir: dir,
+        watcher: { online: false, pid: null },
+        memory: { total_mib: 31850, available_mib: 17614 },
+      });
+      for (const r of [stand, prod])
+        expect(r).toMatchObject({
+          state_dir: null,
+          watcher: null,
+          memory: null,
+        });
+      const t = renderDoctor([local]);
+      expect(t).toContain('\n  memory: 17.2G available of 31.1G');
+      expect(t).toContain(`\n  leases: ${dir}, watcher not running`);
+      expect(renderDoctor([prod])).not.toMatch(/memory:|leases:/);
+      const [on] = await doctor(m, 'local', withState(true), neverHere);
+      expect(on.watcher).toEqual({ online: true, pid: 77 });
+      // the watcher is one of the daemon's processes, not one of the project's
+      expect(on).toMatchObject({ processes: 2, in_namespace: 1 });
+      expect(renderDoctor([on])).toContain(
+        `\n  leases: ${dir}, watcher online pid 77`
+      );
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('limits to one host when asked', async () => {
     const reps = await doctor(loadManifest(basic), 'prod', spawner, neverHere);

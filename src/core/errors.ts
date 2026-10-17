@@ -18,6 +18,17 @@ export const ERROR_CODES = [
   'BAD_ARGUMENT',
   'BUNDLE_INVALID',
   'WRONG_HOST',
+  'UNKNOWN_VAR',
+  'BAD_TEMPLATE',
+  'VAR_CYCLE',
+  'NEVER_FITS',
+  'LEASE_UNSUPPORTED_HOST',
+  'LEASE_NOT_PENDING',
+  'NO_FREE_SLOT',
+  'SLOT_TAKEN',
+  'WORKTREE_EXISTS',
+  'WORKTREE_DIRTY',
+  'NOT_A_WORKTREE',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 

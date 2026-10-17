@@ -17,6 +17,8 @@ export function probeOut(parts: {
   rss?: string;
   args?: string;
   docker?: string;
+  mem?: string;
+  dockermem?: string;
   env?: string;
   urls?: string;
 }): string {
@@ -44,8 +46,11 @@ export function probeOut(parts: {
     MARK.ARGS,
     parts.args ?? '',
     MARK.DOCKER,
-    parts.docker ?? ''
+    parts.docker ?? '',
+    MARK.MEM,
+    parts.mem ?? ''
   );
+  if (parts.dockermem !== undefined) out.push(MARK.DOCKERMEM, parts.dockermem);
   if (parts.env !== undefined) out.push(MARK.ENV, parts.env); // the probe prints it only when it checks a url
   out.push(MARK.URL, parts.urls ?? '');
   return out.join('\n');

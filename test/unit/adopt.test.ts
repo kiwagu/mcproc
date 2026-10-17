@@ -876,6 +876,19 @@ describe('adoptPorts', () => {
       remote: [9000, 9001],
     });
   });
+  it('checks the ports against the override of an overridden checkout', async () => {
+    const { dir } = project(
+      'version: 1\nproject: fx\nvars: { slot: 0 }\napps:\n  api:\n    description: api\n    run: npm run dev\n    ports: ["{{ 3310 + slot }}", 3311]\n'
+    );
+    fs.writeFileSync(
+      path.join(dir, '.mcproc', 'mcproc.local.yaml'),
+      'vars:\n  slot: 2\n'
+    );
+    const r = await adoptPorts(fakeFleet(dir).fleet);
+    // slot 2 declares 3312 and 3311, so 3310 is the undeclared one (templated ports are left unedited, so it is skipped)
+    expect(r.adopted).toEqual([]);
+    expect(r.skipped.map((x) => x.ports)).toContainEqual([3310]);
+  });
   it('a second run finds nothing new and leaves the file alone', async () => {
     const { dir, file } = project();
     await adoptPorts(fakeFleet(dir).fleet);

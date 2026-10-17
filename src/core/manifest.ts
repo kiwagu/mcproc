@@ -4,8 +4,17 @@ import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { McprocError } from './errors.js';
 import { repeatsARepeat } from './incidents/detect.js';
+import { NAME_RE } from './names.js';
+import { loadOverride, type Override } from './override.js';
+import { parsePercent, parseSizeMib } from './sizes.js';
+import {
+  renderTemplate,
+  resolveVars,
+  TemplateError,
+  type VarValue,
+} from './template.js';
 
-export const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
+export { NAME_RE };
 export const MANIFEST_REL = path.join('.mcproc', 'mcproc.yaml');
 export const PROTECTED_PM2_KEYS = [
   'name',
@@ -22,6 +31,10 @@ export const DEFAULT_SHELL = '/bin/bash -lc';
 const name = z.string().regex(NAME_RE, 'must match ^[a-z0-9][a-z0-9._-]*$');
 const envValue = z.union([z.string(), z.number(), z.boolean()]);
 const portNo = z.number().int().min(1).max(65535);
+const VAR_NAME_RE = /^[a-z][a-z0-9_]*$/;
+const varName = z.string().regex(VAR_NAME_RE, 'must match ^[a-z][a-z0-9_]*$');
+const varValue = z.union([z.string(), z.number(), z.boolean()]);
+const sizeString = z.string().min(1);
 
 export type AppKind = 'build' | 'server' | 'worker' | 'task';
 export type DepCondition = 'started' | 'ready' | 'completed';
@@ -87,6 +100,8 @@ const appSchema = z
     run: z.string().min(1),
     cwd: z.string().min(1).default('.'),
     env: z.record(envValue).default({}),
+    memory: sizeString.optional(),
+    containers: z.array(z.string().min(1)).default([]),
     port: portNo.optional(),
     ports: z.array(portNo).optional(),
     url: z
@@ -130,6 +145,27 @@ const hostSchema = z
   })
   .strict();
 
+const resourcesSchema = z
+  .object({
+    reserve: z.string().min(1).optional(),
+    margin: z.string().min(1).optional(),
+    settle: z.number().int().min(0).max(600).optional(),
+  })
+  .strict();
+const worktreeSchema = z
+  .object({
+    dir: z.string().min(1).nullable().optional(),
+    copy: z.array(z.string().min(1)).default([]),
+    link: z.array(z.string().min(1)).default([]),
+    install: z
+      .union([z.string().min(1), z.literal(false)])
+      .nullable()
+      .optional(),
+    slots: z.number().int().min(1).max(99).default(9),
+  })
+  .strict();
+const execSchema = z.object({ env: z.record(varValue).default({}) }).strict();
+
 /** A key left empty in YAML (`apps:` with only comments below it) parses as null: treat it as an empty map. */
 const orEmpty = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess((v) => (v === null || v === undefined ? {} : v), schema);
@@ -138,6 +174,10 @@ export const manifestSchema = z
   .object({
     version: z.literal(1),
     project: name.optional(),
+    vars: orEmpty(z.record(varName, varValue)),
+    resources: orEmpty(resourcesSchema),
+    worktree: orEmpty(worktreeSchema),
+    exec: orEmpty(execSchema),
     apps: orEmpty(z.record(name, appSchema)),
     profiles: orEmpty(z.record(name, z.array(z.string()))),
     hosts: orEmpty(z.record(name, hostSchema)),
@@ -160,6 +200,35 @@ export interface ReloadSettings {
 }
 /** Where an app's url is requested from: its host, then this machine when the host gets no answer (auto); only one side otherwise. */
 export type UrlCheckMode = 'auto' | 'host' | 'here';
+/** One resolved var and where its value came from, as describe shows it. */
+export interface VarInfo {
+  name: string;
+  value: VarValue;
+  source: 'built-in' | 'manifest' | 'override';
+}
+/** What a stand must leave to the rest of the host, the safety margin on an estimate, and the watcher's settle time. */
+export interface Resources {
+  reserve: { kind: 'mib'; mib: number } | { kind: 'percent'; ratio: number };
+  margin: number;
+  settle: number;
+}
+/** What a worktree of this repository gets beyond the git tree. */
+export interface WorktreeSettings {
+  /** where worktrees go; null = `<main checkout>.worktrees` next to the repository */
+  dir: string | null;
+  copy: string[];
+  link: string[];
+  /** the install command; null = detected from the lockfile; false = none */
+  install: string | false | null;
+  slots: number;
+}
+export interface ExecSettings {
+  env: Record<string, string>;
+}
+export const RESERVE_DEFAULT_MIB = 2048;
+export const MARGIN_DEFAULT = 0.1;
+export const SETTLE_DEFAULT_S = 20;
+
 export interface App {
   name: string;
   description: string;
@@ -167,6 +236,10 @@ export interface App {
   run: string;
   cwd: string;
   env: Record<string, string>;
+  /** the memory the app is expected to use, in MiB; null when undeclared */
+  memory_mib: number | null;
+  /** docker containers the app owns, removed with it */
+  containers: string[];
   ports: number[];
   url: string | null;
   /** where the url is requested from: auto (its host, then this machine when the host gets no answer), host, or here */
@@ -201,6 +274,18 @@ export interface Manifest {
   root: string;
   path: string;
   project: string;
+  /** the manifest's own slug (declared, else from the main checkout's directory name), before any override: the registry of worktree slots is keyed by it */
+  base_project: string;
+  vars: VarInfo[];
+  /** the override file that set project or vars; null when the checkout has none */
+  override: string | null;
+  /** the main checkout of this repository: the override's `repo` for a worktree, else this root */
+  repo: string;
+  /** the value of a numeric `slot` var; null when the manifest declares none */
+  slot: number | null;
+  resources: Resources;
+  worktree: WorktreeSettings;
+  exec: ExecSettings;
   apps: Record<string, App>;
   profiles: Record<string, string[]>;
   hosts: Record<string, Host>;
@@ -306,10 +391,80 @@ function checkPatterns(
   }
 }
 
+/** The error a template raised, as the manifest reports it: the field path first, the code by the kind of failure. */
+function templateError(field: string, e: unknown): McprocError {
+  const t = e instanceof TemplateError ? e : null;
+  const code =
+    t?.kind === 'unknown'
+      ? 'UNKNOWN_VAR'
+      : t?.kind === 'cycle'
+        ? 'VAR_CYCLE'
+        : 'BAD_TEMPLATE';
+  // a failure inside one var's template is reported under that var: vars.<name>
+  const where = t?.varName ? `${field}.${t.varName}` : field;
+  const msg = t?.varName
+    ? t.message.slice(t.varName.length + 2)
+    : (e as Error).message;
+  return new McprocError(code, `${where}: ${msg}`, {
+    hint:
+      code === 'UNKNOWN_VAR'
+        ? 'Declare the var under vars: in the manifest; the override may only set declared vars.'
+        : code === 'VAR_CYCLE'
+          ? 'Break the cycle between the named vars: one of them must not depend on the others.'
+          : "Templates are {{ expr }} over var names with integer + - * / % and parentheses; write \\{{ for a literal {{ (a docker --format '{{.Names}}' in a run line needs it).",
+  });
+}
+
+/** Keys whose string values are never templates: structure, not configuration. */
+const NO_TEMPLATE_KEYS = new Set(['version', 'project', 'profiles', 'vars']);
+
+/**
+ * Every string leaf of the raw manifest rendered with the resolved vars, except the structural keys; `port`/`ports`
+ * that rendered to digits become numbers so the schema can check them. Errors name the field path.
+ */
+function interpolateRaw(raw: unknown, vars: Record<string, VarValue>): unknown {
+  const walk = (v: unknown, p: string[]): unknown => {
+    if (typeof v === 'string') {
+      try {
+        const r = renderTemplate(v, vars);
+        const portLike =
+          p[0] === 'apps' &&
+          ((p.length === 3 && p[2] === 'port') ||
+            (p.length === 4 && p[2] === 'ports'));
+        if (portLike) {
+          // a port: a number as rendered, or a string of digits; anything else cannot be a port
+          if (typeof r === 'number') return r;
+          if (typeof r === 'string' && /^\d+$/.test(r)) return Number(r);
+          throw new TemplateError(
+            `must render to an integer, got ${JSON.stringify(r)}`,
+            'type'
+          );
+        }
+        // every other field is a string in the schema: a whole-template number or boolean is written out
+        return typeof r === 'string' ? r : String(r);
+      } catch (e) {
+        throw templateError(p.join('.') || '(root)', e);
+      }
+    }
+    if (Array.isArray(v)) return v.map((x, i) => walk(x, [...p, String(i)]));
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v as Record<string, unknown>))
+        out[k] =
+          p.length === 0 && NO_TEMPLATE_KEYS.has(k) ? x : walk(x, [...p, k]);
+      return out;
+    }
+    return v;
+  };
+  return walk(raw, []);
+}
+
+/** Parses manifest text: renders its `{{ }}` templates with the vars (the override's values win), then checks the result against the schema. */
 export function parseManifest(
   text: string,
   root: string,
-  manifestPath: string
+  manifestPath: string,
+  override: Override | null = null
 ): Manifest {
   let raw: unknown;
   try {
@@ -320,7 +475,52 @@ export function parseManifest(
       `YAML parse error in ${manifestPath}: ${(e as Error).message}`
     );
   }
-  const res = manifestSchema.safeParse(raw);
+  // project and vars come first: everything else is rendered with them
+  const top = (raw && typeof raw === 'object' ? raw : {}) as Record<
+    string,
+    unknown
+  >;
+  if (typeof top.project === 'string' && /\{\{/.test(top.project))
+    throw new McprocError('BAD_TEMPLATE', 'project: must not be a template', {
+      hint: 'Set the project slug in the override file instead.',
+    });
+  // every checkout of a repository shares one base slug: a worktree takes the default from its main checkout's path
+  const base_project =
+    typeof top.project === 'string'
+      ? top.project
+      : defaultProject(override?.repo ?? root);
+  const project = override?.project ?? base_project;
+  const declaredRes = z.record(varName, varValue).safeParse(top.vars ?? {});
+  if (!declaredRes.success)
+    throw new McprocError(
+      'MANIFEST_INVALID',
+      `Invalid manifest ${manifestPath}:\n  vars: ${declaredRes.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`
+    );
+  let resolved: Record<string, VarValue>;
+  try {
+    resolved = resolveVars(
+      declaredRes.data,
+      override?.vars ?? {},
+      {
+        project,
+        root,
+      },
+      override?.path
+    );
+  } catch (e) {
+    throw templateError('vars', e);
+  }
+  const vars: VarInfo[] = Object.entries(resolved).map(([name, value]) => ({
+    name,
+    value,
+    source:
+      name === 'project' || name === 'root'
+        ? 'built-in'
+        : override && Object.hasOwn(override.vars, name)
+          ? 'override'
+          : 'manifest',
+  }));
+  const res = manifestSchema.safeParse(interpolateRaw(raw, resolved));
   if (!res.success) {
     const issues = flattenIssues(res.error.issues).map(
       (i) => `${i.path.join('.') || '(root)'}: ${i.message}`
@@ -417,6 +617,13 @@ export function parseManifest(
     ] as const)
       for (const k of ['match', 'ignore'] as const)
         checkPatterns(problems, `apps.${n}.${field}.${k}`, s?.[k] ?? []);
+    let memory_mib: number | null = null;
+    if (a.memory !== undefined)
+      try {
+        memory_mib = parseSizeMib(a.memory);
+      } catch (e) {
+        problems.push(`apps.${n}.memory: ${(e as Error).message}`);
+      }
     apps[n] = {
       name: n,
       description: a.description,
@@ -424,6 +631,8 @@ export function parseManifest(
       run: a.run,
       cwd: a.cwd,
       env: stringifyEnv(a.env),
+      memory_mib,
+      containers: a.containers,
       ports: a.ports ?? (a.port !== undefined ? [a.port] : []),
       url: a.url ?? null,
       url_check: a.url_check ?? 'auto',
@@ -511,6 +720,41 @@ export function parseManifest(
       );
   }
 
+  let reserve: Resources['reserve'] = {
+    kind: 'mib',
+    mib: RESERVE_DEFAULT_MIB,
+  };
+  let margin = MARGIN_DEFAULT;
+  if (m.resources.reserve !== undefined)
+    try {
+      reserve = m.resources.reserve.trim().endsWith('%')
+        ? { kind: 'percent', ratio: parsePercent(m.resources.reserve) }
+        : { kind: 'mib', mib: parseSizeMib(m.resources.reserve) };
+    } catch (e) {
+      problems.push(`resources.reserve: ${(e as Error).message}`);
+    }
+  if (m.resources.margin !== undefined)
+    try {
+      margin = parsePercent(m.resources.margin);
+    } catch (e) {
+      problems.push(`resources.margin: ${(e as Error).message}`);
+    }
+  const resources: Resources = {
+    reserve,
+    margin,
+    settle: m.resources.settle ?? SETTLE_DEFAULT_S,
+  };
+  const worktree: WorktreeSettings = {
+    dir: m.worktree.dir ?? null,
+    copy: m.worktree.copy,
+    link: m.worktree.link,
+    install: m.worktree.install ?? null,
+    slots: m.worktree.slots,
+  };
+  const exec: ExecSettings = { env: stringifyEnv(m.exec.env) };
+  const slotVar = resolved.slot;
+  const slot = typeof slotVar === 'number' ? slotVar : null;
+
   if (problems.length)
     throw new McprocError(
       'MANIFEST_INVALID',
@@ -520,10 +764,18 @@ export function parseManifest(
   return {
     root,
     path: manifestPath,
-    project: m.project ?? defaultProject(root),
+    project,
+    base_project,
+    vars,
+    override: override?.path ?? null,
+    repo: override?.repo ?? root,
+    slot,
     apps,
     profiles: m.profiles,
     hosts,
+    resources,
+    worktree,
+    exec,
   };
 }
 
@@ -570,6 +822,7 @@ export function loadManifest(startDir: string): Manifest {
   return parseManifest(
     fs.readFileSync(found.path, 'utf8'),
     found.root,
-    found.path
+    found.path,
+    loadOverride(found.root)
   );
 }

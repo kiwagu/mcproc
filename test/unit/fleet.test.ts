@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadManifest } from '../../src/core/manifest.js';
 import {
@@ -9,11 +12,18 @@ import {
   describeFleetApp,
 } from '../../src/core/fleet.js';
 import { describeProject } from '../../src/core/list.js';
+import { renderMutation } from '../../src/mcp/render.js';
 import { listWithReloads } from '../../src/core/reloadcount.js';
 import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
 import { MARK } from '../../src/shell/snippets.js';
+import {
+  LeaseStore,
+  pidAlive,
+  type NewLease,
+} from '../../src/core/leases/store.js';
+import type { GateDeps } from '../../src/core/leases/gate.js';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 
@@ -581,5 +591,410 @@ describe('actOn start with conditions across hosts', () => {
     const rows = await actOn(f, 'web', 'start', { waits });
     expect(rows.map((r) => r.app)).toEqual(['web']);
     expect(waits).toEqual([]);
+  });
+});
+
+describe('actOn start through the memory lease gate', () => {
+  const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
+  let stateDir: string;
+  let store: LeaseStore;
+  let ensured = 0;
+  beforeEach(() => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-fleet-gate-'));
+    store = new LeaseStore(stateDir);
+    ensured = 0;
+  });
+  afterEach(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const gateOf = (available_mib: number): GateDeps => ({
+    store,
+    memory: async () => ({ total_mib: 8000, available_mib }),
+    siblings: async () => new Map(),
+    ensureWatcher: async () => {
+      ensured++;
+    },
+  });
+  /** the vars stand (demo-w2: db 512M, api 256M) on a local fake whose pm2 runs nothing yet */
+  const varsFleet = () => {
+    const ctx = fakeCtx(
+      varsProj,
+      'local',
+      [
+        { match: MARK.JLIST, result: { stdout: probeOut({}) } },
+        { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+        { match: 'cat >', result: {} },
+        { match: /startOrRestart/, result: {} },
+      ],
+      'local',
+      async () => ({ answered: false, fail: 'refused' as const })
+    );
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    const started = () =>
+      ctx.fake.calls.filter((c) => /startOrRestart/.test(c.cmd)).length;
+    return { fleet, started };
+  };
+
+  it('a start that does not fit is queued: queued rows, no pm2 start, one pending lease, the watcher made sure of', async () => {
+    const h = varsFleet();
+    const rows = await actOn(h.fleet, 'dev', 'start', { gate: gateOf(1500) });
+    expect(rows.map((r) => [r.app, r.status, r.lease?.position])).toEqual([
+      ['db', 'queued #1', 1],
+      ['api', 'queued #1', 1],
+    ]);
+    expect(rows[0].lease?.waiting_for).toBe(
+      'needs 922M, host has 476M over the reserve (446M short)'
+    );
+    expect(h.started()).toBe(0);
+    expect(store.list().map((l) => [l.state, l.target, l.apps])).toEqual([
+      ['pending', 'dev', ['db', 'api']],
+    ]);
+    expect(ensured).toBe(1);
+  });
+
+  it("a queued start keeps the caller's --host on its lease; without one the lease names none", async () => {
+    const h = varsFleet();
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(1500) });
+    const ctx = await h.fleet.ctx('local');
+    const local = new Fleet(loadManifest(varsProj), 'local', async () => ctx);
+    await actOn(local, 'dev', 'start', { gate: gateOf(1500) });
+    expect(store.list().map((l) => [l.state, l.target, l.host])).toEqual([
+      ['pending', 'dev', null],
+      ['pending', 'dev', 'local'],
+    ]);
+  });
+
+  it('a start that fits runs at once under a running lease', async () => {
+    const h = varsFleet();
+    const rows = await actOn(h.fleet, 'dev', 'start', {
+      gate: gateOf(9000),
+      note: 'dev up',
+    });
+    expect(rows.map((r) => r.app)).toEqual(['db', 'api']);
+    expect(rows.every((r) => r.lease === undefined)).toBe(true);
+    expect(h.started()).toBe(2);
+    expect(store.list().map((l) => [l.state, l.note, l.child_pid])).toEqual([
+      ['running', 'dev up', null], // its start went through: no starter left to wait for
+    ]);
+    expect(ensured).toBe(0);
+  });
+
+  it('stop frees the running lease once none of its apps is online', async () => {
+    const h = varsFleet();
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(9000) });
+    await actOn(h.fleet, 'dev', 'stop', { gate: gateOf(9000) });
+    expect(store.list().map((l) => l.state)).toEqual(['freed']);
+  });
+
+  it('a start that throws frees the lease it was admitted under', async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+      { match: 'cat >', result: { code: 1, stderr: 'disk full' } },
+    ]);
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    await expect(
+      actOn(fleet, 'dev', 'start', { gate: gateOf(9000) })
+    ).rejects.toMatchObject({ code: 'TRANSPORT_FAILED' });
+    expect(store.list()).toMatchObject([
+      { state: 'freed', error: expect.stringContaining('disk full') },
+    ]);
+  });
+
+  it('a start that runs a budgeted app on a remote host is refused before any host is touched; a stop of it is not', async () => {
+    const mm = {
+      ...m,
+      apps: { ...m.apps, web: { ...m.apps.web, memory_mib: 100 } },
+    };
+    const h = fakeFleet(undefined, {
+      box: [proc('web', 3, '/home/dev/fleet')],
+    });
+    const connected: string[] = [];
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      connected.push(host);
+      await h.fleet.ctx(host);
+      return h.ctxs[host];
+    });
+    await expect(
+      actOn(f, 'web', 'start', { gate: gateOf(9000) })
+    ).rejects.toMatchObject({
+      code: 'LEASE_UNSUPPORTED_HOST',
+      message:
+        'web declare memory but run on host box; the lease queue works on the local host only in this version',
+      hint: 'Drop memory: from apps bound to remote hosts.',
+    });
+    expect(connected).toEqual([]);
+    expect(store.list()).toEqual([]);
+    await actOn(f, 'web', 'stop', { gate: gateOf(9000) });
+    expect(h.log.filter((l) => l.includes("'stop'"))).toEqual([
+      "box: pm2 'stop' '3'",
+    ]);
+  });
+
+  it('a leased start ends its lease once over every local run, two local runs around a remote one', async () => {
+    const { audit: _gone, ...apps } = m.apps;
+    const mm = { ...m, apps }; // start all = watch@local, web@box, tool@local: three runs
+    const h = fakeFleet(undefined, {});
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      return h.ctxs[host];
+    });
+    const l = await store.create(
+      {
+        kind: 'start',
+        project: 'fleet',
+        root: dir,
+        slot: null,
+        repo: dir,
+        target: 'all',
+        host: null,
+        apps: ['watch', 'tool'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'pending'
+    );
+    await store.transition(l.id, 'starting', { child_pid: 4242 });
+    const rows = await actOn(f, 'all', 'start', {
+      gate: gateOf(9000),
+      lease: l.id,
+    });
+    expect(rows.map((r) => `${r.app}@${r.host}:${r.error ?? ''}`)).toEqual([
+      'watch@local:',
+      'web@box:',
+      'tool@local:',
+    ]);
+    expect(h.starts()).toEqual([
+      'local fleet-watch',
+      'box fleet-web',
+      'local fleet-tool',
+    ]);
+    expect(store.get(l.id)).toMatchObject({
+      state: 'running',
+      error: null,
+      child_pid: null,
+    });
+  });
+
+  it('a queued local run holds back its dependents on another host: skipped with the lease, never launched', async () => {
+    const budget = <
+      T extends { apps: Record<string, { memory_mib: number | null }> },
+    >(
+      x: T
+    ) => {
+      if (x.apps.watch) x.apps.watch = { ...x.apps.watch, memory_mib: 512 };
+      return x;
+    };
+    const mm = budget({ ...m, apps: { ...m.apps } });
+    const h = fakeFleet(undefined, {});
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      budget(h.ctxs[host].manifest);
+      return h.ctxs[host];
+    });
+    const rows = await actOn(f, 'web', 'start', { gate: gateOf(10) });
+    const [lease] = store.list();
+    expect(lease).toMatchObject({ state: 'pending', apps: ['watch'] });
+    expect(rows.map((r) => [r.app, r.host, r.status])).toEqual([
+      ['watch', 'local', 'queued #1'],
+      ['web', 'box', 'skipped'],
+    ]);
+    expect(rows[1].error).toBe(
+      `skipped: watch was not started (queued: lease ${lease.id})`
+    );
+    expect(h.starts()).toEqual([]);
+    expect(ensured).toBe(1);
+  });
+
+  it('a stop cancels the overlapping queued and starting leases first (ending the starting child), then stops, then frees', async () => {
+    const lease = (over: Partial<NewLease>): NewLease => ({
+      kind: 'start',
+      project: 'demo-w2',
+      root: varsProj,
+      slot: 2,
+      repo: '/w/demo',
+      target: 'db',
+      host: null,
+      apps: ['db'],
+      reload: false,
+      estimate_mib: 1,
+      need_mib: 1,
+      margin: 0,
+      reserve_mib: 0,
+      sources: {},
+      note: null,
+      requester_pid: 1,
+      ...over,
+    });
+    const child = spawn(process.execPath, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ]);
+    try {
+      const running = await store.create(lease({}), 'running');
+      const starting = await store.create(
+        lease({ target: 'dev', apps: ['db', 'api'] }),
+        'pending'
+      );
+      await store.transition(starting.id, 'starting', { child_pid: child.pid });
+      const pending = await store.create(
+        lease({ target: 'api', apps: ['api'] }),
+        'pending'
+      );
+      let status = 'online';
+      const list = () =>
+        JSON.stringify([
+          {
+            pid: status === 'online' ? 100 : 0,
+            name: 'demo-w2-db',
+            pm_id: 1,
+            pm2_env: { status, namespace: 'demo-w2', pm_cwd: varsProj },
+          },
+        ]);
+      const atStop: string[] = [];
+      const ctx = fakeCtx(varsProj, 'local', [
+        {
+          match: MARK.JLIST,
+          result: () => ({ stdout: probeOut({ jlist: list() }) }),
+        },
+        { match: /pm2 'jlist'/, result: () => ({ stdout: list() }) },
+        {
+          match: /pm2 'stop'/,
+          result: () => {
+            atStop.push(
+              store
+                .list()
+                .map((l) => l.state)
+                .join(','),
+              `child alive: ${pidAlive(child.pid!)}`
+            );
+            status = 'stopped';
+            return {};
+          },
+        },
+      ]);
+      const fleet = new Fleet(
+        loadManifest(varsProj),
+        undefined,
+        async () => ctx
+      );
+      await actOn(fleet, 'dev', 'stop', { gate: gateOf(9000) });
+      expect(atStop).toEqual([
+        'running,cancelled,cancelled',
+        'child alive: false',
+      ]);
+      expect(store.get(running.id)?.state).toBe('freed');
+      expect(store.get(starting.id)).toMatchObject({
+        state: 'cancelled',
+        error: 'stop of db, api',
+      });
+      expect(store.get(pending.id)?.state).toBe('cancelled');
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  it('a stop goes ahead when the lease lock fails, and its rows say the leases were not updated', async () => {
+    const lease = await store.create(
+      {
+        kind: 'start',
+        project: 'demo-w2',
+        root: varsProj,
+        slot: 2,
+        repo: '/w/demo',
+        target: 'dev',
+        host: null,
+        apps: ['db', 'api'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'pending'
+    );
+    const stuck = new LeaseStore(stateDir);
+    stuck.withLock = async () => {
+      throw new McprocError(
+        'TIMEOUT',
+        'the lease lock is held by pid 9 for more than 10 s'
+      );
+    };
+    const list = JSON.stringify([
+      {
+        pid: 100,
+        name: 'demo-w2-db',
+        pm_id: 1,
+        pm2_env: { status: 'online', namespace: 'demo-w2', pm_cwd: varsProj },
+      },
+    ]);
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: MARK.JLIST, result: { stdout: probeOut({ jlist: list }) } },
+      { match: /pm2 'jlist'/, result: { stdout: list } },
+      { match: /pm2 'stop'/, result: {} },
+    ]);
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    const rows = await actOn(fleet, 'db', 'stop', {
+      gate: { ...gateOf(9000), store: stuck },
+    });
+    expect(ctx.fake.calls.some((c) => /pm2 'stop'/.test(c.cmd))).toBe(true);
+    expect(rows[0].note).toBe(
+      'leases not updated: TIMEOUT: the lease lock is held by pid 9 for more than 10 s'
+    );
+    expect(rows[0].error).toBeUndefined();
+    expect(store.get(lease.id)?.state).toBe('pending');
+    expect(renderMutation(rows, 'local', 'stop').text).toContain(
+      'db: leases not updated: TIMEOUT'
+    );
+  });
+
+  it('a queued run counts only the apps the gate counted: an app online already keeps its real row and does not hold back its dependents', async () => {
+    const budget = <
+      T extends { apps: Record<string, { memory_mib: number | null }> },
+    >(
+      x: T
+    ) => {
+      if (x.apps.watch) x.apps.watch = { ...x.apps.watch, memory_mib: 512 };
+      if (x.apps.tool) x.apps.tool = { ...x.apps.tool, memory_mib: 256 };
+      return x;
+    };
+    const mm = budget({
+      ...m,
+      apps: { ...m.apps },
+      profiles: { ...m.profiles, trio: ['watch', 'tool', 'web'] },
+    });
+    const h = fakeFleet(undefined, { local: [proc('watch', 1, dir)] });
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      budget(h.ctxs[host].manifest);
+      return h.ctxs[host];
+    });
+    const rows = await actOn(f, 'trio', 'start', { gate: gateOf(10) });
+    const [lease] = store.list();
+    expect(lease).toMatchObject({ state: 'pending', apps: ['tool'] });
+    expect(rows.map((r) => [r.app, r.host, r.status, r.lease?.id])).toEqual([
+      ['watch', 'local', 'online', undefined],
+      ['tool', 'local', 'queued #1', lease.id],
+      // launched: the fake box lists nothing afterwards, so it reads not-started rather than skipped
+      ['web', 'box', 'not-started', undefined],
+    ]);
+    expect(rows[2].error).toBeUndefined();
+    expect(h.starts()).toEqual(['box fleet-web']);
+  });
+
+  it('the start of an admitted lease skips the queue and ends it as running', async () => {
+    const h = varsFleet();
+    const queued = await actOn(h.fleet, 'dev', 'start', { gate: gateOf(10) });
+    const id = queued[0].lease!.id;
+    await store.withLock(() => store.transition(id, 'starting'));
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(10), lease: id });
+    expect(h.started()).toBe(2);
+    expect(store.get(id)?.state).toBe('running');
   });
 });
