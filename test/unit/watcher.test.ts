@@ -205,6 +205,22 @@ describe('watchLeases', () => {
     });
   });
 
+  it('fails an exec lease its live owner left starting for longer than 60 s, and leaves a younger one alone', async () => {
+    const exec = { kind: 'exec' as const, apps: [], target: 'bun test' };
+    const old = await store.create(input(exec), 'pending');
+    await store.transition(old.id, 'starting');
+    now += 30_000;
+    const young = await store.create(input(exec), 'pending');
+    await store.transition(young.id, 'starting');
+    now += 31_000; // the first one 61 s starting, the second 31 s
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(old.id)).toMatchObject({
+      state: 'failed',
+      error: 'the exec did not take its turn',
+    });
+    expect(store.get(young.id)?.state).toBe('starting');
+  });
+
   it('cancels a pending exec at the head whose requester is gone and judges the next one at once', async () => {
     const t0 = now;
     const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;

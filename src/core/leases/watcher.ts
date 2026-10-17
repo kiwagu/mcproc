@@ -83,11 +83,15 @@ async function moveIf(
   });
 }
 
+/** How long an exec lease may stay starting before the watcher fails it, in milliseconds: its owner polls every second. */
+const EXEC_TURN_GRACE_MS = 60_000;
+
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
  * their starter lives, for at most STARTER_TRUST_MS, see starterAlive); a starting one whose recorded child is gone is
  * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester: once that
- * process is gone, a running one is freed and a starting one failed at once.
+ * process is gone, a running one is freed and a starting one failed at once; a starting one its live owner has not
+ * taken within EXEC_TURN_GRACE_MS (its wait ended without the cancel landing) is failed too, so it cannot hold the queue.
  */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
@@ -106,6 +110,14 @@ async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
             l.state === 'running' ? 'freed' : 'failed',
             { error: 'requester gone' }
           );
+        else if (
+          l.state === 'starting' &&
+          l.admitted_at &&
+          deps.now() - Date.parse(l.admitted_at) > EXEC_TURN_GRACE_MS
+        )
+          await moveIf(store, l.id, 'starting', 'failed', {
+            error: 'the exec did not take its turn',
+          });
         continue;
       }
       if (
@@ -291,9 +303,9 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
  * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
  * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
  * reconciled. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
- * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, and an exec lease whose requester
- * is gone is ended at once (cancelled at the head, failed while starting, freed while running). A tick that throws is
- * logged, not fatal.
+ * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
+ * is gone is ended at once (cancelled at the head, failed while starting, freed while running), and one left starting
+ * for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
  */
 export async function watchLeases(
   deps: WatcherDeps,

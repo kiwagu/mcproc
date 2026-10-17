@@ -95,18 +95,26 @@ export function leasesCovering(
     }));
 }
 
-/** Cancels a pending lease; a starting or ended one is refused (LEASE_NOT_PENDING). */
+/**
+ * Cancels a pending lease, or a starting exec lease (it has no child to end: its owner's wait ends on the cancel); a
+ * starting start or an ended lease is refused (LEASE_NOT_PENDING).
+ */
 export function cancelLease(id: string, dir = stateDir()): Promise<Lease> {
   const store = new LeaseStore(dir);
   return store.withLock(() => {
     const l = store.get(id);
-    // the store lets a starting lease be cancelled (a stop does that, ending its child); a request may not
-    if (l && l.state !== 'pending')
+    // the store lets a starting lease be cancelled (a stop does that, ending its child); a request may only end a
+    // starting exec, which has no child
+    if (
+      l &&
+      l.state !== 'pending' &&
+      !(l.state === 'starting' && l.kind === 'exec')
+    )
       throw new McprocError(
         'LEASE_NOT_PENDING',
-        `lease ${id} is ${l.state}, only a pending lease can be cancelled`,
+        `lease ${id} is ${l.state}, only a pending lease or a starting exec can be cancelled`,
         {
-          hint: 'Stop its target to end a starting or running lease.',
+          hint: 'Stop its target to end a starting or running start.',
         }
       );
     return store.transition(id, 'cancelled', {

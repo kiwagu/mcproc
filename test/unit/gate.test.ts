@@ -771,4 +771,38 @@ describe('leasesView and cancelLease', () => {
       code: 'BAD_ARGUMENT',
     });
   });
+
+  it('cancels a starting exec lease (it has no child to end), still refusing a starting start lease', async () => {
+    const exec = await store.create(
+      {
+        kind: 'exec',
+        project: 'demo-w2',
+        root: varsProj,
+        slot: 2,
+        repo: '/w/demo',
+        target: 'bun test',
+        apps: [],
+        reload: false,
+        estimate_mib: 512,
+        need_mib: 615,
+        margin: 0.2,
+        reserve_mib: 1024,
+        sources: {},
+        note: null,
+        requester_pid: process.pid,
+      },
+      'pending'
+    );
+    await store.transition(exec.id, 'starting');
+    expect(await cancelLease(exec.id, dir)).toMatchObject({
+      state: 'cancelled',
+      error: 'cancelled by request',
+    });
+    const start = await make('pending');
+    await store.transition(start.id, 'starting');
+    await expect(cancelLease(start.id, dir)).rejects.toMatchObject({
+      code: 'LEASE_NOT_PENDING',
+    });
+    expect(store.get(start.id)?.state).toBe('starting');
+  });
 });

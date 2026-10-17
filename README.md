@@ -235,9 +235,9 @@ apps:
 - `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
   apps that declare `containers:`), `describe` and the sibling measurement; never by monit's loop or by `wait`.
 - **Looking and cancelling.** `mcproc leases` (tool `leases`) shows the host's queue: who runs, who waits and why, the
-  memory reading and the watcher. `leases cancel <id>` cancels a pending lease; a starting one is refused: stop its
-  target instead. `ls` shows a queued app as `queued #N`, `wait` rides through the queue, `doctor` reports the state
-  directory and the watcher. `start --note <text>` keeps a reason on the lease.
+  memory reading and the watcher. `leases cancel <id>` cancels a pending lease or a starting exec; a starting start is
+  refused: stop its target instead. `ls` shows a queued app as `queued #N`, `wait` rides through the queue, `doctor`
+  reports the state directory and the watcher. `start --note <text>` keeps a reason on the lease.
 - **State** lives in `~/.local/state/mcproc` (or `$XDG_STATE_HOME/mcproc`, or `MCPROC_STATE_DIR`): `leases/`, `slots/`,
   `watcher.json` and `watcher.ecosystem.json`. A dev checkout runs the watcher from the bundle `MCPROC_CLI_ENTRY` names.
 

@@ -180,7 +180,7 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Cancel a pending lease',
       description:
-        "Remove a pending lease from the host's queue (a start that has not been admitted yet). A starting or running lease is refused: stop its target instead.",
+        "Remove a pending lease from the host's queue (a start that has not been admitted yet), or a starting exec lease. A starting start or a running lease is refused: stop its target instead.",
       inputSchema: {
         id: z.string().describe('The lease id from leases or a queued start'),
       },
