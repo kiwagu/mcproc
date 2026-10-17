@@ -43,7 +43,7 @@ import {
 export interface WatcherDeps {
   store: LeaseStore;
   memory(): Promise<HostMemory | null>;
-  /** the head's estimate taken again, live: a sibling may have grown or gone since it was queued (an exec keeps its own) */
+  /** the head's estimate taken again, live: a sibling may have grown or gone since it was queued (an exec keeps its own); see watchLeases for when */
   estimate(l: Lease): Promise<{
     estimate_mib: number;
     need_mib: number;
@@ -172,14 +172,32 @@ async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   }
 }
 
+/** How long the waiting head's full estimate (its siblings measured) holds while the memory reading says it cannot fit yet. */
+const ESTIMATE_EVERY_MS = 30_000;
+
+/** Records why the head still waits, under the lock and only while it is still pending: a cancel that landed meanwhile must not be written over. */
+async function noteWaiting(
+  store: LeaseStore,
+  head: Lease,
+  fields: Partial<Lease> & { waiting_for: string }
+): Promise<void> {
+  await store
+    .withLock(() => store.patch(head.id, fields, { expect: 'pending' }))
+    .catch(() => undefined);
+}
+
 /**
  * One judgement of the head: admitted (and, for a start, run to its end), still waiting (its reason recorded), or
  * changed under the watcher (cancelled meanwhile, or cancelled now because it can never fit), so the next head is
- * judged at once.
+ * judged at once. Without `full`, the memory reading is judged against the head's last recorded need first, and its
+ * estimate (the sibling measurement, seconds of docker stats) is taken again only when that check lets it fit; `last`
+ * is set to the head and the time of each estimate taken.
  */
 async function judgeHead(
   deps: WatcherDeps,
-  head: Lease
+  head: Lease,
+  last: { id: string | null; at: number },
+  full: boolean
 ): Promise<'admitted' | 'waiting' | 'changed'> {
   const { store } = deps;
   // its checkout was removed (or is now only a path inside another one): it can never start, and it must not hold
@@ -204,17 +222,29 @@ async function judgeHead(
   let est: Awaited<ReturnType<WatcherDeps['estimate']>>;
   try {
     memory = await deps.memory();
+    if (!full) {
+      const cheap = admit({
+        ahead: 0,
+        memory,
+        need_mib: head.need_mib,
+        reserve_mib: head.reserve_mib,
+        ramping_mib: rampingMib(store.list(), deps.now(), deps.settleMs(head)),
+      });
+      if (!cheap.ok && cheap.reason === 'memory') {
+        if (head.waiting_for !== cheap.waiting_for)
+          await noteWaiting(store, head, { waiting_for: cheap.waiting_for });
+        return 'waiting';
+      }
+    }
     est = await deps.estimate(head);
+    last.id = head.id;
+    last.at = deps.now();
   } catch (e) {
     // its checkout cannot be read now: the reason shows in `leases`, the next tick tries again
     const why = `cannot estimate: ${describeError(e)}`;
     if (head.waiting_for !== why) {
       deps.log(`${head.id}: ${why}`);
-      await store
-        .withLock(() =>
-          store.patch(head.id, { waiting_for: why }, { expect: 'pending' })
-        )
-        .catch(() => undefined);
+      await noteWaiting(store, head, { waiting_for: why });
     }
     return 'waiting';
   }
@@ -261,16 +291,7 @@ async function judgeHead(
     return 'changed';
   }
   if (head.waiting_for !== d.waiting_for || head.need_mib !== est.need_mib)
-    // under the lock and only while still pending: a cancel that landed meanwhile must not be written over
-    await store
-      .withLock(() =>
-        store.patch(
-          head.id,
-          { ...est, waiting_for: d.waiting_for },
-          { expect: 'pending' }
-        )
-      )
-      .catch(() => undefined);
+    await noteWaiting(store, head, { ...est, waiting_for: d.waiting_for });
   return 'waiting';
 }
 
@@ -302,7 +323,8 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
  * head of the FIFO: admit it (starting → the child runs the start → running / failed; an exec lease is only marked
  * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
  * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
- * reconciled. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
+ * reconciled. A head is estimated in full when it becomes the head, when the queue changed, when the memory reading
+ * lets its last need fit, and at least every ESTIMATE_EVERY_MS; the ticks between read the memory alone. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
  * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
  * is gone is ended at once (cancelled at the head, failed while starting, freed while running), and one left starting
  * for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
@@ -327,6 +349,9 @@ export async function watchLeases(
   // patches (a waiting_for with live figures), the lock's files and the temp files never do; one made during the
   // judgement (a lease queued or cancelled while a long estimate ran) skips the sleep
   let asleepOn = '';
+  // the head's last full estimate, and whether the queue changed since the last judgement: both call for a new one
+  const last: { id: string | null; at: number } = { id: null, at: 0 };
+  let woken = false;
   const queueOf = () =>
     store
       .list()
@@ -357,9 +382,14 @@ export async function watchLeases(
         }
       } else idleSince = now;
       if (head && !starting) {
+        const full =
+          woken ||
+          last.id !== head.id ||
+          deps.now() - last.at >= ESTIMATE_EVERY_MS;
+        woken = false;
         let r: 'admitted' | 'waiting' | 'changed' = 'waiting';
         try {
-          r = await judgeHead(deps, head);
+          r = await judgeHead(deps, head, last, full);
         } catch (e) {
           deps.log(`error: ${head.id}: ${describeError(e)}`);
         }
@@ -371,12 +401,16 @@ export async function watchLeases(
         }
       }
       if (opts.once) return 'idle';
-      if (queueOf() !== asleepOn) continue;
+      if (queueOf() !== asleepOn) {
+        woken = true;
+        continue;
+      }
       tick = new AbortController();
       const onAbort = () => tick?.abort();
       opts.signal?.addEventListener('abort', onAbort, { once: true });
       await deps.sleep(tickMs, tick.signal);
       opts.signal?.removeEventListener('abort', onAbort);
+      woken = tick.signal.aborted;
       tick = null;
     }
   } finally {

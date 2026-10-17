@@ -118,6 +118,40 @@ describe('watchLeases', () => {
     expect(l.state).toBe('running');
   });
 
+  it('estimates a head that does not fit once per 30 s, not once per tick, keeps its reason current from the memory reading, and estimates and admits it on the tick memory frees', async () => {
+    available = 1500;
+    const a = await store.create(input(), 'pending');
+    const t0 = now;
+    const d = deps();
+    const estimates: number[] = [];
+    const estimate = d.estimate;
+    d.estimate = async (l) => {
+      estimates.push(now - t0);
+      return estimate(l);
+    };
+    let reads = 0;
+    let seen: string | null | undefined;
+    d.memory = async () => {
+      reads++;
+      if (now - t0 === 14_000) seen = store.get(a.id)?.waiting_for;
+      if (now - t0 >= 10_000) available = 1600;
+      if (now - t0 >= 64_000) available = 5000;
+      return { total_mib: 8000, available_mib: available };
+    };
+    expect(await watchLeases(d, { tickMs: 2000, idleExitMs: 10_000 })).toBe(
+      'idle'
+    );
+    // a full estimate when it became the head, at 30 s and 60 s, then on the tick the reading lets it fit
+    expect(estimates).toEqual([0, 30_000, 60_000, 64_000]);
+    expect(reads).toBe(33); // the memory alone on every tick from 0 to 64 s
+    // the reading of 10 s on, recorded by a tick that did not estimate
+    expect(seen).toBe(
+      'needs 845M, host has 576M over the reserve (269M short)'
+    );
+    expect(started).toEqual([a.id]);
+    expect(store.get(a.id)?.state).toBe('running');
+  });
+
   it('records what the head waits for', async () => {
     available = 1500;
     const a = await store.create(input(), 'pending');
@@ -492,11 +526,17 @@ describe('watchLeases', () => {
     const real = new LeaseStore(dir);
     await real.withLock(() => real.create(input(), 'pending'));
     let reads = 0;
+    let estimates = 0;
+    const base = deps();
     const d: WatcherDeps = {
-      ...deps(),
+      ...base,
       store: real,
       // the reading moves 1 MiB per read: waiting_for changes, and is written, on every judgement
       memory: async () => ({ total_mib: 8000, available_mib: 1500 - ++reads }),
+      estimate: async (l) => {
+        estimates++;
+        return base.estimate(l);
+      },
       sleep: abortableSleep,
       now: () => Date.now(),
       watch: leaseDirWatch(real.dir),
@@ -504,12 +544,13 @@ describe('watchLeases', () => {
     const ac = new AbortController();
     const run = watchLeases(d, { tickMs: 2000, signal: ac.signal });
     await new Promise((r) => setTimeout(r, 600));
-    expect(reads).toBe(1);
+    expect([reads, estimates]).toEqual([1, 1]);
     await real.withLock(() =>
       real.create(input({ project: 'demo-w2', root: '/w/b' }), 'pending')
     );
     await new Promise((r) => setTimeout(r, 400));
-    expect(reads).toBe(2);
+    // the wake judges the head in full: its estimate is taken again, well within its 30 s
+    expect([reads, estimates]).toEqual([2, 2]);
     ac.abort();
     expect(await run).toBe('aborted');
   });
