@@ -238,7 +238,8 @@ apps:
 - **The watcher** is a pm2 process, `mcproc-watcher` in the `mcproc` namespace. It judges the head every 2 s and at once
   when the queue changes, exits after a minute idle, and the next queued start launches it again. While the head waits,
   each tick reads the memory alone; its siblings are measured again when that reading lets it fit, when the queue
-  changes, and every 30 s. It ends leases whose owner is gone (`checkout gone`, `requester gone`) and an admitted exec
+  changes, and every 30 s. Each full judgement budgets the head again (apps that came up meanwhile drop out of its need),
+  and a queued start keeps the `--host` it was given. It ends leases whose owner is gone (`checkout gone`, `requester gone`) and an admitted exec
   that has not run within 60 s (`the exec did not take its turn`). `stop` and `delete` cancel the starts they overlap
   before stopping, and free the running leases afterwards.
 - `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
