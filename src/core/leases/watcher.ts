@@ -84,14 +84,18 @@ async function moveIf(
 
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
- * their starter lives); a starting one whose recorded child is gone is over at once, one that never recorded a child
- * (or an exec whose owner is gone) after `stuckMs`.
+ * their starter lives, for at most STARTER_TRUST_MS, see starterAlive); a starting one whose recorded child is gone is
+ * over at once, one that never recorded a child (or an exec whose owner is gone) after `stuckMs`.
  */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
-      if (l.state === 'running' && l.kind === 'start' && !starterAlive(l)) {
+      if (
+        l.state === 'running' &&
+        l.kind === 'start' &&
+        !starterAlive(l, deps.now())
+      ) {
         let gone = deps.gone?.(l) ?? false;
         let online = new Set<string>();
         if (!gone)
@@ -108,7 +112,7 @@ async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
             'running',
             'freed',
             { error: gone ? 'checkout gone' : 'no app online any more' },
-            (cur) => !starterAlive(cur)
+            (cur) => !starterAlive(cur, deps.now())
           );
       }
       if (l.state !== 'starting') continue;
@@ -282,8 +286,9 @@ export async function watchLeases(
   const { store } = deps;
   let idleSince = deps.now();
   let tick: AbortController | null = null;
-  // what the queue looked like when the loop went to sleep: only a change of it wakes the loop, so the watcher's own
-  // patches (a waiting_for with live figures), the lock's files and the temp files never do
+  // what the queue looked like before the head was judged: only a change of it wakes the loop, so the watcher's own
+  // patches (a waiting_for with live figures), the lock's files and the temp files never do; one made during the
+  // judgement (a lease queued or cancelled while a long estimate ran) skips the sleep
   let asleepOn = '';
   const queueOf = () =>
     store
@@ -302,6 +307,7 @@ export async function watchLeases(
         deps.log(`error: prune: ${describeError(e)}`);
       }
       await reconcile(deps, stuckMs);
+      asleepOn = queueOf();
       const starting = store.list().some((l) => l.state === 'starting');
       const head = store.head();
       const now = deps.now();
@@ -328,7 +334,7 @@ export async function watchLeases(
         }
       }
       if (opts.once) return 'idle';
-      asleepOn = queueOf();
+      if (queueOf() !== asleepOn) continue;
       tick = new AbortController();
       const onAbort = () => tick?.abort();
       opts.signal?.addEventListener('abort', onAbort, { once: true });

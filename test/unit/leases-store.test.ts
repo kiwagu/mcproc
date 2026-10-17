@@ -8,6 +8,8 @@ import {
   LOCK_STALE_MS,
   LeaseStore,
   pidAlive,
+  starterAlive,
+  STARTER_TRUST_MS,
   type NewLease,
 } from '../../src/core/leases/store.js';
 
@@ -311,6 +313,60 @@ describe('LeaseStore', () => {
     expect(pidAlive(1)).toBe(true);
     const deadPid = spawnSync(process.execPath, ['-e', '0']).pid as number;
     expect(pidAlive(deadPid)).toBe(false);
+  });
+
+  it('starterAlive: a live starter is trusted for ten minutes from running (else admitted), a dead or missing one never', () => {
+    const now = 1_700_000_000_000;
+    const ago = (ms: number) => new Date(now - ms).toISOString();
+    const deadPid = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    expect(STARTER_TRUST_MS).toBe(600_000);
+    const live = { child_pid: process.pid, admitted_at: null };
+    expect(starterAlive({ ...live, running_at: ago(10_000) }, now)).toBe(true);
+    // a fast start inside a long-lived process whose clear failed pins its lease no longer than that
+    expect(starterAlive({ ...live, running_at: ago(600_001) }, now)).toBe(
+      false
+    );
+    expect(
+      starterAlive(
+        { child_pid: process.pid, running_at: null, admitted_at: ago(1000) },
+        now
+      )
+    ).toBe(true);
+    expect(
+      starterAlive(
+        { child_pid: process.pid, running_at: null, admitted_at: ago(700_000) },
+        now
+      )
+    ).toBe(false);
+    // running_at wins over an older admitted_at: the start under the watcher began when it reached running
+    expect(
+      starterAlive(
+        {
+          child_pid: process.pid,
+          running_at: ago(1000),
+          admitted_at: ago(700_000),
+        },
+        now
+      )
+    ).toBe(true);
+    expect(
+      starterAlive(
+        { child_pid: deadPid, running_at: ago(1000), admitted_at: null },
+        now
+      )
+    ).toBe(false);
+    expect(
+      starterAlive(
+        { child_pid: null, running_at: ago(1000), admitted_at: null },
+        now
+      )
+    ).toBe(false);
+    expect(
+      starterAlive(
+        { child_pid: process.pid, running_at: null, admitted_at: null },
+        now
+      )
+    ).toBe(false);
   });
 
   it('recovers the sequence when .seq is missing or garbled', async () => {

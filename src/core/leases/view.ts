@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { McprocError } from '../errors.js';
 import { readHostMemory, type HostMemory } from '../memory.js';
+import type { Pm2Process } from '../pm2.js';
 import type { Context } from '../resolve.js';
 import { stateDir } from '../state.js';
 import { WATCHER_NAME, WATCHER_NS } from './ensure.js';
@@ -17,30 +18,47 @@ export interface LeasesView {
   leases: (Lease & { position: number })[];
 }
 
-/** The host's queue as `leases` shows it: every lease with its position, the memory reading and the watcher's state when a context is given. */
+/**
+ * The host's queue as `leases` shows it: every lease with its position, the memory reading and the watcher's state when
+ * a context is given. A read never fails on the extras: the prune is skipped when the lease lock cannot be taken, and
+ * the memory or the watcher is null when meminfo or pm2's list does not answer.
+ */
 export async function leasesView(
   dir = stateDir(),
   ctx?: Context
 ): Promise<LeasesView> {
   const store = new LeaseStore(dir);
   // a host that never queued anything keeps no state directory: the read does not make one
-  if (fs.existsSync(store.dir)) await store.withLock(() => store.prune());
+  if (fs.existsSync(store.dir))
+    await store
+      .withLock(() => store.prune())
+      .catch(() => {
+        /* the lock is busy: the ended leases are pruned by a later read or the watcher */
+      });
   const leases = store
     .list()
     .map((l) => ({ ...l, position: store.positionOf(l.id) }));
   let memory: HostMemory | null = null;
   let watcher: LeasesView['watcher'] = null;
   if (ctx?.host.local) {
-    memory = await readHostMemory(ctx.transport, ctx.host);
-    const w = (await ctx.pm2.jlist()).find(
-      (p) => p.name === WATCHER_NAME && p.namespace === WATCHER_NS
-    );
-    watcher = {
-      online: Boolean(w && w.status === 'online'),
-      pid: w && w.pid > 0 ? w.pid : null,
-    };
+    memory = await readHostMemory(ctx.transport, ctx.host).catch(() => null);
+    watcher = await ctx.pm2.jlist().then(watcherIn, () => null);
   }
   return { state_dir: dir, memory, watcher, leases };
+}
+
+/** The watcher's state in a pm2 list: online or not, and its pid (null when it has none). */
+export function watcherIn(procs: Pm2Process[]): {
+  online: boolean;
+  pid: number | null;
+} {
+  const w = procs.find(
+    (p) => p.name === WATCHER_NAME && p.namespace === WATCHER_NS
+  );
+  return {
+    online: Boolean(w && w.status === 'online'),
+    pid: w && w.pid > 0 ? w.pid : null,
+  };
 }
 
 /** Cancels a pending lease; a starting or ended one is refused (LEASE_NOT_PENDING). */

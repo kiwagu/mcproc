@@ -9,6 +9,7 @@ import {
   WATCHER_NAME,
   WATCHER_NS,
 } from '../../src/core/leases/ensure.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 import { Pm2Client } from '../../src/core/pm2.js';
 import { fakeCtx } from '../helpers/ctx.js';
 
@@ -140,9 +141,44 @@ describe('watcherEntry and ensureWatcher', () => {
       { match: /startOrRestart/, result: {} },
     ]);
     expect(await ensureWatcher(ctx, dir)).toBe('started');
-    expect(lists).toBe(3);
+    // three looks while it leaves, then the look under the lock before the launch
+    expect(lists).toBe(4);
     expect(starts(ctx)).toBe(1);
     expect(fs.existsSync(path.join(dir, 'watcher.json'))).toBe(false);
+  });
+
+  it('ensureWatcher never holds the lease lock while it waits out a leaving watcher: it looks again under the lock and launches there', async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
+    note(1000);
+    const lock = path.join(dir, 'leases', '.lock');
+    const held: boolean[] = [];
+    const ctx = fakeCtx(vars, 'local', [
+      {
+        match: /pm2 'jlist'/,
+        result: () => {
+          held.push(fs.existsSync(lock));
+          return { stdout: jlist(held.length <= 2 ? 'online' : 'stopped') };
+        },
+      },
+      {
+        match: /startOrRestart/,
+        result: () => {
+          held.push(fs.existsSync(lock));
+          return {};
+        },
+      },
+    ]);
+    // another holder takes the lock while the wait runs, and gets it at once
+    const other = new LeaseStore(dir);
+    const during = new Promise<number>((resolve) =>
+      setTimeout(() => {
+        const t0 = Date.now();
+        void other.withLock(() => resolve(Date.now() - t0));
+      }, 100)
+    );
+    expect(await ensureWatcher(ctx, dir)).toBe('started');
+    expect(held).toEqual([false, false, false, true, true]);
+    expect(await during).toBeLessThan(100);
   });
 
   it('ensureWatcher serialises its launch: two starts that queue at once launch one watcher', async () => {

@@ -4,6 +4,7 @@ import { readHostMemory, type HostMemory } from '../memory.js';
 import { findProcess, isRunning, type Pm2Process } from '../pm2.js';
 import type { Context } from '../resolve.js';
 import { stateDir } from '../state.js';
+import { abortableSleep } from '../wait.js';
 import {
   admit,
   estimateApps,
@@ -205,20 +206,37 @@ export async function freeOnFailure(
   }
 }
 
-/** A start admitted at once that went through: its starter is cleared under the lock, while the lease is still running and still names it. */
+/** How many times endFastStart tries its clear, and how long it pauses between two tries, in milliseconds. */
+const END_FAST_TRIES = 3;
+const END_FAST_PAUSE_MS = 2000;
+
+/**
+ * A start admitted at once that went through: its starter is cleared under the lock, while the lease is still running
+ * and still names it. A clear that fails (the lock is busy) is tried END_FAST_TRIES times END_FAST_PAUSE_MS apart before
+ * the last error is let through; a lease left naming its starter is then trusted no longer than STARTER_TRUST_MS.
+ */
 export async function endFastStart(
   store: LeaseStore,
-  lease: Lease
+  lease: Lease,
+  sleep: (ms: number) => Promise<void> = abortableSleep
 ): Promise<void> {
-  await store.withLock(async () => {
-    const cur = store.get(lease.id);
-    if (
-      cur?.state === 'running' &&
-      cur.child_pid !== null &&
-      cur.child_pid === lease.child_pid
-    )
-      await store.patch(lease.id, { child_pid: null });
-  });
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await store.withLock(async () => {
+        const cur = store.get(lease.id);
+        if (
+          cur?.state === 'running' &&
+          cur.child_pid !== null &&
+          cur.child_pid === lease.child_pid
+        )
+          await store.patch(lease.id, { child_pid: null });
+      });
+      return;
+    } catch (e) {
+      if (attempt >= END_FAST_TRIES) throw e;
+      await sleep(END_FAST_PAUSE_MS);
+    }
+  }
 }
 
 /** The leases of this checkout that still wait for or hold memory (pending, starting, running), read without the lock. */

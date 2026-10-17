@@ -23,6 +23,7 @@ import {
 import { cancelLease, leasesView } from '../../src/core/leases/view.js';
 import { unreachableRow } from '../../src/core/list.js';
 import { parseJlist } from '../../src/core/pm2.js';
+import { McprocError } from '../../src/core/errors.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
@@ -430,6 +431,58 @@ describe('finishing and releasing', () => {
     });
   });
 
+  it('endFastStart tries its clear three times 2 s apart before it gives up', async () => {
+    const own = await store.create(
+      {
+        kind: 'start',
+        project: 'p',
+        root: '/r',
+        slot: null,
+        repo: '/r',
+        target: 't',
+        apps: ['a'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'running',
+      { child_pid: process.pid }
+    );
+    const slept: number[] = [];
+    const sleep = async (ms: number) => {
+      slept.push(ms);
+    };
+    const busy = new McprocError('TIMEOUT', 'the lease lock is held');
+    // the lock is busy twice, then free: the third try clears the starter
+    const flaky = new LeaseStore(dir);
+    let tries = 0;
+    const take = flaky.withLock.bind(flaky);
+    flaky.withLock = (async (fn: () => unknown) => {
+      if (++tries < 3) throw busy;
+      return take(fn as () => Promise<unknown>);
+    }) as LeaseStore['withLock'];
+    await endFastStart(flaky, own, sleep);
+    expect(tries).toBe(3);
+    expect(slept).toEqual([2000, 2000]);
+    expect(store.get(own.id)?.child_pid).toBeNull();
+    // always busy: the third failure is let through, after the same two pauses
+    const stuck = new LeaseStore(dir);
+    let stuckTries = 0;
+    stuck.withLock = (async () => {
+      stuckTries++;
+      throw busy;
+    }) as LeaseStore['withLock'];
+    slept.length = 0;
+    await expect(endFastStart(stuck, own, sleep)).rejects.toBe(busy);
+    expect(stuckTries).toBe(3);
+    expect(slept).toEqual([2000, 2000]);
+  });
+
   const lease = (over: Partial<NewLease>): NewLease => ({
     kind: 'start',
     project: 'demo-w2',
@@ -617,6 +670,70 @@ describe('leasesView and cancelLease', () => {
     const v = await leasesView(dir, ctx);
     expect(v.memory).toEqual({ total_mib: 8000, available_mib: 4000 });
     expect(v.watcher).toEqual({ online: true, pid: 77 });
+  });
+
+  it('answers with the queue when meminfo and jlist fail: memory and watcher are null, the read does not fail', async () => {
+    const a = await make('pending');
+    // no rule answers: every command the context runs fails
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const v = await leasesView(dir, ctx);
+    expect(v).toMatchObject({ state_dir: dir, memory: null, watcher: null });
+    expect(v.leases.map((l) => [l.id, l.position])).toEqual([[a.id, 1]]);
+    const jlistOnly = fakeCtx(varsProj, 'local', [
+      {
+        match: '__MCPROC_MEM__',
+        result: () => {
+          throw new Error('meminfo: the shell did not start');
+        },
+      },
+      {
+        match: /pm2 'jlist'/,
+        result: { stdout: '[]' },
+      },
+    ]);
+    expect(await leasesView(dir, jlistOnly)).toMatchObject({
+      memory: null,
+      watcher: { online: false, pid: null },
+    });
+  });
+
+  it('skips its prune when the lease lock cannot be taken, and still answers', async () => {
+    const old = new LeaseStore(dir, { now: () => Date.now() - 2 * 86_400_000 });
+    const ended = await old.create(
+      {
+        kind: 'start',
+        project: 'demo-w2',
+        root: varsProj,
+        slot: 2,
+        repo: '/w/demo',
+        target: 'dev',
+        apps: ['db'],
+        reload: false,
+        estimate_mib: 512,
+        need_mib: 615,
+        margin: 0.2,
+        reserve_mib: 1024,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'pending'
+    );
+    await old.transition(ended.id, 'cancelled');
+    const busy = vi
+      .spyOn(LeaseStore.prototype, 'withLock')
+      .mockRejectedValue(
+        new McprocError('TIMEOUT', 'the lease lock is held by pid 9')
+      );
+    try {
+      const v = await leasesView(dir);
+      expect(busy).toHaveBeenCalled();
+      // not pruned: the day-old cancelled lease is still listed
+      expect(v.leases.map((l) => l.id)).toEqual([ended.id]);
+    } finally {
+      busy.mockRestore();
+    }
+    expect((await leasesView(dir)).leases).toEqual([]);
   });
 
   it('cancels a pending lease and refuses a starting or running one', async () => {

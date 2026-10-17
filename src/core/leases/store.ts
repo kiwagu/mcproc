@@ -90,9 +90,23 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
-/** Whether the process running a lease's start is still there (see `child_pid`): a start that runs may not have its apps up yet. */
-export function starterAlive(l: Pick<Lease, 'child_pid'>): boolean {
-  return typeof l.child_pid === 'number' && pidAlive(l.child_pid);
+/** How long a lease's live starter is trusted after its start began, in milliseconds: ten minutes. */
+export const STARTER_TRUST_MS = 600_000;
+
+/**
+ * Whether the process running a lease's start is still there (see `child_pid`) and the start began (`running_at`, else
+ * `admitted_at`) less than STARTER_TRUST_MS before `now`: a start that runs may not have its apps up yet, and a start
+ * admitted at once inside a long-lived process (the MCP server) whose clear failed pins its lease no longer than that.
+ */
+export function starterAlive(
+  l: Pick<Lease, 'child_pid' | 'running_at' | 'admitted_at'>,
+  now = Date.now()
+): boolean {
+  if (typeof l.child_pid !== 'number') return false;
+  const began = l.running_at ?? l.admitted_at;
+  if (began === null || !(now - Date.parse(began) < STARTER_TRUST_MS))
+    return false;
+  return pidAlive(l.child_pid);
 }
 
 /** The tokens of the locks this process holds right now: a lock naming this pid with another token is a leftover. */

@@ -362,6 +362,49 @@ describe('watchLeases', () => {
     expect(lines.filter((l) => l.startsWith('error'))).toEqual([]);
   });
 
+  it('a lease queued while the head is judged is taken at once: the queue is compared as it was before the judgement, not as it is at the sleep', async () => {
+    available = 1500; // the head does not fit: it waits
+    const a = await store.create(input(), 'pending');
+    const events: string[] = [];
+    let wake: (() => void) | null = null;
+    const ac = new AbortController();
+    let b: Lease | null = null;
+    const d: WatcherDeps = {
+      ...deps(),
+      estimate: async (l) => {
+        events.push(`estimate ${l.id === a.id ? 'a' : 'b'}`);
+        // a long estimate: a start queues meanwhile, and its file event fires while the loop is not asleep
+        if (!b) {
+          b = await store.create(
+            input({ project: 'demo-w2', root: '/w/b' }),
+            'pending'
+          );
+          wake?.();
+        }
+        return {
+          estimate_mib: l.estimate_mib,
+          need_mib: l.need_mib,
+          reserve_mib: l.reserve_mib,
+          sources: l.sources,
+        };
+      },
+      watch: (cb) => {
+        wake = cb;
+        return () => undefined;
+      },
+      sleep: async (ms) => {
+        events.push(`sleep ${ms}`);
+        now += ms;
+        ac.abort();
+      },
+    };
+    expect(await watchLeases(d, { tickMs: 2000, signal: ac.signal })).toBe(
+      'aborted'
+    );
+    // the head is judged again at once (the queue changed during the first judgement), and only then does it sleep
+    expect(events).toEqual(['estimate a', 'estimate a', 'sleep 2000']);
+  });
+
   it("wakes on a change of the queue only, through the CLI's fs.watch wiring: its own patch of waiting_for does not wake it, a new pending lease does", async () => {
     const real = new LeaseStore(dir);
     await real.withLock(() => real.create(input(), 'pending'));

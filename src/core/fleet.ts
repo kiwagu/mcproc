@@ -401,7 +401,9 @@ export async function actOn(
       // the start went through: from now on the watcher may judge the lease by its apps
       if (admitted)
         await endFastStart(gate.store, admitted).catch(() => {
-          /* bookkeeping only: the apps run, and a stop still frees the lease */
+          /* bookkeeping only: the apps run; the lease still names this process as its starter, which is trusted for at
+             most ten minutes from its start (starterAlive), so until then a stop leaves it running, and after that a
+             stop or the watcher frees it */
         });
       // a checkout with no live lease skips pm2's list and the lock
       if (stopping)

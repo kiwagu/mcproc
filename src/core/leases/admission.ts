@@ -71,7 +71,7 @@ export function rampingMib(
   let mib = 0;
   for (const l of leases) {
     if (l.state !== 'running' || !l.running_at) continue;
-    if (now - Date.parse(l.running_at) < settleMs || starterAlive(l))
+    if (now - Date.parse(l.running_at) < settleMs || starterAlive(l, now))
       mib += l.need_mib;
   }
   return mib;
