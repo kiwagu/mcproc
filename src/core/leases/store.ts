@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from '../errors.js';
 
@@ -79,14 +80,19 @@ export const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 10_000;
 const PRUNE_AFTER_MS = 24 * 3600 * 1000;
 
-const alive = (pid: number): boolean => {
+/** Whether a process with that pid exists, as `kill -0` tells it (a process of another user, EPERM, exists too). */
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
-};
+}
+
+/** The tokens of the locks this process holds right now: a lock naming this pid with another token is a leftover. */
+const LIVE_TOKENS = new Set<string>();
+const STRAY = /^\.lock\..+\.(tmp|stale)$/;
 
 interface Held {
   pid: number;
@@ -117,8 +123,8 @@ function readHeld(file: string): Held | null {
 
 /**
  * The host's leases as files under `<state>/leases`: one JSON per lease named by sequence and id, a `.seq` counter,
- * and a `.lock` taken with O_EXCL around every change. Reads need no lock: a write is a rename, so a reader sees a
- * whole file or none.
+ * and a `.lock` around every change, hard-linked atomically from a token file its holder wrote first. Reads need no
+ * lock: a write is a rename, so a reader sees a whole file or none.
  */
 export class LeaseStore {
   readonly dir: string;
@@ -150,7 +156,11 @@ export class LeaseStore {
     fs.renameSync(tmp, f);
     return l;
   }
-  /** Runs `fn` holding the lock; a lock older than LOCK_STALE_MS whose holder is dead is broken. */
+  /**
+   * Runs `fn` holding the lock (not reentrant). A lock is broken when it is older than LOCK_STALE_MS and its holder is
+   * dead, when it was taken before this boot, when it names this process with a token this process does not hold, or,
+   * unparseable, when its file's mtime is older than LOCK_STALE_MS.
+   */
   async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true });
     const lock = path.join(this.dir, '.lock');
@@ -161,8 +171,13 @@ export class LeaseStore {
       JSON.stringify({ pid: this.pid, at: this.now(), token })
     );
     const start = Date.now();
+    let swept = false;
     try {
       while (!this.tryLink(tmp, lock)) {
+        if (!swept) {
+          this.sweepStrays();
+          swept = true;
+        }
         if (this.breakIfStale(lock, token)) continue;
         if (Date.now() - start > LOCK_WAIT_MS)
           throw new McprocError(
@@ -175,10 +190,34 @@ export class LeaseStore {
     } finally {
       fs.rmSync(tmp, { force: true });
     }
+    LIVE_TOKENS.add(token);
     try {
       return await fn();
     } finally {
       this.release(lock, token);
+      LIVE_TOKENS.delete(token);
+    }
+  }
+  /** Whether a parsed lock is a leftover: from before this boot, this process's own but not held, or old with a dead holder. */
+  private heldStale(held: Held): boolean {
+    // pids are reused after a reboot and the state directory outlives it: a lock from before the boot is nobody's
+    if (held.at < this.now() - os.uptime() * 1000) return true;
+    // this process knows every lock it holds: one naming it with another token was brought back after its release
+    if (held.pid === process.pid && !LIVE_TOKENS.has(held.token)) return true;
+    return this.now() - held.at > LOCK_STALE_MS && !pidAlive(held.pid);
+  }
+  /** Removes the `.lock.*.tmp` and `.lock.*.stale` files a crashed holder or breaker left, once older than LOCK_STALE_MS by mtime. */
+  private sweepStrays(): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.dir);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      if (!STRAY.test(n)) continue;
+      const f = path.join(this.dir, n);
+      if (this.mtimeAgeMs(f) > LOCK_STALE_MS) fs.rmSync(f, { force: true });
     }
   }
   /** Takes the lock by hard-linking the prepared file, which is atomic: the lock never exists empty; false when it is held. */
@@ -202,7 +241,7 @@ export class LeaseStore {
     }
     const held = parseHeld(raw);
     const stale = held
-      ? this.now() - held.at > LOCK_STALE_MS && !alive(held.pid)
+      ? this.heldStale(held)
       : this.mtimeAgeMs(lock) > LOCK_STALE_MS;
     if (!stale) return false;
     // Only one breaker wins the rename; the loser sees ENOENT and retries.
@@ -220,12 +259,15 @@ export class LeaseStore {
       return true;
     }
     // We moved a lock we did not judge stale: a fresh holder took it in between, so put it back.
-    // Residual window: a third waiter may acquire between the rename and the restore. Accepted, since the
-    // lock is held for milliseconds by a handful of CLI runs.
+    // Residual window: a third waiter may acquire between the rename and the restore. Accepted, since the lock is
+    // held for milliseconds at a time, though its holders may be long-lived processes (the watcher, an MCP server)
+    // as well as CLI runs; a restored lock its holder already released is broken by that holder's next take.
     try {
       fs.linkSync(moved, lock);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      // EEXIST: someone holds the lock again; ENOENT: a sweep took the moved file, nothing to put back
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST' && code !== 'ENOENT') throw e;
     }
     fs.rmSync(moved, { force: true });
     return true;

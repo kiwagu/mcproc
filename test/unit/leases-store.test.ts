@@ -4,7 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { stateDir } from '../../src/core/state.js';
-import { LeaseStore, type NewLease } from '../../src/core/leases/store.js';
+import {
+  LOCK_STALE_MS,
+  LeaseStore,
+  pidAlive,
+  type NewLease,
+} from '../../src/core/leases/store.js';
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -166,6 +171,77 @@ describe('LeaseStore', () => {
     expect(fs.existsSync(lock)).toBe(true);
     expect(JSON.parse(fs.readFileSync(lock, 'utf8')).token).toBe('other');
     fs.rmSync(lock, { force: true });
+  });
+
+  it('breaks a lock that names this process with a token it does not hold (one a restore brought back)', async () => {
+    fs.mkdirSync(path.join(dir, 'leases'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'leases', '.lock'),
+      JSON.stringify({ pid: process.pid, at: now, token: 'released' })
+    );
+    await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+  });
+
+  it("keeps this process's own live locks: two holders without a pid override still take turns", async () => {
+    const real = new LeaseStore(dir, { now: () => now });
+    const order: string[] = [];
+    await Promise.all([
+      real.withLock(async () => {
+        order.push('a-in');
+        await new Promise((r) => setTimeout(r, 50));
+        order.push('a-out');
+      }),
+      real.withLock(async () => {
+        order.push('b');
+      }),
+    ]);
+    expect(order).toEqual(['a-in', 'a-out', 'b']);
+  });
+
+  it('breaks a lock taken before this boot, even when its pid is alive again', async () => {
+    fs.mkdirSync(path.join(dir, 'leases'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'leases', '.lock'),
+      JSON.stringify({
+        pid: process.ppid,
+        at: now - (os.uptime() + 3600) * 1000,
+        token: 'before-boot',
+      })
+    );
+    await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+  });
+
+  it('sweeps stray lock temp and stale files older than LOCK_STALE_MS when the lock is contended', async () => {
+    const leases = path.join(dir, 'leases');
+    fs.mkdirSync(leases, { recursive: true });
+    const old = new Date(Date.now() - LOCK_STALE_MS - 60_000);
+    const stray = (name: string, aged: boolean) => {
+      const f = path.join(leases, name);
+      fs.writeFileSync(f, '{}');
+      if (aged) fs.utimesSync(f, old, old);
+      return f;
+    };
+    const oldTmp = stray('.lock.1-dead.tmp', true);
+    const oldStale = stray('.lock.1-dead.stale', true);
+    const freshTmp = stray('.lock.2-waiting.tmp', false);
+    const other = stray('000001-l_kept.json.1.tmp', true);
+    await Promise.all([
+      store.withLock(() => new Promise((r) => setTimeout(r, 100))),
+      new Promise((r) => setTimeout(r, 20)).then(() =>
+        store.withLock(() => 'ok')
+      ),
+    ]);
+    expect(fs.existsSync(oldTmp)).toBe(false);
+    expect(fs.existsSync(oldStale)).toBe(false);
+    expect(fs.existsSync(freshTmp)).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+  });
+
+  it('pidAlive: this process and pid 1 exist (another user counts), an exited one does not', () => {
+    expect(pidAlive(process.pid)).toBe(true);
+    expect(pidAlive(1)).toBe(true);
+    const deadPid = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    expect(pidAlive(deadPid)).toBe(false);
   });
 
   it('recovers the sequence when .seq is missing or garbled', async () => {
