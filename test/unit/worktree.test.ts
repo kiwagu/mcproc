@@ -28,8 +28,14 @@ import {
   type WorktreeDeps,
 } from '../../src/core/worktree.js';
 
+// the fixtures' own git calls run without the user's global or system config (commit signing, a hooks directory)
+const gitEnv = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_NOSYSTEM: '1',
+};
 const git = (args: string[], cwd: string) =>
-  execFileSync('git', args, { cwd, stdio: 'pipe' }).toString();
+  execFileSync('git', args, { cwd, stdio: 'pipe', env: gitEnv }).toString();
 
 describe('worktree', () => {
   let base: string;
