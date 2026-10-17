@@ -407,3 +407,18 @@ describe('listWithReloads (ls, with and without --reloads)', () => {
     expect(r.errors[1]).toBe(r.unread[0]);
   });
 });
+
+describe('docker stats on the ls path', () => {
+  it('ls asks docker for the declared containers; listFleet by itself does not', async () => {
+    const state = (): FakeState => ({
+      files: {},
+      procs: { local: [], box: [running('web', 3)] },
+    });
+    const ls = fakeHosts(state());
+    await listWithReloads(ls.fleet, ls.fleet.select(['all']), false);
+    expect(ls.probes.some((c) => c.includes('docker stats'))).toBe(true);
+    const plain = fakeHosts(state());
+    await listFleet(plain.fleet, plain.fleet.select(['all']));
+    expect(plain.probes.some((c) => c.includes('docker stats'))).toBe(false);
+  });
+});

@@ -415,7 +415,7 @@ export async function describeApp(
   pm2: Pm2AppConfig;
 }> {
   const app = ctx.manifest.apps[name];
-  const snap = await snapshot(ctx, { urls: [name] });
+  const snap = await snapshot(ctx, { urls: [name], containers: 'probe' });
   const [row] = rowsFor(ctx, snap, [name]);
   const p = findProcess(snap.procs, ctx.manifest.project, name);
   const pm2 = buildEcosystem(ctx.manifest, ctx.host).apps.find(

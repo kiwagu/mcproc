@@ -178,7 +178,9 @@ export async function listWithReloads(
   names: string[],
   reloads: boolean
 ): Promise<{ rows: LsRow[]; errors: HostError[]; unread: HostError[] }> {
-  const listed = await listFleet(fleet, names);
+  const listed = await listFleet(fleet, names, {
+    containers: 'probe',
+  });
   if (!reloads) return { rows: listed.rows, errors: listed.errors, unread: [] };
   const r = await countReloads(fleet, listed.probes, listed.rows);
   return {
