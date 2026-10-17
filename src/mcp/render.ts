@@ -11,6 +11,7 @@ import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
 import type { VarInfo } from '../core/manifest.js';
 import type { LeasesView } from '../core/leases/view.js';
+import type { ExecResult } from '../core/exec.js';
 import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
@@ -655,4 +656,10 @@ export function renderAdopted(r: AdoptResult): {
       'nothing to adopt: every port the running apps hold is declared'
     );
   return { text: lines.join('\n'), failed: r.errors.length > 0 };
+}
+
+/** An exec's answer: the command, how long it waited, its lease, the exit code, then the captured tail. */
+export function renderExec(command: string[], r: ExecResult): string {
+  const head = `exec ${command.join(' ')}: exit ${r.code}${r.waited_ms > 1000 ? ` after ${Math.round(r.waited_ms / 1000)} s in the queue` : ''}${r.lease ? ` (lease ${r.lease.id}, ${r.lease.state})` : ''}`;
+  return r.output ? `${head}\n${r.output}` : head;
 }

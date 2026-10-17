@@ -20,6 +20,8 @@ import {
   watchLeases,
 } from '../core/leases/watcher.js';
 import { stateDir } from '../core/state.js';
+import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
+import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
@@ -601,6 +603,76 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [id]) => {
         const l = await cancelLease(id);
         emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('exec <command...>')
+    .description(
+      "run a one-off command from the project root with the manifest's exec.env; with --memory, under a lease in the host's queue (use -- before the command)"
+    )
+    // no passThroughOptions: it needs positional options on the program, which would refuse the global options written
+    // after a command (`ls --json`); `--` already ends exec's options and hands the rest over verbatim
+    .option(
+      '--memory <size>',
+      'what the command needs, e.g. 4G: it waits its turn like a start'
+    )
+    .option('--note <text>', 'what this run is for, kept on its lease')
+    .option(
+      '--timeout <s>',
+      'seconds to wait in the queue (default 600, max 3600)'
+    )
+    .action(
+      wrap(async (g, o, args) => {
+        // the variadic <command...> arrives as one array argument
+        const command = args.flat();
+        // a bad request is refused before any host is touched
+        let memoryMib: number | undefined;
+        if (o.memory !== undefined)
+          try {
+            memoryMib = parseSizeMib(String(o.memory));
+          } catch (e) {
+            throw new McprocError('BAD_ARGUMENT', (e as Error).message);
+          }
+        const timeoutS =
+          o.timeout === undefined ? undefined : Number(o.timeout);
+        if (timeoutS !== undefined && !(timeoutS > 0))
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            `--timeout is a number of seconds above 0, not "${o.timeout}"`
+          );
+        const prep = prepare({ project: g.project, host: g.host });
+        assertExecHost(prep.host);
+        const ctx = await connect(prep);
+        const ac = new AbortController();
+        const stop = () => ac.abort();
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+        try {
+          const r = await runExec(
+            ctx,
+            {
+              command,
+              memoryMib,
+              note: o.note === undefined ? undefined : String(o.note),
+              timeoutMs: timeoutS === undefined ? undefined : timeoutS * 1000,
+              capture: false,
+              signal: ac.signal,
+            },
+            defaultExecDeps()
+          );
+          if (g.json)
+            io.out(
+              JSON.stringify(
+                { code: r.code, lease: r.lease, waited_ms: r.waited_ms },
+                null,
+                2
+              )
+            );
+          process.exitCode = r.code;
+        } finally {
+          process.off('SIGINT', stop);
+          process.off('SIGTERM', stop);
+        }
       })
     );
   program

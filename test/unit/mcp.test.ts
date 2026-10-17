@@ -47,7 +47,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 17 tools with annotations and short instructions', async () => {
+  it('registers the 18 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -55,6 +55,7 @@ describe('mcp server', () => {
       'delete',
       'describe',
       'doctor',
+      'exec',
       'flush',
       'hosts',
       'incidents',
@@ -90,6 +91,17 @@ describe('mcp server', () => {
       readOnlyHint: false,
       destructiveHint: false,
     });
+    // exec runs whatever it is given: not read-only, not idempotent, never on another host
+    expect(byName.exec.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(byName.exec.description).toMatch(/THIS machine/);
+    expect(byName.exec.description).toMatch(/last 200 lines/);
+    expect(
+      Object.keys(byName.exec.inputSchema.properties as object).sort()
+    ).toEqual(['command', 'host', 'memory', 'note', 'project', 'timeout_s']);
     // what this start is for rides on its lease; the lease id itself is the watcher's business
     const startProps = byName.start.inputSchema.properties as Record<
       string,
@@ -240,6 +252,81 @@ describe('mcp server', () => {
     } finally {
       vi.unstubAllEnvs();
       fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('exec refuses another host and a bad memory size before touching any host', async () => {
+    const cl = await client(neverSpawn);
+    const remote: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, host: 'stand', command: ['echo', 'hi'] },
+    });
+    expect(remote.isError).toBe(true);
+    expect(text(remote)).toMatch(
+      /^BAD_ARGUMENT: exec runs on the local host only/
+    );
+    const ro: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, host: 'prod', command: ['echo', 'hi'] },
+    });
+    expect(text(ro)).toMatch(/^BAD_ARGUMENT/);
+    const size: any = await cl.callTool({
+      name: 'exec',
+      arguments: { project: basic, memory: 'lots', command: ['echo', 'hi'] },
+    });
+    expect(size.isError).toBe(true);
+    expect(text(size)).toMatch(/^BAD_ARGUMENT: not a size/);
+  });
+  it('exec runs the command from the root with exec.env and answers its code and last lines, isError when not 0', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-exec-mcp-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: exec-mcp',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'exec:',
+          '  env: { GREETING: hi }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      const cl = await client(neverSpawn, undefined, dir);
+      const r: any = await cl.callTool({
+        name: 'exec',
+        arguments: {
+          command: [
+            process.execPath,
+            '-e',
+            'console.log("said " + process.env.GREETING); console.error("in " + process.env.MCPROC_PROJECT); process.exit(2)',
+          ],
+        },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent).toMatchObject({
+        code: 2,
+        lease: null,
+        env: { GREETING: 'hi', MCPROC_PROJECT: dir },
+      });
+      expect(r.structuredContent.output.split('\n').sort()).toEqual([
+        `in ${dir}`,
+        'said hi',
+      ]);
+      expect(text(r).split('\n')[0]).toBe(
+        `exec ${process.execPath} -e console.log("said " + process.env.GREETING); console.error("in " + process.env.MCPROC_PROJECT); process.exit(2): exit 2`
+      );
+      const ok: any = await cl.callTool({
+        name: 'exec',
+        arguments: { command: [process.execPath, '-e', '0'] },
+      });
+      expect(ok.isError).toBeFalsy();
+      expect(text(ok)).toBe(`exec ${process.execPath} -e 0: exit 0`);
+    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

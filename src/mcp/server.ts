@@ -7,6 +7,7 @@ import type { UnpackDeps } from '../runtime/unpack.js';
 import type { HereCheck } from '../core/urlcheck.js';
 import { registerReadTools } from './tools/read.js';
 import { registerWriteTools } from './tools/write.js';
+import { registerStandTools } from './tools/stands.js';
 
 export const INSTRUCTIONS = [
   'mcproc drives pm2 for the current project from its .mcproc/mcproc.yaml manifest (apps with descriptions, declared ports, profiles, hosts).',
@@ -50,6 +51,13 @@ export function createServer(
     hereCheck: deps.hereCheck,
   });
   registerWriteTools(server, {
+    roots,
+    spawner: deps.spawner,
+    unpack: deps.unpack,
+    project: deps.project,
+    hereCheck: deps.hereCheck,
+  });
+  registerStandTools(server, {
     roots,
     spawner: deps.spawner,
     unpack: deps.unpack,

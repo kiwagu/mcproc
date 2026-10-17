@@ -216,8 +216,86 @@ describe('cli', () => {
       'unpack',
       'install',
       'mcp',
+      'exec',
     ])
       expect(help).toContain(cmd);
+  });
+  it('exec refuses a bad --memory or --timeout and another host before touching any host', async () => {
+    for (const argv of [
+      ['exec', '--memory', '4X', '--project', basic, '--', 'echo', 'hi'],
+      ['exec', '--timeout', 'soon', '--project', basic, '--', 'echo', 'hi'],
+      ['exec', '--project', basic, '--host', 'stand', '--', 'echo', 'hi'],
+    ]) {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(argv, { from: 'user' });
+      expect(c.err[0], argv.join(' ')).toMatch(/^BAD_ARGUMENT/);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    }
+  });
+  it('exec takes its options before -- and the command after it verbatim, runs it from the root with exec.env and exits with its code', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-exec-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: exec-cli',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'exec:',
+          '  env: { GREETING: hi }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      const check = path.join(dir, 'check.js');
+      fs.writeFileSync(
+        check,
+        [
+          'const [root, ...rest] = process.argv.slice(2);',
+          'const ok =',
+          '  process.env.GREETING === "hi" &&',
+          '  process.env.MCPROC_PROJECT === root &&',
+          '  process.cwd() === require("node:fs").realpathSync(root) &&',
+          '  JSON.stringify(rest) === JSON.stringify(["--timeout", "5", "--json", "--memory", "1G", "--help"]);',
+          'process.exit(ok ? 3 : 4);',
+          '',
+        ].join('\n')
+      );
+      const c = capture();
+      await buildProgram(c.io).parseAsync(
+        [
+          'exec',
+          '--project',
+          dir,
+          '--json',
+          '--',
+          process.execPath,
+          check,
+          dir,
+          '--timeout',
+          '5',
+          '--json',
+          '--memory',
+          '1G',
+          '--help',
+        ],
+        { from: 'user' }
+      );
+      expect(c.err).toEqual([]);
+      expect(JSON.parse(c.out.join(''))).toMatchObject({
+        code: 3,
+        lease: null,
+        waited_ms: expect.any(Number),
+      });
+      expect(process.exitCode).toBe(3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('unpack refuses readonly hosts and a bad --with-node before touching any host', async () => {
     const c = capture();
