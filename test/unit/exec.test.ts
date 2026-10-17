@@ -1,4 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  onTestFinished,
+} from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -305,6 +312,39 @@ describe('defaultExecDeps().run', () => {
       code: 'BAD_ARGUMENT',
       message: expect.stringContaining('mcproc-no-such-binary'),
     });
+  });
+
+  it('answers on the exit and a second of drain when a grandchild it left behind holds its pipes', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    // the child starts a detached grandchild on its own stdout, notes its pid and exits 7 at once
+    // apart from `dir`, which afterEach removes before onTestFinished runs
+    const notes = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-exec-gc-'));
+    const pidFile = path.join(notes, 'grandchild.pid');
+    const script = [
+      "const g = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit', detached: true });",
+      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));`,
+      'console.log(g.pid);',
+      'g.unref();',
+      'process.exitCode = 7;',
+    ].join('\n');
+    // also when the run times out: the grandchild never ends by itself
+    onTestFinished(() => {
+      try {
+        process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL');
+      } catch {
+        /* never started, or gone already */
+      }
+      fs.rmSync(notes, { recursive: true, force: true });
+    });
+    const t0 = Date.now();
+    const r = await runExec(
+      ctx,
+      { command: [process.execPath, '-e', script], capture: true },
+      defaultExecDeps(dir)
+    );
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(r.code).toBe(7);
+    expect(r.output.trim()).toBe(fs.readFileSync(pidFile, 'utf8'));
   });
 
   it('ends the command on the signal', async () => {

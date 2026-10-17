@@ -15,6 +15,8 @@ export const EXEC_TIMEOUT_DEFAULT_MS = 600_000;
 export const EXEC_TIMEOUT_MAX_MS = 3_600_000;
 const POLL_MS = 1000;
 const OUTPUT_LINES = 200;
+/** How long the captured pipes are read after the command exited, in milliseconds: something it left behind may hold them. */
+const DRAIN_MS = 1000;
 
 /** What an exec reads and runs: the lease store, the host's memory, the watcher, the command itself, its sleep and clock. */
 export interface ExecDeps {
@@ -95,7 +97,9 @@ class Tail {
 
 /**
  * The command as a child with the shell left out: argv as given, cwd the project root; captured output keeps its last
- * lines. Not captured, it inherits the terminal; `stdoutToStderr` puts its stdout on the terminal's stderr too.
+ * lines. Not captured, it inherits the terminal; `stdoutToStderr` puts its stdout on the terminal's stderr too. It
+ * answers once the command exited and its pipes closed, or DRAIN_MS after the exit when a process it left behind (a
+ * server in the background) still holds them: the pipes are then closed and the tail is what was read by then.
  */
 export function spawnRun(
   command: string[],
@@ -123,8 +127,29 @@ export function spawnRun(
     const onAbort = () => child.kill('SIGTERM');
     if (opts.signal?.aborted) onAbort();
     else opts.signal?.addEventListener('abort', onAbort, { once: true });
-    child.on('error', (e) => {
+    let exit: { code: number | null; signal: NodeJS.Signals | null } | null =
+      null;
+    let drain: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = () => {
+      settled = true;
+      clearTimeout(drain);
       opts.signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = () => {
+      if (settled || !exit) return;
+      settle();
+      // stop reading: whatever still holds the pipes keeps them without us
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve({
+        code: exit.code ?? (exit.signal ? 128 : 1),
+        output: tail.text(),
+      });
+    };
+    child.on('error', (e) => {
+      if (settled) return;
+      settle();
       reject(
         new McprocError(
           'BAD_ARGUMENT',
@@ -135,11 +160,13 @@ export function spawnRun(
         )
       );
     });
-    // close, not exit: the pipes are read to their end first
-    child.on('close', (code, signal) => {
-      opts.signal?.removeEventListener('abort', onAbort);
-      resolve({ code: code ?? (signal ? 128 : 1), output: tail.text() });
+    // the exit, then the pipes read to their end (close), for at most DRAIN_MS
+    child.on('exit', (code, signal) => {
+      if (settled) return;
+      exit = { code, signal };
+      drain = setTimeout(finish, DRAIN_MS);
     });
+    child.on('close', finish);
   });
 }
 
