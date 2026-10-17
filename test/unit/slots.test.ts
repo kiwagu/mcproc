@@ -31,6 +31,23 @@ describe('slot registry', () => {
       `/state/slots/${registryKey('demo', '/w/demo')}.json`
     );
   });
+  it('keys by the real path: a repository reached through a symlink has the key of its real path; a gone path keys as given', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-key-'));
+    const real = path.join(dir, 'real');
+    const link = path.join(dir, 'link');
+    fs.mkdirSync(real);
+    fs.symlinkSync(real, link);
+    expect(registryKey('demo', link)).toBe(
+      registryKey('demo', fs.realpathSync(real))
+    );
+    expect(registryPath('/state', 'demo', link)).toBe(
+      registryPath('/state', 'demo', real)
+    );
+    expect(registryKey('demo', path.join(dir, 'gone'))).toBe(
+      registryKey('demo', path.join(dir, 'x', '..', 'gone'))
+    );
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   it('claims the lowest free slot from 1, a wanted one when free, and refuses when none is left', () => {
     let r = withMain(emptyRegistry('/w/demo'), entry('/w/demo', 'demo'));
     expect(r.slots['0']).toEqual(entry('/w/demo', 'demo'));

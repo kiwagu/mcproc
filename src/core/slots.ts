@@ -15,9 +15,12 @@ export interface Registry {
   slots: Record<string, SlotEntry>;
 }
 
-/** `<base project>-<8 hex of sha256(main path)>`: two unrelated repositories named alike never share slots. */
+/**
+ * `<base project>-<8 hex of sha256(real main path)>`: two unrelated repositories named alike never share slots, and a
+ * checkout opened through a symlink finds the registry of its real path.
+ */
 export function registryKey(baseProject: string, repo: string): string {
-  return `${baseProject}-${crypto.createHash('sha256').update(repo).digest('hex').slice(0, 8)}`;
+  return `${baseProject}-${crypto.createHash('sha256').update(realOf(repo)).digest('hex').slice(0, 8)}`;
 }
 /** The file that holds a repository's registry under the host state directory. */
 export function registryPath(
@@ -90,7 +93,7 @@ export function releaseSlot(r: Registry, slot: number): Registry {
   return { ...r, slots };
 }
 /** A path as the filesystem sees it: symlinks resolved when it exists, else just made absolute. */
-function realOf(p: string): string {
+export function realOf(p: string): string {
   try {
     return fs.realpathSync(p);
   } catch {

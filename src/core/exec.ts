@@ -94,7 +94,7 @@ class Tail {
 }
 
 /** The command as a child with the shell left out: argv as given, cwd the project root; captured output keeps its last lines. */
-function spawnRun(
+export function spawnRun(
   command: string[],
   opts: {
     cwd: string;
