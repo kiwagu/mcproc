@@ -2,6 +2,7 @@ import type { App } from './manifest.js';
 import { findProcess, type Pm2Process } from './pm2.js';
 import { MARK } from '../shell/snippets.js';
 import { isZone } from './logsince.js';
+import { parseMeminfo, parseDockerStats, type HostMemory } from './memory.js';
 import type { HostEnv, HostUrl } from './urlcheck.js';
 import {
   EMPTY_STATS,
@@ -32,6 +33,10 @@ export interface ProbeData {
   env: HostEnv | null;
   /** the host's UTC offset as `date +%z` prints it ('+0200', '-0330'); null when the section is absent or garbled */
   zone: string | null;
+  /** the host's /proc/meminfo numbers; null where the host has none */
+  memory: HostMemory | null;
+  /** the declared containers' memory in MiB by name; empty unless the probe asked docker */
+  containers: Map<string, number>;
 }
 export interface PortCheck {
   port: number;
@@ -225,6 +230,8 @@ export function parseProbe(stdout: string): ProbeData {
     MARK.RSS,
     MARK.ARGS,
     MARK.DOCKER,
+    MARK.MEM,
+    MARK.DOCKERMEM,
     MARK.ENV,
     MARK.URL,
   ]);
@@ -281,6 +288,8 @@ export function parseProbe(stdout: string): ProbeData {
     urls: parseUrlChecks(sec[MARK.URL]),
     env: parseEnv(sec[MARK.ENV]),
     zone: zoneOf(sec[MARK.CLOCK]),
+    memory: parseMeminfo(sec[MARK.MEM]),
+    containers: parseDockerStats(sec[MARK.DOCKERMEM]),
   };
 }
 

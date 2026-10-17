@@ -45,6 +45,7 @@ const row = (status: string, checks: PortCheck[]): LsRow => ({
   exit_code: null,
   cpu: 0,
   memory: 0,
+  containers_memory: 0,
   procs: 1,
   runtime: null,
   pm2_memory: 0,
@@ -100,6 +101,7 @@ describe('renderLs with tree metrics', () => {
     const r = {
       ...base,
       memory: 2_200_000_000,
+      containers_memory: 0,
       cpu: 84.4,
       procs: 3,
       runtime: 'next-server (v16.2.9)',

@@ -3,6 +3,8 @@ import type { ProcStats, StatSample } from './stats.js';
 
 export interface TreeMetrics {
   memory: number;
+  /** the share of memory that is the app's declared docker containers (bytes); 0 until the snapshot adds them */
+  containers_memory: number;
   cpu: number | null;
   procs: number;
   runtime: string | null;
@@ -77,6 +79,7 @@ export function treeMetrics(
     runtimePid !== undefined ? stats.args.get(runtimePid) : undefined;
   return {
     memory,
+    containers_memory: 0,
     cpu,
     procs: pids.size,
     runtime: args ? shortCommand(args) : null,

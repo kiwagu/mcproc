@@ -23,6 +23,7 @@ import {
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
+const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
 const fx = (p: string) =>
   fs.readFileSync(path.join(here, '..', 'fixtures', 'probe', p), 'utf8');
 const jlist = JSON.stringify([
@@ -684,5 +685,47 @@ describe('url checks: on the host first, then from this machine (url_check)', ()
       url_from: 'here',
       url_reason: 'on stand: refused; here: no answer',
     });
+  });
+});
+
+describe('declared containers', () => {
+  it("adds the declared containers' memory to an app and keeps the host memory", async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      {
+        match: 'jlist',
+        result: (cmd) => ({
+          stdout: probeOut({
+            jlist: JSON.stringify([
+              {
+                pid: 100,
+                name: 'demo-w2-db',
+                pm_id: 0,
+                pm2_env: {
+                  status: 'online',
+                  namespace: 'demo-w2',
+                  pm_cwd: varsProj,
+                },
+              },
+            ]),
+            ps: '100 1',
+            stat: 'CLK 100\n100 1 5',
+            rss: '100 11000',
+            mem: 'MemTotal: 2048000 kB\nMemAvailable: 1024000 kB',
+            dockermem: cmd.includes('docker stats')
+              ? 'demo-w2-db\t40MiB / 2GiB'
+              : '',
+          }),
+        }),
+      },
+    ]);
+    const snap = await snapshot(ctx, { urls: 'none', containers: 'probe' });
+    expect(ctx.fake.calls[0].cmd).toContain("'demo-w2-db'");
+    expect(snap.memory).toEqual({ total_mib: 2000, available_mib: 1000 });
+    const [db] = rowsFor(ctx, snap, ['db']);
+    expect(db.containers_memory).toBe(40 * 1024 * 1024);
+    expect(db.memory).toBe(11000 * 1024 + 40 * 1024 * 1024);
+    const light = await snapshot(ctx, { urls: 'none' });
+    expect(ctx.fake.calls[1].cmd).not.toContain('docker stats');
+    expect(rowsFor(ctx, light, ['db'])[0].containers_memory).toBe(0);
   });
 });

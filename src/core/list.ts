@@ -11,6 +11,7 @@ import {
   type Pm2Process,
 } from './pm2.js';
 import { treeMetrics, type TreeMetrics } from './metrics.js';
+import type { HostMemory } from './memory.js';
 import { hostStamp } from './logsince.js';
 import {
   appPids,
@@ -43,6 +44,8 @@ export interface LsRow {
   exit_code: number | null;
   cpu: number | null;
   memory: number;
+  /** the memory of the app's declared docker containers, inside memory */
+  containers_memory: number;
   procs: number | null;
   runtime: string | null;
   pm2_cpu: number;
@@ -77,6 +80,8 @@ export interface Snapshot {
   urlChecks: Record<string, UrlResult>;
   /** the host's UTC offset ('+0200'); null when the probe could not read it */
   zone: string | null;
+  /** the host's /proc/meminfo numbers; null where it has none */
+  memory: HostMemory | null;
 }
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
@@ -85,6 +90,8 @@ export interface SnapshotOptions {
   metrics?: 'tree' | 'none';
   prev?: { sample: StatSample; at: number };
   urls?: 'check' | 'none' | string[];
+  /** 'probe': ask docker for the declared containers' memory (about 2 s); default 'none', so a polling loop never pays it */
+  containers?: 'probe' | 'none';
 }
 export interface HostInfo {
   name: string;
@@ -148,9 +155,22 @@ export async function snapshot(
         .map((a) => a.url)
     ),
   ];
+  const containers =
+    withMetrics && opts.containers === 'probe'
+      ? [
+          ...new Set(
+            Object.values(ctx.manifest.apps).flatMap((a) => a.containers)
+          ),
+        ]
+      : [];
   const res = ensureOk(
     await ctx.transport.exec(
-      probeScript(ctx.pm2.bin, { cpuSample, urls, metrics: withMetrics }),
+      probeScript(ctx.pm2.bin, {
+        cpuSample,
+        urls,
+        metrics: withMetrics,
+        containers,
+      }),
       {
         env: ctx.pm2.env(),
         // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
@@ -201,6 +221,20 @@ export async function snapshot(
   const metrics: Record<string, TreeMetrics | null> = {};
   for (const [name, set] of pids)
     metrics[name] = treeMetrics(set, data.stats, data.listeners, metricOpts);
+  for (const app of Object.values(ctx.manifest.apps)) {
+    const m = metrics[app.name];
+    if (!m || app.containers.length === 0) continue;
+    const mib = app.containers.reduce(
+      (sum, c) => sum + (data.containers.get(c) ?? 0),
+      0
+    );
+    const bytes = mib * 1024 * 1024;
+    metrics[app.name] = {
+      ...m,
+      memory: m.memory + bytes,
+      containers_memory: bytes,
+    };
+  }
   // the checks from here that url_check asks for, after the probe: a url the host answered costs nothing more
   const urlChecks = await settleUrls(
     asked,
@@ -218,6 +252,7 @@ export async function snapshot(
     sampledAt,
     urlChecks,
     zone: data.zone,
+    memory: data.memory,
   };
 }
 
@@ -265,6 +300,7 @@ export function rowsFor(
       exit_code: p?.exit_code ?? null,
       cpu: m ? m.cpu : (p?.cpu ?? 0),
       memory: m ? m.memory : (p?.memory ?? 0),
+      containers_memory: m?.containers_memory ?? 0,
       procs: m ? m.procs : null,
       runtime: m ? m.runtime : null,
       pm2_cpu: p?.cpu ?? 0,
@@ -298,6 +334,7 @@ export function unreachableRow(
     exit_code: null,
     cpu: null,
     memory: 0,
+    containers_memory: 0,
     procs: null,
     runtime: null,
     pm2_cpu: 0,
@@ -318,7 +355,10 @@ export async function listApps(ctx: Context, app?: string): Promise<LsRow[]> {
   // one app's read asks only its own url
   return rowsFor(
     ctx,
-    await snapshot(ctx, { urls: app ? [app] : 'check' }),
+    await snapshot(ctx, {
+      urls: app ? [app] : 'check',
+      containers: 'probe',
+    }),
     names
   );
 }
