@@ -27,6 +27,7 @@ import {
 } from '../../src/mcp/render.js';
 import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
 import type { Lease } from '../../src/core/leases/store.js';
+import type { DoctorReport } from '../../src/core/doctor.js';
 import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
@@ -418,6 +419,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [],
@@ -443,6 +447,9 @@ describe('renderDoctor', () => {
       daemon: 'answers' as const,
       processes: 0,
       in_namespace: 0,
+      state_dir: null,
+      watcher: null,
+      memory: null,
       recommendations: [],
       environment: {
         container: 'docker' as const,
@@ -559,6 +566,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [
@@ -597,6 +607,9 @@ describe('renderDoctor', () => {
         daemon: 'answers',
         processes: 0,
         in_namespace: 0,
+        state_dir: null,
+        watcher: null,
+        memory: null,
         recommendations: [],
         environment: null,
         urls: [
@@ -896,6 +909,62 @@ describe('renderMutation', () => {
     ).toBe('web: crashed (errored) after 1.3 s while waiting for listening');
     expect(renderWait('web', { ...base, ok: false, reason: 'aborted' })).toBe(
       'web: aborted after 1.3 s while waiting for listening'
+    );
+  });
+  it('renderWait: a wait that ends while the start is still queued names its place and why', () => {
+    const base = { until: 'listening', waited_ms: 60_000, ok: false };
+    expect(
+      renderWait('api', {
+        ...base,
+        reason: 'timeout',
+        status: 'queued #3',
+        observed: 'queued #3: 100M short',
+      })
+    ).toBe('api: listening not reached after 60.0 s (queued #3: 100M short)');
+    expect(
+      renderWait('api', {
+        ...base,
+        reason: 'aborted',
+        status: 'starting',
+        observed: 'starting',
+      })
+    ).toBe('api: aborted after 60.0 s while waiting for listening (starting)');
+  });
+  it('renderDoctor: the local host says its memory, its lease directory and the watcher', () => {
+    const rep: DoctorReport = {
+      host: 'local',
+      transport: 'local',
+      reachable: true,
+      error: null,
+      node: 'v22.1.0',
+      pm2: null,
+      tools: { ps: true, ss: true, tar: true },
+      pm2_home: null,
+      runtime_dir: '/opt/rt',
+      runtime_present: false,
+      runtime_pm2: null,
+      runtime_node: null,
+      daemon: 'answers',
+      processes: 0,
+      in_namespace: 0,
+      state_dir: '/s/mcproc',
+      watcher: { online: true, pid: 77 },
+      memory: { total_mib: 31850, available_mib: 17614 },
+      recommendations: [],
+      environment: null,
+      urls: [],
+    };
+    const lines = renderDoctor([rep]).split('\n');
+    expect(lines).toContain('  memory: 17.2G available of 31.1G');
+    expect(lines).toContain('  leases: /s/mcproc, watcher online pid 77');
+    const quiet = renderDoctor([
+      { ...rep, watcher: { online: false, pid: null }, memory: null },
+    ]).split('\n');
+    expect(quiet).toContain('  leases: /s/mcproc, watcher not running');
+    expect(quiet.some((l) => l.startsWith('  memory:'))).toBe(false);
+    // pm2 did not answer: the watcher's state is not known
+    expect(renderDoctor([{ ...rep, watcher: null }])).toContain(
+      '  leases: /s/mcproc, watcher unknown'
     );
   });
   it('renderWait: a reload names when it began, its line count and its first line (without the stamp shown twice)', () => {

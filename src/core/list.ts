@@ -25,6 +25,8 @@ import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
 import type { Context } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
+import { leasesCovering, type LeaseView } from './leases/view.js';
+import { stateDir } from './state.js';
 import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 
@@ -77,6 +79,7 @@ export interface LsRow {
   /** something the change did not finish beside the app itself, such as the leases a stop could not update */
   note?: string;
 }
+/** One look at a host for this project: pm2's processes, the ports, the metrics, the url checks, the memory and the leases. */
 export interface Snapshot {
   procs: Pm2Process[];
   ports: Record<string, AppPorts>;
@@ -91,6 +94,8 @@ export interface Snapshot {
   zone: string | null;
   /** the host's /proc/meminfo numbers; null where it has none */
   memory: HostMemory | null;
+  /** this checkout's pending and starting leases on this machine (none on another host, or when not asked) */
+  leases: LeaseView[];
 }
 /** `urls`: check every app's URL, none, or only those of the named apps (a mutation answers about what it touched). */
 export interface SnapshotOptions {
@@ -101,6 +106,8 @@ export interface SnapshotOptions {
   urls?: 'check' | 'none' | string[];
   /** 'probe': ask docker for the declared containers' memory (about 2 s); default 'none', so a polling loop never pays it */
   containers?: 'probe' | 'none';
+  /** 'read' (the default): read this checkout's leases from the state directory, on the local host only; 'none': skip it */
+  leases?: 'read' | 'none';
 }
 export interface HostInfo {
   name: string;
@@ -141,6 +148,7 @@ function urlFields(
       };
 }
 
+/** Probes the context's host once (see SnapshotOptions for what it asks), and on this machine reads the checkout's leases. */
 export async function snapshot(
   ctx: Context,
   opts: SnapshotOptions = {}
@@ -262,6 +270,10 @@ export async function snapshot(
     urlChecks,
     zone: data.zone,
     memory: data.memory,
+    leases:
+      ctx.host.local && opts.leases !== 'none'
+        ? leasesCovering(stateDir(), ctx.manifest)
+        : [],
   };
 }
 
@@ -283,6 +295,7 @@ export function statusWord(p: Pm2Process | undefined, app: App): string {
   return `failed (exit ${c})`;
 }
 
+/** One row per named app, in that order: what pm2 and the probe show, or for an app with no process that a lease covers, its place in the queue. */
 export function rowsFor(
   ctx: Context,
   snap: Snapshot,
@@ -291,6 +304,11 @@ export function rowsFor(
   return names.map((name) => {
     const app = ctx.manifest.apps[name];
     const p = findProcess(snap.procs, ctx.manifest.project, name);
+    // a lease speaks only for an app that has no process yet: one that has a process is shown as it is
+    const cover = p
+      ? undefined
+      : snap.leases.find((l) => l.apps.includes(name));
+    if (cover) return queuedRow(app, ctx.host.name, cover, cover.position);
     const m = snap.metrics[name];
     return {
       app: name,

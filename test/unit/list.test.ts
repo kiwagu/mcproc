@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -7,6 +8,7 @@ import { probeOut } from '../helpers/probe.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 import type { Context } from '../../src/core/resolve.js';
 import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
 import {
@@ -727,5 +729,156 @@ describe('declared containers', () => {
     const light = await snapshot(ctx, { urls: 'none' });
     expect(ctx.fake.calls[1].cmd).not.toContain('docker stats');
     expect(rowsFor(ctx, light, ['db'])[0].containers_memory).toBe(0);
+  });
+});
+
+describe('queued and starting rows', () => {
+  it('an app with no process but a pending lease reads queued #N, a starting one reads starting', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const m = loadManifest(varsProj);
+      await store.create(
+        {
+          kind: 'start',
+          project: 'other',
+          root: '/o',
+          slot: null,
+          repo: '/o',
+          target: 'x',
+          apps: ['x'],
+          reload: false,
+          estimate_mib: 1,
+          need_mib: 1,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const mine = await store.create(
+        {
+          kind: 'start',
+          project: m.project,
+          root: m.root,
+          slot: 2,
+          repo: m.repo,
+          target: 'dev',
+          apps: ['db', 'api'],
+          reload: false,
+          estimate_mib: 768,
+          need_mib: 922,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      await store.patch(mine.id, { waiting_for: '1 ahead in the queue' });
+      const ctx = fakeCtx(varsProj, 'local', [
+        { match: 'jlist', result: { stdout: probeOut({}) } },
+      ]);
+      const snap = await snapshot(ctx, { urls: 'none' });
+      expect(snap.leases).toEqual([
+        {
+          id: mine.id,
+          state: 'pending',
+          position: 2,
+          waiting_for: '1 ahead in the queue',
+          apps: ['db', 'api'],
+        },
+      ]);
+      const rows = rowsFor(ctx, snap, ['db', 'api', 'tool']);
+      expect(rows.map((r) => r.status)).toEqual([
+        'queued #2',
+        'queued #2',
+        'not-started',
+      ]);
+      expect(rows[0].lease).toEqual({
+        id: mine.id,
+        state: 'pending',
+        position: 2,
+        waiting_for: '1 ahead in the queue',
+      });
+      await store.transition(mine.id, 'starting');
+      const snap2 = await snapshot(ctx, { urls: 'none' });
+      expect(rowsFor(ctx, snap2, ['db'])[0].status).toBe('starting');
+      expect(
+        (await snapshot(ctx, { urls: 'none', leases: 'none' })).leases
+      ).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an app with a process is never queued, and a host other than this machine reads no leases', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const lease = (m: ReturnType<typeof loadManifest>, apps: string[]) =>
+        store.create(
+          {
+            kind: 'start',
+            project: m.project,
+            root: m.root,
+            slot: m.slot,
+            repo: m.repo,
+            target: apps.join(','),
+            apps,
+            reload: false,
+            estimate_mib: 1,
+            need_mib: 1,
+            margin: 0,
+            reserve_mib: 0,
+            sources: {},
+            note: null,
+            requester_pid: 1,
+          },
+          'pending'
+        );
+      await lease(loadManifest(varsProj), ['db', 'api']);
+      const ctx = fakeCtx(varsProj, 'local', [
+        {
+          match: 'jlist',
+          result: {
+            stdout: probeOut({
+              jlist: JSON.stringify([
+                {
+                  pid: 100,
+                  name: 'demo-w2-db',
+                  pm_id: 0,
+                  pm2_env: { status: 'stopped', namespace: 'demo-w2' },
+                },
+              ]),
+            }),
+          },
+        },
+      ]);
+      const rows = rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), [
+        'db',
+        'api',
+      ]);
+      expect(rows.map((r) => r.status)).toEqual(['stopped', 'queued #1']);
+      expect(rows[0].lease).toBeUndefined();
+      await lease(loadManifest(basic), ['api']);
+      const prod = fakeCtx(basic, 'prod', [
+        { match: 'jlist', result: { stdout: probeOut({}) } },
+      ]);
+      expect((await snapshot(prod, { urls: 'none' })).leases).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

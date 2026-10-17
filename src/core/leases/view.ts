@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { McprocError } from '../errors.js';
+import type { Manifest } from '../manifest.js';
 import { readHostMemory, type HostMemory } from '../memory.js';
 import type { Pm2Process } from '../pm2.js';
 import type { Context } from '../resolve.js';
@@ -59,6 +60,39 @@ export function watcherIn(procs: Pm2Process[]): {
     online: Boolean(w && w.status === 'online'),
     pid: w && w.pid > 0 ? w.pid : null,
   };
+}
+
+/** A lease that covers apps with no process yet, as ls and wait show it: queued (its position) or starting. */
+export interface LeaseView {
+  id: string;
+  state: 'pending' | 'starting';
+  /** 1-based place in the queue, the starting leases counted ahead; 0 for a starting lease */
+  position: number;
+  waiting_for: string | null;
+  apps: string[];
+}
+
+/** The pending and starting leases of one checkout, with their queue positions: what ls and wait show for apps that have no process yet. */
+export function leasesCovering(
+  dir: string,
+  m: Pick<Manifest, 'root' | 'project'>
+): LeaseView[] {
+  const store = new LeaseStore(dir);
+  return store
+    .list()
+    .filter(
+      (l): l is Lease & { state: 'pending' | 'starting' } =>
+        (l.state === 'pending' || l.state === 'starting') &&
+        l.root === m.root &&
+        l.project === m.project
+    )
+    .map((l) => ({
+      id: l.id,
+      state: l.state,
+      position: store.positionOf(l.id),
+      waiting_for: l.waiting_for,
+      apps: l.apps,
+    }));
 }
 
 /** Cancels a pending lease; a starting or ended one is refused (LEASE_NOT_PENDING). */

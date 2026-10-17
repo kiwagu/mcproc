@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -16,12 +18,17 @@ import {
   WAIT_TIMEOUT_MAX_MS,
   type WaitDeps,
 } from '../../src/core/wait.js';
-import { snapshot } from '../../src/core/list.js';
+import { snapshot, type Snapshot } from '../../src/core/list.js';
 import { loadManifest } from '../../src/core/manifest.js';
+import { parseJlist, type Pm2Process } from '../../src/core/pm2.js';
+import type { AppPorts } from '../../src/core/ports.js';
+import { EMPTY_STATS } from '../../src/core/stats.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
 const PS = '1 0\n100 1\n101 100\n';
 const ss = (port: number, pid: number) =>
   `LISTEN 0 511 *:${port} *:* users:(("node",pid=${pid},fd=20))\n`;
@@ -75,9 +82,78 @@ function harness(probes: string[], jlists: string[] = probes) {
       t += ms;
     },
     now: () => t,
+    leases: async () => [],
   };
   return { ctx, deps, calls };
 }
+/** A pm2 process online in a namespace, as Pm2Client.jlist gives it. */
+const onlineProc = (name: string, namespace: string): Pm2Process =>
+  parseJlist(
+    JSON.stringify([
+      {
+        pid: 100,
+        name,
+        pm_id: 0,
+        pm2_env: {
+          status: 'online',
+          namespace,
+          pm_out_log_path: '/l/o',
+          pm_err_log_path: '/l/e',
+        },
+      },
+    ])
+  )[0];
+/** The ports of an app whose one declared port listens. */
+const listening = (port: number): AppPorts => ({
+  actual: [
+    {
+      proto: 'tcp',
+      addr: '*',
+      port,
+      pid: 100,
+      pids: [100],
+      command: 'node',
+      container: null,
+    },
+  ],
+  declared: [port],
+  checks: [{ port, status: 'listening' }],
+  undeclared: [],
+});
+/** A light snapshot holding at most one process, with the given ports per app. */
+const snapWith = (
+  p?: Pm2Process,
+  ports: Record<string, AppPorts> = {}
+): Snapshot => ({
+  procs: p ? [p] : [],
+  ports,
+  listeners: [],
+  tree: new Map(),
+  stats: EMPTY_STATS,
+  metrics: {},
+  sampledAt: 0,
+  urlChecks: {},
+  zone: null,
+  memory: null,
+  leases: [],
+});
+/** WaitDeps on a fake clock (sleep advances it): no process, no follower, no lease, unless `over` says otherwise. */
+const fakeDeps = (over: Partial<WaitDeps> = {}): WaitDeps => {
+  let t = 1_000_000;
+  return {
+    jlist: async () => [],
+    snapshot: async () => snapWith(),
+    follower: () => {
+      throw new Error('not used here');
+    },
+    sleep: async (ms) => {
+      t += ms;
+    },
+    now: () => t,
+    leases: async () => [],
+    ...over,
+  };
+};
 const probe = (p: ReturnType<typeof proc>, tcp = '') =>
   probeOut({ jlist: JSON.stringify([p]), ps: PS, tcp });
 const jl = (p: ReturnType<typeof proc>) => JSON.stringify([p]);
@@ -1168,6 +1244,7 @@ describe('waitFor: url-ok follows the url_check decision', () => {
         t += ms;
       },
       now: () => t,
+      leases: async () => [],
     };
     return { ctx, deps };
   };
@@ -1235,4 +1312,262 @@ describe('waitFor: url-ok follows the url_check decision', () => {
       );
     }
   );
+});
+
+describe('waitFor: a start that is queued (lease-aware)', () => {
+  it('keeps waiting while a pending lease covers an app with no process, then sees it come up', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    let polls = 0;
+    const deps = fakeDeps({
+      jlist: async () =>
+        polls >= 2 ? [onlineProc('demo-w2-api', 'demo-w2')] : [],
+      snapshot: async () => {
+        polls++;
+        return polls >= 2
+          ? snapWith(onlineProc('demo-w2-api', 'demo-w2'), {
+              api: listening(3510),
+            })
+          : snapWith();
+      },
+      leases: async () =>
+        polls >= 2
+          ? []
+          : [
+              {
+                id: 'l_x',
+                state: 'pending',
+                position: 1,
+                waiting_for: '100M short',
+                apps: ['api'],
+              },
+            ],
+    });
+    const r = await waitFor(
+      ctx,
+      'api',
+      { kind: 'listening' },
+      { deps, timeoutMs: 5000 }
+    );
+    expect(r.ok).toBe(true);
+  });
+  it('times out with the queue position as what was observed', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const deps = fakeDeps({
+      jlist: async () => [],
+      snapshot: async () => snapWith(),
+      leases: async () => [
+        {
+          id: 'l_x',
+          state: 'pending',
+          position: 3,
+          waiting_for: '100M short',
+          apps: ['api'],
+        },
+      ],
+    });
+    const r = await waitFor(
+      ctx,
+      'api',
+      { kind: 'listening' },
+      { deps, timeoutMs: 1000 }
+    );
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'queued #3',
+      observed: 'queued #3: 100M short',
+    });
+  });
+  it('still throws NOT_STARTED when no lease covers the app', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const deps = fakeDeps({
+      jlist: async () => [],
+      snapshot: async () => snapWith(),
+      leases: async () => [],
+    });
+    await expect(
+      waitFor(ctx, 'api', { kind: 'listening' }, { deps })
+    ).rejects.toMatchObject({ code: 'NOT_STARTED' });
+  });
+  it('a starting lease reads starting; an aborted wait names the queue too', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const starting = fakeDeps({
+      leases: async () => [
+        {
+          id: 'l_s',
+          state: 'starting',
+          position: 0,
+          waiting_for: null,
+          apps: ['db', 'api'],
+        },
+      ],
+    });
+    expect(
+      await waitFor(
+        ctx,
+        'api',
+        { kind: 'listening' },
+        { deps: starting, timeoutMs: 600 }
+      )
+    ).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'starting',
+      observed: 'starting',
+    });
+    const ac = new AbortController();
+    ac.abort();
+    const queued = fakeDeps({
+      leases: async () => [
+        {
+          id: 'l_q',
+          state: 'pending',
+          position: 2,
+          waiting_for: '1 ahead in the queue',
+          apps: ['api'],
+        },
+      ],
+    });
+    expect(
+      await waitFor(
+        ctx,
+        'api',
+        { kind: 'listening' },
+        { deps: queued, signal: ac.signal }
+      )
+    ).toMatchObject({
+      ok: false,
+      reason: 'aborted',
+      status: 'queued #2',
+      observed: 'queued #2: 1 ahead in the queue',
+    });
+  });
+  it('a lease that ends without the app ever starting is NOT_STARTED at the next look', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    let looks = 0;
+    const deps = fakeDeps({
+      snapshot: async () => {
+        looks++;
+        return snapWith();
+      },
+      leases: async () =>
+        looks >= 2
+          ? []
+          : [
+              {
+                id: 'l_x',
+                state: 'pending',
+                position: 1,
+                waiting_for: null,
+                apps: ['api'],
+              },
+            ],
+    });
+    await expect(
+      waitFor(ctx, 'api', { kind: 'listening' }, { deps, timeoutMs: 5000 })
+    ).rejects.toMatchObject({ code: 'NOT_STARTED' });
+    expect(looks).toBe(2);
+  });
+  it('exited rides through a lease too, then answers with the exit', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    let looks = 0;
+    const done: Pm2Process = {
+      ...onlineProc('demo-w2-tool', 'demo-w2'),
+      pid: 0,
+      status: 'stopped',
+      exit_code: 0,
+    };
+    const deps = fakeDeps({
+      jlist: async () => (++looks >= 3 ? [done] : []),
+      leases: async () =>
+        looks >= 3
+          ? []
+          : [
+              {
+                id: 'l_t',
+                state: 'starting',
+                position: 0,
+                waiting_for: null,
+                apps: ['tool'],
+              },
+            ],
+    });
+    expect(
+      await waitFor(ctx, 'tool', { kind: 'exited' }, { deps })
+    ).toMatchObject({ ok: true, status: 'done', exit_code: 0 });
+    expect(looks).toBe(3);
+  });
+  it("the poll's snapshot reads no leases itself: they come from deps.leases, only while the app has no process", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const asked: unknown[] = [];
+    let leaseReads = 0;
+    const deps = fakeDeps({
+      snapshot: async (_c, o) => {
+        asked.push(o.leases);
+        return snapWith(onlineProc('demo-w2-api', 'demo-w2'), {
+          api: listening(3510),
+        });
+      },
+      leases: async () => {
+        leaseReads++;
+        return [];
+      },
+    });
+    expect(
+      (await waitFor(ctx, 'api', { kind: 'listening' }, { deps })).ok
+    ).toBe(true);
+    expect(asked).toEqual(['none']);
+    expect(leaseReads).toBe(0);
+  });
+  it("the default leases read covers this checkout's pending and starting leases, on this machine only", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wait-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const fleetDir = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+      const make = (root: string, apps: string[]) => {
+        const m = loadManifest(root);
+        return store.create(
+          {
+            kind: 'start',
+            project: m.project,
+            root: m.root,
+            slot: m.slot,
+            repo: m.repo,
+            target: apps.join(','),
+            apps,
+            reload: false,
+            estimate_mib: 1,
+            need_mib: 1,
+            margin: 0,
+            reserve_mib: 0,
+            sources: {},
+            note: null,
+            requester_pid: 1,
+          },
+          'pending'
+        );
+      };
+      const mine = await make(varsProj, ['api']);
+      const done = await make(varsProj, ['db']);
+      await store.transition(done.id, 'running');
+      await make(fleetDir, ['web']);
+      const leases = defaultWaitDeps().leases;
+      expect(await leases(fakeCtx(varsProj, 'local', []))).toEqual([
+        {
+          id: mine.id,
+          state: 'pending',
+          position: 1,
+          waiting_for: null,
+          apps: ['api'],
+        },
+      ]);
+      expect(await leases(fakeCtx(fleetDir, 'box', [], 'local'))).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

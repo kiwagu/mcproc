@@ -97,6 +97,7 @@ const snap = (p = procs): Snapshot => ({
   urlChecks: {},
   zone: null,
   memory: null,
+  leases: [],
 });
 const deferred = <T>() => {
   let resolve!: (v: T) => void;

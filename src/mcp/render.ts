@@ -252,6 +252,7 @@ function fmtDoctorUrl(host: string, u: DoctorUrl): string {
           : `answers on ${host} (${code})`;
   return `${where}; ${answers}`;
 }
+/** Each host's report: whether it answers, its Node, pm2 and runtime, on this machine its memory and lease state, its urls and the fixes. */
 export function renderDoctor(reps: DoctorReport[]): string {
   return reps
     .map((r) => {
@@ -271,6 +272,14 @@ export function renderDoctor(reps: DoctorReport[]): string {
         if (r.runtime_present)
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`
+          );
+        if (r.memory)
+          L.push(
+            `  memory: ${fmtMib(r.memory.available_mib)} available of ${fmtMib(r.memory.total_mib)}`
+          );
+        if (r.state_dir)
+          L.push(
+            `  leases: ${r.state_dir}, watcher ${r.watcher ? (r.watcher.online ? `online pid ${r.watcher.pid}` : 'not running') : 'unknown'}`
           );
         if (r.environment) L.push(`  environment: ${fmtEnv(r.environment)}`);
         for (const u of r.urls)
@@ -365,7 +374,7 @@ export function renderLogsSince(a: SinceAnswer): string {
   ].join('\n');
 }
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
-/** One line: what was reached (or not) after how long, and what was seen. */
+/** One line: what was reached (or not) after how long, and what was seen (a start still queued says its place). */
 export function renderWait(app: string, r: WaitResult): string {
   const seen = r.observed ? ` (${r.observed})` : '';
   if (r.ok) {
@@ -390,7 +399,7 @@ export function renderWait(app: string, r: WaitResult): string {
   if (r.reason === 'timeout')
     return `${app}: ${r.until} not reached after ${secs(r.waited_ms)}${seen}`;
   if (r.reason === 'aborted')
-    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}`;
+    return `${app}: aborted after ${secs(r.waited_ms)} while waiting for ${r.until}${seen}`;
   return `${app}: ${r.reason} (${r.status}) after ${secs(r.waited_ms)} while waiting for ${r.until}`;
 }
 /** `libs (completed), api (ready), logger`: a started dependency is its bare name. */

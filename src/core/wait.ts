@@ -15,6 +15,8 @@ import type { App, Dep } from './manifest.js';
 import { compileReloadRules, type Reload, ReloadTracker } from './reloads.js';
 import { fmtPorts } from '../mcp/render.js';
 import type { UrlResult } from './urlcheck.js';
+import { leasesCovering, type LeaseView } from './leases/view.js';
+import { stateDir } from './state.js';
 
 export type Until =
   | { kind: 'listening' }
@@ -42,6 +44,7 @@ export interface WaitResult {
   /** reloaded: the reload that answered; `line` its first restart or rebuild line, else its first line, as written, and `time` that line's stamp */
   reloaded?: { time: string | null; lines: number; line: string };
 }
+/** What a wait reads and how it passes time: pm2's list, the light probe, the log follower, the leases, its sleep and clock. */
 export interface WaitDeps {
   jlist(ctx: Context): Promise<Pm2Process[]>;
   snapshot(ctx: Context, opts: SnapshotOptions): Promise<Snapshot>;
@@ -51,6 +54,8 @@ export interface WaitDeps {
   ): Pick<LogFollower, 'poll' | 'watch' | 'close' | 'offsets'>;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
   now(): number;
+  /** this checkout's pending and starting leases: a wait rides through one that covers an app with no process yet */
+  leases(ctx: Context): Promise<LeaseView[]>;
 }
 export const WAIT_TIMEOUT_DEFAULT_MS = 60_000;
 export const WAIT_TIMEOUT_MAX_MS = 600_000;
@@ -129,6 +134,7 @@ export function abortableSleep(
   });
 }
 
+/** The real deps: pm2's list and the light probe over the context's transport, the log follower, the real clock and the state directory's leases. */
 export function defaultWaitDeps(): WaitDeps {
   return {
     jlist: (ctx) => ctx.pm2.jlist(),
@@ -137,6 +143,9 @@ export function defaultWaitDeps(): WaitDeps {
     follower: (ctx, paths) => createFollower(ctx, paths, 0),
     sleep: abortableSleep,
     now: () => Date.now(),
+    // the queue lives on this machine only: a wait on another host never finds a lease
+    leases: async (ctx) =>
+      ctx.host.local ? leasesCovering(stateDir(), ctx.manifest) : [],
   };
 }
 
@@ -308,8 +317,9 @@ async function waitOnLogs(
 /**
  * Waits until `until` holds for one app, the timeout passes, the process leaves `online` while the condition is
  * still unmet, or the signal aborts. Every end is a result; only a bad request or an app that was never started
- * throws. The deadline is checked after each sample and the last sleep is cut to what remains, so a wait never
- * overshoots its timeout by a whole interval.
+ * throws. An app with no process that a pending or starting lease covers is waited for as long as the lease lasts,
+ * its queue word (`queued #N`, `starting`) the status. The deadline is checked after each sample and the last sleep is
+ * cut to what remains, so a wait never overshoots its timeout by a whole interval.
  */
 export async function waitFor(
   ctx: Context,
@@ -366,6 +376,22 @@ export async function waitFor(
     );
     return !opts.signal?.aborted;
   };
+  /**
+   * the app has no process: while a lease covers it the wait rides through ('again' once the pause is over, or the
+   * end at the deadline or on abort, its status the queue word); null when no lease covers it
+   */
+  const queued = async (): Promise<WaitResult | 'again' | null> => {
+    const cover = (await deps.leases(ctx)).find((l) => l.apps.includes(app));
+    if (!cover) return null;
+    const status =
+      cover.state === 'starting' ? 'starting' : `queued #${cover.position}`;
+    const observed = `${status}${cover.waiting_for ? `: ${cover.waiting_for}` : ''}`;
+    if (deps.now() >= deadline)
+      return answer({ ok: false, reason: 'timeout', status, observed });
+    if (!(await pause()))
+      return answer({ ok: false, reason: 'aborted', status, observed });
+    return 'again';
+  };
   if (
     until.kind === 'log' ||
     until.kind === 'idle' ||
@@ -380,12 +406,18 @@ export async function waitFor(
       giveUp,
     });
 
-  for (let first = true; ; first = false) {
+  // true until a process is seen: a lease that ends without the app ever starting is still a request for an app that
+  // never started at the next look
+  let first = true;
+  for (;;) {
     let p: Pm2Process | undefined;
     let observed: string | undefined;
     if (until.kind === 'exited') {
       p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
       if (!p) {
+        const q = await queued();
+        if (q === 'again') continue;
+        if (q) return q;
         // gone at the first look is a request for an app that never started; gone later is a result
         if (first) throw notStarted(ctx, app);
         return gone(undefined);
@@ -403,9 +435,16 @@ export async function waitFor(
         metrics: 'none',
         // the option names apps, not urls: the probe checks this app's url
         urls: until.kind === 'url-ok' ? [app] : 'none',
+        // read below through deps.leases, and only while the app has no process
+        leases: 'none',
       });
       p = findProcess(snap.procs, ctx.manifest.project, app);
-      if (first && !p) throw notStarted(ctx, app);
+      if (!p) {
+        const q = await queued();
+        if (q === 'again') continue;
+        if (q) return q;
+        if (first) throw notStarted(ctx, app);
+      }
       let met: boolean;
       if (until.kind === 'listening') {
         const ports = snap.ports[app];
@@ -430,6 +469,8 @@ export async function waitFor(
         observed = `status ${p.status}, ${observed}`;
       }
     }
+    // only a look that saw the process gets here
+    first = false;
     if (deps.now() >= deadline) return giveUp('timeout', p, observed);
     if (!(await pause())) return giveUp('aborted', p, observed);
   }
