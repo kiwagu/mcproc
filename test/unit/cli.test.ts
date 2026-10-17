@@ -7,6 +7,7 @@ import { buildProgram, printLs, printSince } from '../../src/cli/program.js';
 import { parseSince } from '../../src/core/logsince.js';
 import { Fleet } from '../../src/core/fleet.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -78,6 +79,74 @@ describe('cli', () => {
       { from: 'user' }
     );
     expect(c2.err[0]).toContain('READONLY_HOST');
+  });
+  it('registers leases with cancel; start takes --note and a hidden --lease', () => {
+    const p = buildProgram(capture().io);
+    const leases = p.commands.find((x) => x.name() === 'leases')!;
+    expect(leases).toBeDefined();
+    expect(leases.commands.map((x) => x.name())).toEqual(['cancel']);
+    const start = p.commands.find((x) => x.name() === 'start')!;
+    const help = start.helpInformation();
+    expect(help).toContain('--note <text>');
+    expect(help).not.toContain('--lease');
+    expect(start.options.map((o) => o.long)).toContain('--lease');
+  });
+  it('leases prints the queue without a manifest; leases cancel cancels a pending lease and refuses it the second time', async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-state-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-'));
+    vi.stubEnv('MCPROC_STATE_DIR', state);
+    try {
+      const l = await new LeaseStore(state).create(
+        {
+          kind: 'start',
+          project: 'demo',
+          root: '/w/demo',
+          slot: 0,
+          repo: '/w/demo',
+          target: 'dev',
+          apps: ['db'],
+          reload: false,
+          estimate_mib: 512,
+          need_mib: 615,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const c = capture();
+      await buildProgram(c.io).parseAsync(['leases', '--project', dir], {
+        from: 'user',
+      });
+      expect(c.err).toEqual([]);
+      expect(c.out.join('\n')).toContain(`state: ${state}`);
+      expect(c.out.join('\n')).toContain(l.id);
+      const j = capture();
+      await buildProgram(j.io).parseAsync(
+        ['leases', '--project', dir, '--json'],
+        { from: 'user' }
+      );
+      expect(JSON.parse(j.out.join(''))).toMatchObject({
+        leases: [{ id: l.id, position: 1 }],
+      });
+      const x = capture();
+      await buildProgram(x.io).parseAsync(['leases', 'cancel', l.id], {
+        from: 'user',
+      });
+      expect(x.out).toEqual([`cancelled ${l.id} (demo dev)`]);
+      const y = capture();
+      await buildProgram(y.io).parseAsync(['leases', 'cancel', l.id], {
+        from: 'user',
+      });
+      expect(y.err[0]).toContain('LEASE_NOT_PENDING');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('init --adopt-ports needs a manifest, and refuses a readonly local host before connecting, force or not', async () => {
     const init = buildProgram(capture().io).commands.find(

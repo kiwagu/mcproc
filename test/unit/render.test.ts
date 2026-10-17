@@ -22,8 +22,11 @@ import {
   renderLogsSince,
   sinceNotes,
   renderAdopted,
+  queuedNote,
+  renderLeases,
 } from '../../src/mcp/render.js';
-import { describeProject, type LsRow } from '../../src/core/list.js';
+import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
+import type { Lease } from '../../src/core/leases/store.js';
 import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
@@ -1203,4 +1206,167 @@ it('renderProject lists the vars with their sources when there are any', () => {
   expect(
     renderProject(describeProject(loadManifest(fixture('basic'))))
   ).not.toContain('vars:');
+});
+
+describe('queued starts and the lease queue', () => {
+  const vars = loadManifest(fixture('vars'));
+  const waiting = 'needs 922M, host has 476M over the reserve (446M short)';
+  const pending = {
+    id: 'l_1',
+    state: 'pending' as const,
+    waiting_for: waiting,
+  };
+  it('queuedRow: the status word is the position, the lease rides along, no error', () => {
+    const r = queuedRow(vars.apps.db, 'local', pending, 1);
+    expect(r.status).toBe('queued #1');
+    expect(r.lease).toEqual({ ...pending, position: 1 });
+    expect(r.error).toBeUndefined();
+    expect('error' in r).toBe(false);
+    expect(
+      queuedRow(
+        vars.apps.db,
+        'local',
+        { id: 'l_2', state: 'starting', waiting_for: null },
+        0
+      ).status
+    ).toBe('starting');
+  });
+  it('queuedNote: one line per lease, its apps, position and reason; starting says so; none without a lease', () => {
+    const rows = [
+      queuedRow(vars.apps.db, 'local', pending, 1),
+      queuedRow(vars.apps.api, 'local', pending, 1),
+      row('online', []),
+    ];
+    expect(queuedNote(rows)).toBe(
+      `db, api: queued #1: ${waiting} (lease l_1; wait on an app, or leases)`
+    );
+    expect(
+      queuedNote([
+        queuedRow(
+          vars.apps.db,
+          'local',
+          { id: 'l_2', state: 'starting', waiting_for: null },
+          0
+        ),
+      ])
+    ).toBe('db: starting (lease l_2)');
+    expect(queuedNote([row('online', [])])).toBe('');
+  });
+  it('a queued start is not a failure: renderMutation shows the queued rows and the note', () => {
+    const r = renderMutation(
+      [
+        queuedRow(vars.apps.db, 'local', pending, 1),
+        queuedRow(vars.apps.tool, 'local', pending, 1),
+      ],
+      'local',
+      'start'
+    );
+    expect(r.failed).toBe(false);
+    expect(r.text).not.toContain('partly failed');
+    expect(r.text).toContain('queued #1');
+    expect(r.text).toContain('db, tool: queued #1: ');
+    // an app without a url shows what its lease waits for in the URL column
+    const tool = r.text.split('\n').find((l) => l.startsWith('tool '))!;
+    expect(tool).toContain(`queued #1`);
+    expect(tool).toContain(waiting);
+    const db = r.text.split('\n').find((l) => l.startsWith('db '))!;
+    expect(db).toContain('http://127.0.0.1:5632/');
+  });
+  const lease = (over: Partial<Lease>): Lease => ({
+    id: 'l_aaaaaaaaaa',
+    seq: 1,
+    state: 'running',
+    kind: 'start',
+    project: 'demo',
+    root: '/w/demo',
+    slot: 0,
+    repo: '/w/demo',
+    target: 'dev',
+    apps: ['db', 'api'],
+    reload: false,
+    estimate_mib: 768,
+    need_mib: 922,
+    margin: 0.2,
+    reserve_mib: 1024,
+    sources: {
+      db: { mib: 512, source: 'declared' },
+      api: { mib: 256, source: 'declared' },
+    },
+    note: null,
+    requester_pid: 1,
+    child_pid: null,
+    queued_at: '2026-10-17T10:00:00.000Z',
+    admitted_at: '2026-10-17T10:00:00.000Z',
+    running_at: '2026-10-17T10:00:00.000Z',
+    ended_at: null,
+    waiting_for: null,
+    error: null,
+    exit_code: null,
+    ...over,
+  });
+  it('renderLeases: the state directory, the memory and the watcher, then no leases', () => {
+    expect(
+      renderLeases({
+        state_dir: '/s',
+        memory: null,
+        watcher: null,
+        leases: [],
+      })
+    ).toBe(
+      'state: /s\nmemory: no reading on this host (leases are admitted in FIFO order without a check)\nno leases'
+    );
+  });
+  it('renderLeases: one row per lease, oldest first, with its position, estimate, source and reason', () => {
+    const text = renderLeases({
+      state_dir: '/s',
+      memory: { total_mib: 31836, available_mib: 9100 },
+      watcher: { online: true, pid: 42 },
+      leases: [
+        { ...lease({}), position: 0 },
+        {
+          ...lease({
+            id: 'l_bbbbbbbbbb',
+            seq: 2,
+            state: 'pending',
+            project: 'demo-w2',
+            root: '/w/demo.worktrees/b',
+            slot: 2,
+            estimate_mib: 812,
+            need_mib: 975,
+            sources: {
+              db: { mib: 512, source: 'declared' },
+              api: { mib: 300, source: 'measured from slot 0' },
+            },
+            admitted_at: null,
+            running_at: null,
+            waiting_for: waiting,
+          }),
+          position: 1,
+        },
+      ],
+    });
+    const lines = text.split('\n');
+    expect(lines.slice(0, 3)).toEqual([
+      'state: /s',
+      'memory: 8.9G available of 31.1G',
+      'watcher: online pid 42',
+    ]);
+    expect(lines[3]).toMatch(
+      /^POS +STATE +KIND +PROJECT +TARGET +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
+    );
+    expect(lines[4]).toMatch(
+      /^ +running +start +demo \(slot 0\) +dev +768M → 922M +declared +l_aaaaaaaaaa$/
+    );
+    expect(lines[5]).toMatch(
+      /^#1 +pending +start +demo-w2 \(slot 2\) +dev +812M → 975M +measured +needs 922M, .* short\) +l_bbbbbbbbbb$/
+    );
+    expect(
+      renderLeases({
+        state_dir: '/s',
+        memory: null,
+        watcher: { online: false, pid: null },
+        leases: [],
+      })
+    ).toContain('watcher: not running');
+  });
 });

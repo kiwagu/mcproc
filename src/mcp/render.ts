@@ -10,6 +10,8 @@ import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
 import type { VarInfo } from '../core/manifest.js';
+import type { LeasesView } from '../core/leases/view.js';
+import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
   reasonWord,
@@ -77,7 +79,8 @@ export function cut(s: string, n: number): string {
  * the short reason of a url that answered nowhere; the bare url when not requested (monit's live screen never asks).
  */
 export function fmtUrl(r: LsRow): string {
-  if (!r.url) return '-';
+  // a queued app without a url: the column says what its lease waits for
+  if (!r.url) return r.lease?.waiting_for ?? '-';
   const here = r.url_from === 'here' ? ' (here)' : '';
   if (r.url_status === 'ok') return `${r.url} ✓ ${r.url_code}${here}`;
   if (r.url_status === 'error')
@@ -526,7 +529,67 @@ export function waitNote(waits: WaitRecord[]): string {
     : '';
 }
 
-/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start note and the waits made. */
+/** One line per queued app of a start: its position and what the head of the queue waits for. */
+export function queuedNote(rows: LsRow[]): string {
+  const by = new Map<string, LsRow[]>();
+  for (const r of rows)
+    if (r.lease) by.set(r.lease.id, [...(by.get(r.lease.id) ?? []), r]);
+  return [...by.values()]
+    .map((rs) => {
+      const l = rs[0].lease!;
+      const apps = rs.map((r) => r.app).join(', ');
+      return l.state === 'starting'
+        ? `${apps}: starting (lease ${l.id})`
+        : `${apps}: queued #${l.position}${l.waiting_for ? `: ${l.waiting_for}` : ''} (lease ${l.id}; wait on an app, or leases)`;
+    })
+    .join('\n');
+}
+
+/** The queue as a table, oldest first, with the host's memory and the watcher's state above it. */
+export function renderLeases(v: LeasesView): string {
+  const head = [
+    `state: ${v.state_dir}`,
+    v.memory
+      ? `memory: ${fmtMib(v.memory.available_mib)} available of ${fmtMib(v.memory.total_mib)}`
+      : 'memory: no reading on this host (leases are admitted in FIFO order without a check)',
+    v.watcher
+      ? `watcher: ${v.watcher.online ? `online pid ${v.watcher.pid}` : 'not running'}`
+      : '',
+  ].filter(Boolean);
+  if (v.leases.length === 0) return [...head, 'no leases'].join('\n');
+  const rows = v.leases.map((l) => [
+    l.position ? `#${l.position}` : '',
+    l.state,
+    l.kind,
+    l.project + (l.slot !== null ? ` (slot ${l.slot})` : ''),
+    l.target,
+    `${fmtMib(l.estimate_mib)} → ${fmtMib(l.need_mib)}`,
+    Object.values(l.sources).some((s) => s.source.startsWith('measured'))
+      ? 'measured'
+      : 'declared',
+    l.waiting_for ?? l.error ?? '',
+    l.id,
+  ]);
+  return [
+    ...head,
+    table([
+      [
+        'POS',
+        'STATE',
+        'KIND',
+        'PROJECT',
+        'TARGET',
+        'EST → NEED',
+        'FROM',
+        'WAITING FOR / ERROR',
+        'ID',
+      ],
+      ...rows,
+    ]),
+  ].join('\n');
+}
+
+/** A fleet mutation's answer: when a host failed or was skipped, a first line that says which apps and why; then the table, the start and queue notes and the waits made. */
 export function renderMutation(
   rows: LsRow[],
   fallback: string,
@@ -536,6 +599,7 @@ export function renderMutation(
   const bad = rows.filter((r) => r.error);
   const notes = [
     act === 'start' || act === 'restart' ? startNote(rows) : '',
+    act === 'start' ? queuedNote(rows) : '',
     waitNote(waits),
   ].filter(Boolean);
   const head = bad.length

@@ -1,4 +1,4 @@
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
@@ -9,7 +9,9 @@ import {
   connect,
   assertWritable,
   resolveProjectDir,
+  type Context,
 } from '../core/resolve.js';
+import { cancelLease, leasesView } from '../core/leases/view.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
 import { takeIncidents, clearLogs } from '../core/incidents/store.js';
@@ -47,6 +49,7 @@ import {
   renderMutation,
   renderWait,
   renderAdopted,
+  renderLeases,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -197,7 +200,7 @@ export function buildProgram(io: Io = defaultIo): Command {
     g: Globals,
     target: string,
     act: Act,
-    opts: { reload?: boolean } = {}
+    opts: { reload?: boolean; note?: string; lease?: string } = {}
   ) => {
     const fleet = fleetOf(g);
     const waits: WaitRecord[] = [];
@@ -542,8 +545,17 @@ export function buildProgram(io: Io = defaultIo): Command {
     .command('start <target>')
     .description('start an app or profile (dependencies first)')
     .option('--reload', 'restart apps that are already online')
+    .option('--note <text>', 'what this start is for, kept on its lease')
+    // internal: the watcher's child runs the start it admitted under this lease
+    .addOption(new Option('--lease <id>').hideHelp())
     .action(
-      wrap((g, o, [t]) => mutate(g, t, 'start', { reload: Boolean(o.reload) }))
+      wrap((g, o, [t]) =>
+        mutate(g, t, 'start', {
+          reload: Boolean(o.reload),
+          note: o.note as string | undefined,
+          lease: o.lease as string | undefined,
+        })
+      )
     );
   program
     .command('restart <target>')
@@ -557,6 +569,32 @@ export function buildProgram(io: Io = defaultIo): Command {
     .command('delete <target>')
     .description('remove app(s) from pm2')
     .action(wrap((g, _o, [t]) => mutate(g, t, 'delete')));
+  const leases = program
+    .command('leases')
+    .description(
+      "the host's lease queue: who is running, who waits and why, the memory reading and the watcher"
+    )
+    .action(
+      wrap(async (g) => {
+        let ctx: Context | undefined;
+        try {
+          ctx = await ctxOf(g);
+        } catch {
+          ctx = undefined; // no manifest here: the queue is the host's and still reads
+        }
+        const v = await leasesView(undefined, ctx);
+        emit(g, renderLeases(v), v);
+      })
+    );
+  leases
+    .command('cancel <id>')
+    .description('cancel a pending lease')
+    .action(
+      wrap(async (g, _o, [id]) => {
+        const l = await cancelLease(id);
+        emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
   program
     .command('flush [app]')
     .description('truncate pm2 log files; incidents start over from there')

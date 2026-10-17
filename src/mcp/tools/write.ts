@@ -11,6 +11,7 @@ import type { WaitRecord } from '../../core/actions.js';
 import { clearLogs } from '../../core/incidents/store.js';
 import { initProject } from '../../core/init.js';
 import { adoptPorts } from '../../core/adopt.js';
+import { cancelLease } from '../../core/leases/view.js';
 import type { LsRow } from '../../core/list.js';
 import { createTransport } from '../../transport/index.js';
 import { unpack, defaultUnpackDeps } from '../../runtime/unpack.js';
@@ -39,7 +40,13 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     target: z.string().describe('App name, profile name, or "all"'),
   };
   const act = async (
-    args: { project?: string; host?: string; target: string; reload?: boolean },
+    args: {
+      project?: string;
+      host?: string;
+      target: string;
+      reload?: boolean;
+      note?: string;
+    },
     what: Act,
     signal?: AbortSignal // the request's: aborted when the client cancels it or goes away
   ) => {
@@ -47,6 +54,7 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     const waits: WaitRecord[] = [];
     const rows: LsRow[] = await actOn(fleet, args.target, what, {
       reload: args.reload,
+      note: args.note,
       waits,
       signal,
     });
@@ -107,7 +115,15 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
       title: 'Start',
       description:
         'Start an app or profile via pm2 from the generated ecosystem, each app on the host it runs on, dependencies first. A dependency declared with condition ready or completed is waited for (up to its timeout) before the dependent starts, and a dependent whose dependency failed or timed out is skipped with the reason. Apps already online are left alone unless reload is true.',
-      inputSchema: { ...targetInput, reload: z.boolean().optional() },
+      inputSchema: {
+        ...targetInput,
+        reload: z.boolean().optional(),
+        note: z
+          .string()
+          .max(200)
+          .optional()
+          .describe('What this start is for, kept on its lease'),
+      },
       annotations: MUT(false, true),
     },
     (args, extra) =>
@@ -156,6 +172,27 @@ export function registerWriteTools(server: McpServer, deps: ToolDeps): void {
     (args) =>
       runTool(async () => {
         return act(args, 'delete');
+      })
+  );
+
+  server.registerTool(
+    'lease_cancel',
+    {
+      title: 'Cancel a pending lease',
+      description:
+        "Remove a pending lease from the host's queue (a start that has not been admitted yet). A starting or running lease is refused: stop its target instead.",
+      inputSchema: {
+        id: z.string().describe('The lease id from leases or a queued start'),
+      },
+      annotations: MUT(false, true),
+    },
+    (args) =>
+      runTool(async () => {
+        const l = await cancelLease(args.id);
+        return {
+          text: `cancelled ${l.id} (${l.project} ${l.target})`,
+          data: l as unknown as Record<string, unknown>,
+        };
       })
   );
 

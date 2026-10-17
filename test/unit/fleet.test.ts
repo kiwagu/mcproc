@@ -1,4 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest } from '../../src/core/manifest.js';
@@ -14,6 +16,8 @@ import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
 import { MARK } from '../../src/shell/snippets.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
+import type { GateDeps } from '../../src/core/leases/gate.js';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 
@@ -581,5 +585,108 @@ describe('actOn start with conditions across hosts', () => {
     const rows = await actOn(f, 'web', 'start', { waits });
     expect(rows.map((r) => r.app)).toEqual(['web']);
     expect(waits).toEqual([]);
+  });
+});
+
+describe('actOn start through the memory lease gate', () => {
+  const varsProj = path.join(here, '..', 'fixtures', 'projects', 'vars');
+  let stateDir: string;
+  let store: LeaseStore;
+  let ensured = 0;
+  beforeEach(() => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-fleet-gate-'));
+    store = new LeaseStore(stateDir);
+    ensured = 0;
+  });
+  afterEach(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const gateOf = (available_mib: number): GateDeps => ({
+    store,
+    memory: async () => ({ total_mib: 8000, available_mib }),
+    siblings: async () => new Map(),
+    ensureWatcher: async () => {
+      ensured++;
+    },
+  });
+  /** the vars stand (demo-w2: db 512M, api 256M) on a local fake whose pm2 runs nothing yet */
+  const varsFleet = () => {
+    const ctx = fakeCtx(
+      varsProj,
+      'local',
+      [
+        { match: MARK.JLIST, result: { stdout: probeOut({}) } },
+        { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+        { match: 'cat >', result: {} },
+        { match: /startOrRestart/, result: {} },
+      ],
+      'local',
+      async () => ({ answered: false, fail: 'refused' as const })
+    );
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    const started = () =>
+      ctx.fake.calls.filter((c) => /startOrRestart/.test(c.cmd)).length;
+    return { fleet, started };
+  };
+
+  it('a start that does not fit is queued: queued rows, no pm2 start, one pending lease, the watcher made sure of', async () => {
+    const h = varsFleet();
+    const rows = await actOn(h.fleet, 'dev', 'start', { gate: gateOf(1500) });
+    expect(rows.map((r) => [r.app, r.status, r.lease?.position])).toEqual([
+      ['db', 'queued #1', 1],
+      ['api', 'queued #1', 1],
+    ]);
+    expect(rows[0].lease?.waiting_for).toBe(
+      'needs 922M, host has 476M over the reserve (446M short)'
+    );
+    expect(h.started()).toBe(0);
+    expect(store.list().map((l) => [l.state, l.target, l.apps])).toEqual([
+      ['pending', 'dev', ['db', 'api']],
+    ]);
+    expect(ensured).toBe(1);
+  });
+
+  it('a start that fits runs at once under a running lease', async () => {
+    const h = varsFleet();
+    const rows = await actOn(h.fleet, 'dev', 'start', {
+      gate: gateOf(9000),
+      note: 'dev up',
+    });
+    expect(rows.map((r) => r.app)).toEqual(['db', 'api']);
+    expect(rows.every((r) => r.lease === undefined)).toBe(true);
+    expect(h.started()).toBe(2);
+    expect(store.list().map((l) => [l.state, l.note])).toEqual([
+      ['running', 'dev up'],
+    ]);
+    expect(ensured).toBe(0);
+  });
+
+  it('stop frees the running lease once none of its apps is online', async () => {
+    const h = varsFleet();
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(9000) });
+    await actOn(h.fleet, 'dev', 'stop', { gate: gateOf(9000) });
+    expect(store.list().map((l) => l.state)).toEqual(['freed']);
+  });
+
+  it('a start that throws frees the lease it was admitted under', async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+      { match: 'cat >', result: { code: 1, stderr: 'disk full' } },
+    ]);
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    await expect(
+      actOn(fleet, 'dev', 'start', { gate: gateOf(9000) })
+    ).rejects.toMatchObject({ code: 'TRANSPORT_FAILED' });
+    expect(store.list()).toMatchObject([
+      { state: 'freed', error: expect.stringContaining('disk full') },
+    ]);
+  });
+
+  it('the start of an admitted lease skips the queue and ends it as running', async () => {
+    const h = varsFleet();
+    const queued = await actOn(h.fleet, 'dev', 'start', { gate: gateOf(10) });
+    const id = queued[0].lease!.id;
+    await store.withLock(() => store.transition(id, 'starting'));
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(10), lease: id });
+    expect(h.started()).toBe(2);
+    expect(store.get(id)?.state).toBe('running');
   });
 });

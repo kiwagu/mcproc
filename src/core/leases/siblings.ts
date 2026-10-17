@@ -24,12 +24,14 @@ export function registryOf(m: Manifest, dir = stateDir()): Registry | null {
   return readRegistry(registryPath(dir, m.base_project, repoOf(m)));
 }
 
-/** One checkout's rows, read locally with the full probe (containers included) and no url checks. */
+/** One checkout's rows, read locally with the full probe (containers included) and no url checks; none when `root` has no manifest of its own. */
 export async function listCheckout(
   root: string,
   spawner?: Spawner
 ): Promise<LsRow[]> {
   const prep = prepare({ project: root });
+  // the manifest search walks up: a sibling path without one would measure the project that encloses it
+  if (fs.realpathSync(prep.manifest.root) !== fs.realpathSync(root)) return [];
   const ctx = await connect(prep, { spawner });
   // the full probe with the containers' memory: this is the measurement the estimate rests on
   const snap = await snapshot(ctx, {
@@ -43,7 +45,7 @@ export async function listCheckout(
 /**
  * What the other checkouts of the repository show for each app that is online there, the largest value per app
  * (the conservative estimate), from the registry's slots whose path still exists; a checkout that does not answer
- * contributes nothing.
+ * contributes nothing. The checkouts are read at the same time and folded in slot order, so a tie goes to the lowest slot.
  */
 export async function measureSiblings(
   m: Manifest,
@@ -56,14 +58,18 @@ export async function measureSiblings(
   const out = new Map<string, AppMeasure>();
   if (!deps.registry) return out;
   const exists = deps.exists ?? ((p) => fs.existsSync(p));
-  for (const { slot, entry } of siblingsOf(deps.registry, m.root)) {
-    if (!exists(entry.path)) continue;
-    let rows: LsRow[];
-    try {
-      rows = await deps.list(entry.path);
-    } catch {
-      continue;
-    }
+  const read = await Promise.all(
+    siblingsOf(deps.registry, m.root)
+      .filter(({ entry }) => exists(entry.path))
+      .map(async ({ slot, entry }) => {
+        try {
+          return { slot, rows: await deps.list(entry.path) };
+        } catch {
+          return { slot, rows: [] as LsRow[] }; // a checkout that does not answer
+        }
+      })
+  );
+  for (const { slot, rows } of read) {
     for (const r of rows) {
       if (!isRunning(r.status) || r.memory <= 0) continue;
       const mib = Math.ceil(r.memory / MIB);

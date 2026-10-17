@@ -5,9 +5,14 @@ import {
   needOf,
   reserveMib,
 } from '../../src/core/leases/admission.js';
-import { measureSiblings } from '../../src/core/leases/siblings.js';
+import {
+  listCheckout,
+  measureSiblings,
+} from '../../src/core/leases/siblings.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import type { LsRow } from '../../src/core/list.js';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -38,6 +43,9 @@ describe('estimateApps', () => {
   it('needOf adds the margin, rounded up', () => {
     expect(needOf(812, 0.1)).toBe(894);
     expect(needOf(0, 0.1)).toBe(0);
+    // 100 * 1.1 is 110.00000000000001 in floating point: rounded to six decimals first, not up to 111
+    expect(needOf(100, 0.1)).toBe(110);
+    expect(needOf(768, 0.2)).toBe(922);
   });
   it('reserveMib reads a size, or a percent of the total, or the default without a reading', () => {
     expect(reserveMib({ kind: 'mib', mib: 4096 }, null)).toBe(4096);
@@ -127,6 +135,45 @@ describe('measureSiblings', () => {
         ['api', { mib: 400, slot: 0 }],
       ])
     );
+  });
+  it('probes the siblings at the same time and folds them in slot order: on a tie the lowest slot wins', async () => {
+    const registry = {
+      repo: '/w/demo',
+      slots: {
+        '0': { path: '/w/demo', branch: null, project: 'demo' },
+        '1': { path: '/w/demo.worktrees/a', branch: 'a', project: 'demo-w1' },
+      },
+    };
+    let inflight = 0;
+    let most = 0;
+    const list = async (root: string) => {
+      inflight++;
+      most = Math.max(most, inflight);
+      // slot 0 answers last
+      await new Promise((r) => setTimeout(r, root === '/w/demo' ? 40 : 5));
+      inflight--;
+      return [row('db', 'online', 80 * 1024 * 1024)];
+    };
+    const r = await measureSiblings(m, { registry, list, exists: () => true });
+    expect(most).toBe(2);
+    expect(r).toEqual(new Map([['db', { mib: 80, slot: 0 }]]));
+  });
+  it('listCheckout measures nothing at a path whose manifest is an enclosing project', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-sib-'));
+    try {
+      fs.mkdirSync(path.join(root, '.mcproc'));
+      fs.writeFileSync(
+        path.join(root, '.mcproc', 'mcproc.yaml'),
+        'version: 1\nproject: demo\napps:\n  a: { description: d, run: node a.js }\n'
+      );
+      fs.mkdirSync(path.join(root, 'nested'));
+      const never = async (argv: string[]) => {
+        throw new Error(`must not spawn: ${argv.join(' ')}`);
+      };
+      expect(await listCheckout(path.join(root, 'nested'), never)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
   it('is empty without a registry, and skips a checkout that is gone or does not answer', async () => {
     expect(

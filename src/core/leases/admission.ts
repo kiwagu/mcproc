@@ -34,9 +34,9 @@ export function estimateApps(
   return { estimate_mib, sources };
 }
 
-/** The estimate with the safety margin on top, rounded up. */
+/** The estimate with the safety margin on top, rounded up (after six decimals, so 100 * 1.1 is 110, not 111). */
 export const needOf = (estimate_mib: number, margin: number): number =>
-  Math.ceil(estimate_mib * (1 + margin));
+  Math.ceil(Math.round(estimate_mib * (1 + margin) * 1e6) / 1e6);
 
 /** The reserve in MiB: as declared, or a percent of the host's total; the default when a percent has no reading to apply to. */
 export function reserveMib(

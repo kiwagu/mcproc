@@ -13,6 +13,7 @@ import { S, answerReads } from '../helpers/incidents.js';
 import type { Spawner } from '../../src/transport/types.js';
 import type { UnpackDeps } from '../../src/runtime/unpack.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -46,7 +47,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 15 tools with annotations and short instructions', async () => {
+  it('registers the 17 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -58,6 +59,8 @@ describe('mcp server', () => {
       'hosts',
       'incidents',
       'init',
+      'lease_cancel',
+      'leases',
       'logs',
       'ls',
       'ports',
@@ -80,8 +83,23 @@ describe('mcp server', () => {
       'logs',
       'ports',
       'wait',
+      'leases',
     ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
+    expect(byName.lease_cancel.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+    // what this start is for rides on its lease; the lease id itself is the watcher's business
+    const startProps = byName.start.inputSchema.properties as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(startProps)).toContain('note');
+    expect(Object.keys(startProps)).not.toContain('lease');
+    expect(byName.leases.description).toMatch(
+      /pending, starting, running, freed, cancelled, failed/
+    );
     for (const n of ['stop', 'delete', 'flush', 'init'])
       expect(byName[n].annotations?.destructiveHint).toBe(true); // init with force replaces the owner's manifest
     expect(byName.start.annotations).toMatchObject({
@@ -169,6 +187,61 @@ describe('mcp server', () => {
       arguments: { project: basic },
     });
     expect(b.structuredContent.project).toBe('demo');
+  });
+  it('leases reads the host queue without a manifest, and lease_cancel cancels a pending lease once', async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-state-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-empty-'));
+    vi.stubEnv('MCPROC_STATE_DIR', state);
+    try {
+      const store = new LeaseStore(state);
+      const l = await store.create(
+        {
+          kind: 'start',
+          project: 'demo-w2',
+          root: '/w/demo.worktrees/b',
+          slot: 2,
+          repo: '/w/demo',
+          target: 'dev',
+          apps: ['db', 'api'],
+          reload: false,
+          estimate_mib: 768,
+          need_mib: 922,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const cl = await client(neverSpawn, undefined, dir);
+      const r: any = await cl.callTool({ name: 'leases', arguments: {} });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        state_dir: state,
+        memory: null,
+        watcher: null,
+        leases: [{ id: l.id, state: 'pending', position: 1 }],
+      });
+      expect(text(r)).toContain(`state: ${state}`);
+      expect(text(r)).toMatch(/#1 +pending +start +demo-w2 \(slot 2\)/);
+      const c: any = await cl.callTool({
+        name: 'lease_cancel',
+        arguments: { id: l.id },
+      });
+      expect(text(c)).toBe(`cancelled ${l.id} (demo-w2 dev)`);
+      expect(c.structuredContent).toMatchObject({ state: 'cancelled' });
+      const again: any = await cl.callTool({
+        name: 'lease_cancel',
+        arguments: { id: l.id },
+      });
+      expect(again.isError).toBe(true);
+      expect(text(again)).toContain('LEASE_NOT_PENDING');
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(state, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('returns MANIFEST_NOT_FOUND with the init hint as an isError result', async () => {
     const cl = await client(neverSpawn);

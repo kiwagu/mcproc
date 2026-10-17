@@ -65,6 +65,13 @@ export interface LsRow {
    * (the count is then a lower bound)
    */
   reloads?: ReloadCount;
+  /** the lease that covers an app with no process yet: queued (its position) or starting */
+  lease?: {
+    id: string;
+    state: 'pending' | 'starting';
+    position: number;
+    waiting_for: string | null;
+  };
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
 }
@@ -347,6 +354,35 @@ export function unreachableRow(
     url_reason: null,
     ports: { actual: [], declared: app.ports, checks: [], undeclared: [] },
     error,
+  };
+}
+
+/** The row of an app whose start is queued: no runtime facts, the lease's position and reason instead. */
+export function queuedRow(
+  app: App,
+  host: string,
+  lease: {
+    id: string;
+    state: 'pending' | 'starting';
+    waiting_for: string | null;
+  },
+  position: number
+): LsRow {
+  const base = unreachableRow(
+    app,
+    host,
+    '',
+    lease.state === 'starting' ? 'starting' : `queued #${position}`
+  );
+  const { error: _dropped, ...row } = base;
+  return {
+    ...row,
+    lease: {
+      id: lease.id,
+      state: lease.state,
+      position,
+      waiting_for: lease.waiting_for,
+    },
   };
 }
 

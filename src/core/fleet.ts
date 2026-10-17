@@ -14,6 +14,7 @@ import { waitDependency } from './wait.js';
 import {
   depView,
   describeApp,
+  queuedRow,
   rowsFor,
   snapshot,
   unreachableRow,
@@ -21,6 +22,16 @@ import {
   type Snapshot,
   type SnapshotOptions,
 } from './list.js';
+import {
+  defaultGateDeps,
+  finishLeasedStart,
+  freeOnFailure,
+  gateStart,
+  liveLeasesOf,
+  releaseAfter,
+  type GateDeps,
+} from './leases/gate.js';
+import type { Lease } from './leases/store.js';
 import type { Spawner } from '../transport/types.js';
 import type { HereCheck } from './urlcheck.js';
 
@@ -226,7 +237,9 @@ function failedRows(fleet: Fleet, r: HostApps, e: unknown): LsRow[] {
  * start/restart/stop/delete of a target across hosts. start adds the dependencies first (with --host only those that
  * run on that host); the apps are then cut into runs of one host each and acted on run by run, in that order. A run that
  * fails leaves rows saying so and the other runs go on — except for start, where the later runs are skipped (they may
- * need what did not start). When nothing happened at all, the first error is thrown.
+ * need what did not start). When nothing happened at all, the first error is thrown. A local start of apps that declare
+ * memory goes through the lease gate first (a queued run answers queued rows); a local stop or delete frees the
+ * checkout's leases that no longer hold anything.
  */
 export async function actOn(
   fleet: Fleet,
@@ -237,6 +250,12 @@ export async function actOn(
     waits?: WaitRecord[];
     /** ends the dependency waits of a start as `aborted`: the caller's request was cancelled */
     signal?: AbortSignal;
+    /** a note kept on the lease (what this start is for) */
+    note?: string | null;
+    /** the id of a lease the watcher admitted: the start skips the queue and ends the lease as running or failed */
+    lease?: string | null;
+    /** the lease machinery (tests pass fakes); default the host state directory */
+    gate?: GateDeps;
   } = {}
 ): Promise<LsRow[]> {
   const named = fleet.select([target]);
@@ -264,6 +283,7 @@ export async function actOn(
     waitDependency(await fleet.ctx(fleet.hostOf(d.app)), d, {
       signal: opts.signal,
     });
+  const gate = opts.gate ?? defaultGateDeps();
   for (const r of runs) {
     if (failed && act === 'start') {
       rows.push(
@@ -280,8 +300,42 @@ export async function actOn(
     }
     try {
       const ctx = await fleet.ctx(r.host);
-      rows.push(
-        ...(await (act === 'start'
+      let admitted: Lease | null = null;
+      // only a run with an app that declares memory asks pm2 what runs already: the others never touch the queue
+      const budgeted = r.apps.some(
+        (a) => fleet.manifest.apps[a].memory_mib !== null
+      );
+      if (act === 'start' && ctx.host.local && !opts.lease && budgeted) {
+        const g = await gateStart(
+          ctx,
+          r.apps,
+          {
+            target,
+            reload: opts.reload,
+            note: opts.note,
+            procs: await ctx.pm2.jlist(),
+          },
+          gate
+        );
+        if (g.kind === 'queued') {
+          // a queued result is always pending or starting
+          const lease = {
+            ...g.lease,
+            state: g.lease.state as 'pending' | 'starting',
+          };
+          rows.push(
+            ...r.apps.map((a) =>
+              queuedRow(fleet.manifest.apps[a], r.host, lease, g.position)
+            )
+          );
+          done++;
+          continue;
+        }
+        admitted = g.lease;
+      }
+      let runRows: LsRow[];
+      try {
+        runRows = await (act === 'start'
           ? startApps(ctx, r.apps, {
               reload: opts.reload,
               waitDep,
@@ -294,8 +348,21 @@ export async function actOn(
             ? restartApps(ctx, r.apps)
             : act === 'stop'
               ? stopApps(ctx, r.apps)
-              : deleteApps(ctx, r.apps)))
-      );
+              : deleteApps(ctx, r.apps));
+      } catch (e) {
+        if (admitted) await freeOnFailure(gate.store, admitted, e);
+        throw e;
+      }
+      if (act === 'start' && opts.lease && ctx.host.local)
+        await finishLeasedStart(gate.store, opts.lease, runRows);
+      // a checkout with no live lease skips pm2's list and the lock
+      if (
+        (act === 'stop' || act === 'delete') &&
+        ctx.host.local &&
+        liveLeasesOf(gate.store, ctx).length > 0
+      )
+        await releaseAfter(gate.store, ctx, r.apps, await ctx.pm2.jlist());
+      rows.push(...runRows);
       done++;
     } catch (e) {
       failed ??= { host: r.host, error: e };
