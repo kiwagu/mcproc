@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadManifest } from '../../src/core/manifest.js';
 import {
@@ -16,7 +17,11 @@ import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
 import type { Context } from '../../src/core/resolve.js';
 import { MARK } from '../../src/shell/snippets.js';
-import { LeaseStore } from '../../src/core/leases/store.js';
+import {
+  LeaseStore,
+  pidAlive,
+  type NewLease,
+} from '../../src/core/leases/store.js';
 import type { GateDeps } from '../../src/core/leases/gate.js';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
@@ -788,6 +793,127 @@ describe('actOn start through the memory lease gate', () => {
     );
     expect(h.starts()).toEqual([]);
     expect(ensured).toBe(1);
+  });
+
+  it('a stop cancels the overlapping queued and starting leases first (ending the starting child), then stops, then frees', async () => {
+    const lease = (over: Partial<NewLease>): NewLease => ({
+      kind: 'start',
+      project: 'demo-w2',
+      root: varsProj,
+      slot: 2,
+      repo: '/w/demo',
+      target: 'db',
+      apps: ['db'],
+      reload: false,
+      estimate_mib: 1,
+      need_mib: 1,
+      margin: 0,
+      reserve_mib: 0,
+      sources: {},
+      note: null,
+      requester_pid: 1,
+      ...over,
+    });
+    const child = spawn(process.execPath, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ]);
+    try {
+      const running = await store.create(lease({}), 'running');
+      const starting = await store.create(
+        lease({ target: 'dev', apps: ['db', 'api'] }),
+        'pending'
+      );
+      await store.transition(starting.id, 'starting', { child_pid: child.pid });
+      const pending = await store.create(
+        lease({ target: 'api', apps: ['api'] }),
+        'pending'
+      );
+      let status = 'online';
+      const list = () =>
+        JSON.stringify([
+          {
+            pid: status === 'online' ? 100 : 0,
+            name: 'demo-w2-db',
+            pm_id: 1,
+            pm2_env: { status, namespace: 'demo-w2', pm_cwd: varsProj },
+          },
+        ]);
+      const atStop: string[] = [];
+      const ctx = fakeCtx(varsProj, 'local', [
+        {
+          match: MARK.JLIST,
+          result: () => ({ stdout: probeOut({ jlist: list() }) }),
+        },
+        { match: /pm2 'jlist'/, result: () => ({ stdout: list() }) },
+        {
+          match: /pm2 'stop'/,
+          result: () => {
+            atStop.push(
+              store
+                .list()
+                .map((l) => l.state)
+                .join(','),
+              `child alive: ${pidAlive(child.pid!)}`
+            );
+            status = 'stopped';
+            return {};
+          },
+        },
+      ]);
+      const fleet = new Fleet(
+        loadManifest(varsProj),
+        undefined,
+        async () => ctx
+      );
+      await actOn(fleet, 'dev', 'stop', { gate: gateOf(9000) });
+      expect(atStop).toEqual([
+        'running,cancelled,cancelled',
+        'child alive: false',
+      ]);
+      expect(store.get(running.id)?.state).toBe('freed');
+      expect(store.get(starting.id)).toMatchObject({
+        state: 'cancelled',
+        error: 'stop of db, api',
+      });
+      expect(store.get(pending.id)?.state).toBe('cancelled');
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  it('a queued run counts only the apps the gate counted: an app online already keeps its real row and does not hold back its dependents', async () => {
+    const budget = <
+      T extends { apps: Record<string, { memory_mib: number | null }> },
+    >(
+      x: T
+    ) => {
+      if (x.apps.watch) x.apps.watch = { ...x.apps.watch, memory_mib: 512 };
+      if (x.apps.tool) x.apps.tool = { ...x.apps.tool, memory_mib: 256 };
+      return x;
+    };
+    const mm = budget({
+      ...m,
+      apps: { ...m.apps },
+      profiles: { ...m.profiles, trio: ['watch', 'tool', 'web'] },
+    });
+    const h = fakeFleet(undefined, { local: [proc('watch', 1, dir)] });
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      budget(h.ctxs[host].manifest);
+      return h.ctxs[host];
+    });
+    const rows = await actOn(f, 'trio', 'start', { gate: gateOf(10) });
+    const [lease] = store.list();
+    expect(lease).toMatchObject({ state: 'pending', apps: ['tool'] });
+    expect(rows.map((r) => [r.app, r.host, r.status, r.lease?.id])).toEqual([
+      ['watch', 'local', 'online', undefined],
+      ['tool', 'local', 'queued #1', lease.id],
+      // launched: the fake box lists nothing afterwards, so it reads not-started rather than skipped
+      ['web', 'box', 'not-started', undefined],
+    ]);
+    expect(rows[2].error).toBeUndefined();
+    expect(h.starts()).toEqual(['box fleet-web']);
   });
 
   it('the start of an admitted lease skips the queue and ends it as running', async () => {

@@ -2,7 +2,7 @@ import type { App, Resources } from '../manifest.js';
 import { RESERVE_DEFAULT_MIB } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
 import { fmtMib } from '../sizes.js';
-import type { LeaseSource } from './store.js';
+import type { Lease, LeaseSource } from './store.js';
 
 /** What a running sibling slot showed for an app: its resident set plus containers, in MiB, and which slot. */
 export interface AppMeasure {
@@ -60,17 +60,38 @@ export type Admission =
     };
 
 /**
+ * What the running leases that have not settled yet still claim, in MiB: the need of each one that reached running
+ * less than `settleMs` ago, which the host's memory reading may not show yet.
+ */
+export function rampingMib(
+  leases: Lease[],
+  now: number,
+  settleMs: number
+): number {
+  let mib = 0;
+  for (const l of leases) {
+    if (l.state !== 'running' || !l.running_at) continue;
+    if (now - Date.parse(l.running_at) < settleMs) mib += l.need_mib;
+  }
+  return mib;
+}
+
+/**
  * Whether a lease may run now: not when it can never fit the host, not while others are ahead of it (strict FIFO),
- * and only when what the host can give minus the reserve covers the need. Without a memory reading only the queue counts.
+ * and only when what the host can give minus the reserve, less what ramping starts still claim (`ramping_mib`, see
+ * rampingMib), covers the need. Without a memory reading only the queue counts.
  */
 export function admit(opts: {
   ahead: number;
   memory: HostMemory | null;
   need_mib: number;
   reserve_mib: number;
+  /** the need of the running leases younger than the settle time, which the reading may not show yet */
+  ramping_mib?: number;
 }): Admission {
   const { memory, need_mib, reserve_mib } = opts;
-  const free_mib = memory ? memory.available_mib - reserve_mib : null;
+  const ramping = opts.ramping_mib ?? 0;
+  const free_mib = memory ? memory.available_mib - ramping - reserve_mib : null;
   if (memory && need_mib > memory.total_mib - reserve_mib)
     return {
       ok: false,
@@ -89,7 +110,7 @@ export function admit(opts: {
     return {
       ok: false,
       reason: 'memory',
-      waiting_for: `needs ${fmtMib(need_mib)}, host has ${fmtMib(Math.max(0, free_mib))} over the reserve (${fmtMib(need_mib - free_mib)} short)`,
+      waiting_for: `needs ${fmtMib(need_mib)}, host has ${fmtMib(Math.max(0, free_mib))} over the reserve (${fmtMib(need_mib - free_mib)} short${ramping > 0 ? `, ${fmtMib(ramping)} ramping` : ''})`,
       free_mib,
     };
   return { ok: true, free_mib };

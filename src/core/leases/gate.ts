@@ -8,6 +8,7 @@ import {
   admit,
   estimateApps,
   needOf,
+  rampingMib,
   reserveMib,
   type AppMeasure,
 } from './admission.js';
@@ -26,10 +27,20 @@ export interface GateDeps {
   /** the requester's pid kept on the lease; default this process */
   pid?: number;
 }
+/** A lease that still waits for memory: queued, or handed to the watcher and not up yet. */
+export type QueuedLease = Lease & { state: 'pending' | 'starting' };
 /** The gate's answer: go ahead (under a running lease, or none when nothing is budgeted), or queued behind others. */
 export type GateResult =
   | { kind: 'proceed'; lease: Lease | null }
-  | { kind: 'queued'; lease: Lease; position: number; waiting_for: string };
+  | {
+      kind: 'queued';
+      lease: QueuedLease;
+      position: number;
+      waiting_for: string;
+    };
+/** How long a stop waits for the child of a starting lease it cancelled to exit after SIGTERM, in milliseconds. */
+export const CANCEL_WAIT_MS = 10_000;
+const CANCEL_POLL_MS = 200;
 
 /** The real deps: the host state directory, the host's meminfo, the sibling checkouts of the registry. */
 export function defaultGateDeps(dir = stateDir()): GateDeps {
@@ -48,8 +59,9 @@ export function defaultGateDeps(dir = stateDir()): GateDeps {
 /**
  * Whether a start of `apps` on this context may run now. Apps already online count zero; a start with no declared
  * memory never touches the queue. Otherwise the estimate (measured from a sibling slot where one runs, else declared,
- * plus the margin) is judged under the lock: admitted at once as a running lease, or queued as a pending one behind
- * whatever is pending already, in which case the watcher is made sure of and the caller returns.
+ * plus the margin) is judged under the lock, the running leases younger than the manifest's settle time charged on
+ * top of the reading: admitted at once as a running lease, or queued as a pending one behind whatever is pending
+ * already, in which case the watcher is made sure of and the caller returns.
  */
 export async function gateStart(
   ctx: Context,
@@ -107,7 +119,7 @@ export async function gateStart(
     const same = deps.store
       .list()
       .find(
-        (l) =>
+        (l): l is QueuedLease =>
           (l.state === 'pending' || l.state === 'starting') &&
           l.root === m.root &&
           l.project === m.project &&
@@ -120,10 +132,13 @@ export async function gateStart(
         position: deps.store.positionOf(same.id),
         waiting_for: same.waiting_for ?? same.state,
       };
-    const ahead = deps.store
-      .list()
-      .filter((l) => l.state === 'pending' || l.state === 'starting').length;
-    const d = admit({ ahead, memory, need_mib, reserve_mib });
+    const all = deps.store.list();
+    const ahead = all.filter(
+      (l) => l.state === 'pending' || l.state === 'starting'
+    ).length;
+    // a start admitted seconds ago is not in the reading yet: two starts on one reading must not both fit
+    const ramping_mib = rampingMib(all, Date.now(), m.resources.settle * 1000);
+    const d = admit({ ahead, memory, need_mib, reserve_mib, ramping_mib });
     if (!d.ok && d.reason === 'never')
       throw new McprocError('NEVER_FITS', `${target}: ${d.waiting_for}`, {
         hint: "Lower the apps' memory: declarations or the resources.reserve, or run fewer apps.",
@@ -132,11 +147,13 @@ export async function gateStart(
       const lease = await deps.store.create(input, 'running');
       return { kind: 'proceed', lease };
     }
-    let lease = await deps.store.create(input, 'pending');
-    lease = await deps.store.patch(lease.id, { waiting_for: d.waiting_for });
+    const created = await deps.store.create(input, 'pending');
+    const lease = await deps.store.patch(created.id, {
+      waiting_for: d.waiting_for,
+    });
     return {
       kind: 'queued',
-      lease,
+      lease: { ...lease, state: 'pending' },
       position: deps.store.positionOf(lease.id),
       waiting_for: d.waiting_for,
     };
@@ -192,47 +209,71 @@ export function liveLeasesOf(store: LeaseStore, ctx: Context): Lease[] {
 }
 
 /**
- * After a stop or delete of `stopped` on this checkout: every running lease of it none of whose apps is online any
- * more is freed; a pending or starting lease whose apps overlap the stopped ones is cancelled (a starting one's
- * child is told to stop first).
+ * Before a stop or delete of `stopped` on this checkout: every pending or starting lease of it whose apps overlap the
+ * stopped ones is cancelled under the lock; then the child of each cancelled starting lease is sent SIGTERM and
+ * waited for, up to CANCEL_WAIT_MS, so it cannot launch an app after the stop. Returns the cancelled ids.
  */
-export async function releaseAfter(
+export async function cancelBefore(
   store: LeaseStore,
   ctx: Context,
-  stopped: string[],
+  stopped: string[]
+): Promise<string[]> {
+  const m = ctx.manifest;
+  // nothing of this checkout is live: the lock (and the state directory) is left alone
+  if (liveLeasesOf(store, ctx).length === 0) return [];
+  const cancelled: string[] = [];
+  const children: number[] = [];
+  await store.withLock(async () => {
+    for (const l of store.list()) {
+      if (l.root !== m.root || l.project !== m.project) continue;
+      if (l.state !== 'pending' && l.state !== 'starting') continue;
+      if (!l.apps.some((a) => stopped.includes(a))) continue;
+      await store.transition(l.id, 'cancelled', {
+        error: `stop of ${stopped.join(', ')}`,
+      });
+      cancelled.push(l.id);
+      if (l.state === 'starting' && l.child_pid) children.push(l.child_pid);
+    }
+  });
+  // outside the lock: the child may want it on its way out, and the wait can take seconds
+  await Promise.all(children.map((pid) => endChild(pid)));
+  return cancelled;
+}
+
+/** Sends SIGTERM to a lease's child and polls until it is gone, for up to CANCEL_WAIT_MS. */
+async function endChild(pid: number): Promise<void> {
+  if (!pidAlive(pid)) return;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return; // gone meanwhile
+  }
+  const until = Date.now() + CANCEL_WAIT_MS;
+  while (pidAlive(pid) && Date.now() < until)
+    await new Promise((r) => setTimeout(r, CANCEL_POLL_MS));
+}
+
+/** After a stop or delete on this checkout: every running lease of it none of whose apps is online in `procs` is freed. Returns the freed ids. */
+export async function freeAfter(
+  store: LeaseStore,
+  ctx: Context,
   procs: Pm2Process[]
-): Promise<{ freed: string[]; cancelled: string[] }> {
+): Promise<string[]> {
   const m = ctx.manifest;
   const online = (app: string) => {
     const p = findProcess(procs, m.project, app);
     return Boolean(p && isRunning(p.status));
   };
   const freed: string[] = [];
-  const cancelled: string[] = [];
-  // nothing of this checkout is live: the lock (and the state directory) is left alone
-  if (liveLeasesOf(store, ctx).length === 0) return { freed, cancelled };
+  if (liveLeasesOf(store, ctx).length === 0) return freed;
   await store.withLock(async () => {
     for (const l of store.list()) {
       if (l.root !== m.root || l.project !== m.project) continue;
       if (l.state === 'running' && !l.apps.some(online)) {
         await store.transition(l.id, 'freed');
         freed.push(l.id);
-      } else if (
-        (l.state === 'pending' || l.state === 'starting') &&
-        l.apps.some((a) => stopped.includes(a))
-      ) {
-        if (l.child_pid && pidAlive(l.child_pid))
-          try {
-            process.kill(l.child_pid, 'SIGTERM');
-          } catch {
-            /* gone meanwhile */
-          }
-        await store.transition(l.id, 'cancelled', {
-          error: `stop of ${stopped.join(', ')}`,
-        });
-        cancelled.push(l.id);
       }
     }
   });
-  return { freed, cancelled };
+  return freed;
 }

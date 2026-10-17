@@ -23,12 +23,13 @@ import {
   type SnapshotOptions,
 } from './list.js';
 import {
+  cancelBefore,
   defaultGateDeps,
   finishLeasedStart,
+  freeAfter,
   freeOnFailure,
   gateStart,
   liveLeasesOf,
-  releaseAfter,
   type GateDeps,
 } from './leases/gate.js';
 import type { Lease } from './leases/store.js';
@@ -258,9 +259,10 @@ function failedRows(fleet: Fleet, r: HostApps, e: unknown): LsRow[] {
  * fails leaves rows saying so and the other runs go on — except for start, where the later runs are skipped (they may
  * need what did not start). When nothing happened at all, the first error is thrown. A start that would run an app
  * declaring memory on a remote host is refused before any host is touched; a local start of such apps goes through the
- * lease gate first (a queued run answers queued rows and holds back its dependents in later runs), and a start the
- * watcher admitted ends its lease once, over every local row. A local stop or delete frees the checkout's leases that no
- * longer hold anything.
+ * lease gate first (a queued run answers queued rows for the apps the gate counted, the real rows of the others, and
+ * holds back the dependents of the queued ones in later runs), and a start the watcher admitted ends its lease once,
+ * over every local row. A local stop or delete first cancels the checkout's queued and starting leases it overlaps
+ * (ending a starting one's child), then acts, then frees the running leases that no longer hold anything.
  */
 export async function actOn(
   fleet: Fleet,
@@ -340,17 +342,25 @@ export async function actOn(
           gate
         );
         if (g.kind === 'queued') {
-          // a queued result is always pending or starting
-          const lease = {
-            ...g.lease,
-            state: g.lease.state as 'pending' | 'starting',
-          };
-          // what needs these apps in a later run (another host) is skipped, not started without them
-          for (const a of r.apps)
-            notStarted.set(a, `queued: lease ${lease.id}`);
+          // only the apps the gate counted wait: what needs them in a later run (another host) is skipped, not
+          // started without them; an app that was online already answers as it is
+          const queued = new Set(
+            g.lease.apps.filter((a) => r.apps.includes(a))
+          );
+          for (const a of queued)
+            notStarted.set(a, `queued: lease ${g.lease.id}`);
+          const up = r.apps.filter((a) => !queued.has(a));
+          const real = new Map(
+            (up.length
+              ? rowsFor(ctx, await snapshot(ctx, { urls: up }), up)
+              : []
+            ).map((x) => [x.app, x])
+          );
           rows.push(
-            ...r.apps.map((a) =>
-              queuedRow(fleet.manifest.apps[a], r.host, lease, g.position)
+            ...r.apps.map(
+              (a) =>
+                real.get(a) ??
+                queuedRow(fleet.manifest.apps[a], r.host, g.lease, g.position)
             )
           );
           done++;
@@ -358,6 +368,9 @@ export async function actOn(
         }
         admitted = g.lease;
       }
+      // a stop must not race a start it overlaps: the queued and starting leases go first, their children with them
+      if ((act === 'stop' || act === 'delete') && ctx.host.local)
+        await cancelBefore(gate.store, ctx, r.apps);
       let runRows: LsRow[];
       try {
         runRows = await (act === 'start'
@@ -384,7 +397,7 @@ export async function actOn(
         ctx.host.local &&
         liveLeasesOf(gate.store, ctx).length > 0
       )
-        await releaseAfter(gate.store, ctx, r.apps, await ctx.pm2.jlist());
+        await freeAfter(gate.store, ctx, await ctx.pm2.jlist());
       rows.push(...runRows);
       done++;
     } catch (e) {

@@ -3,13 +3,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { fakeCtx } from '../helpers/ctx.js';
-import { LeaseStore } from '../../src/core/leases/store.js';
 import {
+  LeaseStore,
+  pidAlive,
+  type NewLease,
+} from '../../src/core/leases/store.js';
+import {
+  cancelBefore,
   finishLeasedStart,
+  freeAfter,
   freeOnFailure,
   gateStart,
-  releaseAfter,
   type GateDeps,
 } from '../../src/core/leases/gate.js';
 import { cancelLease, leasesView } from '../../src/core/leases/view.js';
@@ -214,6 +220,53 @@ describe('gateStart', () => {
     ).rejects.toMatchObject({ code: 'LEASE_UNSUPPORTED_HOST' });
   });
 
+  it('charges the running leases younger than the settle time: two starts seconds apart are not both admitted on one reading', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const other: NewLease = {
+      kind: 'start',
+      project: 'demo-w1',
+      root: '/w/a',
+      slot: 1,
+      repo: '/w/demo',
+      target: 'dev',
+      apps: ['db', 'api'],
+      reload: false,
+      estimate_mib: 768,
+      need_mib: 845,
+      margin: 0.1,
+      reserve_mib: 1024,
+      sources: {},
+      note: null,
+      requester_pid: 1,
+    };
+    // settled: running for longer than the manifest's settle (5 s), the reading shows it already
+    await new LeaseStore(dir, { now: () => Date.now() - 6000 }).create(
+      other,
+      'running'
+    );
+    const fits = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      deps({ total_mib: 8000, available_mib: 2500 })
+    );
+    expect(fits.kind).toBe('proceed');
+    // the one just admitted (db, 615M) still ramps: charged on top of the reading
+    const r = await gateStart(
+      ctx,
+      ['api'],
+      { target: 'api', procs: [] },
+      deps({ total_mib: 8000, available_mib: 1700 })
+    );
+    expect(r).toMatchObject({
+      kind: 'queued',
+      waiting_for:
+        'needs 308M, host has 61M over the reserve (247M short, 615M ramping)',
+    });
+    if (r.kind === 'queued')
+      expect(store.get(r.lease.id)?.waiting_for).toBe(r.waiting_for);
+  });
+
   it('admits in FIFO order without a memory reading', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const r = await gateStart(
@@ -311,79 +364,107 @@ describe('finishing and releasing', () => {
     });
   });
 
-  it('releaseAfter frees a running lease with no online app, cancels pending and starting ones that overlap', async () => {
+  const lease = (over: Partial<NewLease>): NewLease => ({
+    kind: 'start',
+    project: 'demo-w2',
+    root: varsProj,
+    slot: 2,
+    repo: '/w/demo',
+    target: 'dev',
+    apps: ['db', 'api'],
+    reload: false,
+    estimate_mib: 1,
+    need_mib: 1,
+    margin: 0,
+    reserve_mib: 0,
+    sources: {},
+    note: null,
+    requester_pid: 1,
+    ...over,
+  });
+
+  it('cancelBefore cancels the pending and starting leases of this checkout that overlap the stopped apps, and nothing else', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
-    const running = await store.create(
-      {
-        kind: 'start',
-        project: 'demo-w2',
-        root: varsProj,
-        slot: 2,
-        repo: '/w/demo',
-        target: 'dev',
-        apps: ['db', 'api'],
-        reload: false,
-        estimate_mib: 1,
-        need_mib: 1,
-        margin: 0,
-        reserve_mib: 0,
-        sources: {},
-        note: null,
-        requester_pid: 1,
-      },
-      'running'
-    );
+    const running = await store.create(lease({}), 'running');
     const pending = await fresh();
+    const starting = await store.create(
+      lease({ target: 'api', apps: ['api'] }),
+      'pending'
+    );
+    await store.transition(starting.id, 'starting');
     const other = await store.create(
-      {
-        kind: 'start',
-        project: 'demo-w2',
-        root: varsProj,
-        slot: 2,
-        repo: '/w/demo',
-        target: 'tool',
-        apps: ['tool'],
-        reload: false,
-        estimate_mib: 1,
-        need_mib: 1,
-        margin: 0,
-        reserve_mib: 0,
-        sources: {},
-        note: null,
-        requester_pid: 1,
-      },
+      lease({ target: 'tool', apps: ['tool'] }),
       'pending'
     );
     const elsewhere = await store.create(
-      {
-        kind: 'start',
-        project: 'x',
-        root: '/x',
-        slot: null,
-        repo: '/x',
-        target: 'db',
-        apps: ['db'],
-        reload: false,
-        estimate_mib: 1,
-        need_mib: 1,
-        margin: 0,
-        reserve_mib: 0,
-        sources: {},
-        note: null,
-        requester_pid: 1,
-      },
+      lease({ project: 'x', root: '/x', repo: '/x', target: 'api' }),
+      'pending'
+    );
+    expect(await cancelBefore(store, ctx, ['api'])).toEqual([
+      pending.id,
+      starting.id,
+    ]);
+    expect(store.get(pending.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'stop of api',
+    });
+    expect(store.get(starting.id)?.state).toBe('cancelled');
+    expect(store.get(running.id)?.state).toBe('running');
+    expect(store.get(other.id)?.state).toBe('pending');
+    expect(store.get(elsewhere.id)?.state).toBe('pending');
+  });
+
+  it("cancelBefore ends a starting lease's child with SIGTERM and waits for it to exit", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const child = spawn(process.execPath, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ]);
+    const exited = new Promise<NodeJS.Signals | null>((resolve) =>
+      child.on('exit', (_code, signal) => resolve(signal))
+    );
+    try {
+      const l = await fresh();
+      await store.transition(l.id, 'starting', { child_pid: child.pid });
+      expect(pidAlive(child.pid!)).toBe(true);
+      expect(await cancelBefore(store, ctx, ['db'])).toEqual([l.id]);
+      // the wait is over only once the child is gone
+      expect(pidAlive(child.pid!)).toBe(false);
+      expect(await exited).toBe('SIGTERM');
+      expect(store.get(l.id)).toMatchObject({
+        state: 'cancelled',
+        error: 'stop of db',
+      });
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  it('cancelBefore leaves the store alone when nothing of this checkout is live', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    expect(await cancelBefore(store, ctx, ['db'])).toEqual([]);
+    expect(fs.existsSync(store.dir)).toBe(false);
+  });
+
+  it('freeAfter frees a running lease of this checkout once none of its apps is online', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const running = await store.create(lease({}), 'running');
+    const pending = await fresh();
+    const elsewhere = await store.create(
+      lease({ project: 'x', root: '/x', repo: '/x', apps: ['db'] }),
       'running'
     );
     // db still online after the stop of api: the running lease stays
-    let r = await releaseAfter(store, ctx, ['api'], [
-      proc('demo-w2-db', 'demo-w2'),
-    ] as never);
-    expect(r).toEqual({ freed: [], cancelled: [pending.id] });
-    r = await releaseAfter(store, ctx, ['db'], [
-      proc('demo-w2-db', 'demo-w2', 'stopped'),
-    ] as never);
-    expect(r).toEqual({ freed: [running.id], cancelled: [] });
-    expect(store.get(other.id)?.state).toBe('pending');
+    expect(
+      await freeAfter(store, ctx, [proc('demo-w2-db', 'demo-w2')] as never)
+    ).toEqual([]);
+    expect(
+      await freeAfter(store, ctx, [
+        proc('demo-w2-db', 'demo-w2', 'stopped'),
+      ] as never)
+    ).toEqual([running.id]);
+    expect(store.get(running.id)?.state).toBe('freed');
+    expect(store.get(pending.id)?.state).toBe('pending');
     expect(store.get(elsewhere.id)?.state).toBe('running');
   });
 });

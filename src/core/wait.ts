@@ -111,24 +111,31 @@ export function untilLabel(u: Until): string {
       : u.kind;
 }
 
+/** A sleep of `ms` that the signal ends at once, also when it was aborted before the sleep began. */
+export function abortableSleep(
+  ms: number,
+  signal?: AbortSignal
+): Promise<void> {
+  return new Promise((resolve) => {
+    // an abort that came before the sleep began fires no event: answer at once
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      signal?.removeEventListener('abort', done);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
 export function defaultWaitDeps(): WaitDeps {
   return {
     jlist: (ctx) => ctx.pm2.jlist(),
     snapshot: (ctx, opts) => probeSnapshot(ctx, opts),
     // no history: a wait looks only at what is written after it began
     follower: (ctx, paths) => createFollower(ctx, paths, 0),
-    sleep: (ms, signal) =>
-      new Promise((resolve) => {
-        // an abort that came before the sleep began fires no event: answer at once
-        if (signal?.aborted) return resolve();
-        const done = () => {
-          signal?.removeEventListener('abort', done);
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(done, ms);
-        signal?.addEventListener('abort', done, { once: true });
-      }),
+    sleep: abortableSleep,
     now: () => Date.now(),
   };
 }

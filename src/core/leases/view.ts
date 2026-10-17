@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { McprocError } from '../errors.js';
 import { readHostMemory, type HostMemory } from '../memory.js';
 import type { Context } from '../resolve.js';
@@ -22,7 +23,8 @@ export async function leasesView(
   ctx?: Context
 ): Promise<LeasesView> {
   const store = new LeaseStore(dir);
-  store.prune();
+  // a host that never queued anything keeps no state directory: the read does not make one
+  if (fs.existsSync(store.dir)) await store.withLock(() => store.prune());
   const leases = store
     .list()
     .map((l) => ({ ...l, position: store.positionOf(l.id) }));

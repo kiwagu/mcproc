@@ -119,6 +119,33 @@ describe('LeaseStore', () => {
     expect(store.positionOf(b.id)).toBe(1);
   });
 
+  it('positionOf counts the starting leases ahead too, as the gate counts them', async () => {
+    const s = await store.create(input(), 'pending');
+    const a = await store.create(input(), 'pending');
+    const b = await store.create(input(), 'pending');
+    await store.transition(s.id, 'starting');
+    expect(store.head()?.id).toBe(a.id);
+    expect(store.positionOf(s.id)).toBe(0);
+    expect(store.positionOf(a.id)).toBe(2);
+    expect(store.positionOf(b.id)).toBe(3);
+  });
+
+  it('patch with an expected state refuses a lease in another state and leaves it as it was', async () => {
+    const a = await store.create(input(), 'pending');
+    await expect(
+      store.patch(a.id, { child_pid: 5 }, { expect: 'starting' })
+    ).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      message: `lease ${a.id} is pending, expected starting`,
+    });
+    expect(store.get(a.id)?.child_pid).toBeNull();
+    await store.transition(a.id, 'starting');
+    expect(
+      (await store.patch(a.id, { child_pid: 5 }, { expect: 'starting' }))
+        .child_pid
+    ).toBe(5);
+  });
+
   it('prunes ended leases older than a day and keeps live ones', async () => {
     const a = await store.create(input(), 'running');
     await store.transition(a.id, 'freed');
@@ -236,6 +263,48 @@ describe('LeaseStore', () => {
     expect(fs.existsSync(freshTmp)).toBe(true);
     expect(fs.existsSync(other)).toBe(true);
   });
+
+  it('writes its token file again when a sweep took it during a long wait, and takes the lock', async () => {
+    const leases = path.join(dir, 'leases');
+    let swept = 0;
+    await Promise.all([
+      store.withLock(async () => {
+        await new Promise((r) => setTimeout(r, 30));
+        // the waiter's token file is gone, as a sweep after a stall of more than LOCK_STALE_MS leaves it
+        for (const n of fs.readdirSync(leases))
+          if (/^\.lock\..+\.tmp$/.test(n)) {
+            fs.rmSync(path.join(leases, n));
+            swept++;
+          }
+        await new Promise((r) => setTimeout(r, 30));
+      }),
+      new Promise((r) => setTimeout(r, 10)).then(() =>
+        store.withLock(() => 'ok')
+      ),
+    ]).then(([, b]) => expect(b).toBe('ok'));
+    expect(swept).toBe(1);
+    expect(fs.readdirSync(leases).filter((n) => n.startsWith('.lock'))).toEqual(
+      []
+    );
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'a release that throws does not leave its token live: the next take breaks the lock it left',
+    async () => {
+      const real = new LeaseStore(dir, { now: () => now });
+      const leases = path.join(dir, 'leases');
+      await expect(
+        real.withLock(() => {
+          fs.chmodSync(leases, 0o555); // the lock cannot be unlinked: release throws
+        })
+      ).rejects.toMatchObject({ code: 'EACCES' });
+      fs.chmodSync(leases, 0o755);
+      expect(fs.existsSync(path.join(leases, '.lock'))).toBe(true);
+      const t0 = Date.now();
+      await expect(real.withLock(() => 'ok')).resolves.toBe('ok');
+      expect(Date.now() - t0).toBeLessThan(1000);
+    }
+  );
 
   it('pidAlive: this process and pid 1 exist (another user counts), an exited one does not', () => {
     expect(pidAlive(process.pid)).toBe(true);

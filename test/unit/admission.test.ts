@@ -3,8 +3,10 @@ import {
   admit,
   estimateApps,
   needOf,
+  rampingMib,
   reserveMib,
 } from '../../src/core/leases/admission.js';
+import type { Lease } from '../../src/core/leases/store.js';
 import {
   listCheckout,
   measureSiblings,
@@ -99,6 +101,55 @@ describe('admit', () => {
     expect(
       admit({ ahead: 0, memory: null, need_mib: 5000, reserve_mib: 2048 })
     ).toEqual({ ok: true, free_mib: null });
+  });
+  it('charges what ramping starts still claim against the reading, and names that share when it refuses', () => {
+    expect(
+      admit({
+        ahead: 0,
+        memory,
+        need_mib: 4000,
+        reserve_mib: 4096,
+        ramping_mib: 845,
+      })
+    ).toEqual({ ok: true, free_mib: 4159 });
+    expect(
+      admit({
+        ahead: 0,
+        memory,
+        need_mib: 5000,
+        reserve_mib: 4096,
+        ramping_mib: 845,
+      })
+    ).toEqual({
+      ok: false,
+      reason: 'memory',
+      waiting_for:
+        'needs 4.9G, host has 4.1G over the reserve (841M short, 845M ramping)',
+      free_mib: 4159,
+    });
+  });
+});
+
+describe('rampingMib', () => {
+  const at = (s: number) =>
+    new Date(1_700_000_000_000 + s * 1000).toISOString();
+  const lease = (over: Partial<Lease>): Lease =>
+    ({ state: 'running', need_mib: 100, running_at: at(0), ...over }) as Lease;
+  it('sums the need of the running leases younger than the settle time', () => {
+    const now = 1_700_000_000_000 + 10_000;
+    expect(
+      rampingMib(
+        [
+          lease({ need_mib: 845, running_at: at(5) }), // 5 s old: ramping
+          lease({ need_mib: 300, running_at: at(9) }), // 1 s old: ramping
+          lease({ need_mib: 999, running_at: at(0) }), // 10 s old: settled
+          lease({ state: 'pending', need_mib: 7, running_at: null }),
+          lease({ state: 'freed', need_mib: 7, running_at: at(9) }),
+        ],
+        now,
+        10_000
+      )
+    ).toBe(1145);
   });
 });
 

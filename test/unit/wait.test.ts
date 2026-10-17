@@ -12,6 +12,7 @@ import {
   waitDependency,
   depFailure,
   defaultWaitDeps,
+  abortableSleep,
   WAIT_TIMEOUT_MAX_MS,
   type WaitDeps,
 } from '../../src/core/wait.js';
@@ -356,6 +357,13 @@ describe('waitFor: limits and the real sleep', () => {
     const t0 = Date.now();
     await sleep(20);
     expect(Date.now() - t0).toBeGreaterThanOrEqual(15);
+  });
+  it('the real sleep is the shared abortableSleep', async () => {
+    expect(defaultWaitDeps().sleep).toBe(abortableSleep);
+    const ac = new AbortController();
+    const woke = abortableSleep(60_000, ac.signal);
+    ac.abort();
+    await woke;
   });
 });
 

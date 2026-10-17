@@ -124,7 +124,8 @@ function readHeld(file: string): Held | null {
 /**
  * The host's leases as files under `<state>/leases`: one JSON per lease named by sequence and id, a `.seq` counter,
  * and a `.lock` around every change, hard-linked atomically from a token file its holder wrote first. Reads need no
- * lock: a write is a rename, so a reader sees a whole file or none.
+ * lock: a write is a rename, so a reader sees a whole file or none. Every mutator (`create`, `transition`, `patch`,
+ * `prune`) is called under `withLock`, which is not reentrant: a mutator never takes the lock itself.
  */
 export class LeaseStore {
   readonly dir: string;
@@ -166,14 +167,18 @@ export class LeaseStore {
     const lock = path.join(this.dir, '.lock');
     const token = `${this.pid}-${crypto.randomBytes(6).toString('hex')}`;
     const tmp = path.join(this.dir, `.lock.${token}.tmp`);
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify({ pid: this.pid, at: this.now(), token })
-    );
+    const writeToken = () => {
+      fs.mkdirSync(this.dir, { recursive: true });
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ pid: this.pid, at: this.now(), token })
+      );
+    };
+    writeToken();
     const start = Date.now();
     let swept = false;
     try {
-      while (!this.tryLink(tmp, lock)) {
+      while (!this.tryLink(tmp, lock, writeToken)) {
         if (!swept) {
           this.sweepStrays();
           swept = true;
@@ -194,8 +199,12 @@ export class LeaseStore {
     try {
       return await fn();
     } finally {
-      this.release(lock, token);
-      LIVE_TOKENS.delete(token);
+      // the token leaves the live set before the release: a release that throws must not leave it live
+      try {
+        LIVE_TOKENS.delete(token);
+      } finally {
+        this.release(lock, token);
+      }
     }
   }
   /** Whether a parsed lock is a leftover: from before this boot, this process's own but not held, or old with a dead holder. */
@@ -220,14 +229,25 @@ export class LeaseStore {
       if (this.mtimeAgeMs(f) > LOCK_STALE_MS) fs.rmSync(f, { force: true });
     }
   }
-  /** Takes the lock by hard-linking the prepared file, which is atomic: the lock never exists empty; false when it is held. */
-  private tryLink(tmp: string, lock: string): boolean {
-    try {
-      fs.linkSync(tmp, lock);
-      return true;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw e;
+  /**
+   * Takes the lock by hard-linking the prepared file, which is atomic: the lock never exists empty; false when it is
+   * held. A token file that is gone (a sweep took it while this process stalled for longer than LOCK_STALE_MS) is
+   * written again by `rewrite` and the link is tried once more.
+   */
+  private tryLink(tmp: string, lock: string, rewrite: () => void): boolean {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.linkSync(tmp, lock);
+        return true;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === 'EEXIST') return false;
+        if (code === 'ENOENT' && attempt === 0 && !fs.existsSync(tmp)) {
+          rewrite();
+          continue;
+        }
+        throw e;
+      }
     }
   }
   /** Breaks the lock when its holder is judged stale, by renaming it aside; true when the caller should retry at once. */
@@ -380,10 +400,22 @@ export class LeaseStore {
     if (to !== 'pending') next.waiting_for = null;
     return this.write(next);
   }
-  /** Rewrites fields of a lease without a state change: the watcher's `waiting_for`, a child pid, a refreshed estimate. */
-  async patch(id: string, fields: Partial<Lease>): Promise<Lease> {
+  /**
+   * Rewrites fields of a lease without a state change: the watcher's `waiting_for`, a child pid, a refreshed estimate.
+   * With `expect`, a lease that is no longer in that state is refused (BAD_ARGUMENT) and left as it was.
+   */
+  async patch(
+    id: string,
+    fields: Partial<Lease>,
+    opts: { expect?: LeaseState } = {}
+  ): Promise<Lease> {
     const l = this.get(id);
     if (!l) throw new McprocError('BAD_ARGUMENT', `no lease ${id}`);
+    if (opts.expect && l.state !== opts.expect)
+      throw new McprocError(
+        'BAD_ARGUMENT',
+        `lease ${id} is ${l.state}, expected ${opts.expect}`
+      );
     return this.write({
       ...l,
       ...fields,
@@ -400,9 +432,14 @@ export class LeaseStore {
   head(): Lease | null {
     return this.pending()[0] ?? null;
   }
-  /** 1-based position among the pending leases; 0 when the lease is not pending. */
+  /** 1-based place in the queue, the starting leases counted ahead of every pending one; 0 when the lease is not pending. */
   positionOf(id: string): number {
-    return this.pending().findIndex((l) => l.id === id) + 1;
+    const all = this.list();
+    const i = all
+      .filter((l) => l.state === 'pending')
+      .findIndex((l) => l.id === id);
+    if (i < 0) return 0;
+    return all.filter((l) => l.state === 'starting').length + i + 1;
   }
   /** Removes ended leases older than `maxAgeMs` (a day); returns how many. */
   prune(maxAgeMs = PRUNE_AFTER_MS): number {
