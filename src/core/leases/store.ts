@@ -88,6 +88,33 @@ const alive = (pid: number): boolean => {
   }
 };
 
+interface Held {
+  pid: number;
+  at: number;
+  token: string;
+}
+/** Parses the content of a lock file, or null when it is empty, half-written or of another shape. */
+function parseHeld(raw: string): Held | null {
+  try {
+    const v = JSON.parse(raw) as Partial<Held>;
+    return typeof v.pid === 'number' &&
+      typeof v.at === 'number' &&
+      typeof v.token === 'string'
+      ? (v as Held)
+      : null;
+  } catch {
+    return null;
+  }
+}
+/** Reads a lock file's holder, or null when the file is missing or unreadable as a holder. */
+function readHeld(file: string): Held | null {
+  try {
+    return parseHeld(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The host's leases as files under `<state>/leases`: one JSON per lease named by sequence and id, a `.seq` counter,
  * and a `.lock` taken with O_EXCL around every change. Reads need no lock: a write is a rename, so a reader sees a
@@ -127,39 +154,93 @@ export class LeaseStore {
   async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true });
     const lock = path.join(this.dir, '.lock');
+    const token = `${this.pid}-${crypto.randomBytes(6).toString('hex')}`;
+    const tmp = path.join(this.dir, `.lock.${token}.tmp`);
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ pid: this.pid, at: this.now(), token })
+    );
     const start = Date.now();
-    for (;;) {
-      try {
-        const fd = fs.openSync(lock, 'wx');
-        fs.writeSync(fd, JSON.stringify({ pid: this.pid, at: this.now() }));
-        fs.closeSync(fd);
-        break;
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-        let held: { pid: number; at: number } | null = null;
-        try {
-          held = JSON.parse(fs.readFileSync(lock, 'utf8'));
-        } catch {
-          /* being written, or gone */
-        }
-        if (held && this.now() - held.at > LOCK_STALE_MS && !alive(held.pid)) {
-          fs.rmSync(lock, { force: true });
-          continue;
-        }
+    try {
+      while (!this.tryLink(tmp, lock)) {
+        if (this.breakIfStale(lock, token)) continue;
         if (Date.now() - start > LOCK_WAIT_MS)
           throw new McprocError(
             'TIMEOUT',
-            `the lease lock ${lock} is held by pid ${held?.pid ?? '?'} for more than ${LOCK_WAIT_MS / 1000} s`,
+            `the lease lock ${lock} is held by pid ${readHeld(lock)?.pid ?? '?'} for more than ${LOCK_WAIT_MS / 1000} s`,
             { hint: 'If that process is gone, remove the file.' }
           );
         await new Promise((r) => setTimeout(r, 50));
       }
+    } finally {
+      fs.rmSync(tmp, { force: true });
     }
     try {
       return await fn();
     } finally {
-      fs.rmSync(lock, { force: true });
+      this.release(lock, token);
     }
+  }
+  /** Takes the lock by hard-linking the prepared file, which is atomic: the lock never exists empty; false when it is held. */
+  private tryLink(tmp: string, lock: string): boolean {
+    try {
+      fs.linkSync(tmp, lock);
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      throw e;
+    }
+  }
+  /** Breaks the lock when its holder is judged stale, by renaming it aside; true when the caller should retry at once. */
+  private breakIfStale(lock: string, token: string): boolean {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(lock, 'utf8');
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw e;
+    }
+    const held = parseHeld(raw);
+    const stale = held
+      ? this.now() - held.at > LOCK_STALE_MS && !alive(held.pid)
+      : this.mtimeAgeMs(lock) > LOCK_STALE_MS;
+    if (!stale) return false;
+    // Only one breaker wins the rename; the loser sees ENOENT and retries.
+    const moved = `${lock}.${token}.stale`;
+    try {
+      fs.renameSync(lock, moved);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw e;
+    }
+    const movedHeld = readHeld(moved);
+    const same = held ? movedHeld?.token === held.token : movedHeld === null;
+    if (same) {
+      fs.rmSync(moved, { force: true });
+      return true;
+    }
+    // We moved a lock we did not judge stale: a fresh holder took it in between, so put it back.
+    // Residual window: a third waiter may acquire between the rename and the restore. Accepted, since the
+    // lock is held for milliseconds by a handful of CLI runs.
+    try {
+      fs.linkSync(moved, lock);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+    fs.rmSync(moved, { force: true });
+    return true;
+  }
+  /** Age of a lock file by its modification time on the file system's clock; 0 when it is gone. */
+  private mtimeAgeMs(lock: string): number {
+    try {
+      return Date.now() - fs.statSync(lock).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+  /** Unlinks the lock only when it still carries this holder's token; a lock it does not own is never removed. */
+  private release(lock: string, token: string): void {
+    if (readHeld(lock)?.token === token) fs.rmSync(lock, { force: true });
   }
   /** Every readable lease, in sequence order; a half-written file is skipped. */
   list(): Lease[] {
@@ -186,8 +267,19 @@ export class LeaseStore {
   }
   private nextSeq(): number {
     const f = path.join(this.dir, '.seq');
-    const n = fs.existsSync(f) ? Number(fs.readFileSync(f, 'utf8')) || 0 : 0;
-    fs.writeFileSync(f, String(n + 1));
+    const onDisk = Math.max(
+      0,
+      ...fs
+        .readdirSync(this.dir)
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => Number(name.split('-')[0]))
+        .filter(Number.isFinite)
+    );
+    const parsed = fs.existsSync(f) ? Number(fs.readFileSync(f, 'utf8')) : 0;
+    const n = Math.max(Number.isFinite(parsed) ? parsed : 0, onDisk);
+    const tmp = `${f}.${this.pid}.tmp`;
+    fs.writeFileSync(tmp, String(n + 1));
+    fs.renameSync(tmp, f);
     return n + 1;
   }
   /** A new lease, pending (queued) or running (admitted at once); call it under the lock. */

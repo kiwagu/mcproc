@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { stateDir } from '../../src/core/state.js';
 import { LeaseStore, type NewLease } from '../../src/core/leases/store.js';
 
@@ -42,6 +43,7 @@ describe('LeaseStore', () => {
   let now = 1_700_000_000_000;
   let store: LeaseStore;
   beforeEach(() => {
+    now = 1_700_000_000_000;
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-lease-'));
     store = new LeaseStore(dir, { now: () => now, pid: 4242 });
   });
@@ -134,12 +136,57 @@ describe('LeaseStore', () => {
       }),
     ]);
     expect(order).toEqual(['a-in', 'a-out', 'b']);
-    // a lock left by a dead process, older than 30 s, is broken
+    // a lock left by a process that has exited, older than 30 s, is broken
+    const deadPid = spawnSync(process.execPath, ['-e', '0']).pid as number;
     fs.mkdirSync(path.join(dir, 'leases'), { recursive: true });
     fs.writeFileSync(
       path.join(dir, 'leases', '.lock'),
-      JSON.stringify({ pid: 999999, at: now - 60_000 })
+      JSON.stringify({ pid: deadPid, at: now - 60_000, token: 'dead' })
     );
     await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+  });
+
+  it('breaks an empty lock file whose mtime is older than 30 s', async () => {
+    fs.mkdirSync(path.join(dir, 'leases'), { recursive: true });
+    const lock = path.join(dir, 'leases', '.lock');
+    fs.writeFileSync(lock, '');
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, old, old);
+    await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+  });
+
+  it('release does not remove a lock it does not own', async () => {
+    const lock = path.join(dir, 'leases', '.lock');
+    await store.withLock(() => {
+      fs.writeFileSync(
+        lock,
+        JSON.stringify({ pid: 1, at: now, token: 'other' })
+      );
+    });
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lock, 'utf8')).token).toBe('other');
+    fs.rmSync(lock, { force: true });
+  });
+
+  it('recovers the sequence when .seq is missing or garbled', async () => {
+    const a = await store.create(input(), 'pending');
+    const b = await store.create(input(), 'pending');
+    expect(b.seq).toBe(2);
+    fs.rmSync(path.join(dir, 'leases', '.seq'));
+    const c = await store.create(input(), 'pending');
+    expect(c.seq).toBe(3);
+    fs.writeFileSync(path.join(dir, 'leases', '.seq'), 'junk');
+    const d = await store.create(input(), 'pending');
+    expect(d.seq).toBe(4);
+    const files = fs
+      .readdirSync(path.join(dir, 'leases'))
+      .filter((f) => f.endsWith('.json'))
+      .sort();
+    expect(files).toEqual([
+      `000001-${a.id}.json`,
+      `000002-${b.id}.json`,
+      `000003-${c.id}.json`,
+      `000004-${d.id}.json`,
+    ]);
   });
 });
