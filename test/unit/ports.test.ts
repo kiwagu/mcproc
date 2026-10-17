@@ -39,6 +39,8 @@ const app = (name: string, ports: number[] = []): App => ({
   run: 'x',
   cwd: '.',
   env: {},
+  memory_mib: null,
+  containers: [],
   ports,
   url: null,
   url_check: 'auto',

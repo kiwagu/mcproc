@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   startNote,
   waitNote,
@@ -21,9 +23,13 @@ import {
   sinceNotes,
   renderAdopted,
 } from '../../src/mcp/render.js';
-import type { LsRow } from '../../src/core/list.js';
+import { describeProject, type LsRow } from '../../src/core/list.js';
+import { loadManifest } from '../../src/core/manifest.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const fixture = (n: string) => path.join(here, '..', 'fixtures', 'projects', n);
 
 const row = (status: string, checks: PortCheck[]): LsRow => ({
   app: 'web',
@@ -376,6 +382,9 @@ describe('several hosts', () => {
           host: null,
         },
       ],
+      vars: [],
+      override: null,
+      slot: null,
       profiles: {},
       hosts: [],
       readme: null,
@@ -1171,4 +1180,16 @@ describe('renderAdopted', () => {
       failed: false,
     });
   });
+});
+
+it('renderProject lists the vars with their sources when there are any', () => {
+  const d = describeProject(loadManifest(fixture('vars')));
+  const text = renderProject(d);
+  expect(text).toContain('vars: (override ');
+  expect(text).toContain('slot 2');
+  expect(text).toContain('  api_port = 3510 (manifest)');
+  expect(text).toContain('  slot = 2 (override)');
+  expect(
+    renderProject(describeProject(loadManifest(fixture('basic'))))
+  ).not.toContain('vars:');
 });

@@ -9,6 +9,7 @@ import type { WaitRecord } from '../core/actions.js';
 import type { WaitResult } from '../core/wait.js';
 import type { SinceAnswer } from '../core/logsince.js';
 import type { AdoptResult } from '../core/adopt.js';
+import type { VarInfo } from '../core/manifest.js';
 import {
   type HostEnv,
   reasonWord,
@@ -401,6 +402,9 @@ export function fmtDeps(deps: { app: string; condition: string }[]): string {
 export function renderProject(d: {
   project: string;
   root: string;
+  vars: VarInfo[];
+  override: string | null;
+  slot: number | null;
   apps: {
     name: string;
     kind: string;
@@ -414,7 +418,15 @@ export function renderProject(d: {
   hosts: HostInfo[];
   readme: string | null;
 }): string {
-  const L = [`project: ${d.project} (${d.root})`, 'apps:'];
+  const L = [`project: ${d.project} (${d.root})`];
+  if (d.vars.length > 2 || d.override) {
+    L.push(
+      `vars:${d.override ? ` (override ${d.override})` : ''}${d.slot !== null ? ` slot ${d.slot}` : ''}`
+    );
+    for (const v of d.vars)
+      L.push(`  ${v.name} = ${JSON.stringify(v.value)} (${v.source})`);
+  }
+  L.push('apps:');
   for (const a of d.apps)
     L.push(
       `  ${a.name} [${a.kind}]${a.host ? ` on ${a.host}` : ''}${a.ports.length ? ` :${a.ports.join(',:')}` : ''}${a.url ? ` → ${a.url}` : ''}${a.depends_on.length ? ` after ${fmtDeps(a.depends_on)}` : ''}: ${a.description}`
