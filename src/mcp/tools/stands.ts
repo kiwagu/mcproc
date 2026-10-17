@@ -181,7 +181,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Worktree ls',
       description:
-        'Every checkout of this repository on this host: its slot (0 is the main checkout), project slug, branch, how many of its apps are online, its lease state and its path. A slot whose folder is gone is freed on the way.',
+        'Every checkout of this repository on this host: its slot (0 is the main checkout), project slug, branch, how many of its apps are online, its lease state and its path. A read only: a slot whose folder is gone shows (gone) as its branch until worktree_add or worktree_remove frees it.',
       inputSchema: { project: commonInput.project },
       annotations: RO,
     },

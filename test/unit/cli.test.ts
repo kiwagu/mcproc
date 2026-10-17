@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -237,6 +237,63 @@ describe('cli', () => {
     ).toBe(
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     );
+  });
+  it('worktree add --json keeps stdout to its JSON: the install prints to stderr', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-json-'));
+    const main = path.join(base, 'wtj');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe; a plain sh runs the install
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtj',
+          'hosts:',
+          '  local: { pm2: /bin/false, shell: "/bin/sh -c" }',
+          'worktree:',
+          '  install: "echo install-out; echo install-err >&2"',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      // the real CLI in a child: an install that inherited stdout would write ahead of the JSON
+      const r = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          path.join(here, '..', '..', 'src', 'cli.ts'),
+          'worktree',
+          'add',
+          'j',
+          '--project',
+          main,
+          '--json',
+        ],
+        { cwd: process.cwd(), encoding: 'utf8', timeout: 60_000 }
+      );
+      expect(r.status, r.stderr).toBe(0);
+      expect(JSON.parse(r.stdout)).toMatchObject({
+        branch: 'j',
+        slot: 1,
+        installed: 'echo install-out; echo install-err >&2',
+      });
+      expect(r.stderr).toContain('install-out');
+      expect(r.stderr).toContain('install-err');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
   it('worktree refuses another host before touching it', async () => {
     const c = capture();

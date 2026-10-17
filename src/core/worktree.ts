@@ -3,9 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describeError, McprocError } from './errors.js';
 import { spawnRun } from './exec.js';
-import { actOn, Fleet } from './fleet.js';
+import { actOn, Fleet, type Connector } from './fleet.js';
+import { ownsManifest } from './leases/siblings.js';
 import { LeaseStore } from './leases/store.js';
-import { loadManifest, type Manifest, type VarInfo } from './manifest.js';
+import {
+  loadManifest,
+  MANIFEST_REL,
+  type Manifest,
+  type VarInfo,
+} from './manifest.js';
 import { NAME_RE } from './names.js';
 import { writeOverride } from './override.js';
 import { isRunning, type Pm2Process } from './pm2.js';
@@ -149,8 +155,8 @@ export interface WorktreeDeps {
   run(cmd: string, cwd: string): Promise<number>;
   log(line: string): void;
   jlist(): Promise<Pm2Process[]>;
-  /** stops and deletes every app of a checkout; the names it stopped */
-  stopAll(root: string): Promise<string[]>;
+  /** stops and deletes every app of a checkout; the names it stopped; with `force` a manifest that does not load is noted, not refused */
+  stopAll(root: string, opts: { force: boolean }): Promise<string[]>;
   exists?(p: string): boolean;
   glob?(pattern: string, cwd: string): string[];
 }
@@ -277,7 +283,8 @@ export async function worktreeAdd(
       'BAD_ARGUMENT',
       `project slug "${opts.project}" must match ${NAME_RE.source}`
     );
-  // the branch names the folder: a name git refuses never reaches the filesystem
+  // the branch names the folder: a name git refuses never reaches the filesystem. No `--` here: check-ref-format
+  // refuses one, and `--branch` takes the next argument as the name whatever it looks like (`-x` is refused as a name)
   if (
     (await deps.git(['check-ref-format', '--branch', opts.branch], m.root))
       .code !== 0
@@ -351,16 +358,25 @@ export async function worktreeAdd(
   const exists =
     (
       await deps.git(
-        ['show-ref', '--verify', '--quiet', `refs/heads/${opts.branch}`],
+        ['show-ref', '--verify', '--quiet', '--', `refs/heads/${opts.branch}`],
         main
       )
     ).code === 0;
   try {
     await gitOk(
       deps.git,
+      // `--` before the positionals: a `from` such as `--no-checkout` is a ref git refuses, never an option
       exists
-        ? ['worktree', 'add', target, opts.branch]
-        : ['worktree', 'add', '-b', opts.branch, target, opts.from ?? 'HEAD'],
+        ? ['worktree', 'add', '--', target, opts.branch]
+        : [
+            'worktree',
+            'add',
+            '-b',
+            opts.branch,
+            '--',
+            target,
+            opts.from ?? 'HEAD',
+          ],
       main
     );
   } catch (e) {
@@ -374,21 +390,7 @@ export async function worktreeAdd(
     });
     throw e;
   }
-  const plan = planCopies(main, target, m.worktree.copy, m.worktree.link, deps);
-  for (const c of plan.copies) {
-    fs.mkdirSync(path.dirname(c.to), { recursive: true });
-    fs.cpSync(c.from, c.to, {
-      recursive: true,
-      force: false,
-      errorOnExist: false,
-    });
-  }
-  for (const l of plan.links) {
-    fs.mkdirSync(path.dirname(l.to), { recursive: true });
-    if (!present(l.to)) fs.symlinkSync(l.from, l.to);
-  }
-  for (const miss of plan.missing)
-    deps.log(`copy: ${miss} is not in ${main}, skipped`);
+  // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
   writeOverride(target, {
     project,
     repo: main,
@@ -397,6 +399,34 @@ export async function worktreeAdd(
   // a .mcproc/.gitignore of the branch (a whitelist) already hides the override; else one that hides everything here
   const gi = path.join(target, '.mcproc', '.gitignore');
   if (!present(gi)) fs.writeFileSync(gi, '*\n');
+  const plan = planCopies(main, target, m.worktree.copy, m.worktree.link, deps);
+  let step = '';
+  try {
+    for (const c of plan.copies) {
+      step = `copying ${c.from}`;
+      fs.mkdirSync(path.dirname(c.to), { recursive: true });
+      fs.cpSync(c.from, c.to, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+      });
+    }
+    for (const l of plan.links) {
+      step = `linking ${l.from}`;
+      fs.mkdirSync(path.dirname(l.to), { recursive: true });
+      if (!present(l.to)) fs.symlinkSync(l.from, l.to);
+    }
+  } catch (e) {
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `worktree ${target} is made (slot ${slot}, project ${project}, its override in place), but ${step} failed: ${(e as Error).message}`,
+      {
+        hint: "Clear what is in the way or fix the manifest's worktree: section, then copy it by hand or remove the worktree.",
+      }
+    );
+  }
+  for (const miss of plan.missing)
+    deps.log(`copy: ${miss} is not in ${main}, skipped`);
   const install = opts.install ? installCommand(m, target) : null;
   if (install) {
     const code = await deps.run(install, target);
@@ -405,14 +435,20 @@ export async function worktreeAdd(
   }
   let vars: VarInfo[] = [];
   let next = `cd ${shPath(target)}`;
-  try {
-    const wm = loadManifest(target);
-    vars = wm.vars;
-    const first = Object.keys(wm.profiles)[0] ?? Object.keys(wm.apps)[0];
-    if (first) next += ` && mcproc start ${first}`;
-  } catch (e) {
-    deps.log(`the manifest of ${target} does not load: ${describeError(e)}`);
-  }
+  // the manifest search walks up: without a manifest of its own the checkout would read an enclosing one (the main's)
+  if (!ownsManifest(target))
+    deps.log(
+      `${target} has no manifest of its own (${MANIFEST_REL}): no vars, nothing to start`
+    );
+  else
+    try {
+      const wm = loadManifest(target);
+      vars = wm.vars;
+      const first = Object.keys(wm.profiles)[0] ?? Object.keys(wm.apps)[0];
+      if (first) next += ` && mcproc start ${first}`;
+    } catch (e) {
+      deps.log(`the manifest of ${target} does not load: ${describeError(e)}`);
+    }
   return {
     path: target,
     branch: opts.branch,
@@ -440,18 +476,24 @@ export interface WorktreeRow {
   main: boolean;
 }
 
-/** The registry as a table: every checkout with its branch, how many of its apps are online, and its lease state. */
+/**
+ * The registry as a table: every checkout with its branch, how many of its apps are online, and its lease state. A read
+ * only: a slot whose folder is gone shows `(gone)` as its branch and stays until add or remove reclaims it, and slot 0
+ * is shown from the main checkout without being recorded.
+ */
 export async function worktreeLs(
   m: Manifest,
   deps: WorktreeDeps
 ): Promise<WorktreeRow[]> {
   const main = await mainCheckout(m.root, deps.git);
-  const registry = await settleRegistry(
-    m,
-    main,
-    await currentBranch(main, deps.git),
-    deps
-  );
+  const file = registryPath(deps.stateDir, m.base_project, main);
+  // a write is a rename: the file reads whole without the lock
+  const registry = withMain(readRegistry(file) ?? emptyRegistry(main), {
+    path: main,
+    branch: await currentBranch(main, deps.git),
+    project: m.base_project,
+  });
+  const exists = deps.exists ?? ((p: string) => fs.existsSync(p));
   const branches = await worktreeList(main, deps.git);
   const procs = await deps.jlist();
   const leases = new LeaseStore(deps.stateDir).list();
@@ -460,7 +502,10 @@ export async function worktreeLs(
       slot: Number(k),
       project: e.project,
       path: e.path,
-      branch: branches.get(realOf(e.path)) ?? e.branch,
+      branch:
+        k !== '0' && !exists(realOf(e.path))
+          ? '(gone)'
+          : (branches.get(realOf(e.path)) ?? e.branch),
       online: procs.filter(
         (p) => p.namespace === e.project && isRunning(p.status)
       ).length,
@@ -517,6 +562,31 @@ export async function worktreeRemove(
       'BAD_ARGUMENT',
       'slot 0 is the main checkout; it cannot be removed'
     );
+  const file = registryPath(deps.stateDir, m.base_project, main);
+  /** frees the slot under the lock, read afresh: only while it still names this checkout */
+  const free = () =>
+    new LeaseStore(deps.stateDir).withLock(() => {
+      const now = readRegistry(file);
+      if (now?.slots[k]?.path === e.path)
+        writeRegistry(file, releaseSlot(now, Number(k)));
+    });
+  if (!(await worktreeList(main, deps.git)).has(realOf(e.path))) {
+    // an add that ended between its claim and git leaves an empty folder: nothing in it to stop or keep
+    let empty = false;
+    try {
+      empty = fs.readdirSync(e.path).length === 0;
+    } catch {}
+    if (!empty)
+      throw new McprocError(
+        'NOT_A_WORKTREE',
+        `${e.path} (slot ${k}) is no git worktree of ${main}`,
+        { hint: 'Look at what is in it, remove it by hand, then worktree ls.' }
+      );
+    fs.rmdirSync(e.path);
+    deps.log(`${e.path} was an empty folder git never filled: removed`);
+    await free();
+    return { path: e.path, slot: Number(k), branch: e.branch, stopped: [] };
+  }
   if (!opts.force) {
     const st = await gitOk(deps.git, ['status', '--porcelain'], e.path);
     if (st.trim())
@@ -526,10 +596,10 @@ export async function worktreeRemove(
         { hint: 'Commit or stash them, or pass --force to discard them.' }
       );
   }
-  const stopped = await deps.stopAll(e.path);
+  const stopped = await deps.stopAll(e.path, { force: opts.force });
   await gitOk(
     deps.git,
-    ['worktree', 'remove', ...(opts.force ? ['--force'] : []), e.path],
+    ['worktree', 'remove', ...(opts.force ? ['--force'] : []), '--', e.path],
     main
   );
   // the folders a branch with slashes made (`feat/` of feat/x) go when they are left empty
@@ -545,20 +615,52 @@ export async function worktreeRemove(
       break; // not empty
     }
   }
-  // the slot goes under the lock, read afresh: only while it still names this checkout
-  const file = registryPath(deps.stateDir, m.base_project, main);
-  await new LeaseStore(deps.stateDir).withLock(() => {
-    const now = readRegistry(file);
-    if (now?.slots[k]?.path === e.path)
-      writeRegistry(file, releaseSlot(now, Number(k)));
-  });
+  await free();
   return { path: e.path, slot: Number(k), branch: e.branch, stopped };
 }
 
 /**
+ * Stops and deletes the apps of the checkout at `root` that run on writable hosts, and answers their names. A path
+ * without a manifest of its own has none: the manifest search walks up, so it would stand for an enclosing project, the
+ * main checkout among them. A manifest that does not load is refused, or noted with `force`; an app bound to a readonly
+ * host is left alone with a note.
+ */
+export async function stopCheckout(
+  root: string,
+  opts: { force: boolean; log: (line: string) => void; connector?: Connector }
+): Promise<string[]> {
+  if (!ownsManifest(root)) {
+    opts.log(`${root} has no manifest of its own: no apps to stop`);
+    return [];
+  }
+  let m: Manifest;
+  try {
+    m = loadManifest(root);
+  } catch (e) {
+    if (!opts.force) throw e;
+    opts.log(
+      `the manifest of ${root} does not load (${describeError(e)}): its apps are not stopped`
+    );
+    return [];
+  }
+  const fleet = new Fleet(m, undefined, opts.connector);
+  const stopped: string[] = [];
+  for (const app of fleet.select(['all'])) {
+    const host = fleet.hostOf(app);
+    if (m.hosts[host]?.readonly) {
+      opts.log(`${app} runs on readonly host ${host}: left alone`);
+      continue;
+    }
+    for (const r of await actOn(fleet, app, 'delete')) stopped.push(r.app);
+  }
+  return stopped;
+}
+
+/**
  * The deps of the CLI and MCP: real git, the host state directory, the install run through the host's shell, pm2 of
- * this checkout, stop-and-delete of a checkout through actOn. `capture` keeps the install off the terminal (MCP, whose
- * stdin and stdout carry the protocol) and logs its last lines when it fails; without it the install inherits it (CLI).
+ * this checkout, stop-and-delete of a checkout through stopCheckout. `capture` keeps the install off the terminal (MCP,
+ * whose stdin and stdout carry the protocol) and logs its last lines when it fails; without it the install writes to
+ * the terminal's stderr (CLI), so stdout carries only mcproc's own answer.
  */
 export async function defaultWorktreeDeps(
   ctx: Context,
@@ -572,7 +674,12 @@ export async function defaultWorktreeDeps(
       try {
         const r = await spawnRun(
           [ctx.host.shell.bin, ...ctx.host.shell.flags, cmd],
-          { cwd, env: {}, capture: opts.capture ?? false }
+          {
+            cwd,
+            env: {},
+            capture: opts.capture ?? false,
+            stdoutToStderr: true,
+          }
         );
         if (r.code !== 0 && r.output)
           for (const line of r.output.split('\n').slice(-20)) io.out(line);
@@ -584,10 +691,7 @@ export async function defaultWorktreeDeps(
     },
     log: (line) => io.out(line),
     jlist: () => ctx.pm2.jlist(),
-    stopAll: async (root) => {
-      const fleet = new Fleet(loadManifest(root), undefined);
-      const rows = await actOn(fleet, 'all', 'delete');
-      return rows.map((r) => r.app);
-    },
+    stopAll: (root, o) =>
+      stopCheckout(root, { force: o.force, log: (line) => io.out(line) }),
   };
 }

@@ -93,13 +93,17 @@ class Tail {
   }
 }
 
-/** The command as a child with the shell left out: argv as given, cwd the project root; captured output keeps its last lines. */
+/**
+ * The command as a child with the shell left out: argv as given, cwd the project root; captured output keeps its last
+ * lines. Not captured, it inherits the terminal; `stdoutToStderr` puts its stdout on the terminal's stderr too.
+ */
 export function spawnRun(
   command: string[],
   opts: {
     cwd: string;
     env: Record<string, string>;
     capture: boolean;
+    stdoutToStderr?: boolean;
     signal?: AbortSignal;
   }
 ): Promise<{ code: number; output: string }> {
@@ -107,7 +111,11 @@ export function spawnRun(
     const child = spawn(command[0], command.slice(1), {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
-      stdio: opts.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+      stdio: opts.capture
+        ? ['ignore', 'pipe', 'pipe']
+        : opts.stdoutToStderr
+          ? ['inherit', 2, 2]
+          : 'inherit',
     });
     const tail = new Tail();
     child.stdout?.on('data', (c: Buffer) => tail.take('out', c));

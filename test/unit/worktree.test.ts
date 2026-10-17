@@ -4,7 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadManifest } from '../../src/core/manifest.js';
-import { readRegistry, registryPath } from '../../src/core/slots.js';
+import {
+  readRegistry,
+  registryPath,
+  writeRegistry,
+} from '../../src/core/slots.js';
+import type { Connector } from '../../src/core/fleet.js';
+import { MARK } from '../../src/shell/snippets.js';
+import { fakeCtx } from '../helpers/ctx.js';
+import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
@@ -12,6 +20,7 @@ import {
   installCommand,
   mainCheckout,
   planCopies,
+  stopCheckout,
   worktreeAdd,
   worktreeDir,
   worktreeLs,
@@ -404,7 +413,7 @@ describe('worktree', () => {
     ).rejects.toMatchObject({ code: 'NOT_A_WORKTREE' });
   });
 
-  it('remove by path, and ls reclaims a slot whose checkout is gone', async () => {
+  it('remove by path; ls shows a slot whose checkout is gone as (gone) and leaves it to add, which reclaims it', async () => {
     const m = loadManifest(main);
     const a = await worktreeAdd(m, { branch: 'a', install: false }, deps());
     const b = await worktreeAdd(m, { branch: 'b', install: false }, deps());
@@ -417,12 +426,302 @@ describe('worktree', () => {
       code: 'WORKTREE_EXISTS',
       hint: expect.stringContaining('git worktree prune'),
     });
+    const file = registryPath(state, 'demo', real);
+    const before = fs.readFileSync(file, 'utf8');
     const logged: string[] = [];
     const rows = await worktreeLs(m, { ...deps(), log: (l) => logged.push(l) });
-    expect(rows.map((x) => x.slot)).toEqual([0]);
-    expect(logged).toEqual(['slot 2 reclaimed: its checkout is gone']);
+    expect(rows.map((x) => [x.slot, x.branch])).toEqual([
+      [0, 'main'],
+      [2, '(gone)'],
+    ]);
+    expect(logged).toEqual([]);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    const c = await worktreeAdd(
+      m,
+      { branch: 'c', install: false },
+      { ...deps(), log: (l) => logged.push(l) }
+    );
+    expect(c.slot).toBe(1);
+    expect(logged).toContain('slot 2 reclaimed: its checkout is gone');
+    expect(Object.keys(readRegistry(file)!.slots)).toEqual(['0', '1']);
+  });
+
+  it('ls writes nothing: without a registry it shows the main checkout and records no slot 0', async () => {
+    const rows = await worktreeLs(loadManifest(main), deps());
+    expect(rows).toEqual([
+      {
+        slot: 0,
+        project: 'demo',
+        path: real,
+        branch: 'main',
+        online: 0,
+        lease: null,
+        main: true,
+      },
+    ]);
+    expect(fs.existsSync(registryPath(state, 'demo', real))).toBe(false);
+    expect(fs.existsSync(path.join(state, 'leases'))).toBe(false);
+  });
+
+  it('git gets `--` before its positionals: a `from` that looks like an option is a ref git refuses', async () => {
+    const m = loadManifest(main);
+    const calls: string[][] = [];
+    const recording: WorktreeDeps = {
+      ...deps(),
+      git: (args, cwd) => {
+        calls.push(args);
+        return gitRunner(args, cwd);
+      },
+    };
+    await expect(
+      worktreeAdd(
+        m,
+        { branch: 'n', from: '--no-checkout', install: false },
+        recording
+      )
+    ).rejects.toMatchObject({
+      code: 'TRANSPORT_FAILED',
+      message: expect.stringContaining('--no-checkout'),
+    });
+    expect(fs.existsSync(path.join(`${real}.worktrees`, 'n'))).toBe(false);
+    expect(git(['branch', '--list', 'n'], main).trim()).toBe('');
+    const a = await worktreeAdd(m, { branch: 'a', install: false }, recording);
+    await worktreeRemove(m, 'a', { force: true }, recording);
+    const positional = calls.filter((c) =>
+      ['show-ref', 'worktree add', 'worktree remove'].some((p) =>
+        c.join(' ').startsWith(p)
+      )
+    );
+    expect(positional.length).toBeGreaterThanOrEqual(4);
+    for (const c of positional) expect(c, c.join(' ')).toContain('--');
+    expect(calls).toContainEqual([
+      'worktree',
+      'remove',
+      '--force',
+      '--',
+      a.path,
+    ]);
+  });
+
+  it('a copy that fails leaves the worktree registered with its override in place, and says so', async () => {
+    // a branch whose tree has a file where the manifest copies a folder
+    const tmp = path.join(base, 'tmp-clash');
+    git(['worktree', 'add', '-q', '-b', 'clash', tmp], main);
+    fs.writeFileSync(path.join(tmp, 'certs'), 'a file');
+    git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', 'certs'], tmp);
+    git(
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'clash'],
+      tmp
+    );
+    git(['worktree', 'remove', tmp], main);
+    const m = loadManifest(main);
+    const wt = path.join(`${real}.worktrees`, 'clash');
+    await expect(
+      worktreeAdd(m, { branch: 'clash', install: false }, deps())
+    ).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      message: expect.stringContaining(
+        `worktree ${wt} is made (slot 1, project demo-w1, its override in place), but copying ${path.join(real, 'certs')} failed`
+      ),
+    });
+    const wm = loadManifest(wt);
+    expect(wm.project).toBe('demo-w1');
+    expect(wm.slot).toBe(1);
     expect(
-      Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
-    ).toEqual(['0']);
+      readRegistry(registryPath(state, 'demo', real))!.slots['1']
+    ).toMatchObject({ path: wt, project: 'demo-w1' });
+  });
+
+  it('remove takes back the slot of an add that ended between its claim and git: an empty folder', async () => {
+    const m = loadManifest(main);
+    await worktreeAdd(m, { branch: 'a', install: false }, deps());
+    const file = registryPath(state, 'demo', real);
+    const crashed = path.join(`${real}.worktrees`, 'crashed');
+    fs.mkdirSync(crashed);
+    const reg = readRegistry(file)!;
+    writeRegistry(file, {
+      ...reg,
+      slots: {
+        ...reg.slots,
+        '2': { path: crashed, branch: 'crashed', project: 'demo-w2' },
+      },
+    });
+    const r = await worktreeRemove(m, 'crashed', { force: false }, deps());
+    expect(r).toEqual({
+      path: crashed,
+      slot: 2,
+      branch: 'crashed',
+      stopped: [],
+    });
+    expect(fs.existsSync(crashed)).toBe(false);
+    expect(Object.keys(readRegistry(file)!.slots)).toEqual(['0', '1']);
+    expect(stopped).toEqual([]);
+  });
+
+  describe('a branch without a manifest, and the real stop of a checkout', () => {
+    const never: Connector = async (_m, host) => {
+      throw new Error(`must not connect to ${host}`);
+    };
+    const realStop = (logged: string[]): WorktreeDeps => ({
+      ...deps(),
+      log: (l) => logged.push(l),
+      stopAll: (root, o) =>
+        stopCheckout(root, {
+          force: o.force,
+          log: (l) => logged.push(l),
+          connector: never,
+        }),
+    });
+    /** a branch `bare` whose tree has no .mcproc/mcproc.yaml */
+    const bareBranch = () => {
+      const tmp = path.join(base, 'tmp-bare');
+      git(['worktree', 'add', '-q', '-b', 'bare', tmp], main);
+      git(['rm', '-q', '.mcproc/mcproc.yaml'], tmp);
+      git(
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'bare'],
+        tmp
+      );
+      git(['worktree', 'remove', tmp], main);
+    };
+
+    it('add reads no manifest for it, and remove --force removes it without stopping anything', async () => {
+      bareBranch();
+      const m = loadManifest(main);
+      const logged: string[] = [];
+      const r = await worktreeAdd(
+        m,
+        { branch: 'bare', install: false },
+        realStop(logged)
+      );
+      expect(r).toMatchObject({ vars: [], next: `cd ${r.path}` });
+      expect(logged).toContain(
+        `${r.path} has no manifest of its own (${path.join('.mcproc', 'mcproc.yaml')}): no vars, nothing to start`
+      );
+      const rm = await worktreeRemove(
+        m,
+        'bare',
+        { force: true },
+        realStop(logged)
+      );
+      expect(rm).toMatchObject({ slot: 1, stopped: [] });
+      expect(logged).toContain(
+        `${r.path} has no manifest of its own: no apps to stop`
+      );
+      expect(fs.existsSync(r.path)).toBe(false);
+    });
+
+    it('with worktree.dir inside the main checkout, neither add nor remove ever reads the main manifest', async () => {
+      bareBranch();
+      const file = path.join(main, '.mcproc', 'mcproc.yaml');
+      fs.writeFileSync(
+        file,
+        fs
+          .readFileSync(file, 'utf8')
+          .replace('worktree:\n', 'worktree:\n  dir: .wt\n')
+      );
+      const m = loadManifest(main);
+      const logged: string[] = [];
+      const r = await worktreeAdd(
+        m,
+        { branch: 'bare', install: false },
+        realStop(logged)
+      );
+      expect(r.path).toBe(path.join(real, '.wt', 'bare'));
+      // the main's vars would say port 3000 and next would start the main's db
+      expect(r).toMatchObject({ vars: [], next: `cd ${r.path}` });
+      const rm = await worktreeRemove(
+        m,
+        'bare',
+        { force: true },
+        realStop(logged)
+      );
+      expect(rm.stopped).toEqual([]);
+      expect(fs.existsSync(r.path)).toBe(false);
+    });
+
+    it('stopCheckout deletes the apps on writable hosts and leaves a readonly-bound one alone', async () => {
+      const dir = path.join(base, 'ro-demo');
+      fs.mkdirSync(path.join(dir, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: ro-demo',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '  audit: { description: audit, run: node audit.js, host: ro }',
+          'hosts:',
+          '  ro: { ssh: ro, cwd: /srv/ro, readonly: true }',
+          '',
+        ].join('\n')
+      );
+      const list = JSON.stringify([
+        {
+          pid: 7,
+          name: 'ro-demo-db',
+          pm_id: 4,
+          pm2_env: {
+            status: 'online',
+            namespace: 'ro-demo',
+            pm_cwd: dir,
+            pm_out_log_path: '/l/db-out',
+            pm_err_log_path: '/l/db-err',
+          },
+        },
+      ]);
+      const connected: string[] = [];
+      const deleted: string[] = [];
+      const connector: Connector = async (_m, host, fallback) => {
+        connected.push(host);
+        return fakeCtx(
+          dir,
+          host,
+          [
+            {
+              match: MARK.JLIST,
+              result: { stdout: probeOut({ jlist: list }) },
+            },
+            { match: /pm2 'jlist'/, result: { stdout: list } },
+            {
+              match: /'delete'/,
+              result: (cmd) => {
+                deleted.push(cmd);
+                return { stdout: '' };
+              },
+            },
+          ],
+          fallback
+        );
+      };
+      const logged: string[] = [];
+      const names = await stopCheckout(dir, {
+        force: false,
+        log: (l) => logged.push(l),
+        connector,
+      });
+      expect(names).toEqual(['db']);
+      expect(deleted).toEqual(["pm2 'delete' '4'"]);
+      expect(connected).toEqual(['local']);
+      expect(logged).toEqual(['audit runs on readonly host ro: left alone']);
+      // a manifest that does not load: refused, or noted with force
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        'version: 2\n'
+      );
+      await expect(
+        stopCheckout(dir, { force: false, log: () => undefined, connector })
+      ).rejects.toMatchObject({ code: 'MANIFEST_INVALID' });
+      const noted: string[] = [];
+      expect(
+        await stopCheckout(dir, {
+          force: true,
+          log: (l) => noted.push(l),
+          connector,
+        })
+      ).toEqual([]);
+      expect(noted[0]).toMatch(
+        /does not load \(MANIFEST_INVALID: [\s\S]*\): its apps are not stopped$/
+      );
+    });
   });
 });
