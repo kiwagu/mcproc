@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createTransport } from '../../transport/index.js';
 import { describeError } from '../errors.js';
 import {
@@ -20,6 +22,7 @@ import {
   rampingMib,
   reserveMib,
 } from './admission.js';
+import { WATCHER_NOTE } from './ensure.js';
 import { listCheckout, measureSiblings, registryOf } from './siblings.js';
 import {
   type Lease,
@@ -51,30 +54,46 @@ export interface WatcherDeps {
   watch?(cb: () => void): () => void;
 }
 
-/** Under the lock, moves a lease only while it is still in `from`: a change that landed meanwhile (a cancel, a stop) is not written over. */
+/**
+ * Under the lock, moves a lease only while it is still in `from` (and, with `also`, while that still holds of it): a
+ * change that landed meanwhile (a cancel, a stop, a starter recorded) is not written over.
+ */
 async function moveIf(
   store: LeaseStore,
   id: string,
   from: LeaseState,
   to: LeaseState,
-  patch: Partial<Lease> = {}
+  patch: Partial<Lease> = {},
+  also: (cur: Lease) => boolean = () => true
 ): Promise<Lease | null> {
-  return store.withLock(async () =>
-    store.get(id)?.state === from ? store.transition(id, to, patch) : null
-  );
+  return store.withLock(async () => {
+    const cur = store.get(id);
+    return cur?.state === from && also(cur)
+      ? store.transition(id, to, patch)
+      : null;
+  });
 }
+
+/** Whether the process running a lease's start is still there: a start admitted at once may not have its apps up yet. */
+const starterAlive = (l: Lease): boolean =>
+  l.child_pid !== null && pidAlive(l.child_pid);
 
 /** A running lease whose apps all left pm2 or stopped holds nothing; a starting one without a live owner after `stuckMs` is over. */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
-      if (l.state === 'running' && l.kind === 'start') {
+      if (l.state === 'running' && l.kind === 'start' && !starterAlive(l)) {
         const online = await deps.onlineApps(l);
         if (!l.apps.some((a) => online.has(a)))
-          await moveIf(store, l.id, 'running', 'freed', {
-            error: 'no app online any more',
-          });
+          await moveIf(
+            store,
+            l.id,
+            'running',
+            'freed',
+            { error: 'no app online any more' },
+            (cur) => !starterAlive(cur)
+          );
       }
       if (
         l.state === 'starting' &&
@@ -178,11 +197,35 @@ async function judgeHead(
 }
 
 /**
+ * The last look before an idle exit, under the lock: false when something is pending or starting after all; else the
+ * exit is noted in `<state>/watcher.json` (`exiting_at`), so a start that queues while this process is still on its way
+ * out launches a fresh watcher instead of trusting this one.
+ */
+async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
+  const { store } = deps;
+  return store.withLock(() => {
+    if (
+      store.list().some((l) => l.state === 'pending' || l.state === 'starting')
+    )
+      return false;
+    const file = path.join(path.dirname(store.dir), WATCHER_NOTE);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify({ exiting_at: new Date(deps.now()).toISOString() })
+    );
+    fs.renameSync(tmp, file);
+    return true;
+  });
+}
+
+/**
  * The watcher loop: on every tick (or wake) prune, reconcile running leases against what is online, then judge the
  * head of the FIFO: admit it (starting → the child runs the start → running / failed; an exec lease is only marked
  * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
- * have not settled yet are charged on top of the memory reading. Exits once nothing has been pending or starting for
- * `idleExitMs`; a starting lease without a live owner for `stuckMs` is failed. A tick that throws is logged, not fatal.
+ * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
+ * reconciled. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
+ * leaveIdle); a starting lease without a live owner for `stuckMs` is failed. A tick that throws is logged, not fatal.
  */
 export async function watchLeases(
   deps: WatcherDeps,
@@ -214,7 +257,12 @@ export async function watchLeases(
       const head = store.head();
       const now = deps.now();
       if (!head && !starting) {
-        if (now - idleSince >= idleExitMs) return 'idle';
+        if (now - idleSince >= idleExitMs) {
+          if (await leaveIdle(deps)) return 'idle';
+          // a start queued in the moment before the exit: it is taken first
+          idleSince = now;
+          continue;
+        }
       } else idleSince = now;
       if (head && !starting) {
         let r: 'admitted' | 'waiting' | 'changed' = 'waiting';

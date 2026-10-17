@@ -145,7 +145,10 @@ export async function gateStart(
         hint: "Lower the apps' memory: declarations or the resources.reserve, or run fewer apps.",
       });
     if (d.ok) {
-      const lease = await deps.store.create(input, 'running');
+      // this process runs the start: until it is done, the watcher must not judge the lease by its apps
+      const lease = await deps.store.create(input, 'running', {
+        child_pid: process.pid,
+      });
       return { kind: 'proceed', lease };
     }
     const created = await deps.store.create(input, 'pending');
@@ -180,7 +183,7 @@ export async function finishLeasedStart(
   );
 }
 
-/** A start admitted at once that then threw: its running lease is freed with the error, under the lock. */
+/** A start admitted at once that then threw: its running lease is freed with the error and without its starter, under the lock. */
 export async function freeOnFailure(
   store: LeaseStore,
   lease: Lease,
@@ -188,10 +191,28 @@ export async function freeOnFailure(
 ): Promise<void> {
   const error = e instanceof Error ? e.message : String(e);
   try {
-    await store.withLock(() => store.transition(lease.id, 'freed', { error }));
+    await store.withLock(() =>
+      store.transition(lease.id, 'freed', { error, child_pid: null })
+    );
   } catch {
     /* already ended by someone else */
   }
+}
+
+/** A start admitted at once that went through: its starter is cleared under the lock, while the lease is still running and still names it. */
+export async function endFastStart(
+  store: LeaseStore,
+  lease: Lease
+): Promise<void> {
+  await store.withLock(async () => {
+    const cur = store.get(lease.id);
+    if (
+      cur?.state === 'running' &&
+      cur.child_pid !== null &&
+      cur.child_pid === lease.child_pid
+    )
+      await store.patch(lease.id, { child_pid: null });
+  });
 }
 
 /** The leases of this checkout that still wait for or hold memory (pending, starting, running), read without the lock. */

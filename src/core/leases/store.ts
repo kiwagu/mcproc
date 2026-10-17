@@ -39,7 +39,7 @@ export interface Lease {
   sources: Record<string, LeaseSource>;
   note: string | null;
   requester_pid: number;
-  /** the watcher's child running the start, while starting */
+  /** the process running the start: the watcher's child while starting, the admitted caller while a start admitted at once runs */
   child_pid: number | null;
   queued_at: string;
   admitted_at: string | null;
@@ -344,8 +344,12 @@ export class LeaseStore {
     fs.renameSync(tmp, f);
     return n + 1;
   }
-  /** A new lease, pending (queued) or running (admitted at once); call it under the lock. */
-  async create(input: NewLease, state: 'pending' | 'running'): Promise<Lease> {
+  /** A new lease, pending (queued) or running (admitted at once), with `child_pid` the process running its start; call it under the lock. */
+  async create(
+    input: NewLease,
+    state: 'pending' | 'running',
+    opts: { child_pid?: number | null } = {}
+  ): Promise<Lease> {
     fs.mkdirSync(this.dir, { recursive: true });
     const at = this.stamp();
     const l: Lease = {
@@ -359,7 +363,7 @@ export class LeaseStore {
         .slice(0, 10)}`,
       seq: this.nextSeq(),
       state,
-      child_pid: null,
+      child_pid: opts.child_pid ?? null,
       queued_at: at,
       admitted_at: state === 'running' ? at : null,
       running_at: state === 'running' ? at : null,

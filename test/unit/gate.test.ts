@@ -13,6 +13,7 @@ import {
 import {
   cancelBefore,
   defaultGateDeps,
+  endFastStart,
   finishLeasedStart,
   freeAfter,
   freeOnFailure,
@@ -105,6 +106,8 @@ describe('gateStart', () => {
       },
       note: 'dev up',
       requester_pid: 7,
+      // the process running its start: the watcher leaves the lease alone while it lives
+      child_pid: process.pid,
     });
     expect(ensured).toBe(0);
   });
@@ -280,7 +283,10 @@ describe('gateStart', () => {
         JSON.parse(
           fs.readFileSync(path.join(dir, 'watcher.ecosystem.json'), 'utf8')
         ).apps[0].env
-      ).toEqual({ MCPROC_STATE_DIR: dir });
+      ).toEqual({
+        MCPROC_STATE_DIR: dir,
+        MCPROC_CLI_ENTRY: '/opt/mcproc/dist/cli.js',
+      });
     } finally {
       vi.unstubAllEnvs();
     }
@@ -374,12 +380,53 @@ describe('finishing and releasing', () => {
         note: null,
         requester_pid: 1,
       },
-      'running'
+      'running',
+      { child_pid: process.pid }
     );
     await freeOnFailure(store, a, new Error('pm2 down'));
     expect(store.get(a.id)).toMatchObject({
       state: 'freed',
       error: 'pm2 down',
+      child_pid: null,
+    });
+  });
+
+  it('endFastStart clears the starter of a running lease once its start went through, and nothing it no longer owns', async () => {
+    const own = await store.create(
+      {
+        kind: 'start',
+        project: 'p',
+        root: '/r',
+        slot: null,
+        repo: '/r',
+        target: 't',
+        apps: ['a'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'running',
+      { child_pid: process.pid }
+    );
+    await endFastStart(store, own);
+    expect(store.get(own.id)).toMatchObject({
+      state: 'running',
+      child_pid: null,
+    });
+    // freed by a stop meanwhile: left as it is
+    const freed = await store.create({ ...own, note: 'x' }, 'running', {
+      child_pid: process.pid,
+    });
+    await store.transition(freed.id, 'freed');
+    await endFastStart(store, freed);
+    expect(store.get(freed.id)).toMatchObject({
+      state: 'freed',
+      child_pid: process.pid,
     });
   });
 

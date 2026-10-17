@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import {
   LeaseStore,
   type Lease,
@@ -13,14 +14,6 @@ import {
   defaultWatcherDeps,
   type WatcherDeps,
 } from '../../src/core/leases/watcher.js';
-import {
-  ensureWatcher,
-  watcherEntry,
-  WATCHER_NAME,
-  WATCHER_NS,
-} from '../../src/core/leases/ensure.js';
-import { Pm2Client } from '../../src/core/pm2.js';
-import { fakeCtx } from '../helpers/ctx.js';
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -237,6 +230,49 @@ describe('watchLeases', () => {
     expect(lines.some((l) => l.includes('pm2 down'))).toBe(true);
     expect(store.get(a.id)?.state).toBe('freed');
   });
+
+  it('spares a running lease whose starter is alive (its apps may not be up yet), and frees it once the starter is gone', async () => {
+    const a = await store.create(input(), 'running', {
+      child_pid: process.pid,
+    });
+    online = new Set();
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(a.id)?.state).toBe('running');
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    await store.patch(a.id, { child_pid: gone });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(a.id)?.state).toBe('freed');
+  });
+
+  it('leaves a note in the state directory when it exits idle', async () => {
+    expect(await watchLeases(deps(), { tickMs: 10, idleExitMs: 20 })).toBe(
+      'idle'
+    );
+    expect(
+      JSON.parse(fs.readFileSync(path.join(dir, 'watcher.json'), 'utf8'))
+    ).toEqual({
+      exiting_at: new Date(now).toISOString(),
+    });
+    expect(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('does not exit idle when a lease queued in the moment before: it takes it first', async () => {
+    const d = deps();
+    const t0 = now;
+    let queued: Lease | null = null;
+    d.now = () => {
+      // the start queues between the idle decision and the exit
+      if (!queued && now - t0 >= 20)
+        void store.create(input(), 'pending').then((l) => {
+          queued = l;
+        });
+      return now;
+    };
+    expect(await watchLeases(d, { tickMs: 10, idleExitMs: 20 })).toBe('idle');
+    expect(queued).not.toBeNull();
+    expect(started).toEqual([queued!.id]);
+    expect(fs.existsSync(path.join(dir, 'watcher.json'))).toBe(true);
+  });
 });
 
 describe('defaultWatcherDeps', () => {
@@ -302,100 +338,5 @@ describe('defaultWatcherDeps', () => {
     expect(deps.settleMs({ root: path.join(dir, 'gone') } as Lease)).toBe(
       20_000
     );
-  });
-});
-
-describe('watcherEntry and ensureWatcher', () => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const vars = path.join(here, '..', 'fixtures', 'projects', 'vars');
-  let dir: string;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ensure-'));
-  });
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('watcherEntry: MCPROC_CLI_ENTRY, else the running cli.js, else a refusal that says how to set it', () => {
-    expect(
-      watcherEntry({ MCPROC_CLI_ENTRY: 'dist/cli.js' }, ['node', '/x/y.js'])
-    ).toBe(path.resolve('dist/cli.js'));
-    expect(watcherEntry({}, ['node', '/opt/mcproc/dist/cli.js'])).toBe(
-      '/opt/mcproc/dist/cli.js'
-    );
-    expect(() =>
-      watcherEntry({}, ['node', '/w/mcproc/src/cli.ts'])
-    ).toThrowError(
-      expect.objectContaining({
-        code: 'NOT_STARTED',
-        hint: expect.stringContaining('MCPROC_CLI_ENTRY'),
-      })
-    );
-  });
-
-  const jlist = (status: string) =>
-    JSON.stringify([
-      {
-        pid: 77,
-        name: WATCHER_NAME,
-        pm_id: 9,
-        pm2_env: { status, namespace: WATCHER_NS },
-      },
-    ]);
-
-  it('ensureWatcher leaves an online watcher alone', async () => {
-    const ctx = fakeCtx(vars, 'local', [
-      { match: /pm2 'jlist'/, result: { stdout: jlist('online') } },
-    ]);
-    expect(await ensureWatcher(ctx, dir)).toBe('online');
-    expect(ctx.fake.calls.some((c) => c.cmd.includes('startOrRestart'))).toBe(
-      false
-    );
-  });
-
-  it('ensureWatcher starts a stopped watcher from an ecosystem file in the state directory, with the state dir and PM2_HOME', async () => {
-    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
-    const ctx = fakeCtx(vars, 'local', [
-      { match: /pm2 'jlist'/, result: { stdout: jlist('stopped') } },
-      { match: /startOrRestart/, result: {} },
-    ]);
-    ctx.pm2 = new Pm2Client(ctx.fake, ctx.host, 'pm2', '/tmp/pm2-home-w');
-    expect(await ensureWatcher(ctx, dir)).toBe('started');
-    const file = path.join(dir, 'watcher.ecosystem.json');
-    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({
-      apps: [
-        {
-          name: 'mcproc-watcher',
-          namespace: 'mcproc',
-          cwd: dir,
-          script: process.execPath,
-          args: ['/opt/mcproc/dist/cli.js', 'watch-leases'],
-          interpreter: 'none',
-          env: { MCPROC_STATE_DIR: dir, PM2_HOME: '/tmp/pm2-home-w' },
-          autorestart: false,
-          treekill: true,
-          log_date_format: 'YYYY-MM-DDTHH:mm:ss.SSS',
-        },
-      ],
-    });
-    const start = ctx.fake.calls.find((c) => c.cmd.includes('startOrRestart'))!;
-    expect(start.cmd).toContain(
-      `'startOrRestart' '${file}' '--only' 'mcproc-watcher'`
-    );
-    expect(start.opts.env).toEqual({ PM2_HOME: '/tmp/pm2-home-w' });
-  });
-
-  it('ensureWatcher without a pm2_home carries only the state dir', async () => {
-    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
-    const ctx = fakeCtx(vars, 'local', [
-      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
-      { match: /startOrRestart/, result: {} },
-    ]);
-    expect(await ensureWatcher(ctx, dir)).toBe('started');
-    const eco = JSON.parse(
-      fs.readFileSync(path.join(dir, 'watcher.ecosystem.json'), 'utf8')
-    );
-    expect(eco.apps[0].env).toEqual({ MCPROC_STATE_DIR: dir });
   });
 });

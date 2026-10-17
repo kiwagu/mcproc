@@ -658,8 +658,8 @@ describe('actOn start through the memory lease gate', () => {
     expect(rows.map((r) => r.app)).toEqual(['db', 'api']);
     expect(rows.every((r) => r.lease === undefined)).toBe(true);
     expect(h.started()).toBe(2);
-    expect(store.list().map((l) => [l.state, l.note])).toEqual([
-      ['running', 'dev up'],
+    expect(store.list().map((l) => [l.state, l.note, l.child_pid])).toEqual([
+      ['running', 'dev up', null], // its start went through: no starter left to wait for
     ]);
     expect(ensured).toBe(0);
   });

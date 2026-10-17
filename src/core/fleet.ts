@@ -25,6 +25,7 @@ import {
 import {
   cancelBefore,
   defaultGateDeps,
+  endFastStart,
   finishLeasedStart,
   freeAfter,
   freeOnFailure,
@@ -391,6 +392,11 @@ export async function actOn(
         if (admitted) await freeOnFailure(gate.store, admitted, e);
         throw e;
       }
+      // the start went through: from now on the watcher may judge the lease by its apps
+      if (admitted)
+        await endFastStart(gate.store, admitted).catch(() => {
+          /* bookkeeping only: the apps run, and a stop still frees the lease */
+        });
       // a checkout with no live lease skips pm2's list and the lock
       if (
         (act === 'stop' || act === 'delete') &&
