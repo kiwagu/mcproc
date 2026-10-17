@@ -367,6 +367,34 @@ describe('watchLeases', () => {
     expect(store.get(a.id)?.state).toBe('freed');
   });
 
+  it('a lease directory that cannot be read is logged once, keeps the loop from an idle exit, and the queue is taken once it reads again', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'leases'),
+      'a file where the directory goes'
+    );
+    const lines: string[] = [];
+    const d = deps();
+    d.log = (line) => lines.push(line);
+    let ticks = 0;
+    let a: Lease | null = null;
+    d.sleep = async (ms) => {
+      now += ms;
+      if (++ticks === 6) {
+        fs.rmSync(path.join(dir, 'leases'));
+        a = await store.withLock(() => store.create(input(), 'pending'));
+      }
+    };
+    // six ticks of 10 ms are past the idle time: a blind tick must not count towards it
+    expect(await watchLeases(d, { tickMs: 10, idleExitMs: 20 })).toBe('idle');
+    expect(lines.filter((l) => l.includes('cannot be read'))).toEqual([
+      "error: the lease directory cannot be read: ENOTDIR: not a directory, scandir '" +
+        path.join(dir, 'leases') +
+        "'",
+    ]);
+    expect(lines.filter((l) => l.startsWith('error: prune'))).toHaveLength(1);
+    expect(started).toEqual([a!.id]);
+  });
+
   it('spares a running lease whose starter is alive (its apps may not be up yet), and frees it once the starter is gone', async () => {
     const a = await store.create(input(), 'running', {
       child_pid: process.pid,

@@ -72,27 +72,35 @@ export interface LeaseView {
   apps: string[];
 }
 
-/** The pending and starting leases of one checkout, with their queue positions: what ls and wait show for apps that are not running yet. */
+/**
+ * The pending and starting leases of one checkout, with their queue positions: what ls and wait show for apps that are
+ * not running yet; none when the lease directory cannot be read (its permissions, a file in its place).
+ */
 export function leasesCovering(
   dir: string,
   m: Pick<Manifest, 'root' | 'project'>
 ): LeaseView[] {
   const store = new LeaseStore(dir);
-  return store
-    .list()
-    .filter(
-      (l): l is Lease & { state: 'pending' | 'starting' } =>
-        (l.state === 'pending' || l.state === 'starting') &&
-        l.root === m.root &&
-        l.project === m.project
-    )
-    .map((l) => ({
-      id: l.id,
-      state: l.state,
-      position: store.positionOf(l.id),
-      waiting_for: l.waiting_for,
-      apps: l.apps,
-    }));
+  try {
+    return store
+      .list()
+      .filter(
+        (l): l is Lease & { state: 'pending' | 'starting' } =>
+          (l.state === 'pending' || l.state === 'starting') &&
+          l.root === m.root &&
+          l.project === m.project
+      )
+      .map((l) => ({
+        id: l.id,
+        state: l.state,
+        position: store.positionOf(l.id),
+        waiting_for: l.waiting_for,
+        apps: l.apps,
+      }));
+  } catch {
+    // the queue's bookkeeping must not fail ls, monit or wait: the apps are shown as pm2 has them
+    return [];
+  }
 }
 
 /**

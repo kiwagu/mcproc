@@ -324,7 +324,9 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
  * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
  * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
  * reconciled. A head is estimated in full when it becomes the head, when the queue changed, when the memory reading
- * lets its last need fit, and at least every ESTIMATE_EVERY_MS; the ticks between read the memory alone. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
+ * lets its last need fit, and at least every ESTIMATE_EVERY_MS; the ticks between read the memory alone. A lease
+ * directory that cannot be read is logged once (a failing prune too) and the tick goes on as if nothing were queued,
+ * never into an idle exit it cannot judge. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
  * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
  * is gone is ended at once (cancelled at the head, failed while starting, freed while running), and one left starting
  * for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
@@ -352,28 +354,69 @@ export async function watchLeases(
   // the head's last full estimate, and whether the queue changed since the last judgement: both call for a new one
   const last: { id: string | null; at: number } = { id: null, at: 0 };
   let woken = false;
+  // a failure that repeats every tick is logged once, and again only once it changed or cleared
+  const said = new Map<string, string>();
+  const sayOnce = (key: string, line: string | null) => {
+    if (line === null) said.delete(key);
+    else if (said.get(key) !== line) {
+      said.set(key, line);
+      deps.log(line);
+    }
+  };
+  // whether a read of the lease directory failed in this tick: nothing is known about the queue then
+  let blind = false;
+  const unreadable = (e: unknown) => {
+    blind = true;
+    sayOnce(
+      'read',
+      `error: the lease directory cannot be read: ${describeError(e)}`
+    );
+  };
+  const readable = <T>(read: () => T, fallback: T): T => {
+    try {
+      const v = read();
+      sayOnce('read', null);
+      return v;
+    } catch (e) {
+      unreadable(e);
+      return fallback;
+    }
+  };
   const queueOf = () =>
-    store
-      .list()
-      .map((l) => `${l.id}:${l.state}`)
-      .join(',');
+    readable(
+      () =>
+        store
+          .list()
+          .map((l) => `${l.id}:${l.state}`)
+          .join(','),
+      asleepOn
+    );
   const unwatch = deps.watch?.(() => {
     if (tick && queueOf() !== asleepOn) tick.abort();
   });
   try {
     for (;;) {
       if (opts.signal?.aborted) return 'aborted';
+      blind = false;
       try {
         await store.withLock(() => store.prune());
+        sayOnce('prune', null);
       } catch (e) {
-        deps.log(`error: prune: ${describeError(e)}`);
+        sayOnce('prune', `error: prune: ${describeError(e)}`);
       }
-      await reconcile(deps, stuckMs);
+      try {
+        await reconcile(deps, stuckMs);
+      } catch (e) {
+        unreadable(e); // its own list: each lease's errors are caught inside
+      }
       asleepOn = queueOf();
-      const starting = store.list().some((l) => l.state === 'starting');
-      const head = store.head();
+      const starting = readable(
+        () => store.list().some((l) => l.state === 'starting'),
+        false
+      );
+      const head = readable(() => store.head(), null);
       const now = deps.now();
-      if (!head && !starting) {
+      if (!head && !starting && !blind) {
         if (now - idleSince >= idleExitMs) {
           if (await leaveIdle(deps)) return 'idle';
           // a start queued in the moment before the exit: it is taken first

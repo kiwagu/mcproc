@@ -9,6 +9,7 @@ import { MARK } from '../../src/shell/snippets.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
+import { leasesCovering } from '../../src/core/leases/view.js';
 import type { Context } from '../../src/core/resolve.js';
 import type { Attempt, HereCheck } from '../../src/core/urlcheck.js';
 import {
@@ -733,6 +734,40 @@ describe('declared containers', () => {
 });
 
 describe('queued and starting rows', () => {
+  it('a state directory whose leases cannot be read gives no covering leases, and ls still answers', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-bad-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    const m = loadManifest(varsProj);
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: 'jlist', result: { stdout: probeOut({}) } },
+    ]);
+    try {
+      // the state directory is a file; its lease directory is a file (ENOTDIR); its lease directory has no read access (EACCES)
+      const file = path.join(base, 'state-file');
+      fs.writeFileSync(file, '');
+      const notDir = path.join(base, 'not-dir');
+      fs.mkdirSync(notDir);
+      fs.writeFileSync(path.join(notDir, 'leases'), '');
+      const noAccess = path.join(base, 'no-access');
+      fs.mkdirSync(path.join(noAccess, 'leases'), { recursive: true });
+      fs.chmodSync(path.join(noAccess, 'leases'), 0o000);
+      const bad = [file, notDir];
+      // a root run reads it all the same
+      if (process.getuid?.() !== 0) bad.push(noAccess);
+      for (const dir of bad) {
+        expect(leasesCovering(dir, m)).toEqual([]);
+        process.env.MCPROC_STATE_DIR = dir;
+        const rows = await listApps(ctx);
+        expect(rows.map((r) => r.app)).toEqual(Object.keys(m.apps));
+      }
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.chmodSync(path.join(base, 'no-access', 'leases'), 0o700);
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('an app with no process but a pending lease reads queued #N, a starting one reads starting', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
     const prev = process.env.MCPROC_STATE_DIR;
