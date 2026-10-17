@@ -37,6 +37,13 @@ mcproc logs base --since 2m    # every app of a profile, merged by time stamp
 mcproc doctor        # why a host cannot be driven, and what to do
 ```
 
+## Upgrading from 0.10
+
+`{{` in a manifest string is now a template (see *Variables*). A manifest from 0.10 that holds a literal `{{` in a
+string under `apps`, `hosts`, `worktree` or `exec`, such as a docker `--format '{{.Names}}'` in a `run` line, no longer
+loads: write the literal as `\{{` (`docker ps --format '\{{.Names}}'`), which renders as `{{`. The refusal is
+`BAD_TEMPLATE` and names the field, for example `apps.ps.run: unexpected "." in ".Names"`.
+
 ## The manifest: `.mcproc/mcproc.yaml`
 
 ```yaml
@@ -228,9 +235,10 @@ apps:
   ahead of it. `ramping` is the need of running leases admitted within `settle` seconds, or whose starter is still alive.
   Otherwise the answer is `queued #N`, and the queue is strict FIFO: a small start never jumps a large one. A stand that
   could not fit even on an idle host is refused with `NEVER_FITS`.
-- **The watcher** is a pm2 process, `mcproc-watcher` in the `mcproc` namespace. It wakes only when the queue changes,
-  exits after a minute idle, and the next queued start launches it again. It ends leases whose owner is gone
-  (`checkout gone`, `requester gone`). `stop` and `delete` cancel the starts they overlap before stopping, and free the
+- **The watcher** is a pm2 process, `mcproc-watcher` in the `mcproc` namespace. It judges the head every 2 s and at once
+  when the queue changes, exits after a minute idle, and the next queued start launches it again. While the head waits,
+  each tick reads the memory alone; its siblings are measured again when that reading lets it fit, when the queue
+  changes, and every 30 s. It ends leases whose owner is gone (`checkout gone`, `requester gone`). `stop` and `delete` cancel the starts they overlap before stopping, and free the
   running leases afterwards.
 - `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
   apps that declare `containers:`), `describe` and the sibling measurement; never by monit's loop or by `wait`.
