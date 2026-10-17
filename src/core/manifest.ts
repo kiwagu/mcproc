@@ -274,7 +274,7 @@ export interface Manifest {
   root: string;
   path: string;
   project: string;
-  /** the manifest's own slug (declared or from the directory name), before any override: the registry of worktree slots is keyed by it */
+  /** the manifest's own slug (declared, else from the main checkout's directory name), before any override: the registry of worktree slots is keyed by it */
   base_project: string;
   vars: VarInfo[];
   /** the override file that set project or vars; null when the checkout has none */
@@ -484,8 +484,11 @@ export function parseManifest(
     throw new McprocError('BAD_TEMPLATE', 'project: must not be a template', {
       hint: 'Set the project slug in the override file instead.',
     });
+  // every checkout of a repository shares one base slug: a worktree takes the default from its main checkout's path
   const base_project =
-    typeof top.project === 'string' ? top.project : defaultProject(root);
+    typeof top.project === 'string'
+      ? top.project
+      : defaultProject(override?.repo ?? root);
   const project = override?.project ?? base_project;
   const declaredRes = z.record(varName, varValue).safeParse(top.vars ?? {});
   if (!declaredRes.success)

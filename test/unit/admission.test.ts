@@ -10,7 +10,10 @@ import type { Lease } from '../../src/core/leases/store.js';
 import {
   listCheckout,
   measureSiblings,
+  registryOf,
 } from '../../src/core/leases/siblings.js';
+import { registryPath, writeRegistry } from '../../src/core/slots.js';
+import { writeOverride } from '../../src/core/override.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import type { LsRow } from '../../src/core/list.js';
 import fs from 'node:fs';
@@ -221,6 +224,34 @@ describe('measureSiblings', () => {
     const r = await measureSiblings(m, { registry, list, exists: () => true });
     expect(most).toBe(2);
     expect(r).toEqual(new Map([['db', { mib: 80, slot: 0 }]]));
+  });
+  it("registryOf finds the main checkout's registry from a worktree of a manifest without project:", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-reg-'));
+    try {
+      const main = path.join(base, 'demo');
+      const tree = path.join(base, 'demo.worktrees', 'feature');
+      for (const r of [main, tree]) {
+        fs.mkdirSync(path.join(r, '.mcproc'), { recursive: true });
+        fs.writeFileSync(
+          path.join(r, '.mcproc', 'mcproc.yaml'),
+          'version: 1\napps:\n  a: { description: d, run: node a.js }\n'
+        );
+      }
+      writeOverride(tree, { project: 'demo-w1', repo: main });
+      const state = path.join(base, 'state');
+      const registry = {
+        repo: main,
+        slots: {
+          '0': { path: main, branch: null, project: 'demo' },
+          '1': { path: tree, branch: 'feature', project: 'demo-w1' },
+        },
+      };
+      writeRegistry(registryPath(state, 'demo', main), registry);
+      expect(registryOf(loadManifest(main), state)).toEqual(registry);
+      expect(registryOf(loadManifest(tree), state)).toEqual(registry);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
   it('listCheckout measures nothing at a path whose manifest is an enclosing project', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-sib-'));

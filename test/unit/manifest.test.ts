@@ -531,6 +531,35 @@ describe('vars, override and the new sections', () => {
     expect(m.apps.api.ports).toEqual([3310]);
     expect(m.apps.db.containers).toEqual(['demo-db']);
   });
+  it('without project: a worktree takes its base slug from the main checkout the override records, not its own directory', () => {
+    const root = '/w/demo.worktrees/feature';
+    const text = 'version: 1\napps:\n  a: { description: x, run: y }\n';
+    const at = (o: { project?: string } = {}) =>
+      parseManifest(text, root, `${root}/.mcproc/mcproc.yaml`, {
+        path: `${root}/.mcproc/mcproc.local.yaml`,
+        repo: '/w/demo',
+        vars: {},
+        ...o,
+      });
+    expect(at()).toMatchObject({
+      base_project: 'demo',
+      project: 'demo',
+      repo: '/w/demo',
+    });
+    expect(at({ project: 'demo-w1' })).toMatchObject({
+      base_project: 'demo',
+      project: 'demo-w1',
+    });
+    // the main checkout itself, and a checkout without an override, keep their own directory's name
+    expect(
+      parseManifest(text, '/w/demo', '/w/demo/.mcproc/mcproc.yaml', null)
+        .base_project
+    ).toBe('demo');
+    expect(
+      parseManifest(text, root, `${root}/.mcproc/mcproc.yaml`, null)
+        .base_project
+    ).toBe('feature');
+  });
   it('defaults: no vars, 2G reserve, 10% margin, 20 s settle, empty worktree and exec', () => {
     const m = parse('version: 1\napps:\n  a: { description: x, run: y }\n');
     expect(m.vars).toEqual([
