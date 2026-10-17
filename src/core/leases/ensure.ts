@@ -53,24 +53,27 @@ export function watcherEntry(
  * The watcher as one pm2 process per daemon: online already, or started from an ecosystem file in the state directory.
  * An online watcher without a fresh exit note is trusted at once; one whose note is fresh is leaving after an idle exit
  * and is waited for (up to EXIT_WAIT_MS) before the lease lock is taken, so the lock is never held through that wait.
- * Then, under the lock, pm2 is asked again: an online watcher (one that outlived the wait) is trusted, else a fresh one
- * is started, so two starts that queue at once launch one watcher (a second launch would restart the first, and its tree).
+ * Then, under the lock, pm2 is asked again: an online watcher is trusted unless it is the leaving one (its note still in
+ * place), else a fresh one is started, so two starts that queue at once launch one watcher (a second launch would
+ * restart the first, and its tree).
  */
 export async function ensureWatcher(
   ctx: Context,
   dir = stateDir()
 ): Promise<'online' | 'started'> {
+  let leaving: number | null = null;
   if (await watcherOnline(ctx)) {
     // no fresh note: it stays, since it cannot leave while a lease is pending (see the watcher's leaveIdle)
     const at = exitingAt(dir);
     if (at === null || Date.now() - at >= EXIT_FRESH_MS) return 'online';
+    leaving = at;
     const until = Date.now() + EXIT_WAIT_MS;
     while (Date.now() < until) {
       await new Promise((r) => setTimeout(r, EXIT_POLL_MS));
       if (!(await watcherOnline(ctx))) break;
     }
   }
-  return new LeaseStore(dir).withLock(() => lookAndLaunch(ctx, dir));
+  return new LeaseStore(dir).withLock(() => lookAndLaunch(ctx, dir, leaving));
 }
 
 /** Whether the watcher's pm2 process is online on the context's daemon. */
@@ -83,12 +86,22 @@ async function watcherOnline(ctx: Context): Promise<boolean> {
   );
 }
 
-/** ensureWatcher's look and launch, under the lease lock: an online watcher is left alone, else a fresh one is started. */
+/**
+ * ensureWatcher's look and launch, under the lease lock: an online watcher is left alone, else a fresh one is started.
+ * `leaving` is the exit note a start waited on: while that note is still in place (no launch took it meanwhile), the
+ * online watcher is the one on its way out and a fresh one is started over it, which is safe since it passed leaveIdle
+ * and so runs no start.
+ */
 async function lookAndLaunch(
   ctx: Context,
-  dir: string
+  dir: string,
+  leaving: number | null
 ): Promise<'online' | 'started'> {
-  if (await watcherOnline(ctx)) return 'online';
+  if (
+    (await watcherOnline(ctx)) &&
+    (leaving === null || exitingAt(dir) !== leaving)
+  )
+    return 'online';
   const entry = watcherEntry();
   const file = path.join(dir, 'watcher.ecosystem.json');
   fs.mkdirSync(dir, { recursive: true });

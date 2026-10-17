@@ -293,6 +293,45 @@ describe('gateStart', () => {
     }
   });
 
+  it('cancels its pending lease when the watcher cannot be launched, and fails with the reason', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const d = deps({ total_mib: 8000, available_mib: 1500 });
+    d.ensureWatcher = async () => {
+      throw new Error('pm2 is gone');
+    };
+    await expect(
+      gateStart(ctx, ['db', 'api'], { target: 'dev', procs: [] }, d)
+    ).rejects.toMatchObject({
+      code: 'PM2_FAILED',
+      message: 'the watcher could not be launched: pm2 is gone',
+    });
+    expect(store.list()).toMatchObject([
+      {
+        state: 'cancelled',
+        error: 'the watcher could not be launched: pm2 is gone',
+      },
+    ]);
+    // an mcproc error comes through as it is, its hint with it
+    const refusal = new McprocError('NOT_STARTED', 'no built cli.js', {
+      hint: 'Set MCPROC_CLI_ENTRY',
+    });
+    d.ensureWatcher = async () => {
+      throw refusal;
+    };
+    await expect(
+      gateStart(ctx, ['db', 'api'], { target: 'dev', procs: [] }, d)
+    ).rejects.toBe(refusal);
+    expect(store.list()[1]).toMatchObject({
+      state: 'cancelled',
+      error: 'the watcher could not be launched: NOT_STARTED: no built cli.js',
+    });
+    expect(
+      store
+        .list()
+        .filter((l) => l.state === 'pending' || l.state === 'starting')
+    ).toEqual([]);
+  });
+
   it('admits in FIFO order without a memory reading', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const r = await gateStart(

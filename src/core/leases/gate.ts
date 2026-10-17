@@ -1,4 +1,4 @@
-import { McprocError } from '../errors.js';
+import { describeError, isMcprocError, McprocError } from '../errors.js';
 import type { LsRow } from '../list.js';
 import { readHostMemory, type HostMemory } from '../memory.js';
 import { findProcess, isRunning, type Pm2Process } from '../pm2.js';
@@ -69,7 +69,8 @@ export function defaultGateDeps(dir = stateDir()): GateDeps {
  * memory never touches the queue. Otherwise the estimate (measured from a sibling slot where one runs, else declared,
  * plus the margin) is judged under the lock, the running leases younger than the manifest's settle time charged on
  * top of the reading: admitted at once as a running lease, or queued as a pending one behind whatever is pending
- * already, in which case the watcher is made sure of and the caller returns.
+ * already, in which case the watcher is made sure of and the caller returns. When the watcher cannot be launched, the
+ * pending lease is cancelled with the reason and the start fails (the McprocError as it came, else PM2_FAILED).
  */
 export async function gateStart(
   ctx: Context,
@@ -169,7 +170,21 @@ export async function gateStart(
       waiting_for: d.waiting_for,
     };
   });
-  if (result.kind === 'queued') await deps.ensureWatcher(ctx);
+  if (result.kind === 'queued')
+    try {
+      await deps.ensureWatcher(ctx);
+    } catch (e) {
+      // nothing would ever admit it, and it would hold every later start of the host behind it
+      const error = `the watcher could not be launched: ${describeError(e)}`;
+      const id = result.lease.id;
+      await deps.store
+        .withLock(async () => {
+          if (deps.store.get(id)?.state === 'pending')
+            await deps.store.transition(id, 'cancelled', { error });
+        })
+        .catch(() => undefined);
+      throw isMcprocError(e) ? e : new McprocError('PM2_FAILED', error);
+    }
   return result;
 }
 

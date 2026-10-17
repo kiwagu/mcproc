@@ -216,14 +216,30 @@ describe('watcherEntry and ensureWatcher', () => {
     );
   });
 
-  it('ensureWatcher answers online when a watcher with a fresh exit note is still online after 3 s', async () => {
+  it('ensureWatcher launches anyway when a watcher with a fresh exit note is still online after 3 s: it is on its way out', async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
     note(0);
     const ctx = fakeCtx(vars, 'local', [
       { match: /pm2 'jlist'/, result: { stdout: jlist('online') } },
+      { match: /startOrRestart/, result: {} },
     ]);
     const t0 = Date.now();
-    expect(await ensureWatcher(ctx, dir)).toBe('online');
+    expect(await ensureWatcher(ctx, dir)).toBe('started');
     expect(Date.now() - t0).toBeGreaterThanOrEqual(2900);
+    expect(starts(ctx)).toBe(1);
+    expect(fs.existsSync(path.join(dir, 'watcher.json'))).toBe(false);
+  });
+
+  it('ensureWatcher trusts the online watcher after the wait when a launch took the exit note meanwhile', async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
+    note(0);
+    const ctx = fakeCtx(vars, 'local', [
+      { match: /pm2 'jlist'/, result: { stdout: jlist('online') } },
+      { match: /startOrRestart/, result: {} },
+    ]);
+    // another start launched a fresh watcher while this one waited: the note is gone
+    setTimeout(() => fs.rmSync(path.join(dir, 'watcher.json')), 500);
+    expect(await ensureWatcher(ctx, dir)).toBe('online');
     expect(starts(ctx)).toBe(0);
   });
 });
