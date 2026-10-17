@@ -213,6 +213,8 @@ async function waitOnLogs(
 ): Promise<WaitResult> {
   const { deps, signal } = run;
   let p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+  // a process seen once makes its absence later a result (gone), never a request for an app that never started
+  let seen = p !== undefined;
   // not running (no process yet, or one stopped before a start that queued): while a lease covers the app pm2 is
   // asked again at each poll, and the follower starts once it runs
   while (!p || !isRunning(p.status)) {
@@ -220,8 +222,12 @@ async function waitOnLogs(
     if (q === null) break;
     if (q !== 'again') return q;
     p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+    if (p) seen = true;
   }
-  if (!p) throw notStarted(ctx, app);
+  if (!p) {
+    if (!seen) throw notStarted(ctx, app);
+    return run.gone(undefined);
+  }
   const tracker =
     until.kind === 'reloaded' && a.reloads
       ? new ReloadTracker(compileReloadRules(a.reloads), {
@@ -419,14 +425,15 @@ export async function waitFor(
       queued,
     });
 
-  // true until a process is seen: a lease that ends without the app ever starting is still a request for an app that
-  // never started at the next look
+  // true until a process is seen, whatever it shows: a lease that ends before any process appeared is still a request
+  // for an app that never started at the next look, and a process seen once makes its absence later a result (gone)
   let first = true;
   for (;;) {
     let p: Pm2Process | undefined;
     let observed: string | undefined;
     if (until.kind === 'exited') {
       p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+      if (p) first = false;
       // a run that queued: the last run's exit is not its answer
       if (!p || !isRunning(p.status)) {
         const q = await queued();
@@ -455,6 +462,7 @@ export async function waitFor(
         leases: 'none',
       });
       p = findProcess(snap.procs, ctx.manifest.project, app);
+      if (p) first = false;
       if (!p || !isRunning(p.status)) {
         const q = await queued();
         if (q === 'again') continue;
@@ -485,8 +493,6 @@ export async function waitFor(
         observed = `status ${p.status}, ${observed}`;
       }
     }
-    // only a look that saw the process gets here
-    first = false;
     if (deps.now() >= deadline) return giveUp('timeout', p, observed);
     if (!(await pause())) return giveUp('aborted', p, observed);
   }
@@ -498,7 +504,11 @@ export function untilFor(dep: Dep, depApp: App): Until {
   return depApp.ports.length > 0 ? { kind: 'listening' } : { kind: 'url-ok' };
 }
 
-/** A dependency's condition observed on its own context; `completed` also requires exit code 0. */
+/**
+ * A dependency's condition observed on its own context; `completed` also requires exit code 0. It never rides through
+ * a lease: the start waiting has just started the dependency itself or found it running, so another run's queued
+ * lease over the same app (a task that exited reads stopped) must not hold it back.
+ */
 export async function waitDependency(
   ctx: Context,
   dep: Dep,
@@ -508,7 +518,8 @@ export async function waitDependency(
   if (!depApp) throw unknownApp(ctx, dep.app);
   const r = await waitFor(ctx, dep.app, untilFor(dep, depApp), {
     timeoutMs: dep.timeoutMs,
-    ...opts,
+    signal: opts.signal,
+    deps: { ...(opts.deps ?? defaultWaitDeps()), leases: async () => [] },
   });
   if (dep.condition === 'completed' && r.ok && r.exit_code !== 0)
     return { ...r, ok: false, reason: 'failed' };
