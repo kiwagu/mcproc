@@ -139,7 +139,7 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Describe',
       description:
-        'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config.',
+        'Call this first in a new session. Without app: project summary (apps with descriptions, profiles, hosts) plus .mcproc/README.md. With app: its manifest entry, runtime state, log paths, URL, ports and generated pm2 config. Without app it also lists the resolved vars with their sources and the override file, when the manifest declares vars.',
       inputSchema: { ...commonInput, app: z.string().optional() },
       annotations: RO,
     },

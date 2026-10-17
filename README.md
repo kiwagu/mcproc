@@ -42,6 +42,8 @@ mcproc doctor        # why a host cannot be driven, and what to do
 ```yaml
 version: 1
 project: demo                  # pm2 namespace and process-name prefix; default: directory name
+vars:                          # per-checkout values, see *Variables*
+  slot: 0
 apps:
   libs:
     description: one-shot build of the shared libraries into dist/
@@ -58,6 +60,8 @@ apps:
     env: { PORT: 3310 }
     port: 3310                 # declared listening port (or ports: [3310, 9230])
     url: http://localhost:3310/   # optional: the address to open; ls/describe show it with the HTTP answer, monit shows it
+    memory: 600M               # expected memory, see *Memory*
+    containers: [demo-db]      # docker containers the app owns
     watch: [dist/apps/api]     # pm2 restarts the server when the build output changes
     depends_on:
       - { app: libs, condition: completed }   # wait for the build to exit 0
@@ -168,6 +172,124 @@ A bound app always runs on its host. An app without `host:` runs wherever the co
   happened (`start` skips what comes after the failure). A readonly host refuses the whole change before
   any host is touched, and the error names the apps that run there, dependencies included.
 - ssh gives up connecting after 10 s (`-o ConnectTimeout=10`). A `ConnectTimeout` in `ssh_args` wins.
+
+## Variables and a per-checkout override
+
+Ports, container names and paths that differ per checkout are variables, declared once under `vars:` with a default:
+
+```yaml
+vars:
+  slot: 0                      # the main checkout; a worktree gets its own (see *Worktrees*)
+  web_port: '{{ 5181 + slot * 100 }}'   # a default may use the vars before it
+apps:
+  web:
+    description: dev server
+    run: npm run dev -- --port {{ web_port }}
+    port: '{{ web_port }}'     # port and ports are templates only as quoted strings
+  db:
+    description: postgres for the stand
+    run: docker run --rm --name {{ project }}-db -p {{ 5432 + slot }}:5432 postgres
+    containers: [ '{{ project }}-db' ]
+```
+
+- `{{ expr }}` takes names, integers, `+ - * / %` and parentheses; division truncates. `\{{` writes a literal `{{`,
+  which a docker `--format '{{.Names}}'` in a `run` line needs. The syntax is `{{ }}` because bash, Caddy and compose own
+  the other ones.
+- The built-ins are `project` (the pm2 namespace of this checkout) and `root` (its project root).
+- Templates work in every string field under `apps`, `hosts`, `worktree` and `exec.env`. They do not work in `project`, in
+  the names of apps, profiles and hosts, or in the `vars` names.
+- `.mcproc/mcproc.local.yaml` is the checkout's own override (it lives in the gitignored folder). It holds `project` (the
+  slug this checkout runs under), `repo` (the main checkout, for a worktree) and `vars` (values that win over the
+  defaults). A var the manifest does not declare is refused.
+- `describe` without an app prints the resolved vars, where each value came from, and the override's path.
+
+The slot idiom: the manifest says `slot: 0` and writes ports as `'{{ 5181 + slot * 100 }}'` and containers as
+`{{ project }}-db`. The main checkout keeps 5181 and `demo-db`; a worktree at slot 2 gets 5381 and `demo-w2-db`.
+
+## Memory: budgets and the lease queue
+
+Several stands on one machine can starve it, so a `start` asks for memory first. The manifest declares what an app needs:
+
+```yaml
+resources:
+  reserve: 2G                  # what the host keeps for everything else (default 2G; also a percentage, 15%)
+  margin: 10%                  # added to every estimate (default 10%)
+  settle: 20                   # seconds a fresh start still counts as ramping up (default 20)
+apps:
+  api:
+    memory: 1.5G               # what the app is expected to take
+    containers: [demo-db]      # docker containers it owns: removed with it, counted in its memory
+```
+
+- **The estimate**, per app: the larger of the declared `memory:` and what a running sibling slot of the same app
+  measures (its process tree plus its declared containers; the largest among the siblings). The lease's need is
+  `ceil(estimate × (1 + margin))`.
+- **Admission.** The start runs at once when `MemAvailable − reserve − ramping` covers the need and nothing is pending
+  ahead of it. `ramping` is the need of running leases admitted within `settle` seconds, or whose starter is still alive.
+  Otherwise the answer is `queued #N`, and the queue is strict FIFO: a small start never jumps a large one. A stand that
+  could not fit even on an idle host is refused with `NEVER_FITS`.
+- **The watcher** is a pm2 process, `mcproc-watcher` in the `mcproc` namespace. It wakes only when the queue changes,
+  exits after a minute idle, and the next queued start launches it again. It ends leases whose owner is gone
+  (`checkout gone`, `requester gone`). `stop` and `delete` cancel the starts they overlap before stopping, and free the
+  running leases afterwards.
+- `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
+  apps that declare `containers:`), `describe` and the sibling measurement; never by monit's loop or by `wait`.
+- **Looking and cancelling.** `mcproc leases` (tool `leases`) shows the host's queue: who runs, who waits and why, the
+  memory reading and the watcher. `leases cancel <id>` cancels a pending lease; a starting one is refused: stop its
+  target instead. `ls` shows a queued app as `queued #N`, `wait` rides through the queue, `doctor` reports the state
+  directory and the watcher. `start --note <text>` keeps a reason on the lease.
+- **State** lives in `~/.local/state/mcproc` (or `$XDG_STATE_HOME/mcproc`, or `MCPROC_STATE_DIR`): `leases/`, `slots/`,
+  `watcher.json` and `watcher.ecosystem.json`. A dev checkout runs the watcher from the bundle `MCPROC_CLI_ENTRY` names.
+
+### Exec: one-off work under a lease
+
+```bash
+mcproc exec --memory 4G --note "e2e run" -- npx vitest run     # --timeout <s> bounds the wait in the queue (default 600, max 3600)
+```
+
+`exec` runs a command from the project root with the manifest's `exec.env` (templates allowed, so it can point at this
+checkout's ports) and `MCPROC_PROJECT` set. With `--memory` it is a lease like a start: it runs at once when the host has
+room, else waits its turn, and frees the lease when the command exits. Without it, it runs at once. The MCP tool returns
+the exit code and the last 200 lines of output, and is marked destructive: it runs any local argv.
+
+### Limits
+
+- Leases are local: `exec` and the worktree commands refuse a `host`, and a `start` of an app bound to a remote host that
+  declares `memory:` is refused (`LEASE_UNSUPPORTED_HOST`). That makes monit's `R` key (`start all --reload`) refuse such
+  a manifest.
+- Without `/proc/meminfo` (not Linux) there is no memory reading, so nothing is checked.
+
+## Worktrees
+
+An isolated checkout per branch, each with its own slot, project slug, ports and containers, so stands do not collide:
+
+```yaml
+worktree:
+  dir: ../demo.worktrees       # default: <repo>.worktrees next to the repository
+  copy: [.env.local]           # files copied into every new worktree
+  link: [node_modules/.cache]  # symlinked to the main checkout's
+  install: npm ci              # default: by the lockfile (bun, yarn, pnpm, npm); false = none
+  slots: 9                     # how many worktrees at most (1 to 99)
+```
+
+```bash
+mcproc worktree add feat/x [--from main] [--slot 2] [--slug demo-x] [--no-install]
+mcproc worktree ls
+mcproc worktree remove feat/x [--force]     # by branch, path or slot
+```
+
+`worktree add` does, in order: claims the lowest free slot (or `--slot`) in the registry, makes `git worktree add` on the
+branch (a new branch starts at `--from`, default the main checkout's HEAD), copies and links the declared files, writes
+`.mcproc/mcproc.local.yaml` there with `repo`, `project` (`--slug`, default `<project>-w<slot>`) and, when the manifest declares a `slot` var, `vars.slot`, and
+runs the install. It prints the path and how to go on; if git fails the slot is given back.
+
+`worktree ls` reads only: each checkout's slot (0 is the main one), project slug, branch, apps online, lease state and
+path; a slot whose folder is gone shows `(gone)`, and `add` and `remove` reclaim it. `worktree remove` stops and deletes
+the worktree's apps (freeing its leases), removes the checkout and frees the slot; the branch stays. Uncommitted or
+untracked changes refuse it unless `--force`, and the main checkout is never removed. The registry is
+`<state>/slots/<project>-<hash>.json`.
+
+The agent then passes `project: <worktree path>` on every call for that stand (`start`, `wait`, `logs`...).
 
 ## Readiness: `wait` and `depends_on` conditions
 
@@ -320,7 +442,10 @@ one before it counts as a reload. Put that server's line in the app's `reloads.i
 | `wait <app> until=…` | block until listening / url-ok / exited / a log line matches / idle / reloaded, with a timeout; ok false with what was last seen |
 | `hosts`, `doctor` | hosts from the manifest with the apps bound to each; per-host readiness (reachable, Node, which pm2 and why, ps/ss/tar, daemon; the host's environment and where each url answers) |
 | `init` | manifest draft from package.json scripts, workspaces, nx `project.json`, `turbo.json` (a turbo repo's dev task drafts live, with a `dev` profile and `libs` / `libs-watch` builders for dist-built libraries), `ecosystem.json`, `Procfile`; `adopt_ports` writes the ports `ls` reports as undeclared into the existing manifest |
-| `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason |
+| `start <target>` | app or profile, dependencies first; online apps untouched unless `reload`. Dependencies declared with `condition: ready` or `completed` are waited for (with their timeout), and a dependent whose dependency failed or timed out is skipped with the reason. When the host cannot hold the stand yet the answer is `queued #N` and a watcher starts it in FIFO order |
+| `leases`, `lease_cancel <id>` | the host's lease queue (who runs, who waits and why, estimates, the watcher); cancel a pending lease |
+| `exec [--memory] -- <command>` | a one-off command from the project root with `exec.env`, under a memory lease when `--memory` is given; destructive, local host only |
+| `worktree add <branch>`, `worktree ls`, `worktree remove <ref>` | an isolated checkout with its own slot, slug and ports; every checkout with its slot and apps online; remove one and free its slot |
 | `restart`, `stop`, `delete <target>` | by app or profile |
 | `flush [app]` | truncate pm2 log files; incidents start over from there |
 | `unpack` | bring pm2 (assembled with npm from the lockfile mcproc ships), and Node when the host has none ≥ 18, into `<cwd>/.mcproc/runtime` on that host |
