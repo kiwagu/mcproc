@@ -36,6 +36,10 @@ const input = (over: Partial<NewLease> = {}): NewLease => ({
 });
 
 describe('stateDir', () => {
+  it('the unit suite keeps its own state directory under the OS temp dir (test/setup.ts), never the real one', () => {
+    expect(stateDir().startsWith(os.tmpdir() + path.sep)).toBe(true);
+    expect(stateDir()).not.toBe(stateDir({}));
+  });
   it('prefers MCPROC_STATE_DIR, then XDG_STATE_HOME, then ~/.local/state', () => {
     expect(stateDir({ MCPROC_STATE_DIR: '/tmp/x' })).toBe('/tmp/x');
     expect(stateDir({ XDG_STATE_HOME: '/xdg' })).toBe('/xdg/mcproc');

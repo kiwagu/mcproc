@@ -1497,6 +1497,99 @@ describe('waitFor: a start that is queued (lease-aware)', () => {
     ).toMatchObject({ ok: true, status: 'done', exit_code: 0 });
     expect(looks).toBe(3);
   });
+  it('log: rides through a pending lease until the process appears on the third look, then matches a line', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    let looks = 0;
+    const f = fakeFollower([
+      { out: ['old: ready on 3510'] },
+      { out: ['2026-10-17T10:00:00.000: ready on 3510'] },
+    ]);
+    const slept: number[] = [];
+    let t = 1_000_000;
+    const deps = fakeDeps({
+      jlist: async () =>
+        ++looks >= 3 ? [onlineProc('demo-w2-api', 'demo-w2')] : [],
+      leases: async () =>
+        looks >= 3
+          ? []
+          : [
+              {
+                id: 'l_x',
+                state: 'pending',
+                position: 1,
+                waiting_for: '100M short',
+                apps: ['api'],
+              },
+            ],
+      follower: () => f,
+      sleep: async (ms) => {
+        slept.push(ms);
+        t += ms;
+      },
+      now: () => t,
+    });
+    const r = await waitFor(ctx, 'api', parseUntil('log:ready on \\d+'), {
+      deps,
+      timeoutMs: 5000,
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      status: 'online',
+      matched_line: '2026-10-17T10:00:00.000: ready on 3510',
+    });
+    expect(looks).toBe(3);
+    // pm2 is asked again at the local poll interval while queued
+    expect(slept).toEqual([500, 500]);
+    expect(f.closed).toBe(true);
+  });
+  it('log: times out while queued with the queue word as the status, and never makes a follower', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const deps = fakeDeps({
+      leases: async () => [
+        {
+          id: 'l_x',
+          state: 'pending',
+          position: 2,
+          waiting_for: '1 ahead in the queue',
+          apps: ['api'],
+        },
+      ],
+    });
+    expect(
+      await waitFor(ctx, 'api', parseUntil('log:ready'), {
+        deps,
+        timeoutMs: 1000,
+      })
+    ).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      until: 'log:ready',
+      status: 'queued #2',
+      observed: 'queued #2: 1 ahead in the queue',
+    });
+  });
+  it('idle: a lease that ends without the app ever starting is NOT_STARTED, as before', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    let reads = 0;
+    const deps = fakeDeps({
+      leases: async () =>
+        ++reads >= 2
+          ? []
+          : [
+              {
+                id: 'l_x',
+                state: 'starting',
+                position: 0,
+                waiting_for: null,
+                apps: ['api'],
+              },
+            ],
+    });
+    await expect(
+      waitFor(ctx, 'api', parseUntil('idle:2'), { deps, timeoutMs: 5000 })
+    ).rejects.toMatchObject({ code: 'NOT_STARTED' });
+    expect(reads).toBe(2);
+  });
   it("the poll's snapshot reads no leases itself: they come from deps.leases, only while the app has no process", async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const asked: unknown[] = [];

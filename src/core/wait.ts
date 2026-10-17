@@ -186,6 +186,8 @@ interface LogRun {
     p: Pm2Process | undefined,
     observed?: string
   ) => WaitResult;
+  /** the app has no process: rides through a covering lease ('again' after a pause), ends at the deadline or on abort, null without a lease */
+  queued: () => Promise<WaitResult | 'again' | null>;
 }
 
 /** What a reloaded wait saw when it ends with a burst still open: a reload under way, not the absence of one. */
@@ -200,6 +202,7 @@ const inProgress = (r: Reload): string =>
  * answers with the first reload it closes: a later marker closes a burst at once, quiet closes it RELOAD_GAP_MS after
  * its last marker arrived, so the tick's sleep is cut to that moment. A re-listen line counts from its first burst:
  * the app's boot was before the call. A wait that times out or is aborted with a burst open says so in `observed`.
+ * An app with no process that a lease covers is waited for first, as waitFor's other conditions do.
  */
 async function waitOnLogs(
   ctx: Context,
@@ -210,7 +213,13 @@ async function waitOnLogs(
 ): Promise<WaitResult> {
   const { deps, signal } = run;
   let p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
-  if (!p) throw notStarted(ctx, app);
+  // no process yet: while a lease covers the app pm2 is asked again at each poll, and the follower starts once it is up
+  while (!p) {
+    const q = await run.queued();
+    if (q === null) throw notStarted(ctx, app);
+    if (q !== 'again') return q;
+    p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
+  }
   const tracker =
     until.kind === 'reloaded' && a.reloads
       ? new ReloadTracker(compileReloadRules(a.reloads), {
@@ -404,6 +413,7 @@ export async function waitFor(
       answer,
       gone,
       giveUp,
+      queued,
     });
 
   // true until a process is seen: a lease that ends without the app ever starting is still a request for an app that

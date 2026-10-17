@@ -7,5 +7,6 @@ export default defineConfig({
       ? ['node_modules/**']
       : ['node_modules/**', 'test/integration/**'],
     testTimeout: 20_000,
+    setupFiles: ['test/setup.ts'],
   },
 });
