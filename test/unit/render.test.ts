@@ -24,7 +24,7 @@ import {
   renderAdopted,
 } from '../../src/mcp/render.js';
 import { describeProject, type LsRow } from '../../src/core/list.js';
-import { loadManifest } from '../../src/core/manifest.js';
+import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
 
@@ -1182,6 +1182,15 @@ describe('renderAdopted', () => {
       failed: false,
     });
   });
+});
+
+it('renderProject shows a declared var even without an override', () => {
+  const m = parseManifest(
+    'version: 1\nvars: { x: 1 }\napps:\n  a: { description: d, run: y }\n',
+    '/proj',
+    '/proj/.mcproc/mcproc.yaml'
+  );
+  expect(renderProject(describeProject(m))).toContain('  x = 1 (manifest)');
 });
 
 it('renderProject lists the vars with their sources when there are any', () => {

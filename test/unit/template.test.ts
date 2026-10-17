@@ -71,6 +71,15 @@ describe('resolveVars', () => {
       url: 'http://x:8300',
     });
   });
+  it('names the var whose template failed, keeping the kind', () => {
+    expect(() => resolveVars({ p: '{{ 1 +' }, {}, {})).toThrow(/^p: /);
+    expect(() => resolveVars({ p: '{{ nope }}' }, {}, {})).toThrowError(
+      expect.objectContaining({
+        kind: 'unknown',
+        message: expect.stringMatching(/^p: /),
+      })
+    );
+  });
   it('refuses a cycle, an override of an undeclared var and a built-in name', () => {
     expect(() => resolveVars({ a: '{{ b }}', b: '{{ a }}' }, {}, {})).toThrow(
       /cycle: a -> b -> a/

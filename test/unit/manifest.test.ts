@@ -477,6 +477,7 @@ describe('vars, override and the new sections', () => {
       path.join(varsProj, '.mcproc', 'mcproc.local.yaml')
     );
     expect(m.slot).toBe(2);
+    expect(m.repo).toBe('/w/demo');
     expect(m.vars).toEqual([
       { name: 'project', value: 'demo-w2', source: 'built-in' },
       { name: 'root', value: varsProj, source: 'built-in' },
@@ -525,6 +526,7 @@ describe('vars, override and the new sections', () => {
     );
     expect(m.project).toBe('demo');
     expect(m.override).toBeNull();
+    expect(m.repo).toBe(varsProj);
     expect(m.slot).toBe(0);
     expect(m.apps.api.ports).toEqual([3310]);
     expect(m.apps.db.containers).toEqual(['demo-db']);
@@ -595,6 +597,43 @@ describe('vars, override and the new sections', () => {
         'version: 1\napps:\n  a: { description: x, run: y, memory: huge }\n'
       )
     ).toThrow(/apps\.a\.memory/);
+  });
+  it('names the var of a failing template, and the override file of an undeclared var', () => {
+    expect(() =>
+      parse(
+        'version: 1\nvars: { p: "{{ 1 +" }\napps:\n  a: { description: x, run: y }\n'
+      )
+    ).toThrow(/vars\.p: /);
+    try {
+      parse(
+        'version: 1\nvars: { p: "{{ 1 +" }\napps:\n  a: { description: x, run: y }\n'
+      );
+    } catch (e) {
+      expect((e as McprocError).hint).toContain('\\{{');
+    }
+    try {
+      parse(
+        'version: 1\nvars: { a: "{{ b }}", b: "{{ a }}" }\napps:\n  a: { description: x, run: y }\n'
+      );
+    } catch (e) {
+      expect((e as McprocError).hint).toMatch(/Break the cycle/);
+      expect((e as McprocError).hint).not.toMatch(/Templates are/);
+    }
+    expect(() =>
+      parseManifest(
+        'version: 1\nvars: { slot: 0 }\napps:\n  a: { description: x, run: y }\n',
+        '/proj',
+        '/proj/.mcproc/mcproc.yaml',
+        { path: '/proj/.mcproc/mcproc.local.yaml', vars: { slut: 1 } }
+      )
+    ).toThrow(/\/proj\/\.mcproc\/mcproc\.local\.yaml/);
+  });
+  it('takes an explicit null for worktree.install and worktree.dir as the default', () => {
+    const w = parse(
+      'version: 1\nworktree: { install: null, dir: null }\napps:\n  a: { description: x, run: y }\n'
+    ).worktree;
+    expect(w.install).toBeNull();
+    expect(w.dir).toBeNull();
   });
   it('refuses an override var the manifest does not declare', () => {
     const text =

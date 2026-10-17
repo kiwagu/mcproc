@@ -154,10 +154,13 @@ const resourcesSchema = z
   .strict();
 const worktreeSchema = z
   .object({
-    dir: z.string().min(1).optional(),
+    dir: z.string().min(1).nullable().optional(),
     copy: z.array(z.string().min(1)).default([]),
     link: z.array(z.string().min(1)).default([]),
-    install: z.union([z.string().min(1), z.literal(false)]).optional(),
+    install: z
+      .union([z.string().min(1), z.literal(false)])
+      .nullable()
+      .optional(),
     slots: z.number().int().min(1).max(99).default(9),
   })
   .strict();
@@ -276,6 +279,8 @@ export interface Manifest {
   vars: VarInfo[];
   /** the override file that set project or vars; null when the checkout has none */
   override: string | null;
+  /** the main checkout of this repository: the override's `repo` for a worktree, else this root */
+  repo: string;
   /** the value of a numeric `slot` var; null when the manifest declares none */
   slot: number | null;
   resources: Resources;
@@ -395,11 +400,18 @@ function templateError(field: string, e: unknown): McprocError {
       : t?.kind === 'cycle'
         ? 'VAR_CYCLE'
         : 'BAD_TEMPLATE';
-  return new McprocError(code, `${field}: ${(e as Error).message}`, {
+  // a failure inside one var's template is reported under that var: vars.<name>
+  const where = t?.varName ? `${field}.${t.varName}` : field;
+  const msg = t?.varName
+    ? t.message.slice(t.varName.length + 2)
+    : (e as Error).message;
+  return new McprocError(code, `${where}: ${msg}`, {
     hint:
       code === 'UNKNOWN_VAR'
         ? 'Declare the var under vars: in the manifest; the override may only set declared vars.'
-        : 'Templates are {{ expr }} over var names with integer + - * / % and parentheses.',
+        : code === 'VAR_CYCLE'
+          ? 'Break the cycle between the named vars: one of them must not depend on the others.'
+          : "Templates are {{ expr }} over var names with integer + - * / % and parentheses; write \\{{ for a literal {{ (a docker --format '{{.Names}}' in a run line needs it).",
   });
 }
 
@@ -483,10 +495,15 @@ export function parseManifest(
     );
   let resolved: Record<string, VarValue>;
   try {
-    resolved = resolveVars(declaredRes.data, override?.vars ?? {}, {
-      project,
-      root,
-    });
+    resolved = resolveVars(
+      declaredRes.data,
+      override?.vars ?? {},
+      {
+        project,
+        root,
+      },
+      override?.path
+    );
   } catch (e) {
     throw templateError('vars', e);
   }
@@ -748,6 +765,7 @@ export function parseManifest(
     base_project,
     vars,
     override: override?.path ?? null,
+    repo: override?.repo ?? root,
     slot,
     apps,
     profiles: m.profiles,

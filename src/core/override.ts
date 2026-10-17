@@ -12,6 +12,8 @@ export const OVERRIDE_REL = path.join('.mcproc', 'mcproc.local.yaml');
 export interface Override {
   path: string;
   project?: string;
+  /** the main checkout of the repository, recorded by worktree add so the slot registry can be found from a worktree */
+  repo?: string;
   vars: Record<string, VarValue>;
 }
 
@@ -21,7 +23,12 @@ const overrideSchema = z
       .string()
       .regex(NAME_RE, 'must match ^[a-z0-9][a-z0-9._-]*$')
       .optional(),
-    vars: z.record(z.union([z.string(), z.number(), z.boolean()])).default({}),
+    repo: z.string().min(1).optional(),
+    // a key left empty in YAML parses as null: treat it as no vars
+    vars: z.preprocess(
+      (v) => (v === null || v === undefined ? {} : v),
+      z.record(z.union([z.string(), z.number(), z.boolean()]))
+    ),
   })
   .strict();
 
@@ -41,9 +48,14 @@ export function parseOverride(text: string, overridePath: string): Override {
     throw new McprocError(
       'MANIFEST_INVALID',
       `Invalid override ${overridePath}:\n  ${res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('\n  ')}`,
-      { hint: 'The override may set only project and vars.' }
+      { hint: 'The override may set only project, repo and vars.' }
     );
-  return { path: overridePath, project: res.data.project, vars: res.data.vars };
+  return {
+    path: overridePath,
+    project: res.data.project,
+    ...(res.data.repo !== undefined ? { repo: res.data.repo } : {}),
+    vars: res.data.vars,
+  };
 }
 
 /** The override next to the manifest of `root`, or null when the checkout has none. */
@@ -56,10 +68,11 @@ export function loadOverride(root: string): Override | null {
 /** Writes the override of a checkout (worktree add), replacing any earlier one; returns its path. */
 export function writeOverride(
   root: string,
-  o: { project: string; vars?: Record<string, VarValue> }
+  o: { project: string; repo?: string; vars?: Record<string, VarValue> }
 ): string {
   const p = path.join(root, OVERRIDE_REL);
   const body: Record<string, unknown> = { project: o.project };
+  if (o.repo) body.repo = o.repo;
   if (o.vars && Object.keys(o.vars).length) body.vars = o.vars;
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(

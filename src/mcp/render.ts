@@ -419,7 +419,7 @@ export function renderProject(d: {
   readme: string | null;
 }): string {
   const L = [`project: ${d.project} (${d.root})`];
-  if (d.vars.length > 2 || d.override) {
+  if (d.vars.some((v) => v.source !== 'built-in') || d.override) {
     L.push(
       `vars:${d.override ? ` (override ${d.override})` : ''}${d.slot !== null ? ` slot ${d.slot}` : ''}`
     );

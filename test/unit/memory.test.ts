@@ -46,6 +46,7 @@ describe('dockerMemSnippet', () => {
     expect(s).toContain("docker ps --format '{{.Names}}'");
     expect(s).toContain("'demo-db' 'it'\\''s'");
     expect(s).toContain('docker stats --no-stream');
+    expect(s).toContain('grep -qxF --');
     expect(dockerMemSnippet([])).toBe('');
   });
 });

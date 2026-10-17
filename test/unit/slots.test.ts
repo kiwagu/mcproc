@@ -69,6 +69,28 @@ describe('slot registry', () => {
       { slot: 0, entry: entry('/w/demo', 'demo') },
     ]);
   });
+  it('compares real paths: a checkout reached through a symlink is not its own sibling', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-real-'));
+    const real = path.join(dir, 'real');
+    const link = path.join(dir, 'link');
+    fs.mkdirSync(real);
+    fs.symlinkSync(real, link);
+    let r = withMain(emptyRegistry(real), entry(real, 'demo'));
+    r = claimSlot(r, { max: 9, entry: entry('/w/a', 'demo-w1') }).registry;
+    expect(siblingsOf(r, link).map((s) => s.slot)).toEqual([1]);
+    const via = withMain(emptyRegistry(real), entry(link, 'demo'));
+    expect(siblingsOf(via, real)).toEqual([]);
+    const seen: string[] = [];
+    reclaimGone(
+      claimSlot(via, { max: 9, entry: entry(link, 'demo-w1') }).registry,
+      (p) => {
+        seen.push(p);
+        return true;
+      }
+    );
+    expect(seen).toEqual([fs.realpathSync(link)]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   it('reads and writes the file', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-slots-'));
     const file = registryPath(dir, 'demo', '/w/demo');

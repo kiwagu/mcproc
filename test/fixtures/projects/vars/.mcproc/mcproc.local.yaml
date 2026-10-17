@@ -1,3 +1,4 @@
 project: demo-w2
+repo: /w/demo
 vars:
   slot: 2

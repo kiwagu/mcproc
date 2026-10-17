@@ -4,7 +4,9 @@ export type VarValue = string | number | boolean;
 export class TemplateError extends Error {
   constructor(
     message: string,
-    readonly kind: 'syntax' | 'unknown' | 'cycle' | 'type' = 'syntax'
+    readonly kind: 'syntax' | 'unknown' | 'cycle' | 'type' = 'syntax',
+    /** the var whose template failed, when the failure came from rendering one var */
+    readonly varName?: string
   ) {
     super(message);
     this.name = 'TemplateError';
@@ -173,7 +175,8 @@ function namesIn(v: VarValue): string[] {
 export function resolveVars(
   declared: Record<string, VarValue>,
   overrides: Record<string, VarValue>,
-  builtins: Record<string, VarValue>
+  builtins: Record<string, VarValue>,
+  overridePath?: string
 ): Record<string, VarValue> {
   for (const n of Object.keys(declared))
     if (Object.hasOwn(builtins, n))
@@ -183,7 +186,7 @@ export function resolveVars(
   for (const n of Object.keys(overrides))
     if (!Object.hasOwn(declared, n))
       throw new TemplateError(
-        `undeclared var "${n}" in the override (declared: ${Object.keys(declared).join(', ') || 'none'})`,
+        `undeclared var "${n}" in the override${overridePath ? ` ${overridePath}` : ''} (declared: ${Object.keys(declared).join(', ') || 'none'})`,
         'unknown'
       );
   const raw: Record<string, VarValue> = { ...declared, ...overrides };
@@ -200,7 +203,17 @@ export function resolveVars(
     for (const d of namesIn(raw[n])) if (Object.hasOwn(raw, d)) visit(d);
     visiting.pop();
     const v = raw[n];
-    done[n] = typeof v === 'string' ? renderTemplate(v, done) : v;
+    if (typeof v !== 'string') {
+      done[n] = v;
+      return;
+    }
+    try {
+      done[n] = renderTemplate(v, done);
+    } catch (e) {
+      if (e instanceof TemplateError)
+        throw new TemplateError(`${n}: ${e.message}`, e.kind, n);
+      throw e;
+    }
   };
   for (const n of Object.keys(raw)) visit(n);
   return done;

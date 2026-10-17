@@ -109,7 +109,7 @@ export function dockerMemSnippet(names: string[]): string {
   if (names.length === 0) return '';
   return [
     `echo ${MARK.DOCKERMEM}`,
-    `if command -v docker >/dev/null 2>&1; then R=$(${bounded(3, "docker ps --format '{{.Names}}' 2>/dev/null")}); L=""; for n in ${names.map(shq).join(' ')}; do if printf '%s\\n' "$R" | grep -qx -- "$n"; then L="$L $n"; fi; done; if [ -n "$L" ]; then ${bounded(5, "docker stats --no-stream --format '{{.Name}}\\t{{.MemUsage}}' $L 2>/dev/null")}; fi; fi`,
+    `if command -v docker >/dev/null 2>&1; then R=$(${bounded(3, "docker ps --format '{{.Names}}' 2>/dev/null")}); L=""; for n in ${names.map(shq).join(' ')}; do if printf '%s\\n' "$R" | grep -qxF -- "$n"; then L="$L $n"; fi; done; if [ -n "$L" ]; then ${bounded(5, "docker stats --no-stream --format '{{.Name}}\\t{{.MemUsage}}' $L 2>/dev/null")}; fi; fi`,
   ].join('\n');
 }
 

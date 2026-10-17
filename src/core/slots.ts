@@ -89,6 +89,14 @@ export function releaseSlot(r: Registry, slot: number): Registry {
   delete slots[String(slot)];
   return { ...r, slots };
 }
+/** A path as the filesystem sees it: symlinks resolved when it exists, else just made absolute. */
+function realOf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
 /** Drops the slots (never 0) whose checkout path no longer exists; returns them. */
 export function reclaimGone(
   r: Registry,
@@ -97,7 +105,7 @@ export function reclaimGone(
   const freed: number[] = [];
   let out = r;
   for (const [k, e] of Object.entries(r.slots)) {
-    if (k === '0' || exists(e.path)) continue;
+    if (k === '0' || exists(realOf(e.path))) continue;
     out = releaseSlot(out, Number(k));
     freed.push(Number(k));
   }
@@ -109,7 +117,7 @@ export function siblingsOf(
   root: string
 ): { slot: number; entry: SlotEntry }[] {
   return Object.entries(r.slots)
-    .filter(([, e]) => path.resolve(e.path) !== path.resolve(root))
+    .filter(([, e]) => realOf(e.path) !== realOf(root))
     .map(([k, entry]) => ({ slot: Number(k), entry }))
     .sort((a, b) => a.slot - b.slot);
 }

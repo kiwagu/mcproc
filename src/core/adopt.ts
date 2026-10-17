@@ -4,6 +4,7 @@ import { McprocError } from './errors.js';
 import { type Fleet, type HostError, listFleet } from './fleet.js';
 import type { LsRow } from './list.js';
 import { type Manifest, parseManifest } from './manifest.js';
+import { loadOverride } from './override.js';
 import { pickHost } from './resolve.js';
 
 /** Linux hands out ports from here for outgoing connections: a listener there is almost always transient. */
@@ -439,7 +440,7 @@ export async function adoptPorts(fleet: Fleet): Promise<AdoptResult> {
     );
   const before = fs.readFileSync(m.path, 'utf8');
   // the text that will be edited, not the copy the fleet loaded earlier: a port declared in between is seen
-  const current = parseManifest(before, m.root, m.path);
+  const current = parseManifest(before, m.root, m.path, loadOverride(m.root));
   // ports come from the listener sections, which the light probe keeps: no CPU sample, tree metrics or URL checks
   const { rows, errors } = await listFleet(fleet, fleet.select(['all']), {
     cpu: 'none',
@@ -459,7 +460,7 @@ export async function adoptPorts(fleet: Fleet): Promise<AdoptResult> {
   if (splice.text === before)
     return { path: m.path, written: false, adopted, skipped, errors, diff: [] };
   try {
-    parseManifest(splice.text, m.root, m.path); // never write a manifest the loader would refuse
+    parseManifest(splice.text, m.root, m.path, loadOverride(m.root)); // never write a manifest the loader would refuse
   } catch (e) {
     const issues = (e as McprocError).details;
     const reason = Array.isArray(issues)
