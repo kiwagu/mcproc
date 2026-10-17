@@ -36,7 +36,8 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
         note: z.string().max(200).optional(),
         timeout_s: z.number().int().min(1).max(3600).optional(),
       },
-      annotations: MUT(false, false),
+      // any local argv, `rm` included: not an additive update, so clients ask before they run it
+      annotations: MUT(true, false),
     },
     (args, extra) =>
       runTool(async () => {

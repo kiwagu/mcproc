@@ -297,6 +297,64 @@ describe('cli', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+  it('exec ends its command on SIGINT, SIGTERM or SIGHUP, every time it gets one, and drops its handlers after', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-exec-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: exec-cli',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+        const before = process.rawListeners(sig);
+        const c = capture();
+        const run = buildProgram(c.io).parseAsync(
+          [
+            'exec',
+            '--project',
+            dir,
+            '--json',
+            '--',
+            process.execPath,
+            '-e',
+            'setInterval(() => {}, 1000)',
+          ],
+          { from: 'user' }
+        );
+        let mine = process.rawListeners(sig).filter((f) => !before.includes(f));
+        while (mine.length === 0) {
+          await new Promise((r) => setTimeout(r, 10));
+          mine = process.rawListeners(sig).filter((f) => !before.includes(f));
+        }
+        // the exec's own handler only, called the way the signal would: never the test runner's
+        for (const f of mine) f(sig);
+        // still there after the first one: a second signal is handled too, never Node's default exit
+        expect(
+          process.rawListeners(sig).filter((f) => !before.includes(f)),
+          sig
+        ).toHaveLength(1);
+        for (const f of mine) f(sig);
+        await run;
+        expect(JSON.parse(c.out.join('')), sig).toMatchObject({
+          code: 128,
+          lease: null,
+        });
+        expect(process.rawListeners(sig), sig).toEqual(before);
+        process.exitCode = 0;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('unpack refuses readonly hosts and a bad --with-node before touching any host', async () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(

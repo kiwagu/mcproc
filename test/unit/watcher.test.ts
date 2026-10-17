@@ -167,6 +167,73 @@ describe('watchLeases', () => {
     expect(store.get(a.id)?.state).toBe('starting');
   });
 
+  it('ends an exec lease whose requester is gone on the next tick: a running one freed, a starting one failed', async () => {
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    const exec = { kind: 'exec' as const, apps: [], target: 'bun test' };
+    const running = await store.create(
+      input({ ...exec, requester_pid: gone }),
+      'running'
+    );
+    const starting = await store.create(
+      input({ ...exec, requester_pid: gone }),
+      'pending'
+    );
+    await store.transition(starting.id, 'starting');
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(running.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+    expect(store.get(starting.id)).toMatchObject({
+      state: 'failed',
+      error: 'requester gone',
+    });
+  });
+
+  it('leaves the exec leases of a live requester alone, running, starting or pending', async () => {
+    const exec = { kind: 'exec' as const, apps: [], target: 'bun test' };
+    const running = await store.create(input(exec), 'running');
+    const starting = await store.create(input(exec), 'pending');
+    await store.transition(starting.id, 'starting');
+    const pending = await store.create(input(exec), 'pending');
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(running.id)?.state).toBe('running');
+    expect(store.get(starting.id)?.state).toBe('starting');
+    expect(store.get(pending.id)).toMatchObject({
+      state: 'pending',
+      error: null,
+    });
+  });
+
+  it('cancels a pending exec at the head whose requester is gone and judges the next one at once', async () => {
+    const t0 = now;
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    const dead = await store.create(
+      input({
+        kind: 'exec',
+        apps: [],
+        target: 'bun test',
+        requester_pid: gone,
+      }),
+      'pending'
+    );
+    const b = await store.create(input({ project: 'demo-w2' }), 'pending');
+    const d = deps();
+    const at: number[] = [];
+    const run = d.runStart;
+    d.runStart = async (l) => {
+      at.push(now - t0);
+      await run(l);
+    };
+    expect(await watchLeases(d, { tickMs: 10, idleExitMs: 50 })).toBe('idle');
+    expect(store.get(dead.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'requester gone',
+    });
+    expect(started).toEqual([b.id]);
+    expect(at).toEqual([0]); // no tick passed between the cancel and the next judgement
+  });
+
   it('cancels a head that stopped fitting at all', async () => {
     const a = await store.create(input({ need_mib: 20000 }), 'pending');
     await watchLeases(deps(), { tickMs: 10, once: true });

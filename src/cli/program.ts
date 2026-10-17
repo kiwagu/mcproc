@@ -645,8 +645,10 @@ export function buildProgram(io: Io = defaultIo): Command {
         const ctx = await connect(prep);
         const ac = new AbortController();
         const stop = () => ac.abort();
-        process.once('SIGINT', stop);
-        process.once('SIGTERM', stop);
+        // on, not once: a second Ctrl-C must not fall to Node's default exit, which skips the lease's cleanup; a closed
+        // terminal (SIGHUP) ends the command and frees its lease the same way
+        const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+        for (const s of signals) process.on(s, stop);
         try {
           const r = await runExec(
             ctx,
@@ -670,8 +672,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             );
           process.exitCode = r.code;
         } finally {
-          process.off('SIGINT', stop);
-          process.off('SIGTERM', stop);
+          for (const s of signals) process.off(s, stop);
         }
       })
     );

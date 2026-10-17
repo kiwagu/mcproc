@@ -91,10 +91,10 @@ describe('mcp server', () => {
       readOnlyHint: false,
       destructiveHint: false,
     });
-    // exec runs whatever it is given: not read-only, not idempotent, never on another host
+    // exec runs whatever argv it is given, `rm` included: destructive, not idempotent, never on another host
     expect(byName.exec.annotations).toMatchObject({
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
     });
     expect(byName.exec.description).toMatch(/THIS machine/);

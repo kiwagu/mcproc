@@ -86,12 +86,28 @@ async function moveIf(
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
  * their starter lives, for at most STARTER_TRUST_MS, see starterAlive); a starting one whose recorded child is gone is
- * over at once, one that never recorded a child (or an exec whose owner is gone) after `stuckMs`.
+ * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester: once that
+ * process is gone, a running one is freed and a starting one failed at once.
  */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
+      if (l.kind === 'exec') {
+        // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal)
+        if (
+          (l.state === 'running' || l.state === 'starting') &&
+          !pidAlive(l.requester_pid)
+        )
+          await moveIf(
+            store,
+            l.id,
+            l.state,
+            l.state === 'running' ? 'freed' : 'failed',
+            { error: 'requester gone' }
+          );
+        continue;
+      }
       if (
         l.state === 'running' &&
         l.kind === 'start' &&
@@ -129,18 +145,15 @@ async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
           );
         continue;
       }
-      if (l.admitted_at && deps.now() - Date.parse(l.admitted_at) > stuckMs) {
-        const owner = l.kind === 'start' ? null : l.requester_pid;
-        if (!owner || !pidAlive(owner))
-          await moveIf(
-            store,
-            l.id,
-            'starting',
-            'failed',
-            { error: `the start did not answer within ${stuckMs / 1000} s` },
-            (cur) => cur.child_pid === null
-          );
-      }
+      if (l.admitted_at && deps.now() - Date.parse(l.admitted_at) > stuckMs)
+        await moveIf(
+          store,
+          l.id,
+          'starting',
+          'failed',
+          { error: `the start did not answer within ${stuckMs / 1000} s` },
+          (cur) => cur.child_pid === null
+        );
     } catch (e) {
       deps.log(`error: ${l.id}: ${describeError(e)}`);
     }
@@ -164,6 +177,15 @@ async function judgeHead(
       error: 'checkout gone',
     });
     if (c) deps.log(`cancel ${head.id}: checkout gone (${head.root})`);
+    return 'changed';
+  }
+  // an exec whose requester is gone would be marked starting for nobody, and hold every later lease behind it
+  if (head.kind === 'exec' && !pidAlive(head.requester_pid)) {
+    const c = await moveIf(store, head.id, 'pending', 'cancelled', {
+      error: 'requester gone',
+    });
+    if (c)
+      deps.log(`cancel ${head.id}: requester gone (pid ${head.requester_pid})`);
     return 'changed';
   }
   let memory: HostMemory | null;
@@ -269,7 +291,9 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
  * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
  * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
  * reconciled. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
- * leaveIdle); a starting lease without a live owner for `stuckMs` is failed. A tick that throws is logged, not fatal.
+ * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, and an exec lease whose requester
+ * is gone is ended at once (cancelled at the head, failed while starting, freed while running). A tick that throws is
+ * logged, not fatal.
  */
 export async function watchLeases(
   deps: WatcherDeps,
