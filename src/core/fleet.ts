@@ -336,6 +336,7 @@ export async function actOn(
           r.apps,
           {
             target,
+            host: fleet.requested ?? null,
             reload: opts.reload,
             note: opts.note,
             procs: await ctx.pm2.jlist(),

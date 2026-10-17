@@ -359,6 +359,7 @@ describe('worktree', () => {
         slot: 1,
         repo: real,
         target: 'db',
+        host: null,
         apps: ['db'],
         reload: false,
         estimate_mib: 1,

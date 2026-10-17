@@ -34,6 +34,7 @@ const input = (over: Partial<NewLease> = {}): NewLease => ({
   slot: 1,
   repo: '/w/demo',
   target: 'dev',
+  host: null,
   apps: ['db', 'api'],
   reload: false,
   estimate_mib: 768,
@@ -616,6 +617,33 @@ describe('defaultWatcherDeps', () => {
       exit_code: 3,
       child_pid: null,
     });
+  });
+
+  it("runStart gives the child the caller's --host when the lease names one", async () => {
+    const entry = path.join(dir, 'cli.js');
+    const argvFile = path.join(dir, 'argv.json');
+    fs.writeFileSync(
+      entry,
+      `require('node:fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); process.exit(3);`
+    );
+    const deps = defaultWatcherDeps(dir, entry);
+    const l = await deps.store.withLock(() =>
+      deps.store.create(input({ host: 'local', root: vars }), 'pending')
+    );
+    const admitted = await deps.store.withLock(() =>
+      deps.store.transition(l.id, 'starting')
+    );
+    await deps.runStart(admitted);
+    expect(JSON.parse(fs.readFileSync(argvFile, 'utf8'))).toEqual([
+      '--project',
+      vars,
+      '--host',
+      'local',
+      'start',
+      'dev',
+      '--lease',
+      l.id,
+    ]);
   });
 
   it('runStart leaves a lease the child answered alone', async () => {

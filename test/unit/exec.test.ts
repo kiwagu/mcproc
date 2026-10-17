@@ -191,6 +191,7 @@ describe('runExec', () => {
           slot: 1,
           repo: '/w/demo',
           target: 'dev',
+          host: null,
           apps: ['db'],
           reload: false,
           estimate_mib: 2500,

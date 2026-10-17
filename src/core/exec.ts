@@ -265,6 +265,7 @@ export async function runExec(
       slot: m.slot,
       repo: m.repo,
       target: opts.command.join(' '),
+      host: null,
       apps: [],
       reload: false,
       estimate_mib: opts.memoryMib,

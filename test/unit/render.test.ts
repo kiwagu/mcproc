@@ -1354,6 +1354,7 @@ describe('queued starts and the lease queue', () => {
     slot: 0,
     repo: '/w/demo',
     target: 'dev',
+    host: null,
     apps: ['db', 'api'],
     reload: false,
     estimate_mib: 768,

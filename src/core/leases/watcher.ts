@@ -549,6 +549,8 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             entry,
             '--project',
             l.root,
+            // the caller's host selection: the replay acts on the hosts the queued start named
+            ...(l.host ? ['--host', l.host] : []),
             'start',
             l.target,
             ...(l.reload ? ['--reload'] : []),

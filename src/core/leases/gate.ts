@@ -78,6 +78,8 @@ export async function gateStart(
   opts: {
     /** the target as the caller named it (an app, a profile, all): the watcher starts it again by this name */
     target: string;
+    /** the `--host` the caller gave, else none: kept on the lease so the watcher's child acts on the same hosts */
+    host?: string | null;
     reload?: boolean;
     note?: string | null;
     procs: Pm2Process[];
@@ -107,6 +109,7 @@ export async function gateStart(
   const need_mib = needOf(estimate_mib, m.resources.margin);
   const reserve_mib = reserveMib(m.resources.reserve, memory);
   const target = opts.target;
+  const host = opts.host ?? null;
   const input: NewLease = {
     kind: 'start',
     project: m.project,
@@ -114,6 +117,7 @@ export async function gateStart(
     slot: m.slot,
     repo: m.repo,
     target,
+    host,
     apps: toStart,
     reload: Boolean(opts.reload),
     estimate_mib,
@@ -132,7 +136,8 @@ export async function gateStart(
           (l.state === 'pending' || l.state === 'starting') &&
           l.root === m.root &&
           l.project === m.project &&
-          l.target === target
+          l.target === target &&
+          (l.host ?? null) === host
       );
     if (same)
       return {

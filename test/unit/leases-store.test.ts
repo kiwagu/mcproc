@@ -20,6 +20,7 @@ const input = (over: Partial<NewLease> = {}): NewLease => ({
   slot: 1,
   repo: '/w/demo',
   target: 'dev',
+  host: null,
   apps: ['db', 'api'],
   reload: false,
   estimate_mib: 768,

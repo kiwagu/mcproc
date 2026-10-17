@@ -247,6 +247,7 @@ describe('mcp server', () => {
           slot: 2,
           repo: '/w/demo',
           target: 'dev',
+          host: null,
           apps: ['db', 'api'],
           reload: false,
           estimate_mib: 768,

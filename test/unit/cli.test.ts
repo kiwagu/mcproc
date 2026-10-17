@@ -111,6 +111,7 @@ describe('cli', () => {
           slot: 0,
           repo: '/w/demo',
           target: 'dev',
+          host: null,
           apps: ['db'],
           reload: false,
           estimate_mib: 512,

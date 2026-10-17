@@ -650,6 +650,18 @@ describe('actOn start through the memory lease gate', () => {
     expect(ensured).toBe(1);
   });
 
+  it("a queued start keeps the caller's --host on its lease; without one the lease names none", async () => {
+    const h = varsFleet();
+    await actOn(h.fleet, 'dev', 'start', { gate: gateOf(1500) });
+    const ctx = await h.fleet.ctx('local');
+    const local = new Fleet(loadManifest(varsProj), 'local', async () => ctx);
+    await actOn(local, 'dev', 'start', { gate: gateOf(1500) });
+    expect(store.list().map((l) => [l.state, l.target, l.host])).toEqual([
+      ['pending', 'dev', null],
+      ['pending', 'dev', 'local'],
+    ]);
+  });
+
   it('a start that fits runs at once under a running lease', async () => {
     const h = varsFleet();
     const rows = await actOn(h.fleet, 'dev', 'start', {
@@ -732,6 +744,7 @@ describe('actOn start through the memory lease gate', () => {
         slot: null,
         repo: dir,
         target: 'all',
+        host: null,
         apps: ['watch', 'tool'],
         reload: false,
         estimate_mib: 1,
@@ -804,6 +817,7 @@ describe('actOn start through the memory lease gate', () => {
       slot: 2,
       repo: '/w/demo',
       target: 'db',
+      host: null,
       apps: ['db'],
       reload: false,
       estimate_mib: 1,
@@ -892,6 +906,7 @@ describe('actOn start through the memory lease gate', () => {
         slot: 2,
         repo: '/w/demo',
         target: 'dev',
+        host: null,
         apps: ['db', 'api'],
         reload: false,
         estimate_mib: 1,

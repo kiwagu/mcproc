@@ -160,6 +160,38 @@ describe('gateStart', () => {
     expect(store.list()).toHaveLength(1);
   });
 
+  it("keeps the caller's host on the lease, and joins a queued lease only when its host matches too", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const short = () => deps({ total_mib: 8000, available_mib: 1500 });
+    const any = await gateStart(
+      ctx,
+      ['db', 'api'],
+      { target: 'dev', procs: [] },
+      short()
+    );
+    const local = await gateStart(
+      ctx,
+      ['db', 'api'],
+      { target: 'dev', host: 'local', procs: [] },
+      short()
+    );
+    expect(any.kind).toBe('queued');
+    expect(local.kind).toBe('queued');
+    expect(any.lease?.id).not.toBe(local.lease?.id);
+    expect(store.list().map((l) => [l.target, l.host])).toEqual([
+      ['dev', null],
+      ['dev', 'local'],
+    ]);
+    const again = await gateStart(
+      ctx,
+      ['db', 'api'],
+      { target: 'dev', host: 'local', procs: [] },
+      short()
+    );
+    expect(again.lease?.id).toBe(local.lease?.id);
+    expect(store.list()).toHaveLength(2);
+  });
+
   it('queues behind a pending lease even when memory would do, in FIFO order', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     await store.create(
@@ -170,6 +202,7 @@ describe('gateStart', () => {
         slot: null,
         repo: '/o',
         target: 'x',
+        host: null,
         apps: ['x'],
         reload: false,
         estimate_mib: 1,
@@ -234,6 +267,7 @@ describe('gateStart', () => {
       slot: 1,
       repo: '/w/demo',
       target: 'dev',
+      host: null,
       apps: ['db', 'api'],
       reload: false,
       estimate_mib: 768,
@@ -361,6 +395,7 @@ describe('finishing and releasing', () => {
         slot: 2,
         repo: '/w/demo',
         target: 'dev',
+        host: null,
         apps: ['db', 'api'],
         reload: false,
         estimate_mib: 768,
@@ -410,6 +445,7 @@ describe('finishing and releasing', () => {
         slot: null,
         repo: '/r',
         target: 't',
+        host: null,
         apps: ['a'],
         reload: false,
         estimate_mib: 1,
@@ -440,6 +476,7 @@ describe('finishing and releasing', () => {
         slot: null,
         repo: '/r',
         target: 't',
+        host: null,
         apps: ['a'],
         reload: false,
         estimate_mib: 1,
@@ -479,6 +516,7 @@ describe('finishing and releasing', () => {
         slot: null,
         repo: '/r',
         target: 't',
+        host: null,
         apps: ['a'],
         reload: false,
         estimate_mib: 1,
@@ -529,6 +567,7 @@ describe('finishing and releasing', () => {
     slot: 2,
     repo: '/w/demo',
     target: 'dev',
+    host: null,
     apps: ['db', 'api'],
     reload: false,
     estimate_mib: 1,
@@ -672,6 +711,7 @@ describe('leasesView and cancelLease', () => {
         slot: 2,
         repo: '/w/demo',
         target: 'dev',
+        host: null,
         apps: ['db'],
         reload: false,
         estimate_mib: 512,
@@ -761,6 +801,7 @@ describe('leasesView and cancelLease', () => {
         slot: 2,
         repo: '/w/demo',
         target: 'dev',
+        host: null,
         apps: ['db'],
         reload: false,
         estimate_mib: 512,
@@ -820,6 +861,7 @@ describe('leasesView and cancelLease', () => {
         slot: 2,
         repo: '/w/demo',
         target: 'bun test',
+        host: null,
         apps: [],
         reload: false,
         estimate_mib: 512,

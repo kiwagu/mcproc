@@ -1874,6 +1874,7 @@ describe('waitFor: a start that is queued (lease-aware)', () => {
             slot: m.slot,
             repo: m.repo,
             target: apps.join(','),
+            host: null,
             apps,
             reload: false,
             estimate_mib: 1,

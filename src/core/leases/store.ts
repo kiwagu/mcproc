@@ -30,6 +30,8 @@ export interface Lease {
   slot: number | null;
   repo: string | null;
   target: string;
+  /** the `--host` the caller gave the start, else null: the watcher's child starts the target again on the same hosts */
+  host: string | null;
   apps: string[];
   reload: boolean;
   estimate_mib: number;
