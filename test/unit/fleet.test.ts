@@ -680,6 +680,116 @@ describe('actOn start through the memory lease gate', () => {
     ]);
   });
 
+  it('a start that runs a budgeted app on a remote host is refused before any host is touched; a stop of it is not', async () => {
+    const mm = {
+      ...m,
+      apps: { ...m.apps, web: { ...m.apps.web, memory_mib: 100 } },
+    };
+    const h = fakeFleet(undefined, {
+      box: [proc('web', 3, '/home/dev/fleet')],
+    });
+    const connected: string[] = [];
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      connected.push(host);
+      await h.fleet.ctx(host);
+      return h.ctxs[host];
+    });
+    await expect(
+      actOn(f, 'web', 'start', { gate: gateOf(9000) })
+    ).rejects.toMatchObject({
+      code: 'LEASE_UNSUPPORTED_HOST',
+      message:
+        'web declare memory but run on host box; the lease queue works on the local host only in this version',
+      hint: 'Drop memory: from apps bound to remote hosts.',
+    });
+    expect(connected).toEqual([]);
+    expect(store.list()).toEqual([]);
+    await actOn(f, 'web', 'stop', { gate: gateOf(9000) });
+    expect(h.log.filter((l) => l.includes("'stop'"))).toEqual([
+      "box: pm2 'stop' '3'",
+    ]);
+  });
+
+  it('a leased start ends its lease once over every local run, two local runs around a remote one', async () => {
+    const { audit: _gone, ...apps } = m.apps;
+    const mm = { ...m, apps }; // start all = watch@local, web@box, tool@local: three runs
+    const h = fakeFleet(undefined, {});
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      return h.ctxs[host];
+    });
+    const l = await store.create(
+      {
+        kind: 'start',
+        project: 'fleet',
+        root: dir,
+        slot: null,
+        repo: dir,
+        target: 'all',
+        apps: ['watch', 'tool'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'pending'
+    );
+    await store.transition(l.id, 'starting', { child_pid: 4242 });
+    const rows = await actOn(f, 'all', 'start', {
+      gate: gateOf(9000),
+      lease: l.id,
+    });
+    expect(rows.map((r) => `${r.app}@${r.host}:${r.error ?? ''}`)).toEqual([
+      'watch@local:',
+      'web@box:',
+      'tool@local:',
+    ]);
+    expect(h.starts()).toEqual([
+      'local fleet-watch',
+      'box fleet-web',
+      'local fleet-tool',
+    ]);
+    expect(store.get(l.id)).toMatchObject({
+      state: 'running',
+      error: null,
+      child_pid: null,
+    });
+  });
+
+  it('a queued local run holds back its dependents on another host: skipped with the lease, never launched', async () => {
+    const budget = <
+      T extends { apps: Record<string, { memory_mib: number | null }> },
+    >(
+      x: T
+    ) => {
+      if (x.apps.watch) x.apps.watch = { ...x.apps.watch, memory_mib: 512 };
+      return x;
+    };
+    const mm = budget({ ...m, apps: { ...m.apps } });
+    const h = fakeFleet(undefined, {});
+    const f = new Fleet(mm, undefined, async (_m, host) => {
+      await h.fleet.ctx(host);
+      budget(h.ctxs[host].manifest);
+      return h.ctxs[host];
+    });
+    const rows = await actOn(f, 'web', 'start', { gate: gateOf(10) });
+    const [lease] = store.list();
+    expect(lease).toMatchObject({ state: 'pending', apps: ['watch'] });
+    expect(rows.map((r) => [r.app, r.host, r.status])).toEqual([
+      ['watch', 'local', 'queued #1'],
+      ['web', 'box', 'skipped'],
+    ]);
+    expect(rows[1].error).toBe(
+      `skipped: watch was not started (queued: lease ${lease.id})`
+    );
+    expect(h.starts()).toEqual([]);
+    expect(ensured).toBe(1);
+  });
+
   it('the start of an admitted lease skips the queue and ends it as running', async () => {
     const h = varsFleet();
     const queued = await actOn(h.fleet, 'dev', 'start', { gate: gateOf(10) });

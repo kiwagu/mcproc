@@ -205,6 +205,25 @@ export function assertWritableRuns(
   }
 }
 
+/**
+ * Refuse a start before any host is touched when one of its runs lands on a remote host with an app that declares
+ * memory: the lease queue works on the local host only in this version.
+ */
+function assertLocalBudgets(fleet: Fleet, runs: HostApps[]): void {
+  for (const r of runs) {
+    if (pickHost(fleet.manifest, r.host).local) continue;
+    const budgeted = r.apps.filter(
+      (a) => fleet.manifest.apps[a].memory_mib !== null
+    );
+    if (budgeted.length === 0) continue;
+    throw new McprocError(
+      'LEASE_UNSUPPORTED_HOST',
+      `${budgeted.join(', ')} declare memory but run on host ${r.host}; the lease queue works on the local host only in this version`,
+      { hint: 'Drop memory: from apps bound to remote hosts.' }
+    );
+  }
+}
+
 function dependsOn(
   m: Manifest,
   app: string,
@@ -237,9 +256,11 @@ function failedRows(fleet: Fleet, r: HostApps, e: unknown): LsRow[] {
  * start/restart/stop/delete of a target across hosts. start adds the dependencies first (with --host only those that
  * run on that host); the apps are then cut into runs of one host each and acted on run by run, in that order. A run that
  * fails leaves rows saying so and the other runs go on — except for start, where the later runs are skipped (they may
- * need what did not start). When nothing happened at all, the first error is thrown. A local start of apps that declare
- * memory goes through the lease gate first (a queued run answers queued rows); a local stop or delete frees the
- * checkout's leases that no longer hold anything.
+ * need what did not start). When nothing happened at all, the first error is thrown. A start that would run an app
+ * declaring memory on a remote host is refused before any host is touched; a local start of such apps goes through the
+ * lease gate first (a queued run answers queued rows and holds back its dependents in later runs), and a start the
+ * watcher admitted ends its lease once, over every local row. A local stop or delete frees the checkout's leases that no
+ * longer hold anything.
  */
 export async function actOn(
   fleet: Fleet,
@@ -268,6 +289,7 @@ export async function actOn(
       : named;
   const runs = fleet.runs(names);
   assertWritableRuns(fleet, runs, named);
+  if (act === 'start') assertLocalBudgets(fleet, runs);
   const rows: LsRow[] = [];
   let failed: { host: string; error: unknown } | null = null;
   let done = 0;
@@ -323,6 +345,9 @@ export async function actOn(
             ...g.lease,
             state: g.lease.state as 'pending' | 'starting',
           };
+          // what needs these apps in a later run (another host) is skipped, not started without them
+          for (const a of r.apps)
+            notStarted.set(a, `queued: lease ${lease.id}`);
           rows.push(
             ...r.apps.map((a) =>
               queuedRow(fleet.manifest.apps[a], r.host, lease, g.position)
@@ -353,8 +378,6 @@ export async function actOn(
         if (admitted) await freeOnFailure(gate.store, admitted, e);
         throw e;
       }
-      if (act === 'start' && opts.lease && ctx.host.local)
-        await finishLeasedStart(gate.store, opts.lease, runRows);
       // a checkout with no live lease skips pm2's list and the lock
       if (
         (act === 'stop' || act === 'delete') &&
@@ -370,6 +393,10 @@ export async function actOn(
     }
   }
   if (failed && done === 0) throw failed.error;
+  // the watcher's start ends its lease once, over every local row (two local runs around a remote one included)
+  const local = rows.filter((r) => pickHost(fleet.manifest, r.host).local);
+  if (act === 'start' && opts.lease && local.length > 0)
+    await finishLeasedStart(gate.store, opts.lease, local);
   return rows;
 }
 
