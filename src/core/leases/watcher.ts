@@ -8,6 +8,7 @@ import {
   type Host,
   loadManifest,
   parseShell,
+  type Resources,
   SETTLE_DEFAULT_S,
 } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
@@ -42,7 +43,7 @@ import {
 export interface WatcherDeps {
   store: LeaseStore;
   memory(): Promise<HostMemory | null>;
-  /** the head's estimate taken again, live: a sibling may have grown or gone since it was queued */
+  /** the head's estimate taken again, live: a sibling may have grown or gone since it was queued (an exec keeps its own) */
   estimate(l: Lease): Promise<{
     estimate_mib: number;
     need_mib: number;
@@ -371,16 +372,37 @@ const localHost = (cwd: string): Host => ({
   env: {},
 });
 
-/** The real deps of the pm2-managed watcher: the state directory's store, the host's meminfo, each lease's checkout for its estimate and pm2 state, the CLI entry for the child starts. */
+/**
+ * The real deps of the pm2-managed watcher: the state directory's store, the host's meminfo, each lease's checkout for
+ * its estimate and pm2 state, the CLI entry for the child starts. An exec lease keeps the size its caller named, with
+ * the reserve taken again from its manifest and the current reading (`memory`, as the deps hold it at the call).
+ */
 export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
   const store = new LeaseStore(dir);
   const host = localHost(dir);
   const transport = createTransport(host);
   const ctxOf = async (l: Lease) => connect(prepare({ project: l.root }));
-  return {
+  const deps: WatcherDeps = {
     store,
     memory: () => readHostMemory(transport, host),
     estimate: async (l) => {
+      // an exec has no apps to measure: what it needs is what its caller named, never a sum over `apps` (none)
+      if (l.kind === 'exec') {
+        let reserve: Resources['reserve'] | null = null;
+        try {
+          reserve = loadManifest(l.root).resources.reserve;
+        } catch {
+          // its checkout cannot be read: the reserve it was queued with
+        }
+        return {
+          estimate_mib: l.estimate_mib,
+          need_mib: l.need_mib,
+          reserve_mib: reserve
+            ? reserveMib(reserve, await deps.memory())
+            : l.reserve_mib,
+          sources: {},
+        };
+      }
       const m = loadManifest(l.root);
       const measured = await measureSiblings(m, {
         registry: registryOf(m, dir),
@@ -475,4 +497,5 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
     now: () => Date.now(),
     log: (line) => console.log(`${new Date().toISOString()} ${line}`),
   };
+  return deps;
 }

@@ -509,6 +509,75 @@ describe('defaultWatcherDeps', () => {
     });
   });
 
+  it('a queued exec keeps its own estimate: not admitted with 500M over the reserve, admitted with 1200M', async () => {
+    const deps = defaultWatcherDeps(dir, '/nowhere/cli.js');
+    let available = 1024 + 500; // the vars manifest keeps a 1G reserve
+    deps.memory = async () => ({ total_mib: 8000, available_mib: available });
+    deps.sleep = async () => undefined;
+    deps.log = () => undefined;
+    const l = await deps.store.withLock(() =>
+      deps.store.create(
+        input({
+          kind: 'exec',
+          apps: [],
+          target: 'bun test',
+          root: vars,
+          estimate_mib: 1000,
+          need_mib: 1200,
+          margin: 0.2,
+          reserve_mib: 1024,
+          sources: {},
+        }),
+        'pending'
+      )
+    );
+    await watchLeases(deps, { tickMs: 1, once: true });
+    expect(deps.store.get(l.id)).toMatchObject({
+      state: 'pending',
+      estimate_mib: 1000,
+      need_mib: 1200,
+    });
+    expect(deps.store.get(l.id)?.waiting_for).toMatch(/needs 1\.2G/);
+    available = 1024 + 1200;
+    await watchLeases(deps, { tickMs: 1, once: true });
+    expect(deps.store.get(l.id)).toMatchObject({
+      state: 'starting',
+      estimate_mib: 1000,
+      need_mib: 1200,
+      reserve_mib: 1024,
+      sources: {},
+    });
+  });
+
+  it("estimate of an exec takes the reserve from its manifest and the current reading, else the lease's own", async () => {
+    const deps = defaultWatcherDeps(dir, '/nowhere/cli.js');
+    deps.memory = async () => ({ total_mib: 8000, available_mib: 4000 });
+    const proj = path.join(dir, 'proj');
+    fs.mkdirSync(path.join(proj, '.mcproc'), { recursive: true });
+    fs.writeFileSync(
+      path.join(proj, '.mcproc', 'mcproc.yaml'),
+      'version: 1\nproject: p\nresources: { reserve: 10% }\napps:\n  a: { description: a, run: echo a }\n'
+    );
+    const exec = (root: string) =>
+      ({
+        ...input({ kind: 'exec', apps: [], root, estimate_mib: 1000 }),
+        need_mib: 1100,
+        reserve_mib: 777,
+      }) as Lease;
+    expect(await deps.estimate(exec(proj))).toEqual({
+      estimate_mib: 1000,
+      need_mib: 1100,
+      reserve_mib: 800,
+      sources: {},
+    });
+    expect(await deps.estimate(exec(path.join(dir, 'gone')))).toEqual({
+      estimate_mib: 1000,
+      need_mib: 1100,
+      reserve_mib: 777,
+      sources: {},
+    });
+  });
+
   it('settleMs reads the manifest of the lease, and the default where there is none', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const deps = defaultWatcherDeps(dir, '/nowhere/cli.js');

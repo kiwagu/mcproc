@@ -300,8 +300,9 @@ async function endChild(pid: number): Promise<void> {
 }
 
 /**
- * After a stop or delete on this checkout: every running lease of it none of whose apps is online in `procs` is freed,
- * unless its starter is still alive (another process is still starting it). Returns the freed ids.
+ * After a stop or delete on this checkout: every running start lease of it none of whose apps is online in `procs` is
+ * freed, unless its starter is still alive (another process is still starting it); an exec lease belongs to its own
+ * process and ends with it. Returns the freed ids.
  */
 export async function freeAfter(
   store: LeaseStore,
@@ -318,7 +319,12 @@ export async function freeAfter(
   await store.withLock(async () => {
     for (const l of store.list()) {
       if (l.root !== m.root || l.project !== m.project) continue;
-      if (l.state === 'running' && !starterAlive(l) && !l.apps.some(online)) {
+      if (
+        l.kind === 'start' &&
+        l.state === 'running' &&
+        !starterAlive(l) &&
+        !l.apps.some(online)
+      ) {
         await store.transition(l.id, 'freed');
         freed.push(l.id);
       }

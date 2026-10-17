@@ -578,6 +578,21 @@ describe('finishing and releasing', () => {
     expect(await freeAfter(store, ctx, down)).toEqual([starting.id]);
   });
 
+  it('freeAfter leaves a running exec lease alone: it belongs to its own process and ends with it', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const exec = await store.create(
+      lease({ kind: 'exec', apps: [], target: 'bun test' }),
+      'running'
+    );
+    const start = await store.create(lease({}), 'running');
+    const down = [proc('demo-w2-db', 'demo-w2', 'stopped')] as never;
+    expect(await freeAfter(store, ctx, down)).toEqual([start.id]);
+    expect(store.get(exec.id)).toMatchObject({
+      state: 'running',
+      ended_at: null,
+    });
+  });
+
   it('freeAfter frees a running lease of this checkout once none of its apps is online', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const running = await store.create(lease({}), 'running');
