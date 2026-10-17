@@ -119,6 +119,13 @@ export class Fleet {
     return [...out];
   }
 
+  /** `named` with their dependencies, dependencies first: what a start acts on; with --host only the apps that run there. */
+  withDeps(named: string[]): string[] {
+    return orderWithDeps(this.manifest, named).filter(
+      (n) => this.requested === undefined || this.hostOf(n) === this.requested
+    );
+  }
+
   /** One group per host, each app in it, hosts in first-appearance order: for reads, which may run in parallel. */
   groups(names: string[]): HostApps[] {
     const by = new Map<string, string[]>();
@@ -283,13 +290,7 @@ export async function actOn(
   } = {}
 ): Promise<LsRow[]> {
   const named = fleet.select([target]);
-  const names =
-    act === 'start'
-      ? orderWithDeps(fleet.manifest, named).filter(
-          (n) =>
-            fleet.requested === undefined || fleet.hostOf(n) === fleet.requested
-        )
-      : named;
+  const names = act === 'start' ? fleet.withDeps(named) : named;
   const runs = fleet.runs(names);
   assertWritableRuns(fleet, runs, named);
   if (act === 'start') assertLocalBudgets(fleet, runs);

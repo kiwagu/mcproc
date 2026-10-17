@@ -3,18 +3,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createTransport } from '../../transport/index.js';
 import { describeError, isMcprocError } from '../errors.js';
+import { Fleet } from '../fleet.js';
 import {
   DEFAULT_SHELL,
   type Host,
   loadManifest,
+  type Manifest,
   parseShell,
   type Resources,
   SETTLE_DEFAULT_S,
 } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
 import { readHostMemory } from '../memory.js';
-import { findProcess, isRunning } from '../pm2.js';
-import { connect, prepare } from '../resolve.js';
+import { findProcess, isRunning, type Pm2Process } from '../pm2.js';
+import { connect, pickHost, prepare } from '../resolve.js';
 import { abortableSleep } from '../wait.js';
 import {
   admit,
@@ -53,6 +55,8 @@ export interface WatcherDeps {
   /** runs the admitted start and resolves when it has ended; the child itself writes running or failed */
   runStart(l: Lease): Promise<void>;
   onlineApps(l: Lease): Promise<Set<string>>;
+  /** what a start of the lease's target would launch on this host now (see appsToLaunch): what its estimate must cover */
+  targetApps(l: Lease): Promise<string[]>;
   settleMs(l: Lease): number;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
   now(): number;
@@ -220,6 +224,8 @@ async function judgeHead(
   }
   let memory: HostMemory | null;
   let est: Awaited<ReturnType<WatcherDeps['estimate']>>;
+  // the head as judged: its apps taken again before a full estimate of a start
+  let cur = head;
   try {
     memory = await deps.memory();
     if (!full) {
@@ -236,7 +242,14 @@ async function judgeHead(
         return 'waiting';
       }
     }
-    est = await deps.estimate(head);
+    // The child runs `start <target> --lease <id>`, and startApps skips what is online when it looks: the budget is
+    // taken over what is not running now (an app online at queue time may have stopped meanwhile), so the launched set
+    // equals the budgeted one up to the window between this admission and the child's own look.
+    if (head.kind === 'start') {
+      const apps = await deps.targetApps(head);
+      if (apps.join('\0') !== head.apps.join('\0')) cur = { ...head, apps };
+    }
+    est = await deps.estimate(cur);
     last.id = head.id;
     last.at = deps.now();
   } catch (e) {
@@ -247,6 +260,24 @@ async function judgeHead(
       await noteWaiting(store, head, { waiting_for: why });
     }
     return 'waiting';
+  }
+  if (cur !== head) {
+    // its apps and their sources under the lock, while it is still pending: a cancel that landed meanwhile wins
+    const patched = await store
+      .withLock(() =>
+        store.patch(
+          head.id,
+          { apps: cur.apps, sources: est.sources },
+          { expect: 'pending' }
+        )
+      )
+      .catch((e: unknown) => {
+        if (store.get(head.id)?.state === 'pending') throw e;
+        return null;
+      });
+    if (!patched) return 'changed';
+    deps.log(`${head.id}: apps now ${cur.apps.join(', ') || 'none'}`);
+    cur = patched;
   }
   // a start admitted seconds ago is not in the reading yet, as the gate charges it
   const ramping_mib = rampingMib(store.list(), deps.now(), deps.settleMs(head));
@@ -290,7 +321,7 @@ async function judgeHead(
     if (c) deps.log(`cancel ${head.id}: ${d.waiting_for}`);
     return 'changed';
   }
-  if (head.waiting_for !== d.waiting_for || head.need_mib !== est.need_mib)
+  if (cur.waiting_for !== d.waiting_for || cur.need_mib !== est.need_mib)
     await noteWaiting(store, head, { ...est, waiting_for: d.waiting_for });
   return 'waiting';
 }
@@ -474,6 +505,26 @@ export function leaseDirWatch(dir: string): (cb: () => void) => () => void {
   };
 }
 
+/**
+ * The apps a start of the lease's target launches on this machine now: the target's apps and their dependencies, in
+ * dependency order and with the lease's host selection kept (as actOn picks them), that run on a local host and are
+ * not running in `procs`. `m` is the checkout's full manifest.
+ */
+export function appsToLaunch(
+  m: Manifest,
+  l: Pick<Lease, 'target' | 'host'>,
+  procs: Pm2Process[]
+): string[] {
+  const fleet = new Fleet(m, l.host ?? undefined);
+  return fleet
+    .withDeps(fleet.select([l.target]))
+    .filter((n) => pickHost(m, fleet.hostOf(n)).local)
+    .filter((n) => {
+      const p = findProcess(procs, m.project, n);
+      return !(p && isRunning(p.status));
+    });
+}
+
 /** The local host the watcher reads its memory on: a plain local shell in `cwd`, no ssh, no docker. */
 const localHost = (cwd: string): Host => ({
   name: 'local',
@@ -590,6 +641,11 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             .then(() => resolve(), reject);
         });
       });
+    },
+    targetApps: async (l) => {
+      const prep = prepare({ project: l.root });
+      const ctx = await connect(prep);
+      return appsToLaunch(prep.manifest, l, await ctx.pm2.jlist());
     },
     onlineApps: async (l) => {
       const ctx = await ctxOf(l);

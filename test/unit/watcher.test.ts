@@ -10,11 +10,15 @@ import {
   type NewLease,
 } from '../../src/core/leases/store.js';
 import {
+  appsToLaunch,
   watchLeases,
   defaultWatcherDeps,
   leaseDirWatch,
   type WatcherDeps,
 } from '../../src/core/leases/watcher.js';
+import { needOf } from '../../src/core/leases/admission.js';
+import { loadManifest } from '../../src/core/manifest.js';
+import { parseJlist } from '../../src/core/pm2.js';
 import { ownsManifest } from '../../src/core/leases/siblings.js';
 import { McprocError } from '../../src/core/errors.js';
 import { abortableSleep } from '../../src/core/wait.js';
@@ -71,6 +75,8 @@ describe('watchLeases', () => {
       await store.transition(l.id, 'running', { child_pid: null }); // what the child does
     },
     onlineApps: async () => online,
+    // nothing of the target changed since it was queued
+    targetApps: async (l) => l.apps,
     settleMs: () => 5,
     sleep: async (ms) => {
       now += ms;
@@ -151,6 +157,63 @@ describe('watchLeases', () => {
     );
     expect(started).toEqual([a.id]);
     expect(store.get(a.id)?.state).toBe('running');
+  });
+
+  it('budgets a queued start for what it will launch: an app of its target that stopped during the wait joins its apps and its estimate', async () => {
+    // queued while db was online: the lease covers web alone, and the host has 76M over the reserve
+    available = 1100;
+    online = new Set(['db']);
+    const declared: Record<string, number> = { db: 512, web: 256 };
+    const a = await store.create(
+      input({
+        target: 'dev',
+        apps: ['web'],
+        estimate_mib: 256,
+        need_mib: 282,
+        sources: { web: { mib: 256, source: 'declared' } },
+      }),
+      'pending'
+    );
+    const d = deps();
+    const judged: string[][] = [];
+    d.targetApps = async () => ['db', 'web'].filter((x) => !online.has(x));
+    d.estimate = async (l) => {
+      judged.push(l.apps);
+      const estimate_mib = l.apps.reduce((s, x) => s + declared[x], 0);
+      return {
+        estimate_mib,
+        need_mib: needOf(estimate_mib, l.margin),
+        reserve_mib: l.reserve_mib,
+        sources: Object.fromEntries(
+          l.apps.map((x) => [x, { mib: declared[x], source: 'declared' }])
+        ),
+      };
+    };
+    await watchLeases(d, { tickMs: 1, once: true });
+    expect(store.get(a.id)).toMatchObject({ state: 'pending', apps: ['web'] });
+    online.delete('db'); // db stops while web waits
+    await watchLeases(d, { tickMs: 1, once: true });
+    expect(judged).toEqual([['web'], ['db', 'web']]);
+    expect(store.get(a.id)).toMatchObject({
+      state: 'pending',
+      apps: ['db', 'web'],
+      estimate_mib: 768,
+      need_mib: 845,
+      sources: {
+        db: { mib: 512, source: 'declared' },
+        web: { mib: 256, source: 'declared' },
+      },
+    });
+    expect(store.get(a.id)?.waiting_for).toMatch(/needs 845M/);
+    // admitted over both, and started as such
+    available = 5000;
+    await watchLeases(d, { tickMs: 1, once: true });
+    expect(started).toEqual([a.id]);
+    expect(store.get(a.id)).toMatchObject({
+      state: 'running',
+      apps: ['db', 'web'],
+      need_mib: 845,
+    });
   });
 
   it('records what the head waits for', async () => {
@@ -582,6 +645,45 @@ describe('watchLeases', () => {
     expect([reads, estimates]).toEqual([2, 2]);
     ac.abort();
     expect(await run).toBe('aborted');
+  });
+});
+
+describe('appsToLaunch', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const fleetProj = path.join(here, '..', 'fixtures', 'projects', 'fleet');
+  const proc = (name: string, ns: string, status = 'online') =>
+    parseJlist(
+      JSON.stringify([
+        { pid: 100, name, pm_id: 0, pm2_env: { status, namespace: ns } },
+      ])
+    )[0];
+  it('takes the target with its dependencies first and leaves out what runs already', () => {
+    const m = loadManifest(vars); // demo-w2: api depends on db
+    const l = { target: 'api', host: null };
+    expect(appsToLaunch(m, l, [])).toEqual(['db', 'api']);
+    expect(appsToLaunch(m, l, [proc('demo-w2-db', 'demo-w2')])).toEqual([
+      'api',
+    ]);
+    // a stopped process is launched again
+    expect(
+      appsToLaunch(m, l, [proc('demo-w2-db', 'demo-w2', 'stopped')])
+    ).toEqual(['db', 'api']);
+  });
+  it('counts the local apps only, with the host selection of the lease', () => {
+    const m = loadManifest(fleetProj); // watch@local, web@box, tool unbound, audit@ro
+    expect(appsToLaunch(m, { target: 'dev', host: null }, [])).toEqual([
+      'watch',
+    ]);
+    expect(appsToLaunch(m, { target: 'all', host: null }, [])).toEqual([
+      'watch',
+      'tool',
+    ]);
+    expect(appsToLaunch(m, { target: 'all', host: 'local' }, [])).toEqual([
+      'watch',
+      'tool',
+    ]);
+    // with --host box the unbound tool runs there, and watch is not on that host
+    expect(appsToLaunch(m, { target: 'all', host: 'box' }, [])).toEqual([]);
   });
 });
 
