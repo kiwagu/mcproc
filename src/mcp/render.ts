@@ -12,6 +12,11 @@ import type { AdoptResult } from '../core/adopt.js';
 import type { VarInfo } from '../core/manifest.js';
 import type { LeasesView } from '../core/leases/view.js';
 import type { ExecResult } from '../core/exec.js';
+import type {
+  WorktreeAdded,
+  WorktreeRemoved,
+  WorktreeRow,
+} from '../core/worktree.js';
 import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
@@ -662,4 +667,44 @@ export function renderAdopted(r: AdoptResult): {
 export function renderExec(command: string[], r: ExecResult): string {
   const head = `exec ${command.join(' ')}: exit ${r.code}${r.waited_ms > 1000 ? ` after ${Math.round(r.waited_ms / 1000)} s in the queue` : ''}${r.lease ? ` (lease ${r.lease.id}, ${r.lease.state})` : ''}`;
   return r.output ? `${head}\n${r.output}` : head;
+}
+
+/** A new worktree: where, its branch (new or existing), slot and project, what was copied, linked, missing and installed, its vars, then how to go on. */
+export function renderWorktreeAdded(r: WorktreeAdded): string {
+  const L = [
+    `worktree ${r.path}`,
+    `branch: ${r.branch} (${r.created_branch ? 'new' : 'existing'})`,
+    `slot ${r.slot}, project ${r.project}`,
+  ];
+  if (r.copied.length) L.push(`copied: ${r.copied.join(', ')}`);
+  if (r.linked.length) L.push(`linked: ${r.linked.join(', ')}`);
+  if (r.missing.length) L.push(`missing: ${r.missing.join(', ')}`);
+  L.push(`installed: ${r.installed ?? 'nothing'}`);
+  const vars = r.vars.filter((v) => v.source !== 'built-in');
+  if (vars.length) {
+    L.push('vars:');
+    for (const v of vars) L.push(`  ${v.name} = ${JSON.stringify(v.value)}`);
+  }
+  L.push(`next: ${r.next}`);
+  return L.join('\n');
+}
+
+/** Every checkout of the repository as a table, slot 0 marked as the main one. */
+export function renderWorktrees(rows: WorktreeRow[]): string {
+  return table([
+    ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
+    ...rows.map((r) => [
+      r.main ? `${r.slot} (main)` : String(r.slot),
+      r.project,
+      r.branch ?? '(detached)',
+      String(r.online),
+      r.lease ?? '-',
+      r.path,
+    ]),
+  ]);
+}
+
+/** A removed worktree in one line: its path, the slot it freed, the branch it kept and the apps it stopped. */
+export function renderWorktreeRemoved(r: WorktreeRemoved): string {
+  return `removed ${r.path}: slot ${r.slot} is free, branch ${r.branch ?? '(detached)'} kept; stopped ${r.stopped.length ? r.stopped.join(', ') : 'nothing'}`;
 }

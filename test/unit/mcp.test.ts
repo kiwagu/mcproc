@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -47,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 18 tools with annotations and short instructions', async () => {
+  it('registers the 21 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -70,6 +71,9 @@ describe('mcp server', () => {
       'stop',
       'unpack',
       'wait',
+      'worktree_add',
+      'worktree_ls',
+      'worktree_remove',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
@@ -85,8 +89,37 @@ describe('mcp server', () => {
       'ports',
       'wait',
       'leases',
+      'worktree_ls',
     ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
+    // add makes a checkout and never discards anything; remove discards a worktree (with force, its changes too)
+    expect(byName.worktree_add.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(byName.worktree_remove.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_add.inputSchema.properties as object).sort()
+    ).toEqual(['branch', 'from', 'install', 'project', 'slot', 'slug']);
+    expect(byName.worktree_add.description).toMatch(
+      /<repo>\.worktrees\/<branch>/
+    );
+    expect(byName.worktree_add.description).toContain(
+      'its slug (the project slug this checkout runs under, default <project>-w<slot>)'
+    );
+    expect(
+      Object.keys(
+        byName.worktree_remove.inputSchema.properties as object
+      ).sort()
+    ).toEqual(['force', 'project', 'ref']);
+    expect(
+      Object.keys(byName.worktree_ls.inputSchema.properties as object)
+    ).toEqual(['project']);
     expect(byName.lease_cancel.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
@@ -276,6 +309,111 @@ describe('mcp server', () => {
     });
     expect(size.isError).toBe(true);
     expect(text(size)).toMatch(/^BAD_ARGUMENT: not a size/);
+  });
+  it('worktree_add makes a checkout with its slot and slug, the failed install in its notes; worktree_ls and worktree_remove read and refuse', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcp-'));
+    const main = path.join(base, 'wtm');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe; a plain sh runs the install
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtm',
+          'vars: { slot: 0, port: "{{ 3000 + slot }}" }',
+          'hosts:',
+          '  local: { pm2: /bin/false, shell: "/bin/sh -c" }',
+          'worktree:',
+          '  install: "echo out-line; echo err-line >&2; exit 3"',
+          'apps:',
+          '  db: { description: db, run: node db.js, port: "{{ port }}" }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const real = fs.realpathSync(main);
+      const wt = path.join(`${real}.worktrees`, 'feat', 'x');
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('jlist'))
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                pid: 7,
+                name: 'wtm-two-db',
+                pm_id: 0,
+                pm2_env: { status: 'online', namespace: 'wtm-two' },
+              },
+            ]),
+            stderr: '',
+          };
+        throw new Error(`unexpected ${cmd}`);
+      };
+      const cl = await client(spawner, undefined, main);
+      const r: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'feat/x', slot: 2, slug: 'wtm-two' },
+      });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        path: wt,
+        slot: 2,
+        project: 'wtm-two',
+        repo: real,
+        installed: 'echo out-line; echo err-line >&2; exit 3',
+      });
+      expect(
+        r.structuredContent.vars.find((v: any) => v.name === 'port').value
+      ).toBe(3002);
+      const t = text(r).split('\n');
+      expect(t.slice(0, 3)).toEqual([
+        `worktree ${wt}`,
+        'branch: feat/x (new)',
+        'slot 2, project wtm-two',
+      ]);
+      expect(t).toContain(`next: cd ${wt} && mcproc start db`);
+      // the install's output never reaches the protocol stream: its last lines come back as notes when it fails
+      expect(r.structuredContent.notes.slice().sort()).toEqual(
+        [
+          'err-line',
+          `echo out-line; echo err-line >&2; exit 3 exited 3 in ${wt}; run it by hand`,
+          'out-line',
+        ].sort()
+      );
+      expect(t.slice(-3).sort()).toEqual(
+        r.structuredContent.notes.slice().sort()
+      );
+      const ls: any = await cl.callTool({ name: 'worktree_ls', arguments: {} });
+      expect(ls.isError).toBeFalsy();
+      expect(ls.structuredContent.rows).toMatchObject([
+        { slot: 0, project: 'wtm', branch: 'main', online: 0, main: true },
+        { slot: 2, project: 'wtm-two', branch: 'feat/x', online: 1, path: wt },
+      ]);
+      expect(text(ls).split('\n')[1]).toMatch(/^0 \(main\)\s+wtm\s+main\s+0/);
+      for (const [ref, code] of [
+        ['0', 'BAD_ARGUMENT'],
+        ['nope', 'NOT_A_WORKTREE'],
+      ]) {
+        const rm: any = await cl.callTool({
+          name: 'worktree_remove',
+          arguments: { ref, force: true },
+        });
+        expect(rm.isError).toBe(true);
+        expect(rm.structuredContent.error.code).toBe(code);
+      }
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
   it('exec runs the command from the root with exec.env and answers its code and last lines, isError when not 0', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-exec-mcp-'));

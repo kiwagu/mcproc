@@ -1,14 +1,47 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { commonInput, MUT, runTool, type ToolDeps } from '../common.js';
+import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { connect, prepare } from '../../core/resolve.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../../core/exec.js';
 import { parseSizeMib } from '../../core/sizes.js';
 import { McprocError } from '../../core/errors.js';
-import { renderExec } from '../render.js';
+import {
+  defaultWorktreeDeps,
+  worktreeAdd,
+  worktreeLs,
+  worktreeRemove,
+  type WorktreeDeps,
+} from '../../core/worktree.js';
+import {
+  renderExec,
+  renderWorktreeAdded,
+  renderWorktreeRemoved,
+  renderWorktrees,
+} from '../render.js';
 
-/** The tools of the stands a checkout runs: `exec`, one-off work in a stand's environment under a memory lease when asked. */
+/**
+ * The tools of the stands a checkout runs: `exec`, one-off work in a stand's environment under a memory lease when
+ * asked, and the worktrees that give one repository several stands side by side.
+ */
 export function registerStandTools(server: McpServer, deps: ToolDeps): void {
+  /** The checkout's manifest on the local host (git runs here) and the worktree deps, whose notes end up in `notes`. */
+  const worktreeCtx = async (project: string | undefined, notes: string[]) => {
+    const ctx = await connect(
+      prepare({
+        project: project ?? deps.project,
+        roots: await deps.roots(),
+      }),
+      { spawner: deps.spawner, hereCheck: deps.hereCheck }
+    );
+    const wdeps: WorktreeDeps = await defaultWorktreeDeps(
+      ctx,
+      { out: (line) => notes.push(line) },
+      { capture: true }
+    );
+    return { manifest: ctx.manifest, wdeps };
+  };
+  const withNotes = (text: string, notes: string[]) =>
+    notes.length ? `${text}\n${notes.join('\n')}` : text;
   server.registerTool(
     'exec',
     {
@@ -75,6 +108,129 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           text: renderExec(args.command, r),
           data: { ...r },
           isError: r.code !== 0,
+        };
+      })
+  );
+
+  server.registerTool(
+    'worktree_add',
+    {
+      title: 'Worktree add',
+      description:
+        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files the manifest's worktree: section copies or links, its own slot (ports shifted by the manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. Then drive its stand with project: <its path> on every call.",
+      inputSchema: {
+        project: commonInput.project,
+        branch: z
+          .string()
+          .min(1)
+          .describe(
+            'The branch to check out; made from `from` when it does not exist yet'
+          ),
+        from: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Where a new branch starts (default: the main checkout's HEAD)"
+          ),
+        slot: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe('A specific slot (default: the lowest free one)'),
+        slug: z
+          .string()
+          .optional()
+          .describe(
+            'The project slug this checkout runs under (default: <project>-w<slot>); project stays the project root'
+          ),
+        install: z
+          .boolean()
+          .optional()
+          .describe(
+            "Run the install command in the new checkout (default true): the manifest's worktree.install, else by the lockfile"
+          ),
+      },
+      annotations: MUT(false, false),
+    },
+    (args) =>
+      runTool(async () => {
+        const notes: string[] = [];
+        const { manifest, wdeps } = await worktreeCtx(args.project, notes);
+        const r = await worktreeAdd(
+          manifest,
+          {
+            branch: args.branch,
+            from: args.from,
+            slot: args.slot,
+            project: args.slug,
+            install: args.install ?? true,
+          },
+          wdeps
+        );
+        return {
+          text: withNotes(renderWorktreeAdded(r), notes),
+          data: { ...r, notes },
+        };
+      })
+  );
+
+  server.registerTool(
+    'worktree_ls',
+    {
+      title: 'Worktree ls',
+      description:
+        'Every checkout of this repository on this host: its slot (0 is the main checkout), project slug, branch, how many of its apps are online, its lease state and its path. A slot whose folder is gone is freed on the way.',
+      inputSchema: { project: commonInput.project },
+      annotations: RO,
+    },
+    (args) =>
+      runTool(async () => {
+        const notes: string[] = [];
+        const { manifest, wdeps } = await worktreeCtx(args.project, notes);
+        const rows = await worktreeLs(manifest, wdeps);
+        return {
+          text: withNotes(renderWorktrees(rows), notes),
+          data: { rows, notes },
+        };
+      })
+  );
+
+  server.registerTool(
+    'worktree_remove',
+    {
+      title: 'Worktree remove',
+      description:
+        'Stop and delete the apps of a worktree (freeing its leases), remove the checkout and free its slot; the branch stays. ref is its slot number, path or branch. A checkout with uncommitted or untracked changes is refused unless force, which discards them. The main checkout (slot 0) is never removed.',
+      inputSchema: {
+        project: commonInput.project,
+        ref: z
+          .string()
+          .min(1)
+          .describe('The worktree: its slot number, path or branch'),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            'Remove it even with uncommitted or untracked changes, discarding them (default false)'
+          ),
+      },
+      annotations: MUT(true, false),
+    },
+    (args) =>
+      runTool(async () => {
+        const notes: string[] = [];
+        const { manifest, wdeps } = await worktreeCtx(args.project, notes);
+        const r = await worktreeRemove(
+          manifest,
+          args.ref,
+          { force: args.force ?? false },
+          wdeps
+        );
+        return {
+          text: withNotes(renderWorktreeRemoved(r), notes),
+          data: { ...r, notes },
         };
       })
   );

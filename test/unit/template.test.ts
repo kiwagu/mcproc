@@ -7,7 +7,7 @@ import {
   TemplateError,
 } from '../../src/core/template.js';
 
-const vars = { slot: 2, base: 5181, name: 'perch', on: true };
+const vars = { slot: 2, base: 5181, name: 'demo', on: true };
 
 describe('evaluate', () => {
   it('does integer arithmetic with precedence and parentheses', () => {
@@ -19,7 +19,7 @@ describe('evaluate', () => {
     expect(evaluate('2 - 3 - 4', vars)).toBe(-5);
   });
   it('returns a bare name as its value, whatever the type', () => {
-    expect(evaluate('name', vars)).toBe('perch');
+    expect(evaluate('name', vars)).toBe('demo');
     expect(evaluate('on', vars)).toBe(true);
     expect(evaluate('slot', vars)).toBe(2);
   });
@@ -38,12 +38,12 @@ describe('renderTemplate', () => {
   it('renders several templates inside a string', () => {
     expect(
       renderTemplate('http://127.0.0.1:{{ base + slot*100 }}/{{name}}', vars)
-    ).toBe('http://127.0.0.1:5381/perch');
+    ).toBe('http://127.0.0.1:5381/demo');
   });
   it('returns the raw value for a template that is the whole string', () => {
     expect(renderTemplate('{{ slot }}', vars)).toBe(2);
     expect(renderTemplate('{{on}}', vars)).toBe(true);
-    expect(renderTemplate('{{ name }}', vars)).toBe('perch');
+    expect(renderTemplate('{{ name }}', vars)).toBe('demo');
   });
   it('leaves a string without templates alone and unescapes \\{{', () => {
     expect(renderTemplate('plain', vars)).toBe('plain');

@@ -24,6 +24,9 @@ import {
   renderAdopted,
   queuedNote,
   renderLeases,
+  renderWorktreeAdded,
+  renderWorktrees,
+  renderWorktreeRemoved,
 } from '../../src/mcp/render.js';
 import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
 import type { Lease } from '../../src/core/leases/store.js';
@@ -1437,5 +1440,82 @@ describe('queued starts and the lease queue', () => {
         leases: [],
       })
     ).toContain('watcher: not running');
+  });
+});
+
+describe('worktree renderers', () => {
+  it('add: path, branch, slot and project, the copies, the install, the vars that are not built in, then next', () => {
+    expect(
+      renderWorktreeAdded({
+        path: '/w/demo.worktrees/feat/x',
+        branch: 'feat/x',
+        created_branch: true,
+        slot: 1,
+        project: 'demo-w1',
+        repo: '/w/demo',
+        copied: ['certs'],
+        linked: ['notes'],
+        missing: ['gone.txt'],
+        installed: 'bun install',
+        vars: [
+          { name: 'project', value: 'demo-w1', source: 'built-in' },
+          { name: 'slot', value: 1, source: 'override' },
+          { name: 'port', value: 3100, source: 'manifest' },
+        ],
+        next: 'cd /w/demo.worktrees/feat/x && mcproc start db',
+      })
+    ).toBe(
+      [
+        'worktree /w/demo.worktrees/feat/x',
+        'branch: feat/x (new)',
+        'slot 1, project demo-w1',
+        'copied: certs',
+        'linked: notes',
+        'missing: gone.txt',
+        'installed: bun install',
+        'vars:',
+        '  slot = 1',
+        '  port = 3100',
+        'next: cd /w/demo.worktrees/feat/x && mcproc start db',
+      ].join('\n')
+    );
+  });
+  it('ls: a table with the main checkout marked; remove: one line', () => {
+    expect(
+      renderWorktrees([
+        {
+          slot: 0,
+          project: 'demo',
+          path: '/w/demo',
+          branch: 'main',
+          online: 2,
+          lease: null,
+          main: true,
+        },
+        {
+          slot: 1,
+          project: 'demo-w1',
+          path: '/w/demo.worktrees/a',
+          branch: null,
+          online: 0,
+          lease: 'pending',
+          main: false,
+        },
+      ]).split('\n')
+    ).toEqual([
+      'SLOT      PROJECT  BRANCH      ONLINE  LEASE    PATH',
+      '0 (main)  demo     main        2       -        /w/demo',
+      '1         demo-w1  (detached)  0       pending  /w/demo.worktrees/a',
+    ]);
+    expect(
+      renderWorktreeRemoved({
+        path: '/w/demo.worktrees/a',
+        slot: 1,
+        branch: 'a',
+        stopped: ['db'],
+      })
+    ).toBe(
+      'removed /w/demo.worktrees/a: slot 1 is free, branch a kept; stopped db'
+    );
   });
 });

@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -217,8 +218,109 @@ describe('cli', () => {
       'install',
       'mcp',
       'exec',
+      'worktree',
     ])
       expect(help).toContain(cmd);
+  });
+  it('registers worktree with add, ls and remove and their options; the slug is no global --project', () => {
+    const p = buildProgram(capture().io);
+    const wt = p.commands.find((x) => x.name() === 'worktree')!;
+    expect(wt.commands.map((x) => x.name())).toEqual(['add', 'ls', 'remove']);
+    const opts = (n: string) =>
+      wt.commands.find((x) => x.name() === n)!.options.map((o) => o.long);
+    expect(opts('add')).toEqual(['--from', '--slot', '--slug', '--no-install']);
+    expect(opts('remove')).toEqual(['--force']);
+    expect(
+      wt.commands
+        .find((x) => x.name() === 'add')!
+        .options.find((o) => o.long === '--slug')!.description
+    ).toBe(
+      'the project slug this checkout runs under (default: <project>-w<slot>)'
+    );
+  });
+  it('worktree refuses another host before touching it', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(
+      ['worktree', 'ls', '--project', basic, '--host', 'stand'],
+      { from: 'user' }
+    );
+    expect(c.err[0]).toMatch(
+      /^BAD_ARGUMENT: worktree runs on the local host only/
+    );
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+  });
+  it('worktree add makes the checkout with --slot, --slug and --no-install; remove refuses slot 0 and an unknown ref', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-cli-'));
+    const main = path.join(base, 'wtc');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtc',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(path.join(main, 'package-lock.json'), '{}');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const real = fs.realpathSync(main);
+      const c = capture();
+      await buildProgram(c.io).parseAsync(
+        [
+          'worktree',
+          'add',
+          'feat/y',
+          '--slot',
+          '3',
+          '--slug',
+          'wtc-three',
+          '--no-install',
+          '--project',
+          main,
+          '--json',
+        ],
+        { from: 'user' }
+      );
+      expect(c.err).toEqual([]);
+      const r = JSON.parse(c.out[0]);
+      expect(r).toMatchObject({
+        path: path.join(`${real}.worktrees`, 'feat', 'y'),
+        slot: 3,
+        project: 'wtc-three',
+        installed: null,
+        next: `cd ${path.join(`${real}.worktrees`, 'feat', 'y')} && mcproc start db`,
+      });
+      for (const [ref, code] of [
+        ['0', 'BAD_ARGUMENT'],
+        ['nope', 'NOT_A_WORKTREE'],
+      ]) {
+        const e = capture();
+        await buildProgram(e.io).parseAsync(
+          ['worktree', 'remove', ref, '--force', '--project', main],
+          { from: 'user' }
+        );
+        expect(e.err[0]).toMatch(new RegExp(`^${code}: `));
+        expect(process.exitCode).toBe(1);
+        process.exitCode = 0;
+      }
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
   it('exec refuses a bad --memory or --timeout and another host before touching any host', async () => {
     for (const argv of [

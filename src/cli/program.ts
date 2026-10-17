@@ -21,6 +21,12 @@ import {
 } from '../core/leases/watcher.js';
 import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
+import {
+  defaultWorktreeDeps,
+  worktreeAdd,
+  worktreeLs,
+  worktreeRemove,
+} from '../core/worktree.js';
 import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
@@ -60,6 +66,9 @@ import {
   renderWait,
   renderAdopted,
   renderLeases,
+  renderWorktreeAdded,
+  renderWorktreeRemoved,
+  renderWorktrees,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -674,6 +683,88 @@ export function buildProgram(io: Io = defaultIo): Command {
         } finally {
           for (const s of signals) process.off(s, stop);
         }
+      })
+    );
+  // git runs here: the worktree commands act on the local checkout; their notes go to stderr, the answer to stdout
+  const worktreeCtx = async (g: Globals) => {
+    const prep = prepare({ project: g.project, host: g.host });
+    if (!prep.host.local)
+      throw new McprocError(
+        'BAD_ARGUMENT',
+        `worktree runs on the local host only, not on ${prep.host.name}`,
+        { hint: 'Drop --host; the checkout is on this machine.' }
+      );
+    const ctx = await connect(prep);
+    return {
+      manifest: ctx.manifest,
+      deps: await defaultWorktreeDeps(ctx, { out: io.err }),
+    };
+  };
+  const worktree = program
+    .command('worktree')
+    .description(
+      'worktrees of this repository, each with its own slot, project slug and ports'
+    );
+  worktree
+    .command('add <branch>')
+    .description(
+      'a worktree in the sibling folder on that branch: copies and links from the manifest, the override with its slot, the install'
+    )
+    .option(
+      '--from <ref>',
+      "where a new branch starts (default: the main checkout's HEAD)"
+    )
+    .option('--slot <n>', 'a specific slot (default: the lowest free one)')
+    .option(
+      '--slug <slug>',
+      'the project slug this checkout runs under (default: <project>-w<slot>)'
+    )
+    .option('--no-install', 'skip the install command')
+    .action(
+      wrap(async (g, o, [branch]) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const r = await worktreeAdd(
+          manifest,
+          {
+            branch,
+            from: o.from === undefined ? undefined : String(o.from),
+            slot: o.slot === undefined ? undefined : Number(o.slot),
+            project: o.slug === undefined ? undefined : String(o.slug),
+            install: o.install !== false,
+          },
+          deps
+        );
+        emit(g, renderWorktreeAdded(r), r);
+      })
+    );
+  worktree
+    .command('ls')
+    .description(
+      'every checkout: slot, project, branch, apps online, lease, path'
+    )
+    .action(
+      wrap(async (g) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const rows = await worktreeLs(manifest, deps);
+        emit(g, renderWorktrees(rows), rows);
+      })
+    );
+  worktree
+    .command('remove <ref>')
+    .description(
+      'stop its apps, remove the worktree (by branch, path or slot) and free its slot; the branch stays'
+    )
+    .option('--force', 'remove even with uncommitted or untracked changes')
+    .action(
+      wrap(async (g, o, [ref]) => {
+        const { manifest, deps } = await worktreeCtx(g);
+        const r = await worktreeRemove(
+          manifest,
+          ref,
+          { force: Boolean(o.force) },
+          deps
+        );
+        emit(g, renderWorktreeRemoved(r), r);
       })
     );
   program
