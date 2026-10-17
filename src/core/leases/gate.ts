@@ -70,7 +70,8 @@ export function defaultGateDeps(dir = stateDir()): GateDeps {
  * plus the margin) is judged under the lock, the running leases younger than the manifest's settle time charged on
  * top of the reading: admitted at once as a running lease, or queued as a pending one behind whatever is pending
  * already, in which case the watcher is made sure of and the caller returns. When the watcher cannot be launched, the
- * pending lease is cancelled with the reason and the start fails (the McprocError as it came, else PM2_FAILED).
+ * pending lease this call created is cancelled with the reason (one it joined is left to its caller) and the start
+ * fails (the McprocError as it came, else PM2_FAILED).
  */
 export async function gateStart(
   ctx: Context,
@@ -128,66 +129,84 @@ export async function gateStart(
     note: opts.note ?? null,
     requester_pid: deps.pid ?? process.pid,
   };
-  const result = await deps.store.withLock(async (): Promise<GateResult> => {
-    const same = deps.store
-      .list()
-      .find(
-        (l): l is QueuedLease =>
-          (l.state === 'pending' || l.state === 'starting') &&
-          l.root === m.root &&
-          l.project === m.project &&
-          l.target === target &&
-          (l.host ?? null) === host
+  // `created`: whether this call wrote the lease, or joined one an earlier caller queued
+  const { result, created } = await deps.store.withLock(
+    async (): Promise<{
+      result: GateResult;
+      created: boolean;
+    }> => {
+      const same = deps.store
+        .list()
+        .find(
+          (l): l is QueuedLease =>
+            (l.state === 'pending' || l.state === 'starting') &&
+            l.root === m.root &&
+            l.project === m.project &&
+            l.target === target &&
+            (l.host ?? null) === host
+        );
+      if (same)
+        return {
+          result: {
+            kind: 'queued',
+            lease: same,
+            position: deps.store.positionOf(same.id),
+            waiting_for: same.waiting_for ?? same.state,
+          },
+          created: false,
+        };
+      const all = deps.store.list();
+      const ahead = all.filter(
+        (l) => l.state === 'pending' || l.state === 'starting'
+      ).length;
+      // a start admitted seconds ago is not in the reading yet: two starts on one reading must not both fit
+      const ramping_mib = rampingMib(
+        all,
+        Date.now(),
+        m.resources.settle * 1000
       );
-    if (same)
+      const d = admit({ ahead, memory, need_mib, reserve_mib, ramping_mib });
+      if (!d.ok && d.reason === 'never')
+        throw new McprocError('NEVER_FITS', `${target}: ${d.waiting_for}`, {
+          hint: "Lower the apps' memory: declarations or the resources.reserve, or run fewer apps.",
+        });
+      if (d.ok) {
+        // this process runs the start: until it is done, the watcher must not judge the lease by its apps
+        const lease = await deps.store.create(input, 'running', {
+          child_pid: process.pid,
+        });
+        return { result: { kind: 'proceed', lease }, created: true };
+      }
+      const created = await deps.store.create(input, 'pending');
+      const lease = await deps.store.patch(created.id, {
+        waiting_for: d.waiting_for,
+      });
       return {
-        kind: 'queued',
-        lease: same,
-        position: deps.store.positionOf(same.id),
-        waiting_for: same.waiting_for ?? same.state,
+        result: {
+          kind: 'queued',
+          lease: { ...lease, state: 'pending' },
+          position: deps.store.positionOf(lease.id),
+          waiting_for: d.waiting_for,
+        },
+        created: true,
       };
-    const all = deps.store.list();
-    const ahead = all.filter(
-      (l) => l.state === 'pending' || l.state === 'starting'
-    ).length;
-    // a start admitted seconds ago is not in the reading yet: two starts on one reading must not both fit
-    const ramping_mib = rampingMib(all, Date.now(), m.resources.settle * 1000);
-    const d = admit({ ahead, memory, need_mib, reserve_mib, ramping_mib });
-    if (!d.ok && d.reason === 'never')
-      throw new McprocError('NEVER_FITS', `${target}: ${d.waiting_for}`, {
-        hint: "Lower the apps' memory: declarations or the resources.reserve, or run fewer apps.",
-      });
-    if (d.ok) {
-      // this process runs the start: until it is done, the watcher must not judge the lease by its apps
-      const lease = await deps.store.create(input, 'running', {
-        child_pid: process.pid,
-      });
-      return { kind: 'proceed', lease };
     }
-    const created = await deps.store.create(input, 'pending');
-    const lease = await deps.store.patch(created.id, {
-      waiting_for: d.waiting_for,
-    });
-    return {
-      kind: 'queued',
-      lease: { ...lease, state: 'pending' },
-      position: deps.store.positionOf(lease.id),
-      waiting_for: d.waiting_for,
-    };
-  });
+  );
   if (result.kind === 'queued')
     try {
       await deps.ensureWatcher(ctx);
     } catch (e) {
-      // nothing would ever admit it, and it would hold every later start of the host behind it
+      // nothing would ever admit it, and it would hold every later start of the host behind it; a lease joined from an
+      // earlier caller is that caller's, and is left alone
       const error = `the watcher could not be launched: ${describeError(e)}`;
       const id = result.lease.id;
-      await deps.store
-        .withLock(async () => {
-          if (deps.store.get(id)?.state === 'pending')
-            await deps.store.transition(id, 'cancelled', { error });
-        })
-        .catch(() => undefined);
+      if (created)
+        await deps.store
+          .withLock(async () => {
+            if (deps.store.get(id)?.state === 'pending')
+              await deps.store.transition(id, 'cancelled', { error });
+          })
+          .catch(() => undefined);
       throw isMcprocError(e) ? e : new McprocError('PM2_FAILED', error);
     }
   return result;

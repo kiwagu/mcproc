@@ -366,6 +366,27 @@ describe('gateStart', () => {
     ).toEqual([]);
   });
 
+  it('leaves a lease it joined alone when the watcher cannot be launched: only the lease a call created is cancelled', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const d = deps({ total_mib: 8000, available_mib: 1500 });
+    const first = await gateStart(
+      ctx,
+      ['db', 'api'],
+      { target: 'dev', procs: [] },
+      d
+    );
+    expect(first.kind).toBe('queued');
+    d.ensureWatcher = async () => {
+      throw new Error('pm2 is gone');
+    };
+    await expect(
+      gateStart(ctx, ['db', 'api'], { target: 'dev', procs: [] }, d)
+    ).rejects.toMatchObject({ code: 'PM2_FAILED' });
+    expect(store.list()).toMatchObject([
+      { id: first.lease?.id, state: 'pending', error: null },
+    ]);
+  });
+
   it('admits in FIFO order without a memory reading', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const r = await gateStart(
