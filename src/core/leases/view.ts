@@ -122,7 +122,12 @@ export function cancelLease(id: string, dir = stateDir()): Promise<Lease> {
         'LEASE_NOT_PENDING',
         `lease ${id} is ${l.state}, only a pending lease or a starting exec can be cancelled`,
         {
-          hint: 'Stop its target to end a starting or running start.',
+          hint:
+            l.kind !== 'exec'
+              ? 'Stop its target to end a starting or running start.'
+              : l.state === 'running'
+                ? 'A running exec frees its lease when its command exits: wait for it to end.'
+                : 'The exec has ended: there is nothing left to cancel.',
         }
       );
     return store.transition(id, 'cancelled', {

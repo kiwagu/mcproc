@@ -238,8 +238,9 @@ apps:
 - **The watcher** is a pm2 process, `mcproc-watcher` in the `mcproc` namespace. It judges the head every 2 s and at once
   when the queue changes, exits after a minute idle, and the next queued start launches it again. While the head waits,
   each tick reads the memory alone; its siblings are measured again when that reading lets it fit, when the queue
-  changes, and every 30 s. It ends leases whose owner is gone (`checkout gone`, `requester gone`). `stop` and `delete` cancel the starts they overlap before stopping, and free the
-  running leases afterwards.
+  changes, and every 30 s. It ends leases whose owner is gone (`checkout gone`, `requester gone`) and an admitted exec
+  that has not run within 60 s (`the exec did not take its turn`). `stop` and `delete` cancel the starts they overlap
+  before stopping, and free the running leases afterwards.
 - `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
   apps that declare `containers:`), `describe` and the sibling measurement; never by monit's loop or by `wait`.
 - **Looking and cancelling.** `mcproc leases` (tool `leases`) shows the host's queue: who runs, who waits and why, the
@@ -258,7 +259,9 @@ mcproc exec --memory 4G --note "e2e run" -- npx vitest run     # --timeout <s> b
 `exec` runs a command from the project root with the manifest's `exec.env` (templates allowed, so it can point at this
 checkout's ports) and `MCPROC_PROJECT` set. With `--memory` it is a lease like a start: it runs at once when the host has
 room, else waits its turn, and frees the lease when the command exits. Without it, it runs at once. The MCP tool returns
-the exit code and the last 200 lines of output, and is marked destructive: it runs any local argv.
+the exit code and the last 200 lines of output, and is marked destructive: it runs any local argv. It reads that output
+through pipes: a process the command leaves behind on them (a server sent to the background) loses them one second after
+the command exits (its next write gets EPIPE), so such a process should detach its own stdio.
 
 ### Limits
 

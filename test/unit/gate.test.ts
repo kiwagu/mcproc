@@ -900,10 +900,24 @@ describe('leasesView and cancelLease', () => {
       state: 'cancelled',
       error: 'cancelled by request',
     });
+    // a running exec has no target to stop: it ends with its command
+    const running = await store.create(
+      { ...exec, kind: 'exec', host: null, target: 'bun test' },
+      'running'
+    );
+    await expect(cancelLease(running.id, dir)).rejects.toMatchObject({
+      code: 'LEASE_NOT_PENDING',
+      hint: 'A running exec frees its lease when its command exits: wait for it to end.',
+    });
+    await expect(cancelLease(exec.id, dir)).rejects.toMatchObject({
+      code: 'LEASE_NOT_PENDING',
+      hint: 'The exec has ended: there is nothing left to cancel.',
+    });
     const start = await make('pending');
     await store.transition(start.id, 'starting');
     await expect(cancelLease(start.id, dir)).rejects.toMatchObject({
       code: 'LEASE_NOT_PENDING',
+      hint: 'Stop its target to end a starting or running start.',
     });
     expect(store.get(start.id)?.state).toBe('starting');
   });
