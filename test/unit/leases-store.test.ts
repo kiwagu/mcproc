@@ -193,6 +193,149 @@ describe('LeaseStore', () => {
     await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
   });
 
+  describe('the break guard', () => {
+    let leases: string;
+    let lock: string;
+    let guard: string;
+    let deadPid: number;
+    beforeEach(() => {
+      leases = path.join(dir, 'leases');
+      lock = path.join(leases, '.lock');
+      guard = `${lock}.break`;
+      fs.mkdirSync(leases, { recursive: true });
+      deadPid = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    });
+    const staleLock = () =>
+      fs.writeFileSync(
+        lock,
+        JSON.stringify({ pid: deadPid, at: now - 60_000, token: 'dead' })
+      );
+    const tokenOf = () => JSON.parse(fs.readFileSync(lock, 'utf8')).token;
+    const lockNames = () =>
+      fs.readdirSync(leases).filter((n) => n.startsWith('.lock'));
+
+    it('breaks a stale lock and takes it, leaving no guard, token or moved file behind', async () => {
+      staleLock();
+      let seen: string | null = null;
+      await expect(
+        store.withLock(() => {
+          seen = tokenOf();
+          return 'ok';
+        })
+      ).resolves.toBe('ok');
+      expect(seen).toMatch(/^4242-[0-9a-f]{12}$/);
+      expect(lockNames()).toEqual([]);
+    });
+
+    it('waits while a fresh guard is held and leaves the lock alone, then breaks it once the guard is gone', async () => {
+      staleLock();
+      fs.mkdirSync(guard);
+      fs.writeFileSync(
+        path.join(guard, 'holder'),
+        JSON.stringify({ pid: process.pid, at: now, token: 'breaking' })
+      );
+      let atRelease: string | null = null;
+      let released = 0;
+      setTimeout(() => {
+        atRelease = tokenOf(); // the waiting breaker has not touched the lock
+        released = Date.now();
+        fs.rmSync(guard, { recursive: true, force: true });
+      }, 200);
+      let took = 0;
+      await store.withLock(() => {
+        took = Date.now();
+      });
+      expect(atRelease).toBe('dead');
+      expect(released).toBeGreaterThan(0);
+      expect(took).toBeGreaterThanOrEqual(released);
+      expect(lockNames()).toEqual([]);
+    });
+
+    it('removes a stale guard (an old holder whose pid is dead, or none and an old mtime) and goes on with the break', async () => {
+      staleLock();
+      fs.mkdirSync(guard);
+      fs.writeFileSync(
+        path.join(guard, 'holder'),
+        JSON.stringify({ pid: deadPid, at: now - 60_000, token: 'crashed' })
+      );
+      const t0 = Date.now();
+      await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(lockNames()).toEqual([]);
+      // a breaker that died before writing its holder: judged by the directory's mtime
+      staleLock();
+      fs.mkdirSync(guard);
+      const old = new Date(Date.now() - LOCK_STALE_MS - 60_000);
+      fs.utimesSync(guard, old, old);
+      await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+      expect(lockNames()).toEqual([]);
+    });
+
+    it('under the guard, a lock whose token changed since it was judged stale is not unlinked: its fresh holder keeps it', async () => {
+      staleLock();
+      let hooked = 0;
+      const breaker = new LeaseStore(dir, {
+        now: () => now,
+        pid: 4242,
+        beforeUnlink: () => {
+          hooked++;
+          // a fresh holder took the lock between the judgement and the guard (pid 1 lives)
+          if (hooked === 1)
+            fs.writeFileSync(
+              lock,
+              JSON.stringify({ pid: 1, at: now, token: 'fresh' })
+            );
+        },
+      });
+      let atRelease: string | null = null;
+      setTimeout(() => {
+        atRelease = tokenOf();
+        fs.rmSync(lock, { force: true }); // the fresh holder releases
+      }, 200);
+      const t0 = Date.now();
+      await expect(breaker.withLock(() => 'ok')).resolves.toBe('ok');
+      expect(hooked).toBe(1);
+      expect(atRelease).toBe('fresh');
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+      expect(lockNames()).toEqual([]);
+    });
+
+    it('two breakers and a plain acquirer of one stale lock never hold it at the same time', async () => {
+      staleLock();
+      let inside = 0;
+      let most = 0;
+      const order: string[] = [];
+      const section = (name: string) => async () => {
+        inside++;
+        most = Math.max(most, inside);
+        order.push(`${name}-in`);
+        await new Promise((r) => setTimeout(r, 60));
+        order.push(`${name}-out`);
+        inside--;
+      };
+      const other = new LeaseStore(dir, { now: () => now, pid: 4343 });
+      const late: Promise<void>[] = [];
+      // while the first breaker holds the guard, the second breaker and the plain acquirer try their own take: each
+      // sees the stale lock and the busy guard, and waits
+      const first = new LeaseStore(dir, {
+        now: () => now,
+        pid: 4242,
+        beforeUnlink: () => {
+          if (late.length) return;
+          late.push(other.withLock(section('second')));
+          late.push(store.withLock(section('plain')));
+          expect(tokenOf()).toBe('dead');
+        },
+      });
+      await Promise.all([first.withLock(section('first')), ...late]);
+      expect(late).toHaveLength(2);
+      expect(most).toBe(1);
+      expect(order.slice(0, 2)).toEqual(['first-in', 'first-out']);
+      expect(order).toHaveLength(6);
+      expect(lockNames()).toEqual([]);
+    });
+  });
+
   it('release does not remove a lock it does not own', async () => {
     const lock = path.join(dir, 'leases', '.lock');
     await store.withLock(() => {
@@ -206,7 +349,7 @@ describe('LeaseStore', () => {
     fs.rmSync(lock, { force: true });
   });
 
-  it('breaks a lock that names this process with a token it does not hold (one a restore brought back)', async () => {
+  it('breaks a lock that names this process with a token it does not hold (one a release that threw left)', async () => {
     fs.mkdirSync(path.join(dir, 'leases'), { recursive: true });
     fs.writeFileSync(
       path.join(dir, 'leases', '.lock'),
@@ -258,6 +401,16 @@ describe('LeaseStore', () => {
     const oldStale = stray('.lock.1-dead.stale', true);
     const freshTmp = stray('.lock.2-waiting.tmp', false);
     const other = stray('000001-l_kept.json.1.tmp', true);
+    // a guard a breaker moved aside and died before removing: a directory with its holder inside
+    const movedGuard = (name: string, aged: boolean) => {
+      const d = path.join(leases, name);
+      fs.mkdirSync(d);
+      fs.writeFileSync(path.join(d, 'holder'), '{}');
+      if (aged) fs.utimesSync(d, old, old);
+      return d;
+    };
+    const oldGuard = movedGuard('.lock.break.1-dead.stale', true);
+    const freshGuard = movedGuard('.lock.break.2-live.stale', false);
     await Promise.all([
       store.withLock(() => new Promise((r) => setTimeout(r, 100))),
       new Promise((r) => setTimeout(r, 20)).then(() =>
@@ -266,7 +419,9 @@ describe('LeaseStore', () => {
     ]);
     expect(fs.existsSync(oldTmp)).toBe(false);
     expect(fs.existsSync(oldStale)).toBe(false);
+    expect(fs.existsSync(oldGuard)).toBe(false);
     expect(fs.existsSync(freshTmp)).toBe(true);
+    expect(fs.existsSync(freshGuard)).toBe(true);
     expect(fs.existsSync(other)).toBe(true);
   });
 
