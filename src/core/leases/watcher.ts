@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createTransport } from '../../transport/index.js';
-import { describeError } from '../errors.js';
+import { describeError, isMcprocError } from '../errors.js';
 import {
   DEFAULT_SHELL,
   type Host,
@@ -23,13 +23,19 @@ import {
   reserveMib,
 } from './admission.js';
 import { WATCHER_NOTE } from './ensure.js';
-import { listCheckout, measureSiblings, registryOf } from './siblings.js';
+import {
+  listCheckout,
+  measureSiblings,
+  ownsManifest,
+  registryOf,
+} from './siblings.js';
 import {
   type Lease,
   type LeaseSource,
   type LeaseState,
   LeaseStore,
   pidAlive,
+  starterAlive,
 } from './store.js';
 
 /** What the watcher reads and runs: the lease store, the host's memory, each lease's estimate, start and pm2 state, and its clock. */
@@ -52,6 +58,8 @@ export interface WatcherDeps {
   log(line: string): void;
   /** wakes the loop on a change of the queue; returns the unsubscribe */
   watch?(cb: () => void): () => void;
+  /** whether the lease's checkout is gone (its root has no manifest of its own any more); absent, none is */
+  gone?(l: Lease): boolean;
 }
 
 /**
@@ -74,37 +82,59 @@ async function moveIf(
   });
 }
 
-/** Whether the process running a lease's start is still there: a start admitted at once may not have its apps up yet. */
-const starterAlive = (l: Lease): boolean =>
-  l.child_pid !== null && pidAlive(l.child_pid);
-
-/** A running lease whose apps all left pm2 or stopped holds nothing; a starting one without a live owner after `stuckMs` is over. */
+/**
+ * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
+ * their starter lives); a starting one whose recorded child is gone is over at once, one that never recorded a child
+ * (or an exec whose owner is gone) after `stuckMs`.
+ */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
       if (l.state === 'running' && l.kind === 'start' && !starterAlive(l)) {
-        const online = await deps.onlineApps(l);
-        if (!l.apps.some((a) => online.has(a)))
+        let gone = deps.gone?.(l) ?? false;
+        let online = new Set<string>();
+        if (!gone)
+          try {
+            online = await deps.onlineApps(l);
+          } catch (e) {
+            if (!isMcprocError(e) || e.code !== 'MANIFEST_NOT_FOUND') throw e;
+            gone = true;
+          }
+        if (gone || !l.apps.some((a) => online.has(a)))
           await moveIf(
             store,
             l.id,
             'running',
             'freed',
-            { error: 'no app online any more' },
+            { error: gone ? 'checkout gone' : 'no app online any more' },
             (cur) => !starterAlive(cur)
           );
       }
-      if (
-        l.state === 'starting' &&
-        l.admitted_at &&
-        deps.now() - Date.parse(l.admitted_at) > stuckMs
-      ) {
-        const owner = l.kind === 'start' ? l.child_pid : l.requester_pid;
+      if (l.state !== 'starting') continue;
+      if (l.kind === 'start' && l.child_pid !== null) {
+        if (!pidAlive(l.child_pid))
+          await moveIf(
+            store,
+            l.id,
+            'starting',
+            'failed',
+            { error: "the start's child is gone", child_pid: null },
+            (cur) => cur.child_pid === l.child_pid
+          );
+        continue;
+      }
+      if (l.admitted_at && deps.now() - Date.parse(l.admitted_at) > stuckMs) {
+        const owner = l.kind === 'start' ? null : l.requester_pid;
         if (!owner || !pidAlive(owner))
-          await moveIf(store, l.id, 'starting', 'failed', {
-            error: `the start did not answer within ${stuckMs / 1000} s`,
-          });
+          await moveIf(
+            store,
+            l.id,
+            'starting',
+            'failed',
+            { error: `the start did not answer within ${stuckMs / 1000} s` },
+            (cur) => cur.child_pid === null
+          );
       }
     } catch (e) {
       deps.log(`error: ${l.id}: ${describeError(e)}`);
@@ -122,6 +152,15 @@ async function judgeHead(
   head: Lease
 ): Promise<'admitted' | 'waiting' | 'changed'> {
   const { store } = deps;
+  // its checkout was removed (or is now only a path inside another one): it can never start, and it must not hold
+  // every later lease behind it
+  if (deps.gone?.(head)) {
+    const c = await moveIf(store, head.id, 'pending', 'cancelled', {
+      error: 'checkout gone',
+    });
+    if (c) deps.log(`cancel ${head.id}: checkout gone (${head.root})`);
+    return 'changed';
+  }
   let memory: HostMemory | null;
   let est: Awaited<ReturnType<WatcherDeps['estimate']>>;
   try {
@@ -243,7 +282,17 @@ export async function watchLeases(
   const { store } = deps;
   let idleSince = deps.now();
   let tick: AbortController | null = null;
-  const unwatch = deps.watch?.(() => tick?.abort());
+  // what the queue looked like when the loop went to sleep: only a change of it wakes the loop, so the watcher's own
+  // patches (a waiting_for with live figures), the lock's files and the temp files never do
+  let asleepOn = '';
+  const queueOf = () =>
+    store
+      .list()
+      .map((l) => `${l.id}:${l.state}`)
+      .join(',');
+  const unwatch = deps.watch?.(() => {
+    if (tick && queueOf() !== asleepOn) tick.abort();
+  });
   try {
     for (;;) {
       if (opts.signal?.aborted) return 'aborted';
@@ -279,6 +328,7 @@ export async function watchLeases(
         }
       }
       if (opts.once) return 'idle';
+      asleepOn = queueOf();
       tick = new AbortController();
       const onAbort = () => tick?.abort();
       opts.signal?.addEventListener('abort', onAbort, { once: true });
@@ -289,6 +339,19 @@ export async function watchLeases(
   } finally {
     unwatch?.();
   }
+}
+
+/**
+ * The wake of the pm2-managed watcher: `fs.watch` on the lease directory. The lock's own files (`.lock`, its token
+ * and stale files, `.seq`) are dot-names and never wake it.
+ */
+export function leaseDirWatch(dir: string): (cb: () => void) => () => void {
+  return (cb) => {
+    const w = fs.watch(dir, (_e, name) => {
+      if (!name?.startsWith('.')) cb();
+    });
+    return () => w.close();
+  };
 }
 
 /** The local host the watcher reads its memory on: a plain local shell in `cwd`, no ssh, no docker. */
@@ -329,8 +392,16 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
         sources,
       };
     },
-    runStart: (l) =>
-      new Promise<void>((resolve, reject) => {
+    gone: (l) => !ownsManifest(l.root),
+    runStart: async (l) => {
+      // the checkout went away since the head was judged: nothing to start there (nor the project around it)
+      if (!ownsManifest(l.root)) {
+        await moveIf(store, l.id, 'starting', 'cancelled', {
+          error: 'checkout gone',
+        });
+        return;
+      }
+      await new Promise<void>((resolve, reject) => {
         const child = spawn(
           process.execPath,
           [
@@ -375,7 +446,8 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             )
             .then(() => resolve(), reject);
         });
-      }),
+      });
+    },
     onlineApps: async (l) => {
       const ctx = await ctxOf(l);
       const procs = await ctx.pm2.jlist();

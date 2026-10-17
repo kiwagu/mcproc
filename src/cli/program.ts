@@ -14,7 +14,11 @@ import {
 } from '../core/resolve.js';
 import { cancelLease, leasesView } from '../core/leases/view.js';
 import { watcherEntry } from '../core/leases/ensure.js';
-import { defaultWatcherDeps, watchLeases } from '../core/leases/watcher.js';
+import {
+  defaultWatcherDeps,
+  leaseDirWatch,
+  watchLeases,
+} from '../core/leases/watcher.js';
 import { stateDir } from '../core/state.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
@@ -611,13 +615,7 @@ export function buildProgram(io: Io = defaultIo): Command {
         process.once('SIGINT', stop);
         process.once('SIGTERM', stop);
         fs.mkdirSync(deps.store.dir, { recursive: true });
-        deps.watch = (cb) => {
-          // the lock's own files (.lock, its token and stale files, .seq) churn on every change: only a lease wakes it
-          const w = fs.watch(deps.store.dir, (_e, name) => {
-            if (!name?.startsWith('.')) cb();
-          });
-          return () => w.close();
-        };
+        deps.watch = leaseDirWatch(deps.store.dir);
         const r = await watchLeases(deps, { signal: ac.signal });
         io.out(`watcher ${r}`);
       })

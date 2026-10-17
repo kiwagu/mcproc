@@ -12,8 +12,20 @@ import {
 import {
   watchLeases,
   defaultWatcherDeps,
+  leaseDirWatch,
   type WatcherDeps,
 } from '../../src/core/leases/watcher.js';
+import { ownsManifest } from '../../src/core/leases/siblings.js';
+import { McprocError } from '../../src/core/errors.js';
+import { abortableSleep } from '../../src/core/wait.js';
+
+const vars = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'fixtures',
+  'projects',
+  'vars'
+);
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -123,10 +135,17 @@ describe('watchLeases', () => {
     expect(store.get(a.id)?.state).toBe('freed');
   });
 
-  it('fails a starting lease whose child died without an answer, after the stuck time', async () => {
+  it('fails a starting lease that never recorded its child, after the stuck time', async () => {
     const a = await store.create(input(), 'pending');
-    await store.transition(a.id, 'starting', { child_pid: 999999 });
-    now += 11 * 60 * 1000;
+    await store.transition(a.id, 'starting', { child_pid: null });
+    now += 9 * 60 * 1000; // within the grace: left alone
+    await watchLeases(deps(), {
+      tickMs: 10,
+      once: true,
+      stuckMs: 10 * 60 * 1000,
+    });
+    expect(store.get(a.id)?.state).toBe('starting');
+    now += 2 * 60 * 1000;
     await watchLeases(deps(), {
       tickMs: 10,
       once: true,
@@ -273,6 +292,101 @@ describe('watchLeases', () => {
     expect(started).toEqual([queued!.id]);
     expect(fs.existsSync(path.join(dir, 'watcher.json'))).toBe(true);
   });
+
+  it('fails a starting lease whose recorded child is gone at once', async () => {
+    const a = await store.create(input(), 'pending');
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    await store.transition(a.id, 'starting', { child_pid: gone });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(a.id)).toMatchObject({
+      state: 'failed',
+      error: "the start's child is gone",
+    });
+  });
+
+  it('cancels a head whose checkout is gone and judges the next one at once', async () => {
+    const t0 = now;
+    const gone = await store.create(
+      input({ root: path.join(dir, 'gone') }),
+      'pending'
+    );
+    const b = await store.create(
+      input({ project: 'demo-w2', root: vars }),
+      'pending'
+    );
+    const d = deps();
+    d.gone = (l) => !ownsManifest(l.root);
+    const at: number[] = [];
+    const run = d.runStart;
+    d.runStart = async (l) => {
+      at.push(now - t0);
+      await run(l);
+    };
+    expect(await watchLeases(d, { tickMs: 10, idleExitMs: 50 })).toBe('idle');
+    expect(store.get(gone.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'checkout gone',
+    });
+    expect(started).toEqual([b.id]);
+    expect(at).toEqual([0]); // no tick passed between the cancel and the next judgement
+  });
+
+  it('frees a running lease whose checkout is gone, without an error every tick', async () => {
+    const a = await store.create(
+      input({ root: path.join(dir, 'gone') }),
+      'running'
+    );
+    const lines: string[] = [];
+    const d = deps();
+    d.gone = (l) => !ownsManifest(l.root);
+    d.log = (line) => lines.push(line);
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(a.id)).toMatchObject({
+      state: 'freed',
+      error: 'checkout gone',
+    });
+    // the same when only pm2's side finds the manifest missing
+    const b = await store.create(input(), 'running');
+    d.gone = undefined;
+    d.onlineApps = async () => {
+      throw new McprocError(
+        'MANIFEST_NOT_FOUND',
+        'No .mcproc/mcproc.yaml found in /w/a or its parents'
+      );
+    };
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(b.id)).toMatchObject({
+      state: 'freed',
+      error: 'checkout gone',
+    });
+    expect(lines.filter((l) => l.startsWith('error'))).toEqual([]);
+  });
+
+  it("wakes on a change of the queue only, through the CLI's fs.watch wiring: its own patch of waiting_for does not wake it, a new pending lease does", async () => {
+    const real = new LeaseStore(dir);
+    await real.withLock(() => real.create(input(), 'pending'));
+    let reads = 0;
+    const d: WatcherDeps = {
+      ...deps(),
+      store: real,
+      // the reading moves 1 MiB per read: waiting_for changes, and is written, on every judgement
+      memory: async () => ({ total_mib: 8000, available_mib: 1500 - ++reads }),
+      sleep: abortableSleep,
+      now: () => Date.now(),
+      watch: leaseDirWatch(real.dir),
+    };
+    const ac = new AbortController();
+    const run = watchLeases(d, { tickMs: 2000, signal: ac.signal });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(reads).toBe(1);
+    await real.withLock(() =>
+      real.create(input({ project: 'demo-w2', root: '/w/b' }), 'pending')
+    );
+    await new Promise((r) => setTimeout(r, 400));
+    expect(reads).toBe(2);
+    ac.abort();
+    expect(await run).toBe('aborted');
+  });
 });
 
 describe('defaultWatcherDeps', () => {
@@ -291,14 +405,14 @@ describe('defaultWatcherDeps', () => {
     );
     const deps = defaultWatcherDeps(dir, entry);
     const l = await deps.store.withLock(() =>
-      deps.store.create(input({ reload: true }), 'pending')
+      deps.store.create(input({ reload: true, root: vars }), 'pending')
     );
     const admitted = await deps.store.withLock(() =>
       deps.store.transition(l.id, 'starting')
     );
     await deps.runStart(admitted);
     expect(JSON.parse(fs.readFileSync(argvFile, 'utf8'))).toEqual({
-      argv: ['--project', '/w/a', 'start', 'dev', '--reload', '--lease', l.id],
+      argv: ['--project', vars, 'start', 'dev', '--reload', '--lease', l.id],
       state: dir,
     });
     expect(deps.store.get(l.id)).toMatchObject({
@@ -318,7 +432,7 @@ describe('defaultWatcherDeps', () => {
     );
     const deps = defaultWatcherDeps(dir, entry);
     const l = await deps.store.withLock(() =>
-      deps.store.create(input(), 'pending')
+      deps.store.create(input({ root: vars }), 'pending')
     );
     const admitted = await deps.store.withLock(() =>
       deps.store.transition(l.id, 'starting')
@@ -327,6 +441,28 @@ describe('defaultWatcherDeps', () => {
     expect(deps.store.get(l.id)).toMatchObject({
       state: 'running',
       error: null,
+    });
+  });
+
+  it('runStart drops a lease whose checkout is gone instead of starting it', async () => {
+    const entry = path.join(dir, 'cli.js');
+    const ran = path.join(dir, 'ran');
+    fs.writeFileSync(
+      entry,
+      `require('node:fs').writeFileSync(${JSON.stringify(ran)}, '1');`
+    );
+    const deps = defaultWatcherDeps(dir, entry);
+    const l = await deps.store.withLock(() =>
+      deps.store.create(input({ root: path.join(dir, 'gone') }), 'pending')
+    );
+    const admitted = await deps.store.withLock(() =>
+      deps.store.transition(l.id, 'starting')
+    );
+    await deps.runStart(admitted);
+    expect(fs.existsSync(ran)).toBe(false);
+    expect(deps.store.get(l.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'checkout gone',
     });
   });
 

@@ -2,7 +2,7 @@ import type { App, Resources } from '../manifest.js';
 import { RESERVE_DEFAULT_MIB } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
 import { fmtMib } from '../sizes.js';
-import type { Lease, LeaseSource } from './store.js';
+import { type Lease, type LeaseSource, starterAlive } from './store.js';
 
 /** What a running sibling slot showed for an app: its resident set plus containers, in MiB, and which slot. */
 export interface AppMeasure {
@@ -61,7 +61,7 @@ export type Admission =
 
 /**
  * What the running leases that have not settled yet still claim, in MiB: the need of each one that reached running
- * less than `settleMs` ago, which the host's memory reading may not show yet.
+ * less than `settleMs` ago, or whose starter is still launching it, which the host's memory reading may not show yet.
  */
 export function rampingMib(
   leases: Lease[],
@@ -71,7 +71,8 @@ export function rampingMib(
   let mib = 0;
   for (const l of leases) {
     if (l.state !== 'running' || !l.running_at) continue;
-    if (now - Date.parse(l.running_at) < settleMs) mib += l.need_mib;
+    if (now - Date.parse(l.running_at) < settleMs || starterAlive(l))
+      mib += l.need_mib;
   }
   return mib;
 }

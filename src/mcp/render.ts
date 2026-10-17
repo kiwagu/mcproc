@@ -529,6 +529,16 @@ export function waitNote(waits: WaitRecord[]): string {
     : '';
 }
 
+/** One line per distinct note the change left on its rows, with the apps it concerns. */
+export function rowNote(rows: LsRow[]): string {
+  const by = new Map<string, string[]>();
+  for (const r of rows)
+    if (r.note) by.set(r.note, [...(by.get(r.note) ?? []), r.app]);
+  return [...by]
+    .map(([note, apps]) => `${apps.join(', ')}: ${note}`)
+    .join('\n');
+}
+
 /** One line per queued app of a start: its position and what the head of the queue waits for. */
 export function queuedNote(rows: LsRow[]): string {
   const by = new Map<string, LsRow[]>();
@@ -601,6 +611,7 @@ export function renderMutation(
     act === 'start' || act === 'restart' ? startNote(rows) : '',
     act === 'start' ? queuedNote(rows) : '',
     waitNote(waits),
+    rowNote(rows),
   ].filter(Boolean);
   const head = bad.length
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`

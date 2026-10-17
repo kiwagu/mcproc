@@ -369,9 +369,15 @@ export async function actOn(
         }
         admitted = g.lease;
       }
-      // a stop must not race a start it overlaps: the queued and starting leases go first, their children with them
-      if ((act === 'stop' || act === 'delete') && ctx.host.local)
-        await cancelBefore(gate.store, ctx, r.apps);
+      // a stop must not race a start it overlaps: the queued and starting leases go first, their children with them;
+      // the leases are bookkeeping, so a lock that fails never holds back a stop: its rows say so instead
+      const stopping = (act === 'stop' || act === 'delete') && ctx.host.local;
+      const leaseNotes: string[] = [];
+      const unrecorded = (e: unknown) => {
+        leaseNotes.push(`leases not updated: ${describeError(e)}`);
+      };
+      if (stopping)
+        await cancelBefore(gate.store, ctx, r.apps).catch(unrecorded);
       let runRows: LsRow[];
       try {
         runRows = await (act === 'start'
@@ -398,13 +404,15 @@ export async function actOn(
           /* bookkeeping only: the apps run, and a stop still frees the lease */
         });
       // a checkout with no live lease skips pm2's list and the lock
-      if (
-        (act === 'stop' || act === 'delete') &&
-        ctx.host.local &&
-        liveLeasesOf(gate.store, ctx).length > 0
-      )
-        await freeAfter(gate.store, ctx, await ctx.pm2.jlist());
-      rows.push(...runRows);
+      if (stopping)
+        try {
+          if (liveLeasesOf(gate.store, ctx).length > 0)
+            await freeAfter(gate.store, ctx, await ctx.pm2.jlist());
+        } catch (e) {
+          unrecorded(e);
+        }
+      const note = leaseNotes[0];
+      rows.push(...(note ? runRows.map((x) => ({ ...x, note })) : runRows));
       done++;
     } catch (e) {
       failed ??= { host: r.host, error: e };

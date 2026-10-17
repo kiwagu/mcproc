@@ -145,13 +145,39 @@ describe('watcherEntry and ensureWatcher', () => {
     expect(fs.existsSync(path.join(dir, 'watcher.json'))).toBe(false);
   });
 
+  it('ensureWatcher serialises its launch: two starts that queue at once launch one watcher', async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
+    let launched = false;
+    const ctx = fakeCtx(vars, 'local', [
+      {
+        match: /pm2 'jlist'/,
+        result: () => ({ stdout: jlist(launched ? 'online' : 'stopped') }),
+      },
+      {
+        match: /startOrRestart/,
+        result: () => {
+          launched = true;
+          return {};
+        },
+      },
+    ]);
+    const r = await Promise.all([
+      ensureWatcher(ctx, dir),
+      ensureWatcher(ctx, dir),
+    ]);
+    expect(r.sort()).toEqual(['online', 'started']);
+    expect(starts(ctx)).toBe(1);
+  });
+
   it('ensureWatcher trusts an online watcher whose exit note is older than 5 s', async () => {
     note(6000);
     const ctx = fakeCtx(vars, 'local', [
       { match: /pm2 'jlist'/, result: { stdout: jlist('online') } },
     ]);
     expect(await ensureWatcher(ctx, dir)).toBe('online');
-    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls.filter((c) => c.cmd.includes('jlist'))).toHaveLength(
+      1
+    );
   });
 
   it('ensureWatcher answers online when a watcher with a fresh exit note is still online after 3 s', async () => {

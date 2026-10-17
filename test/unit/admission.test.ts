@@ -151,6 +151,19 @@ describe('rampingMib', () => {
       )
     ).toBe(1145);
   });
+  it('counts a running lease whose starter is alive past the settle time: it is still launching', () => {
+    const now = 1_700_000_000_000 + 60_000;
+    expect(
+      rampingMib(
+        [
+          lease({ need_mib: 845, running_at: at(0), child_pid: process.pid }),
+          lease({ need_mib: 999, running_at: at(0), child_pid: null }),
+        ],
+        now,
+        10_000
+      )
+    ).toBe(845);
+  });
 });
 
 describe('measureSiblings', () => {

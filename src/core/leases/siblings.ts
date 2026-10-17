@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import type { Spawner } from '../../transport/types.js';
 import type { LsRow } from '../list.js';
 import { rowsFor, snapshot } from '../list.js';
-import type { Manifest } from '../manifest.js';
+import { findManifestPath, type Manifest } from '../manifest.js';
 import { isRunning } from '../pm2.js';
 import { connect, prepare } from '../resolve.js';
 import {
@@ -24,15 +24,27 @@ export function registryOf(m: Manifest, dir = stateDir()): Registry | null {
   return readRegistry(registryPath(dir, m.base_project, repoOf(m)));
 }
 
+/**
+ * Whether `root` is a checkout with a manifest of its own. The manifest search walks up, so a path without one (gone,
+ * or nested in another checkout) would otherwise stand for the project that encloses it.
+ */
+export function ownsManifest(root: string): boolean {
+  const found = findManifestPath(root);
+  if (!found) return false;
+  try {
+    return fs.realpathSync(found.root) === fs.realpathSync(root);
+  } catch {
+    return false; // gone meanwhile
+  }
+}
+
 /** One checkout's rows, read locally with the full probe (containers included) and no url checks; none when `root` has no manifest of its own. */
 export async function listCheckout(
   root: string,
   spawner?: Spawner
 ): Promise<LsRow[]> {
-  const prep = prepare({ project: root });
-  // the manifest search walks up: a sibling path without one would measure the project that encloses it
-  if (fs.realpathSync(prep.manifest.root) !== fs.realpathSync(root)) return [];
-  const ctx = await connect(prep, { spawner });
+  if (!ownsManifest(root)) return [];
+  const ctx = await connect(prepare({ project: root }), { spawner });
   // the full probe with the containers' memory: this is the measurement the estimate rests on
   const snap = await snapshot(ctx, {
     urls: 'none',

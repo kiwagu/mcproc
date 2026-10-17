@@ -4,6 +4,7 @@ import { LOG_STAMP } from '../ecosystem.js';
 import { McprocError } from '../errors.js';
 import type { Context } from '../resolve.js';
 import { stateDir } from '../state.js';
+import { LeaseStore } from './store.js';
 
 /** The pm2 process name of the host's lease watcher. */
 export const WATCHER_NAME = 'mcproc-watcher';
@@ -51,11 +52,20 @@ export function watcherEntry(
 /**
  * The watcher as one pm2 process per daemon: online already, or started from an ecosystem file in the state directory.
  * An online watcher whose exit note is fresh is leaving after an idle exit: it is waited for (up to EXIT_WAIT_MS) and,
- * once gone, a fresh one is started; one still online after that is trusted.
+ * once gone, a fresh one is started; one still online after that is trusted. The look and the launch hold the lease
+ * lock, so two starts that queue at once launch one watcher (a second launch would restart the first, and its tree).
  */
-export async function ensureWatcher(
+export function ensureWatcher(
   ctx: Context,
   dir = stateDir()
+): Promise<'online' | 'started'> {
+  return new LeaseStore(dir).withLock(() => lookAndLaunch(ctx, dir));
+}
+
+/** ensureWatcher's look and launch, under the lease lock. */
+async function lookAndLaunch(
+  ctx: Context,
+  dir: string
 ): Promise<'online' | 'started'> {
   const online = async () =>
     (await ctx.pm2.jlist()).some(

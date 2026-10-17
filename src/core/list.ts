@@ -74,6 +74,8 @@ export interface LsRow {
   };
   /** set when the app's host could not be reached; status is then "unreachable" */
   error?: string;
+  /** something the change did not finish beside the app itself, such as the leases a stop could not update */
+  note?: string;
 }
 export interface Snapshot {
   procs: Pm2Process[];

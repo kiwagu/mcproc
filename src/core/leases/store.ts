@@ -90,6 +90,11 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+/** Whether the process running a lease's start is still there (see `child_pid`): a start that runs may not have its apps up yet. */
+export function starterAlive(l: Pick<Lease, 'child_pid'>): boolean {
+  return typeof l.child_pid === 'number' && pidAlive(l.child_pid);
+}
+
 /** The tokens of the locks this process holds right now: a lock naming this pid with another token is a leftover. */
 const LIVE_TOKENS = new Set<string>();
 const STRAY = /^\.lock\..+\.(tmp|stale)$/;

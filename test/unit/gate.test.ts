@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fakeCtx } from '../helpers/ctx.js';
 import {
   LeaseStore,
@@ -510,6 +510,19 @@ describe('finishing and releasing', () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     expect(await cancelBefore(store, ctx, ['db'])).toEqual([]);
     expect(fs.existsSync(store.dir)).toBe(false);
+  });
+
+  it('freeAfter spares a running lease whose starter is alive: another process is still starting it', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const starting = await store.create(lease({}), 'running', {
+      child_pid: process.pid,
+    });
+    const down = [proc('demo-w2-db', 'demo-w2', 'stopped')] as never;
+    expect(await freeAfter(store, ctx, down)).toEqual([]);
+    expect(store.get(starting.id)?.state).toBe('running');
+    const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
+    await store.patch(starting.id, { child_pid: gone });
+    expect(await freeAfter(store, ctx, down)).toEqual([starting.id]);
   });
 
   it('freeAfter frees a running lease of this checkout once none of its apps is online', async () => {

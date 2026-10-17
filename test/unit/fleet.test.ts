@@ -12,6 +12,7 @@ import {
   describeFleetApp,
 } from '../../src/core/fleet.js';
 import { describeProject } from '../../src/core/list.js';
+import { renderMutation } from '../../src/mcp/render.js';
 import { listWithReloads } from '../../src/core/reloadcount.js';
 import { McprocError } from '../../src/core/errors.js';
 import type { WaitRecord } from '../../src/core/actions.js';
@@ -880,6 +881,62 @@ describe('actOn start through the memory lease gate', () => {
     } finally {
       child.kill('SIGKILL');
     }
+  });
+
+  it('a stop goes ahead when the lease lock fails, and its rows say the leases were not updated', async () => {
+    const lease = await store.create(
+      {
+        kind: 'start',
+        project: 'demo-w2',
+        root: varsProj,
+        slot: 2,
+        repo: '/w/demo',
+        target: 'dev',
+        apps: ['db', 'api'],
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+      },
+      'pending'
+    );
+    const stuck = new LeaseStore(stateDir);
+    stuck.withLock = async () => {
+      throw new McprocError(
+        'TIMEOUT',
+        'the lease lock is held by pid 9 for more than 10 s'
+      );
+    };
+    const list = JSON.stringify([
+      {
+        pid: 100,
+        name: 'demo-w2-db',
+        pm_id: 1,
+        pm2_env: { status: 'online', namespace: 'demo-w2', pm_cwd: varsProj },
+      },
+    ]);
+    const ctx = fakeCtx(varsProj, 'local', [
+      { match: MARK.JLIST, result: { stdout: probeOut({ jlist: list }) } },
+      { match: /pm2 'jlist'/, result: { stdout: list } },
+      { match: /pm2 'stop'/, result: {} },
+    ]);
+    const fleet = new Fleet(loadManifest(varsProj), undefined, async () => ctx);
+    const rows = await actOn(fleet, 'db', 'stop', {
+      gate: { ...gateOf(9000), store: stuck },
+    });
+    expect(ctx.fake.calls.some((c) => /pm2 'stop'/.test(c.cmd))).toBe(true);
+    expect(rows[0].note).toBe(
+      'leases not updated: TIMEOUT: the lease lock is held by pid 9 for more than 10 s'
+    );
+    expect(rows[0].error).toBeUndefined();
+    expect(store.get(lease.id)?.state).toBe('pending');
+    expect(renderMutation(rows, 'local', 'stop').text).toContain(
+      'db: leases not updated: TIMEOUT'
+    );
   });
 
   it('a queued run counts only the apps the gate counted: an app online already keeps its real row and does not hold back its dependents', async () => {
