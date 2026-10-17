@@ -213,10 +213,10 @@ describe('memory leases against real pm2', () => {
   }, 60_000);
 
   it('queue, watcher, release: B waits for memory, the watcher starts it once A is stopped', async () => {
-    // both stands down: their leases are freed. B's process is deleted, so its start is a request for an app with no
-    // process yet, which is what wait rides through
+    // both stands down: their leases are freed. B's process stays, stopped: its queued start reads queued in ls and
+    // wait rides through it, as after any stop
     await actOn(fleetOf(a), 'web', 'stop');
-    await actOn(fleetOf(b), 'web', 'delete');
+    await actOn(fleetOf(b), 'web', 'stop');
     expect(
       store()
         .list()

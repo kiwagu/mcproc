@@ -819,7 +819,7 @@ describe('queued and starting rows', () => {
     }
   });
 
-  it('an app with a process is never queued, and a host other than this machine reads no leases', async () => {
+  it('a covering lease wins over a stopped or errored process, never over a running one; a host other than this machine reads no leases', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ls-'));
     const prev = process.env.MCPROC_STATE_DIR;
     process.env.MCPROC_STATE_DIR = dir;
@@ -846,30 +846,45 @@ describe('queued and starting rows', () => {
           },
           'pending'
         );
-      await lease(loadManifest(varsProj), ['db', 'api']);
+      const mine = await lease(loadManifest(varsProj), ['db', 'api', 'tool']);
+      const proc = (app: string, status: string) => ({
+        pid: status === 'online' ? 100 : 0,
+        name: `demo-w2-${app}`,
+        pm_id: 0,
+        pm2_env: { status, namespace: 'demo-w2' },
+      });
       const ctx = fakeCtx(varsProj, 'local', [
         {
           match: 'jlist',
           result: {
             stdout: probeOut({
               jlist: JSON.stringify([
-                {
-                  pid: 100,
-                  name: 'demo-w2-db',
-                  pm_id: 0,
-                  pm2_env: { status: 'stopped', namespace: 'demo-w2' },
-                },
+                proc('db', 'online'),
+                proc('api', 'stopped'),
+                proc('tool', 'errored'),
               ]),
             }),
           },
         },
       ]);
-      const rows = rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), [
-        'db',
-        'api',
+      const names = ['db', 'api', 'tool'];
+      const rows = rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), names);
+      // a stop then a start that queued: the stopped process reads as the queue, the running one as itself
+      expect(rows.map((r) => r.status)).toEqual([
+        'online',
+        'queued #1',
+        'queued #1',
       ]);
-      expect(rows.map((r) => r.status)).toEqual(['stopped', 'queued #1']);
       expect(rows[0].lease).toBeUndefined();
+      expect(rows[1].lease).toMatchObject({ id: mine.id, position: 1 });
+      expect(rows[1].pid).toBeNull();
+      // without a covering lease a stopped process is shown as it is
+      await store.transition(mine.id, 'cancelled');
+      expect(
+        rowsFor(ctx, await snapshot(ctx, { urls: 'none' }), names).map(
+          (r) => r.status
+        )
+      ).toEqual(['online', 'stopped', 'errored']);
       await lease(loadManifest(basic), ['api']);
       const prod = fakeCtx(basic, 'prod', [
         { match: 'jlist', result: { stdout: probeOut({}) } },

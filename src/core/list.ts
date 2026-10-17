@@ -4,6 +4,7 @@ import { McprocError } from './errors.js';
 import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
+  isRunning,
   parseJlist,
   pm2Name,
   runtimeDir,
@@ -67,7 +68,7 @@ export interface LsRow {
    * (the count is then a lower bound)
    */
   reloads?: ReloadCount;
-  /** the lease that covers an app with no process yet: queued (its position) or starting */
+  /** the lease that covers an app that is not running yet: queued (its position) or starting */
   lease?: {
     id: string;
     state: 'pending' | 'starting';
@@ -295,7 +296,7 @@ export function statusWord(p: Pm2Process | undefined, app: App): string {
   return `failed (exit ${c})`;
 }
 
-/** One row per named app, in that order: what pm2 and the probe show, or for an app with no process that a lease covers, its place in the queue. */
+/** One row per named app, in that order: what pm2 and the probe show, or for an app not running that a lease covers, its place in the queue. */
 export function rowsFor(
   ctx: Context,
   snap: Snapshot,
@@ -304,10 +305,12 @@ export function rowsFor(
   return names.map((name) => {
     const app = ctx.manifest.apps[name];
     const p = findProcess(snap.procs, ctx.manifest.project, name);
-    // a lease speaks only for an app that has no process yet: one that has a process is shown as it is
-    const cover = p
-      ? undefined
-      : snap.leases.find((l) => l.apps.includes(name));
+    // a lease speaks for an app whose process is not running (none yet, or stopped before a start that queued); a
+    // running process is shown as it is
+    const cover =
+      p && isRunning(p.status)
+        ? undefined
+        : snap.leases.find((l) => l.apps.includes(name));
     if (cover) return queuedRow(app, ctx.host.name, cover, cover.position);
     const m = snap.metrics[name];
     return {

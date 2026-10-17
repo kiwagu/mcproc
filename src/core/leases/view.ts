@@ -62,7 +62,7 @@ export function watcherIn(procs: Pm2Process[]): {
   };
 }
 
-/** A lease that covers apps with no process yet, as ls and wait show it: queued (its position) or starting. */
+/** A lease that covers apps not running yet, as ls and wait show it: queued (its position) or starting. */
 export interface LeaseView {
   id: string;
   state: 'pending' | 'starting';
@@ -72,7 +72,11 @@ export interface LeaseView {
   apps: string[];
 }
 
-/** The pending and starting leases of one checkout, with their queue positions: what ls and wait show for apps that have no process yet. */
+/**
+ * The pending and starting leases of one checkout, with their queue positions: what ls and wait show for apps that are
+ * not running yet. A lease this process runs the start of itself (its `child_pid`, the watcher's child) covers nothing
+ * for it: that start's own rows and dependency waits see its apps as pm2 shows them, so a task it ran reads completed.
+ */
 export function leasesCovering(
   dir: string,
   m: Pick<Manifest, 'root' | 'project'>
@@ -84,7 +88,8 @@ export function leasesCovering(
       (l): l is Lease & { state: 'pending' | 'starting' } =>
         (l.state === 'pending' || l.state === 'starting') &&
         l.root === m.root &&
-        l.project === m.project
+        l.project === m.project &&
+        l.child_pid !== process.pid
     )
     .map((l) => ({
       id: l.id,

@@ -1590,6 +1590,138 @@ describe('waitFor: a start that is queued (lease-aware)', () => {
     ).rejects.toMatchObject({ code: 'NOT_STARTED' });
     expect(reads).toBe(2);
   });
+  it('listening: a stopped process that a pending lease covers is waited through until it is online (a stop, then a start that queued)', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const stopped: Pm2Process = {
+      ...onlineProc('demo-w2-api', 'demo-w2'),
+      pid: 0,
+      status: 'stopped',
+    };
+    const pending = [
+      {
+        id: 'l_x',
+        state: 'pending' as const,
+        position: 1,
+        waiting_for: '100M short',
+        apps: ['api'],
+      },
+    ];
+    let polls = 0;
+    const deps = fakeDeps({
+      snapshot: async () => {
+        polls++;
+        return polls >= 3
+          ? snapWith(onlineProc('demo-w2-api', 'demo-w2'), {
+              api: listening(3510),
+            })
+          : snapWith(stopped);
+      },
+      leases: async () => (polls >= 3 ? [] : pending),
+    });
+    expect(
+      await waitFor(
+        ctx,
+        'api',
+        { kind: 'listening' },
+        { deps, timeoutMs: 5000 }
+      )
+    ).toMatchObject({ ok: true, status: 'online' });
+    expect(polls).toBe(3);
+    // the lease never admits it: the wait times out as queued, not as exited
+    const never = fakeDeps({
+      snapshot: async () => snapWith(stopped),
+      leases: async () => pending,
+    });
+    expect(
+      await waitFor(
+        ctx,
+        'api',
+        { kind: 'listening' },
+        { deps: never, timeoutMs: 2000 }
+      )
+    ).toMatchObject({
+      ok: false,
+      reason: 'timeout',
+      status: 'queued #1',
+      observed: 'queued #1: 100M short',
+    });
+    // no covering lease: a stopped process still ends the wait at once, as before
+    expect(
+      await waitFor(
+        ctx,
+        'api',
+        { kind: 'listening' },
+        {
+          deps: fakeDeps({
+            snapshot: async () =>
+              snapWith(stopped, {
+                api: {
+                  actual: [],
+                  declared: [3510],
+                  checks: [{ port: 3510, status: 'declared-not-listening' }],
+                  undeclared: [],
+                },
+              }),
+          }),
+          timeoutMs: 2000,
+        }
+      )
+    ).toMatchObject({ ok: false, reason: 'exited', status: 'stopped' });
+  });
+  it('exited and log: ride through a covering lease over a stopped process too', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const done: Pm2Process = {
+      ...onlineProc('demo-w2-tool', 'demo-w2'),
+      pid: 0,
+      status: 'stopped',
+      exit_code: 0,
+    };
+    const lease = (app: string) => [
+      {
+        id: 'l_t',
+        state: 'starting' as const,
+        position: 0,
+        waiting_for: null,
+        apps: [app],
+      },
+    ];
+    // the last run's exit is not the answer while the queued run has not started
+    expect(
+      await waitFor(
+        ctx,
+        'tool',
+        { kind: 'exited' },
+        {
+          deps: fakeDeps({
+            jlist: async () => [done],
+            leases: async () => lease('tool'),
+          }),
+          timeoutMs: 1000,
+        }
+      )
+    ).toMatchObject({ ok: false, reason: 'timeout', status: 'starting' });
+    let looks = 0;
+    const f = fakeFollower([{}, { out: ['ready on 3510'] }]);
+    const stoppedApi: Pm2Process = {
+      ...onlineProc('demo-w2-api', 'demo-w2'),
+      pid: 0,
+      status: 'stopped',
+    };
+    expect(
+      await waitFor(ctx, 'api', parseUntil('log:ready'), {
+        deps: fakeDeps({
+          jlist: async () =>
+            ++looks >= 3
+              ? [onlineProc('demo-w2-api', 'demo-w2')]
+              : [stoppedApi],
+          leases: async () => (looks >= 3 ? [] : lease('api')),
+          follower: () => f,
+        }),
+        timeoutMs: 5000,
+      })
+    ).toMatchObject({ ok: true, matched_line: 'ready on 3510' });
+    expect(looks).toBe(3);
+  });
   it("the poll's snapshot reads no leases itself: they come from deps.leases, only while the app has no process", async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const asked: unknown[] = [];
@@ -1611,6 +1743,70 @@ describe('waitFor: a start that is queued (lease-aware)', () => {
     ).toBe(true);
     expect(asked).toEqual(['none']);
     expect(leaseReads).toBe(0);
+  });
+  it("the start this process runs under its own lease (the watcher's child) sees its apps as pm2 does: a task that finished is completed, not starting", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wait-'));
+    const prev = process.env.MCPROC_STATE_DIR;
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const m = loadManifest(varsProj);
+      const own = await store.create(
+        {
+          kind: 'start',
+          project: m.project,
+          root: m.root,
+          slot: m.slot,
+          repo: m.repo,
+          target: 'tool',
+          apps: ['tool'],
+          reload: false,
+          estimate_mib: 1,
+          need_mib: 1,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      await store.transition(own.id, 'starting', { child_pid: process.pid });
+      const ctx = fakeCtx(varsProj, 'local', []);
+      const done: Pm2Process = {
+        ...onlineProc('demo-w2-tool', 'demo-w2'),
+        pid: 0,
+        status: 'stopped',
+        exit_code: 0,
+      };
+      const deps = fakeDeps({
+        jlist: async () => [done],
+        leases: defaultWaitDeps().leases,
+      });
+      // a completed dependency of the leased start itself: its own lease must not hide the exit
+      expect(
+        await waitFor(
+          ctx,
+          'tool',
+          { kind: 'exited' },
+          { deps, timeoutMs: 1000 }
+        )
+      ).toMatchObject({ ok: true, status: 'done', exit_code: 0 });
+      // the same lease run by another process covers the app for this one
+      await store.patch(own.id, { child_pid: 1 });
+      expect(
+        await waitFor(
+          ctx,
+          'tool',
+          { kind: 'exited' },
+          { deps, timeoutMs: 1000 }
+        )
+      ).toMatchObject({ ok: false, reason: 'timeout', status: 'starting' });
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it("the default leases read covers this checkout's pending and starting leases, on this machine only", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wait-'));
