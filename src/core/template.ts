@@ -159,11 +159,11 @@ export function renderTemplate(
   return out;
 }
 
-/** The names a template value depends on (its bare identifiers), for ordering the resolution. */
+/** The names a template value depends on (its bare identifiers; an escaped `\{{` is text), for ordering the resolution. */
 function namesIn(v: VarValue): string[] {
   if (typeof v !== 'string') return [];
   const out = new Set<string>();
-  for (const m of v.matchAll(/\{\{([^}]*)\}\}/g))
+  for (const m of v.matchAll(/(?<!\\)\{\{([^}]*)\}\}/g))
     for (const n of m[1].matchAll(/[a-z_][a-z0-9_]*/gi)) out.add(n[0]);
   return [...out];
 }

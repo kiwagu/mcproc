@@ -80,6 +80,13 @@ describe('resolveVars', () => {
       })
     );
   });
+  it('takes no dependency from an escaped \\{{, so it is no cycle', () => {
+    expect(resolveVars({ a: 'x \\{{ b }}', b: '{{ a }}' }, {}, {})).toEqual({
+      a: 'x {{ b }}',
+      b: 'x {{ b }}',
+    });
+  });
+
   it('refuses a cycle, an override of an undeclared var and a built-in name', () => {
     expect(() => resolveVars({ a: '{{ b }}', b: '{{ a }}' }, {}, {})).toThrow(
       /cycle: a -> b -> a/
