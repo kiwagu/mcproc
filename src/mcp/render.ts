@@ -675,9 +675,16 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
     `worktree ${r.path}`,
     `branch: ${r.branch} (${r.created_branch ? 'new' : 'existing'})`,
     `slot ${r.slot}, project ${r.project}`,
+    `decided by: the ${r.manifest === 'worktree' ? "worktree's own" : "main checkout's"} manifest`,
   ];
-  if (r.copied.length) L.push(`copied: ${r.copied.join(', ')}`);
-  if (r.linked.length) L.push(`linked: ${r.linked.join(', ')}`);
+  const mark = (e: string) =>
+    r.from_override.includes(e) ? `${e} (override)` : e;
+  if (r.copied.length) L.push(`copied: ${r.copied.map(mark).join(', ')}`);
+  if (r.linked.length) L.push(`linked: ${r.linked.map(mark).join(', ')}`);
+  if (r.excluded.length)
+    L.push(
+      `ignored in git: ${r.excluded.join(', ')} (the repository's info/exclude)`
+    );
   if (r.missing.length) L.push(`missing: ${r.missing.join(', ')}`);
   L.push(`installed: ${r.installed ?? 'nothing'}`);
   const vars = r.vars.filter((v) => v.source !== 'built-in');

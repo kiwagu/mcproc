@@ -13,7 +13,7 @@ import {
   type VarInfo,
 } from './manifest.js';
 import { NAME_RE } from './names.js';
-import { writeOverride } from './override.js';
+import { loadOverride, writeOverride } from './override.js';
 import { isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
@@ -168,12 +168,97 @@ export interface WorktreeAdded {
   slot: number;
   project: string;
   repo: string;
+  /** whose manifest decided the slot var, the copies and the install: the new worktree's own, or the main checkout's when the worktree has none that loads */
+  manifest: 'worktree' | 'main';
   copied: string[];
   linked: string[];
+  /** the copy and link entries that came from the main checkout's override, not from a manifest */
+  from_override: string[];
+  /** the links as root-anchored patterns written to git's exclude file of the repository */
+  excluded: string[];
   missing: string[];
   installed: string | null;
   vars: VarInfo[];
   next: string;
+}
+
+/** The new worktree's own manifest, or null when it has none of its own or it does not load (logged, with what the main checkout's decides instead). */
+function ownManifest(
+  target: string,
+  log: (line: string) => void,
+  instead: string
+): Manifest | null {
+  if (!ownsManifest(target)) return null;
+  try {
+    return loadManifest(target);
+  } catch (e) {
+    log(
+      `the manifest of ${target} does not load (${describeError(e)}): the main checkout's decides ${instead}`
+    );
+    return null;
+  }
+}
+
+/**
+ * A path relative to the checkout root as a gitignore pattern that matches exactly it: root-anchored, forward slashes,
+ * `./` and doubled slashes folded, the wildcard characters and a trailing space escaped. Null for a path outside the root.
+ */
+export function excludePattern(rel: string): string | null {
+  // a trailing slash would make the pattern match directories only, and a symlink is not one to git
+  const p = path.posix
+    .normalize(rel.split(path.sep).join('/'))
+    .replace(/\/+$/, '');
+  if (
+    p === '.' ||
+    p === '' ||
+    p === '..' ||
+    p.startsWith('../') ||
+    p.startsWith('/')
+  )
+    return null;
+  return `/${p.replace(/[\\*?[\]]/g, (c) => `\\${c}`).replace(/ $/, '\\ ')}`;
+}
+
+/**
+ * Writes each link as a root-anchored pattern into git's exclude file of the repository (`git rev-parse --git-path
+ * info/exclude`: shared by its worktrees, never tracked), once each; answers the patterns. A git that cannot name the file
+ * is logged, and the links stay visible to `git status`.
+ */
+async function excludeLinks(
+  target: string,
+  links: string[],
+  git: GitRunner,
+  log: (line: string) => void
+): Promise<string[]> {
+  if (!links.length) return [];
+  const patterns: string[] = [];
+  for (const l of links) {
+    const p = excludePattern(l);
+    if (p === null)
+      log(
+        `link ${l} is outside the checkout: not written to git's exclude file`
+      );
+    else if (!patterns.includes(p)) patterns.push(p);
+  }
+  if (!patterns.length) return [];
+  const r = await git(['rev-parse', '--git-path', 'info/exclude'], target);
+  if (r.code !== 0) {
+    log(
+      `git names no exclude file for ${target} (${r.stderr.trim()}): the links stay visible to git status`
+    );
+    return [];
+  }
+  const file = path.resolve(target, r.stdout.trim());
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const had = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const lines = new Set(had.split('\n'));
+  const add = patterns.filter((p) => !lines.has(p));
+  if (add.length)
+    fs.appendFileSync(
+      file,
+      `${had.length && !had.endsWith('\n') ? '\n' : ''}${add.join('\n')}\n`
+    );
+  return patterns;
 }
 
 /**
@@ -294,6 +379,9 @@ export async function worktreeAdd(
       `"${opts.branch}" is not a valid branch name`
     );
   const main = await mainCheckout(m.root, deps.git);
+  // the main checkout's own override may add copy and link entries for every new worktree; a bad one refuses here,
+  // before anything is made
+  const extras = loadOverride(main)?.worktree ?? { copy: [], link: [] };
   const prefix = (
     await gitOk(deps.git, ['rev-parse', '--show-prefix'], m.root)
   ).trim();
@@ -390,16 +478,62 @@ export async function worktreeAdd(
     });
     throw e;
   }
+  // the new worktree's own manifest says what it gets (a branch that introduces the slot scheme gets it from its first
+  // worktree); the main checkout's only when the worktree has none that loads. It is read first without the override,
+  // only to learn whether it declares `slot`, and again once the override is in place, so that its templates (an
+  // install command, a copy entry) see this checkout's slug and slot, as every later command does
+  const probe = ownManifest(
+    target,
+    deps.log,
+    'the slot var, the copies and the install'
+  );
   // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
   writeOverride(target, {
     project,
     repo: main,
-    vars: m.slot !== null ? { slot } : undefined,
+    vars: (probe ?? m).slot !== null ? { slot } : undefined,
   });
   // a .mcproc/.gitignore of the branch (a whitelist) already hides the override; else one that hides everything here
   const gi = path.join(target, '.mcproc', '.gitignore');
   if (!present(gi)) fs.writeFileSync(gi, '*\n');
-  const plan = planCopies(main, target, m.worktree.copy, m.worktree.link, deps);
+  const own = probe
+    ? ownManifest(target, deps.log, 'the copies and the install')
+    : null;
+  const dm = own ?? m;
+  // the override's extras come after the manifest's entries; what both name counts as the manifest's
+  const only = (xs: string[], not: string[]) =>
+    [...new Set(xs)].filter((e) => !not.includes(e));
+  const ownPlan = planCopies(
+    main,
+    target,
+    dm.worktree.copy,
+    dm.worktree.link,
+    deps
+  );
+  const extraPlan = planCopies(
+    main,
+    target,
+    only(extras.copy, dm.worktree.copy),
+    only(extras.link, dm.worktree.link),
+    deps
+  );
+  // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
+  const addedCopies = extraPlan.copies.filter(
+    (c) => !ownPlan.copies.some((o) => o.to === c.to)
+  );
+  const addedLinks = extraPlan.links.filter(
+    (l) => !ownPlan.links.some((o) => o.to === l.to)
+  );
+  const plan = {
+    copies: [...ownPlan.copies, ...addedCopies],
+    links: [...ownPlan.links, ...addedLinks],
+    missing: [...ownPlan.missing, ...extraPlan.missing],
+  };
+  // provenance after the globs are expanded: the entries the override added, as the copied and linked lists name them
+  const fromOverride = [
+    ...addedCopies.map((c) => path.relative(main, c.from)),
+    ...addedLinks.map((l) => path.relative(main, l.from)),
+  ];
   let step = '';
   try {
     for (const c of plan.copies) {
@@ -427,7 +561,13 @@ export async function worktreeAdd(
   }
   for (const miss of plan.missing)
     deps.log(`copy: ${miss} is not in ${main}, skipped`);
-  const install = opts.install ? installCommand(m, target) : null;
+  const excluded = await excludeLinks(
+    target,
+    plan.links.map((l) => path.relative(target, l.to)),
+    deps.git,
+    deps.log
+  );
+  const install = opts.install ? installCommand(dm, target) : null;
   if (install) {
     const code = await deps.run(install, target);
     if (code !== 0)
@@ -440,15 +580,12 @@ export async function worktreeAdd(
     deps.log(
       `${target} has no manifest of its own (${MANIFEST_REL}): no vars, nothing to start`
     );
-  else
-    try {
-      const wm = loadManifest(target);
-      vars = wm.vars;
-      const first = Object.keys(wm.profiles)[0] ?? Object.keys(wm.apps)[0];
-      if (first) next += ` && mcproc start ${first}`;
-    } catch (e) {
-      deps.log(`the manifest of ${target} does not load: ${describeError(e)}`);
-    }
+  else if (own) {
+    // the manifest as read with its override: the vars carry the slot
+    vars = own.vars;
+    const first = Object.keys(own.profiles)[0] ?? Object.keys(own.apps)[0];
+    if (first) next += ` && mcproc start ${first}`;
+  }
   return {
     path: target,
     branch: opts.branch,
@@ -456,8 +593,11 @@ export async function worktreeAdd(
     slot,
     project,
     repo: main,
+    manifest: own ? 'worktree' : 'main',
     copied: plan.copies.map((c) => path.relative(main, c.from)),
     linked: plan.links.map((l) => path.relative(main, l.from)),
+    from_override: fromOverride,
+    excluded,
     missing: plan.missing,
     installed: install,
     vars,

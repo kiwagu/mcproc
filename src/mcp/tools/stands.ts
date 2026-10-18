@@ -117,7 +117,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Worktree add',
       description:
-        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files the manifest's worktree: section copies or links, its own slot (ports shifted by the manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. Then drive its stand with project: <its path> on every call.",
+        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files its own manifest's worktree: section (plus the main checkout's override) copies or links, its own slot (ports shifted by that manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. Then drive its stand with project: <its path> on every call.",
       inputSchema: {
         project: commonInput.project,
         branch: z
