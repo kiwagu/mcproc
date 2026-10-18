@@ -123,4 +123,4 @@ any host. `mcproc monit` is the terminal dashboard on the same data ([monit](doc
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
