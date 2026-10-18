@@ -708,7 +708,7 @@ export function buildProgram(io: Io = defaultIo): Command {
   worktree
     .command('add <branch>')
     .description(
-      'a worktree in the sibling folder on that branch: copies and links from the manifest, the override with its slot, the install'
+      "a worktree in the sibling folder on that branch: copies and links from its manifest and the main checkout's override, the override with its slot, the install"
     )
     .option(
       '--from <ref>',
