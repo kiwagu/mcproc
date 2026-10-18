@@ -82,7 +82,7 @@ function tarFlags(): string[] {
 
 /**
  * The pm2 tree `unpack` ships to hosts, assembled on THIS machine with npm ci from the lockfile mcproc ships
- * (never embedded in the package: pm2 is AGPL-3.0, mcproc is MIT) and cached once per pm2 version + lockfile.
+ * (never embedded in the package) and cached once per pm2 version + lockfile.
  */
 export async function ensurePm2Bundle(
   opts: { root?: string; cacheDir?: string; run?: Runner; force?: boolean } = {}
