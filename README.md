@@ -85,25 +85,25 @@ fields, the kinds and the process naming: [the manifest](docs/manifest.md).
 
 ## Tools (MCP) and commands (CLI)
 
-| tool | what it does |
+| tool (CLI form when it differs) | what it does |
 |------|--------------|
 | `describe [app]` | the project summary (apps with descriptions, profiles, hosts, the notes file), or one app in detail |
 | `ls [app]` | one row per app from the host it runs on: status, pid, uptime, restarts, memory and CPU of the process tree, ports with `✓`/`✗` against the declared ones, the URL's answer; `reloads` adds the in-process reloads since the pm2 start |
 | `ports [port]` | every listening socket on the host with its pid and owning app, or who holds one port |
 | `logs` | one app's tail, or several apps merged by time: the latest lines, `since` a span or a time, or `last` ([logs](docs/logs.md)) |
 | `incidents [app]` | new errors with context since they were last taken, plus crashes and restarts; `peek` looks without taking ([incidents](docs/incidents.md)) |
-| `wait <app> until=…` | block until listening, url-ok, exited, a log line matches, idle, or reloaded ([readiness](docs/readiness.md)) |
+| `wait <app>` with `until` (CLI `--until`) | block until listening, url-ok, exited, a log line matches, idle, or reloaded ([readiness](docs/readiness.md)) |
 | `start`, `restart`, `stop`, `delete <target>` | by app or profile; `start` launches dependencies first and waits for their conditions, `reload` restarts the apps already online, and a stand the host cannot hold yet is `queued` ([memory](docs/memory.md)) |
 | `flush [app]` | truncate the pm2 log files; incidents start over from there |
 | `init` | a manifest draft from the repository's scripts and workspaces; `adopt_ports` writes the ports `ls` reports as undeclared into the existing manifest ([init](docs/init.md)) |
 | `hosts`, `doctor` | the hosts and the apps bound to each; per-host readiness, which pm2 a host would use and why, where each url answers ([hosts](docs/hosts.md)) |
 | `unpack` | bring pm2, and Node when the host has none, to a host ([hosts](docs/hosts.md#hosts-without-pm2-unpack)) |
-| `leases`, `lease_cancel <id>` | the host's memory lease queue; cancel a pending lease |
+| `leases`, `lease_cancel` (CLI `leases cancel <id>`) | this machine's memory lease queue; cancel a pending lease ([memory](docs/memory.md)) |
 | `exec -- <command>` | a one-off command from the project root with the manifest's `exec.env`, under a lease with `--memory` |
-| `worktree add`, `ls`, `remove` | an isolated checkout per branch with its own slot, slug and ports ([worktrees](docs/worktrees.md)) |
+| `worktree_add`, `worktree_ls`, `worktree_remove` (CLI `worktree add \| ls \| remove`) | an isolated checkout per branch with its own slot, slug and ports ([worktrees](docs/worktrees.md)) |
 
-Every tool takes `project` and `host`: without `host`, each app is reached where it runs ([hosts](docs/hosts.md)).
-Read-only tools are annotated as such; mutating tools refuse `readonly` hosts and unknown app names before touching
+Every tool takes `project`; the tools that act on apps take `host` too, and without it each app is reached where it
+runs ([hosts](docs/hosts.md)). Leases, `exec` and worktrees are local to this machine. Read-only tools are annotated as such; mutating tools refuse `readonly` hosts and unknown app names before touching
 any host. `mcproc monit` is the terminal dashboard on the same data ([monit](docs/monit.md)).
 
 ## Documentation

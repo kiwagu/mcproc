@@ -9,10 +9,10 @@ as text, which is what an agent or a script reads.
 
 | key | what it does |
 |---|---|
-| `j` / `k`, Tab | select an app |
+| `j` / `k`, Tab | select an app (off in the incidents view) |
 | `↑` / `↓`, PageUp / PageDown, the mouse wheel | scroll the log pane; End returns to the tail |
 | `o` / `e` / `b` | show stdout, stderr or both |
-| `r` / `s` / `x` | restart, start or stop the selected app |
+| `r` / `s` / `x` | restart, start or stop the selected app (dashboard only) |
 | `c` twice | clear the logs of the running apps in view; the pane title then shows `cleared HH:MM`, and `incidents` starts over there |
 | `R` twice | reload every app in view the way `mcproc start all --reload` does: in dependency order with their `depends_on` waits, running apps restart, stopped ones start, `kind: task` apps run again. A view with an app on a readonly host is refused whole; narrow it with `h` |
 | `f` | the flat view: every app's logs merged into one labeled stream, `app \| line` and `app ! line` for stderr, one color per app, like `mcproc logs -f`; `f` again returns |
