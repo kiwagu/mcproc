@@ -51,7 +51,7 @@ the command exits (its next write gets EPIPE), so such a process should detach i
 
 ## Limits
 
-- Leases are local: `exec` and the worktree commands refuse a `host`, and a `start` of an app bound to a remote host that
+- Leases are local: `exec` and the worktree commands run on this machine only (a `host` other than `local` is refused), and a `start` of an app bound to a remote host that
   declares `memory:` is refused (`LEASE_UNSUPPORTED_HOST`). That makes monit's `R` key (`start all --reload`) refuse such
   a manifest.
 - Without `/proc/meminfo` (not Linux) there is no memory reading, so nothing is checked.
