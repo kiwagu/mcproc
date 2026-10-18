@@ -321,7 +321,8 @@ describe('worktree', () => {
     // `./private` is the same link as `private`; `odd[1]` is a literal name git would read as a wildcard; a glob copy
     fs.writeFileSync(
       path.join(main, '.mcproc', 'mcproc.local.yaml'),
-      'worktree:\n  copy: [local.env, "extra/**/*.txt"]\n  link: [./private, "odd[1]"]\n'
+      // `snaps/a.spec.ts-snapshots` is what the manifest's glob already copies: not the override's, not copied twice
+      'worktree:\n  copy: [local.env, "extra/**/*.txt", snaps/a.spec.ts-snapshots]\n  link: [./private, "odd[1]"]\n'
     );
     const r = await worktreeAdd(
       loadManifest(main),

@@ -517,25 +517,22 @@ export async function worktreeAdd(
     only(extras.link, dm.worktree.link),
     deps
   );
+  // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
+  const addedCopies = extraPlan.copies.filter(
+    (c) => !ownPlan.copies.some((o) => o.to === c.to)
+  );
+  const addedLinks = extraPlan.links.filter(
+    (l) => !ownPlan.links.some((o) => o.to === l.to)
+  );
   const plan = {
-    copies: [
-      ...ownPlan.copies,
-      ...extraPlan.copies.filter(
-        (c) => !ownPlan.copies.some((o) => o.to === c.to)
-      ),
-    ],
-    links: [
-      ...ownPlan.links,
-      ...extraPlan.links.filter(
-        (l) => !ownPlan.links.some((o) => o.to === l.to)
-      ),
-    ],
+    copies: [...ownPlan.copies, ...addedCopies],
+    links: [...ownPlan.links, ...addedLinks],
     missing: [...ownPlan.missing, ...extraPlan.missing],
   };
   // provenance after the globs are expanded: the entries the override added, as the copied and linked lists name them
   const fromOverride = [
-    ...extraPlan.copies.map((c) => path.relative(main, c.from)),
-    ...extraPlan.links.map((l) => path.relative(main, l.from)),
+    ...addedCopies.map((c) => path.relative(main, c.from)),
+    ...addedLinks.map((l) => path.relative(main, l.from)),
   ];
   let step = '';
   try {
