@@ -16,6 +16,7 @@ import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
+  excludePattern,
   gitRunner,
   installCommand,
   mainCheckout,
@@ -130,6 +131,15 @@ describe('worktree', () => {
   });
   afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
+  it('excludePattern: root-anchored, normalized and escaped; null outside the root', () => {
+    expect(excludePattern('notes')).toBe('/notes');
+    expect(excludePattern('./notes')).toBe('/notes');
+    expect(excludePattern('a//b/')).toBe('/a/b');
+    expect(excludePattern('odd[1]*?\\')).toBe('/odd\\[1\\]\\*\\?\\\\');
+    expect(excludePattern('a b ')).toBe('/a b\\ ');
+    expect(excludePattern('../x')).toBeNull();
+    expect(excludePattern('.')).toBeNull();
+  });
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
     expect(await mainCheckout(main, gitRunner)).toBe(real);
     const m = loadManifest(main);
@@ -225,7 +235,8 @@ describe('worktree', () => {
         'vars: { slot: 0, port: "{{ 3000 + slot * 100 }}" }',
         'worktree:',
         '  copy: [certs]',
-        '  install: bun install',
+        // templates in the worktree section see this checkout's slug and slot, not the main's
+        '  install: "echo {{ project }} {{ slot }}"',
         'apps:',
         '  db:',
         '    description: db',
@@ -249,14 +260,14 @@ describe('worktree', () => {
       manifest: 'worktree',
       copied: ['certs'],
       linked: [],
-      installed: 'bun install',
+      installed: 'echo demo-w1 1',
     });
     expect(
       fs.readFileSync(path.join(wt, '.mcproc', 'mcproc.local.yaml'), 'utf8')
     ).toContain('slot: 1');
     expect(r.vars.find((v) => v.name === 'port')?.value).toBe(3100);
     expect(fs.existsSync(path.join(wt, 'certs', 'k.pem'))).toBe(true);
-    expect(ran).toEqual([{ cmd: 'bun install', cwd: wt }]);
+    expect(ran).toEqual([{ cmd: 'echo demo-w1 1', cwd: wt }]);
     // the other way round: main declares a slot, the branch does not: the override gets no slot var
     git(['switch', '-qc', 'feat/plain', 'main'], main);
     fs.writeFileSync(
@@ -302,10 +313,15 @@ describe('worktree', () => {
   it("add: copy and link extras from the main checkout's override, and every link is ignored through git's exclude file", async () => {
     fs.mkdirSync(path.join(main, 'private'));
     fs.writeFileSync(path.join(main, 'private', 'p.md'), 'private');
+    fs.mkdirSync(path.join(main, 'odd[1]'));
+    fs.writeFileSync(path.join(main, 'odd[1]', 'o.md'), 'odd');
+    fs.mkdirSync(path.join(main, 'extra', 'a'), { recursive: true });
+    fs.writeFileSync(path.join(main, 'extra', 'a', 'one.txt'), 'one');
     fs.writeFileSync(path.join(main, 'local.env'), 'X=1');
+    // `./private` is the same link as `private`; `odd[1]` is a literal name git would read as a wildcard; a glob copy
     fs.writeFileSync(
       path.join(main, '.mcproc', 'mcproc.local.yaml'),
-      'worktree:\n  copy: [local.env]\n  link: [private]\n'
+      'worktree:\n  copy: [local.env, "extra/**/*.txt"]\n  link: [./private, "odd[1]"]\n'
     );
     const r = await worktreeAdd(
       loadManifest(main),
@@ -313,13 +329,24 @@ describe('worktree', () => {
       deps()
     );
     expect(r).toMatchObject({
-      copied: ['certs', 'snaps/a.spec.ts-snapshots', 'local.env'],
-      linked: ['notes', 'private'],
-      from_override: ['local.env', 'private'],
-      excluded: ['/notes', '/private'],
+      copied: [
+        'certs',
+        'snaps/a.spec.ts-snapshots',
+        'local.env',
+        'extra/a/one.txt',
+      ],
+      linked: ['notes', 'private', 'odd[1]'],
+      from_override: ['local.env', 'extra/a/one.txt', 'private', 'odd[1]'],
+      excluded: ['/notes', '/private', '/odd\\[1\\]'],
     });
     expect(fs.readFileSync(path.join(r.path, 'local.env'), 'utf8')).toBe('X=1');
+    expect(
+      fs.readFileSync(path.join(r.path, 'extra', 'a', 'one.txt'), 'utf8')
+    ).toBe('one');
     expect(fs.lstatSync(path.join(r.path, 'private')).isSymbolicLink()).toBe(
+      true
+    );
+    expect(fs.lstatSync(path.join(r.path, 'odd[1]')).isSymbolicLink()).toBe(
       true
     );
     // the exclude file is the repository's own (shared by its worktrees), never a tracked file
@@ -329,9 +356,15 @@ describe('worktree', () => {
     );
     expect(exclude).toContain('/notes\n');
     expect(exclude).toContain('/private\n');
+    expect(exclude).toContain('/odd\\[1\\]\n');
+    // the links are ignored; the copies show as the untracked files they are
     expect(
-      git(['status', '--porcelain'], r.path).trim().split('\n').filter(Boolean)
-    ).toEqual(['?? local.env']);
+      git(['status', '--porcelain'], r.path)
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .sort()
+    ).toEqual(['?? extra/', '?? local.env']);
     // a second worktree writes no duplicate lines
     await worktreeAdd(
       loadManifest(main),

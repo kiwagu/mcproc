@@ -301,7 +301,8 @@ decided, and how to go on; if git fails the slot is given back.
 
 Machine-local extras stay out of the repository: the main checkout's own `.mcproc/mcproc.local.yaml` may add to the
 lists, and every link, from either source, is written as a root-anchored pattern to git's exclude file of the repository
-(`.git/info/exclude`, shared by its worktrees, never tracked), so a linked folder never shows as untracked:
+(`.git/info/exclude`, shared by its worktrees, never tracked), so a linked folder does not show as untracked (when git
+cannot name that file, mcproc says so and the link stays visible to `git status`):
 
 ```yaml
 # .mcproc/mcproc.local.yaml of the main checkout
