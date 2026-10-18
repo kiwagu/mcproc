@@ -16,6 +16,7 @@ import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
+  excludePattern,
   gitRunner,
   installCommand,
   mainCheckout,
@@ -130,6 +131,15 @@ describe('worktree', () => {
   });
   afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
+  it('excludePattern: root-anchored, normalized and escaped; null outside the root', () => {
+    expect(excludePattern('notes')).toBe('/notes');
+    expect(excludePattern('./notes')).toBe('/notes');
+    expect(excludePattern('a//b/')).toBe('/a/b');
+    expect(excludePattern('odd[1]*?\\')).toBe('/odd\\[1\\]\\*\\?\\\\');
+    expect(excludePattern('a b ')).toBe('/a b\\ ');
+    expect(excludePattern('../x')).toBeNull();
+    expect(excludePattern('.')).toBeNull();
+  });
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
     expect(await mainCheckout(main, gitRunner)).toBe(real);
     const m = loadManifest(main);
@@ -197,6 +207,176 @@ describe('worktree', () => {
       project: 'demo-w1',
     });
     expect(loadManifest(wt).project).toBe('demo-w1');
+  });
+
+  it("add: the new worktree's manifest decides the slot var, the copies and the install; the main checkout's only when the worktree has none", async () => {
+    // main: no vars, no copies, no install hint; the branch: a slot var and a copy list, as a branch that introduces slots has
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.yaml'),
+      [
+        'version: 1',
+        'project: demo',
+        'worktree: { install: false }',
+        'apps:',
+        '  db:',
+        '    description: db',
+        '    run: node db.js',
+        '',
+      ].join('\n')
+    );
+    const c = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
+    git([...c, 'commit', '-qam', 'main without slots'], main);
+    git(['switch', '-qc', 'feat/slots'], main);
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.yaml'),
+      [
+        'version: 1',
+        'project: demo',
+        'vars: { slot: 0, port: "{{ 3000 + slot * 100 }}" }',
+        'worktree:',
+        '  copy: [certs]',
+        // templates in the worktree section see this checkout's slug and slot, not the main's
+        '  install: "echo {{ project }} {{ slot }}"',
+        'apps:',
+        '  db:',
+        '    description: db',
+        '    run: node db.js',
+        '    port: "{{ port }}"',
+        '',
+      ].join('\n')
+    );
+    git([...c, 'commit', '-qam', 'slots on the branch'], main);
+    git(['switch', '-q', 'main'], main);
+    const m = loadManifest(main);
+    expect(m.slot).toBeNull();
+    const r = await worktreeAdd(
+      m,
+      { branch: 'feat/slots', install: true },
+      deps()
+    );
+    const wt = path.join(`${real}.worktrees`, 'feat', 'slots');
+    expect(r).toMatchObject({
+      slot: 1,
+      manifest: 'worktree',
+      copied: ['certs'],
+      linked: [],
+      installed: 'echo demo-w1 1',
+    });
+    expect(
+      fs.readFileSync(path.join(wt, '.mcproc', 'mcproc.local.yaml'), 'utf8')
+    ).toContain('slot: 1');
+    expect(r.vars.find((v) => v.name === 'port')?.value).toBe(3100);
+    expect(fs.existsSync(path.join(wt, 'certs', 'k.pem'))).toBe(true);
+    expect(ran).toEqual([{ cmd: 'echo demo-w1 1', cwd: wt }]);
+    // the other way round: main declares a slot, the branch does not: the override gets no slot var
+    git(['switch', '-qc', 'feat/plain', 'main'], main);
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.yaml'),
+      'version: 1\nproject: demo\napps:\n  db:\n    description: db\n    run: node db.js\n'
+    );
+    git([...c, 'commit', '-qam', 'plain'], main);
+    git(['switch', '-q', 'main'], main);
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.yaml'),
+      [
+        'version: 1',
+        'project: demo',
+        'vars: { slot: 0 }',
+        'worktree: { copy: [certs], install: false }',
+        'apps:',
+        '  db:',
+        '    description: db',
+        '    run: node db.js',
+        '',
+      ].join('\n')
+    );
+    const r2 = await worktreeAdd(
+      loadManifest(main),
+      { branch: 'feat/plain', install: true },
+      deps()
+    );
+    // the plain manifest declares no install: the lockfile decides, as for any checkout
+    expect(r2).toMatchObject({
+      slot: 2,
+      manifest: 'worktree',
+      copied: [],
+      installed: 'bun install',
+    });
+    expect(
+      fs.readFileSync(
+        path.join(r2.path, '.mcproc', 'mcproc.local.yaml'),
+        'utf8'
+      )
+    ).not.toContain('slot:');
+  });
+
+  it("add: copy and link extras from the main checkout's override, and every link is ignored through git's exclude file", async () => {
+    fs.mkdirSync(path.join(main, 'private'));
+    fs.writeFileSync(path.join(main, 'private', 'p.md'), 'private');
+    fs.mkdirSync(path.join(main, 'odd[1]'));
+    fs.writeFileSync(path.join(main, 'odd[1]', 'o.md'), 'odd');
+    fs.mkdirSync(path.join(main, 'extra', 'a'), { recursive: true });
+    fs.writeFileSync(path.join(main, 'extra', 'a', 'one.txt'), 'one');
+    fs.writeFileSync(path.join(main, 'local.env'), 'X=1');
+    // `./private` is the same link as `private`; `odd[1]` is a literal name git would read as a wildcard; a glob copy
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.local.yaml'),
+      // `snaps/a.spec.ts-snapshots` is what the manifest's glob already copies: not the override's, not copied twice
+      'worktree:\n  copy: [local.env, "extra/**/*.txt", snaps/a.spec.ts-snapshots]\n  link: [./private, "odd[1]"]\n'
+    );
+    const r = await worktreeAdd(
+      loadManifest(main),
+      { branch: 'feat/x', install: false },
+      deps()
+    );
+    expect(r).toMatchObject({
+      copied: [
+        'certs',
+        'snaps/a.spec.ts-snapshots',
+        'local.env',
+        'extra/a/one.txt',
+      ],
+      linked: ['notes', 'private', 'odd[1]'],
+      from_override: ['local.env', 'extra/a/one.txt', 'private', 'odd[1]'],
+      excluded: ['/notes', '/private', '/odd\\[1\\]'],
+    });
+    expect(fs.readFileSync(path.join(r.path, 'local.env'), 'utf8')).toBe('X=1');
+    expect(
+      fs.readFileSync(path.join(r.path, 'extra', 'a', 'one.txt'), 'utf8')
+    ).toBe('one');
+    expect(fs.lstatSync(path.join(r.path, 'private')).isSymbolicLink()).toBe(
+      true
+    );
+    expect(fs.lstatSync(path.join(r.path, 'odd[1]')).isSymbolicLink()).toBe(
+      true
+    );
+    // the exclude file is the repository's own (shared by its worktrees), never a tracked file
+    const exclude = fs.readFileSync(
+      path.join(real, '.git', 'info', 'exclude'),
+      'utf8'
+    );
+    expect(exclude).toContain('/notes\n');
+    expect(exclude).toContain('/private\n');
+    expect(exclude).toContain('/odd\\[1\\]\n');
+    // the links are ignored; the copies show as the untracked files they are
+    expect(
+      git(['status', '--porcelain'], r.path)
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .sort()
+    ).toEqual(['?? extra/', '?? local.env']);
+    // a second worktree writes no duplicate lines
+    await worktreeAdd(
+      loadManifest(main),
+      { branch: 'feat/y', install: false },
+      deps()
+    );
+    expect(
+      fs
+        .readFileSync(path.join(real, '.git', 'info', 'exclude'), 'utf8')
+        .match(/\/private\n/g)?.length
+    ).toBe(1);
   });
 
   it('add: an existing branch is checked out as it is; without a .mcproc/.gitignore one that hides everything is written', async () => {

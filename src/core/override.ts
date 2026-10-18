@@ -8,13 +8,18 @@ import type { VarValue } from './template.js';
 
 export const OVERRIDE_REL = path.join('.mcproc', 'mcproc.local.yaml');
 
-/** The per-checkout override: a project slug and var values; nothing else may differ between checkouts of one manifest. */
+/**
+ * The per-checkout override: a project slug and var values, nothing else that the manifest decides; a main checkout's
+ * may also name machine-local copy and link extras for the worktrees made from it, so they never enter the repository.
+ */
 export interface Override {
   path: string;
   project?: string;
   /** the main checkout of the repository, recorded by worktree add so the slot registry can be found from a worktree */
   repo?: string;
   vars: Record<string, VarValue>;
+  /** extra `worktree.copy` and `worktree.link` entries for new worktrees, beside the manifest's */
+  worktree?: { copy: string[]; link: string[] };
 }
 
 const overrideSchema = z
@@ -28,6 +33,17 @@ const overrideSchema = z
     vars: z.preprocess(
       (v) => (v === null || v === undefined ? {} : v),
       z.record(z.union([z.string(), z.number(), z.boolean()]))
+    ),
+    // an empty `worktree:` key is no extras
+    worktree: z.preprocess(
+      (v) => (v === null ? undefined : v),
+      z
+        .object({
+          copy: z.array(z.string().min(1)).default([]),
+          link: z.array(z.string().min(1)).default([]),
+        })
+        .strict()
+        .optional()
     ),
   })
   .strict();
@@ -48,13 +64,16 @@ export function parseOverride(text: string, overridePath: string): Override {
     throw new McprocError(
       'MANIFEST_INVALID',
       `Invalid override ${overridePath}:\n  ${res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('\n  ')}`,
-      { hint: 'The override may set only project, repo and vars.' }
+      {
+        hint: 'The override may set only project, repo, vars and worktree (copy, link).',
+      }
     );
   return {
     path: overridePath,
     project: res.data.project,
     ...(res.data.repo !== undefined ? { repo: res.data.repo } : {}),
     vars: res.data.vars,
+    ...(res.data.worktree !== undefined ? { worktree: res.data.worktree } : {}),
   };
 }
 

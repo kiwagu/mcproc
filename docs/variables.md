@@ -26,7 +26,8 @@ apps:
   the names of apps, profiles and hosts, or in the `vars` names.
 - `.mcproc/mcproc.local.yaml` is the checkout's own override (it lives in the gitignored folder). It holds `project` (the
   slug this checkout runs under), `repo` (the main checkout, for a worktree) and `vars` (values that win over the
-  defaults). A var the manifest does not declare is refused.
+  defaults). A var the manifest does not declare is refused. In a main checkout it may also hold `worktree` (`copy`,
+  `link`): machine-local extras for every new worktree (see [worktrees](worktrees.md)).
 - `describe` without an app prints the resolved vars, where each value came from, and the override's path.
 
 The slot idiom: the manifest says `slot: 0` and writes ports as `'{{ 5181 + slot * 100 }}'` and containers as

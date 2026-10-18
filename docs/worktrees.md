@@ -18,9 +18,24 @@ mcproc worktree remove feat/x [--force]     # by branch, path or slot
 ```
 
 `worktree add` does, in order: claims the lowest free slot (or `--slot`) in the registry, makes `git worktree add` on the
-branch (a new branch starts at `--from`, default the main checkout's HEAD), copies and links the declared files, writes
-`.mcproc/mcproc.local.yaml` there with `repo`, `project` (`--slug`, default `<project>-w<slot>`) and, when the manifest declares a `slot` var, `vars.slot`, and
-runs the install. It prints the path and how to go on; if git fails the slot is given back.
+branch (a new branch starts at `--from`, default the main checkout's HEAD), then reads the new worktree's own manifest
+(the main checkout's only when the worktree has none that loads) for the rest: it writes `.mcproc/mcproc.local.yaml` there
+with `repo`, `project` (`--slug`, default `<project>-w<slot>`) and, when that manifest declares a `slot` var, `vars.slot`,
+copies and links what that manifest declares, and runs its install. So a branch that introduces the slot scheme gets a
+correct worktree from the first try, whatever the main checkout's manifest says. It prints the path, which manifest
+decided, and how to go on; if git fails the slot is given back.
+
+Machine-local extras stay out of the repository: the main checkout's own `.mcproc/mcproc.local.yaml` may add to the
+lists, and every link, from either source, is written as a root-anchored pattern to git's exclude file of the repository
+(`.git/info/exclude`, shared by its worktrees, never tracked), so a linked folder does not show as untracked (when git
+cannot name that file, mcproc says so and the link stays visible to `git status`):
+
+```yaml
+# .mcproc/mcproc.local.yaml of the main checkout
+worktree:
+  copy: [.env.local]
+  link: [notes]               # a folder the repository itself must not name
+```
 
 `worktree ls` reads only: each checkout's slot (0 is the main one), project slug, branch, apps online, lease state and
 path; a slot whose folder is gone shows `(gone)`, and `add` and `remove` reclaim it. `worktree remove` stops and deletes
