@@ -15,11 +15,13 @@ import { describeHost } from '../../transport/index.js';
 import type { HereCheck } from '../urlcheck.js';
 import type { StatSample } from '../stats.js';
 import type { Pm2Process } from '../pm2.js';
+import { describeError, isMcprocError } from '../errors.js';
 import type {
   EndpointRead,
   Orphan,
   ProjectInput,
   StackApps,
+  StackError,
   StackView,
 } from './types.js';
 
@@ -41,19 +43,25 @@ export const claimKey = (endpoint: string, namespace: string) =>
 /** Whether a path lies at or below a root (POSIX paths: a remote host's too). */
 const under = (p: string, root: string) =>
   p === root || p.startsWith(root.endsWith('/') ? root : `${root}/`);
+/** A directory without its trailing slashes, so that one directory written two ways compares equal. */
+const bare = (dir: string) => dir.replace(/(.)\/+$/, '$1');
 
-/** The directories a checkout's apps run from on one endpoint: the cwd of each of its hosts there, its root without a manifest. */
+/**
+ * The directories a checkout's apps run from on one endpoint: the cwd of each of its hosts there, its root without a
+ * manifest. A host its manifest does not know adds none: a rival's bad input never fails this checkout's read.
+ */
 function cwdsOn(p: ProjectInput, key: string): string[] {
   const m = p.manifest;
-  if (!m) return [p.root];
+  if (!m) return [bare(p.root)];
   return Object.entries(p.endpoints)
-    .filter(([, k]) => k === key)
-    .map(([name]) => pickHost(m, name).cwd);
+    .filter(([name, k]) => k === key && Object.hasOwn(m.hosts, name))
+    .map(([name]) => bare(m.hosts[name].cwd));
 }
 
 /**
  * The processes of `p`'s namespace on an endpoint that are its own. With one claimant, all of them; when checkouts share
- * the slug there, each process goes to the one whose directory holds its cwd most closely (none holds it: no one's).
+ * the slug there, each process goes to the one whose directory holds its cwd most closely. A process that no directory
+ * holds, or that two checkouts hold through the same directory, is no one's.
  */
 function ownProcs(
   p: ProjectInput,
@@ -67,12 +75,26 @@ function ownProcs(
     cwdsOn(c, key).map((dir) => ({ c, dir }))
   );
   return mine.filter((pr) => {
-    let best: { c: ProjectInput; dir: string } | undefined;
-    for (const d of dirs)
-      if (under(pr.cwd, d.dir) && (!best || d.dir.length > best.dir.length))
-        best = d;
-    return best?.c === p;
+    let best = -1;
+    let owners = new Set<ProjectInput>();
+    for (const d of dirs) {
+      if (!under(pr.cwd, d.dir) || d.dir.length < best) continue;
+      if (d.dir.length > best) {
+        best = d.dir.length;
+        owners = new Set();
+      }
+      owners.add(d.c);
+    }
+    return owners.size === 1 && owners.has(p);
   });
+}
+
+/** An error as a stack carries it: an mcproc error's code, message and hint; ERROR and the message for anything else. */
+function stackError(e: unknown): StackError {
+  if (!isMcprocError(e)) return { code: 'ERROR', message: describeError(e) };
+  return e.hint
+    ? { code: e.code, message: e.message, hint: e.hint }
+    : { code: e.code, message: e.message };
 }
 
 /** A process's memory as the tree under it holds it; pm2's root number without /proc stats. */
@@ -99,10 +121,15 @@ function counts(statuses: string[], queued: number): StackApps {
   };
 }
 
-/** A stack's totals from its app rows: what runs, what waits, the memory and cpu of what is online, its ports. */
+/**
+ * A stack's totals from its app rows: what runs, what waits in the queue (a starting lease has left it), the memory and
+ * cpu of what is online, its ports.
+ */
 function summary(rows: LsRow[]) {
   const online = rows.filter((r) => r.status === 'online');
-  const queued = rows.flatMap((r) => (r.lease ? [r.lease.position] : []));
+  const queued = rows.flatMap((r) =>
+    r.lease?.state === 'pending' ? [r.lease.position] : []
+  );
   const cpus = online.flatMap((r) => (r.cpu === null ? [] : [r.cpu]));
   return {
     apps: counts(
@@ -197,9 +224,8 @@ async function stackOf(
   );
   const notes = shared > 1 ? [`slug shared by ${shared} checkouts`] : [];
 
-  const m: Manifest | null = p.manifest;
-  if (!m) {
-    // no manifest to read the rows with: its namespace on the local daemon says what runs
+  // no rows to read (the manifest did not load, or reading with it failed): its namespace on the local daemon says what runs
+  const fromNamespace = (error: StackError | null): StackView => {
     const key = p.endpoints.local;
     const probe = key ? reads.get(key)?.probe : undefined;
     const procs = probe ? ownProcs(p, key, probe.procs, claimantsOn(key)) : [];
@@ -214,13 +240,38 @@ async function stackOf(
       memory: probe ? procs.reduce((a, x) => a + procMemory(x, probe), 0) : 0,
       cpu: null,
       ports: [],
-      manifest_error: p.error,
+      manifest_error: error,
       notes,
       present: procs.length > 0,
       rows: [],
     };
+  };
+  if (!p.manifest) return fromNamespace(p.error);
+  let rows: LsRow[];
+  try {
+    rows = await manifestRows(p, p.manifest, reads, claimantsOn, opts);
+  } catch (e) {
+    // one checkout's bad input fails its own stack, never the whole answer
+    return fromNamespace(stackError(e));
   }
+  return {
+    ...identity(p),
+    hosts,
+    ...summary(rows),
+    manifest_error: null,
+    notes,
+    rows,
+  };
+}
 
+/** A checkout's app rows, each read with its manifest from what the endpoint of its host answered. */
+async function manifestRows(
+  p: ProjectInput,
+  m: Manifest,
+  reads: Map<string, EndpointRead>,
+  claimantsOn: (key: string) => ProjectInput[],
+  opts: { hereCheck: HereCheck; prev?: Prev }
+): Promise<LsRow[]> {
   const byApp = new Map<string, LsRow>();
   for (const g of new Fleet(m, undefined).groups(Object.keys(m.apps))) {
     const key = p.endpoints[g.host];
@@ -256,15 +307,7 @@ async function stackOf(
     for (const row of rows) byApp.set(row.app, row);
   }
   // the manifest's order, as ls shows it, whichever host each app runs on
-  const rows = Object.keys(m.apps).map((a) => byApp.get(a)!);
-  return {
-    ...identity(p),
-    hosts,
-    ...summary(rows),
-    manifest_error: null,
-    notes,
-    rows,
-  };
+  return Object.keys(m.apps).map((a) => byApp.get(a)!);
 }
 
 function identity(p: ProjectInput) {

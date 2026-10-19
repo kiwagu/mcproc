@@ -7,6 +7,8 @@ import { parseProbe } from '../../src/core/ports.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import type { HostProbe } from '../../src/core/list.js';
 import { bareLocalHost } from '../../src/core/resolve.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
+import { stateDir } from '../../src/core/state.js';
 import {
   buildStacks,
   claimKey,
@@ -267,6 +269,128 @@ describe('buildStacks', () => {
     expect(byRoot[two].apps.online).toBe(1);
     expect(byRoot[one].apps.online).toBe(0);
     expect(r.orphans).toEqual([]);
+  });
+
+  it.each([
+    ['plain', '/srv/app'],
+    ['slash', '/srv/app/'],
+  ])(
+    'two checkouts of one slug in one directory on one endpoint (%s): the process belongs to neither',
+    async (tag, cwd2) => {
+      const SSH = 'ssh box|';
+      const yaml = (cwd: string) =>
+        `version: 1\nproject: tied\napps:\n  web: { description: w, run: "node w.js", host: box }\nhosts:\n  box: { ssh: box, cwd: ${cwd} }\n`;
+      const one = checkout(base, `tied-one-${tag}`, yaml('/srv/app'));
+      const two = checkout(base, `tied-two-${tag}`, yaml(cwd2));
+      const probe = probeOf([proc('tied-web', 'tied', '/srv/app', 901)]);
+      const r = await buildStacks(
+        [
+          { ...input(one), endpoints: { local: LOCAL, box: SSH } },
+          { ...input(two), endpoints: { local: LOCAL, box: SSH } },
+        ],
+        new Map([[SSH, { ...read(probe), key: SSH, label: 'box' }]]),
+        { all: true, hereCheck: noHere }
+      );
+      expect(r.stacks).toHaveLength(2);
+      for (const s of r.stacks) {
+        expect(s.apps.online).toBe(0);
+        expect(s.present).toBe(false);
+        expect(s.notes).toContain('slug shared by 2 checkouts');
+      }
+      expect(r.orphans).toEqual([]);
+    }
+  );
+
+  it('a starting lease has left the queue: queued and the queue position count the pending ones only', async () => {
+    const leased = checkout(
+      base,
+      'leased',
+      'version: 1\nproject: leased\napps:\n  a: { description: a, run: "node a.js" }\n  b: { description: b, run: "node b.js" }\n'
+    );
+    const m = loadManifest(leased);
+    // the suite's own state directory (test/setup.ts), which deriveSnapshot reads the leases from
+    const store = new LeaseStore(stateDir());
+    const lease = (apps: string[]) =>
+      store.withLock(() =>
+        store.create(
+          {
+            kind: 'start',
+            project: m.project,
+            root: m.root,
+            slot: null,
+            repo: m.repo,
+            target: apps[0],
+            host: null,
+            apps,
+            reload: false,
+            estimate_mib: 1,
+            need_mib: 1,
+            margin: 0,
+            reserve_mib: 0,
+            sources: {},
+            note: null,
+            requester_pid: process.pid,
+          },
+          'pending'
+        )
+      );
+    const starting = await lease(['a']);
+    await store.withLock(() => store.transition(starting.id, 'starting'));
+    const pending = await lease(['b']);
+    const r = await buildStacks(
+      [input(leased)],
+      new Map([[LOCAL, read(probeOf([]))]]),
+      { all: false, hereCheck: noHere }
+    );
+    const s = r.stacks[0];
+    expect(s.rows.map((x) => x.lease?.state)).toEqual(['starting', 'pending']);
+    expect(s.apps.queued).toBe(1);
+    expect(store.positionOf(pending.id)).toBe(2);
+    expect(s.queue_position).toBe(2);
+    expect(s.present).toBe(true);
+  });
+
+  it('a checkout that cannot be read with its manifest fails its own stack only', async () => {
+    const bad = checkout(
+      base,
+      'longhome',
+      `version: 1\nproject: longhome\napps:\n  web: { description: w, run: "node w.js" }\nhosts:\n  local: { pm2_home: /${'p'.repeat(100)} }\n`
+    );
+    const LONG = endpointKey(loadManifest(bad).hosts.local);
+    const probe = probeOf([proc('alpha-web', 'alpha', alpha, 701)]);
+    const r = await buildStacks(
+      [{ ...input(bad), endpoints: { local: LONG } }, input(alpha)],
+      new Map([
+        [LOCAL, read(probe)],
+        [LONG, { ...read(probeOf([])), key: LONG }],
+      ]),
+      { all: true, hereCheck: noHere }
+    );
+    const byRoot = Object.fromEntries(r.stacks.map((s) => [s.root, s]));
+    expect(byRoot[bad].manifest_error?.code).toBe('PM2_HOME_TOO_LONG');
+    expect(byRoot[bad].rows).toEqual([]);
+    expect(byRoot[alpha].manifest_error).toBeNull();
+    expect(byRoot[alpha].apps.online).toBe(1);
+  });
+
+  it('a rival whose endpoints name a host its manifest lacks does not fail the other checkout', async () => {
+    const yaml =
+      'version: 1\nproject: ghost\napps:\n  web: { description: w, run: "node w.js" }\n';
+    const one = checkout(base, 'ghost-one', yaml);
+    const two = checkout(base, 'ghost-two', yaml);
+    const probe = probeOf([proc('ghost-web', 'ghost', one, 801)]);
+    const r = await buildStacks(
+      [
+        input(one),
+        { ...input(two), endpoints: { local: LOCAL, nowhere: LOCAL } },
+      ],
+      new Map([[LOCAL, read(probe)]]),
+      { all: true, hereCheck: noHere }
+    );
+    const byRoot = Object.fromEntries(r.stacks.map((s) => [s.root, s]));
+    expect(byRoot[one].manifest_error).toBeNull();
+    expect(byRoot[one].apps.online).toBe(1);
+    expect(byRoot[two].apps.online).toBe(0);
   });
 
   it('orphan notes are carried; the namespace of a claimed project never is an orphan', async () => {
