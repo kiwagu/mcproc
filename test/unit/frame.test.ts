@@ -542,6 +542,15 @@ describe('renderFrame', () => {
       /^web {2}\| 2026-10-11T13:00:07: \x1b\[38;5;66mtimestamp=/
     );
   });
+  it('the apps table fits the width: no column falls off the edge, a long cell ends with …', () => {
+    for (const width of [80, 120]) {
+      const f = renderFrame(base(), { width, height: 24 });
+      expect(f.table[0]).toContain('RUNTIME');
+      for (const l of f.table)
+        expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      expect(f.table[1]).toMatch(/next-server.*…$/);
+    }
+  });
 });
 
 describe('logsTitle', () => {
