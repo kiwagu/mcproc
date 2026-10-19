@@ -81,6 +81,8 @@ import { runMonit } from '../monit/tui.js';
 export interface Io {
   out: (s: string) => void;
   err: (s: string) => void;
+  /** the terminal's columns when stdout is one; undefined when piped (text tables then keep one record per line) */
+  columns?: () => number | undefined;
 }
 type Globals = { project?: string; host?: string; json?: boolean };
 type Opts = Record<string, string | boolean | undefined>;
@@ -88,6 +90,7 @@ type Opts = Record<string, string | boolean | undefined>;
 const defaultIo: Io = {
   out: (s) => process.stdout.write(`${s}\n`),
   err: (s) => process.stderr.write(`${s}\n`),
+  columns: () => (process.stdout.isTTY ? process.stdout.columns : undefined),
 };
 
 /**
@@ -170,7 +173,7 @@ export async function printLs(
   io.out(
     how.json
       ? JSON.stringify(rows, null, 2)
-      : renderLs(rows, fleet.fallback, unread)
+      : renderLs(rows, fleet.fallback, unread, io.columns?.())
   );
   if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
 }
@@ -191,6 +194,8 @@ export function buildProgram(io: Io = defaultIo): Command {
 
   const emit = (g: Globals, text: string, data: unknown) =>
     io.out(g.json ? JSON.stringify(data, null, 2) : text);
+  /** the width text tables fit: the terminal's, none for --json or piped output */
+  const width = (g: Globals) => (g.json ? undefined : io.columns?.());
   const wrap =
     (fn: (g: Globals, opts: Opts, args: string[]) => Promise<void>) =>
     async (...all: unknown[]) => {
@@ -224,7 +229,13 @@ export function buildProgram(io: Io = defaultIo): Command {
     const fleet = fleetOf(g);
     const waits: WaitRecord[] = [];
     const rows = await actOn(fleet, target, act, { ...opts, waits });
-    const { text, failed } = renderMutation(rows, fleet.fallback, act, waits);
+    const { text, failed } = renderMutation(
+      rows,
+      fleet.fallback,
+      act,
+      waits,
+      width(g)
+    );
     emit(g, text, { ...hostsOf(rows, fleet.fallback), rows, waits });
     if (failed) process.exitCode = 1; // a host failed or was skipped: the first line says so, the exit code too
   };
@@ -261,7 +272,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest } = prepare({ project: g.project });
         const h = hostsInfo(manifest);
-        emit(g, renderHosts(h), h);
+        emit(g, renderHosts(h, width(g)), h);
       })
     );
   program
@@ -314,7 +325,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             `${d.app.name} [${d.app.kind}]: ${d.app.description}`,
             `run: ${d.app.run}`,
             `cwd: ${d.app.cwd}`,
-            renderLs([d.row], d.host),
+            renderLs([d.row], d.host, [], width(g)),
             urlNote(d.row),
             `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
           ]
@@ -557,7 +568,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [port]) => {
         const ctx = await ctxOf(g);
         const r = await portsReport(ctx, port ? Number(port) : undefined);
-        emit(g, renderPorts(r, ctx.host.name), r);
+        emit(g, renderPorts(r, ctx.host.name, width(g)), r);
       })
     );
   program
@@ -602,7 +613,7 @@ export function buildProgram(io: Io = defaultIo): Command {
           ctx = undefined; // no manifest here: the queue is the host's and still reads
         }
         const v = await leasesView(undefined, ctx);
-        emit(g, renderLeases(v), v);
+        emit(g, renderLeases(v, width(g)), v);
       })
     );
   leases
@@ -746,7 +757,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest, deps } = await worktreeCtx(g);
         const rows = await worktreeLs(manifest, deps);
-        emit(g, renderWorktrees(rows), rows);
+        emit(g, renderWorktrees(rows, width(g)), rows);
       })
     );
   worktree

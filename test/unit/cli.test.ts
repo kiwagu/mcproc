@@ -705,6 +705,25 @@ describe('cli', () => {
     expect(opt?.description).toMatch(/reload/);
     expect(opt?.required || opt?.optional).toBeFalsy(); // a switch, no value
   });
+  it('on a terminal the text tables stay within its columns; without columns they print as before', async () => {
+    const narrow = capture();
+    await buildProgram({ ...narrow.io, columns: () => 70 }).parseAsync(
+      ['hosts', '--project', basic],
+      { from: 'user' }
+    );
+    for (const l of narrow.out.join('\n').split('\n'))
+      expect(l.length).toBeLessThanOrEqual(70);
+    const plain = capture();
+    await buildProgram(plain.io).parseAsync(['hosts', '--project', basic], {
+      from: 'user',
+    });
+    expect(
+      plain.out
+        .join('\n')
+        .split('\n')
+        .some((l) => l.length > 70)
+    ).toBe(true);
+  });
 });
 
 describe('printLs (ls)', () => {

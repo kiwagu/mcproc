@@ -215,7 +215,8 @@ function fmtRestarts(r: LsRow): string {
 export function renderLs(
   rows: LsRow[],
   host: string,
-  errors: HostError[] = []
+  errors: HostError[] = [],
+  width?: number
 ): string {
   const hosts = [...new Set(rows.map((r) => r.host))];
   const multi = hosts.length > 1;
@@ -227,40 +228,46 @@ export function renderLs(
       rows.filter((r) => r.error).map((r) => [r.host, `${r.host}: ${r.error}`])
     ).values(),
   ];
+  const o = multi ? 1 : 0;
+  // without a width the long cells keep their caps (MCP answers, piped output); a terminal wraps them instead
+  const cap = (s: string, n: number) => (width === undefined ? cut(s, n) : s);
   return [
     head,
-    table([
+    table(
       [
-        'APP',
-        ...(multi ? ['HOST'] : []),
-        'KIND',
-        'STATUS',
-        'PID',
-        'UPTIME',
-        'RESTARTS',
-        'MEM',
-        'CPU',
-        'PORTS',
-        'URL',
-        'RUNTIME',
-        'DESCRIPTION',
+        [
+          'APP',
+          ...(multi ? ['HOST'] : []),
+          'KIND',
+          'STATUS',
+          'PID',
+          'UPTIME',
+          'RESTARTS',
+          'MEM',
+          'CPU',
+          'PORTS',
+          'URL',
+          'RUNTIME',
+          'DESCRIPTION',
+        ],
+        ...rows.map((r) => [
+          r.app,
+          ...(multi ? [r.host] : []),
+          r.kind,
+          r.status,
+          r.pid === null ? '-' : String(r.pid),
+          fmtUptime(r.uptime_ms),
+          fmtRestarts(r),
+          r.memory ? fmtBytes(r.memory) : '-',
+          r.status === 'online' ? fmtCpu(r.cpu) : '-',
+          fmtPorts(r.ports),
+          fmtUrl(r),
+          r.runtime ? cap(r.runtime, 32) : '-',
+          cap(r.description.split('\n')[0], 40),
+        ]),
       ],
-      ...rows.map((r) => [
-        r.app,
-        ...(multi ? [r.host] : []),
-        r.kind,
-        r.status,
-        r.pid === null ? '-' : String(r.pid),
-        fmtUptime(r.uptime_ms),
-        fmtRestarts(r),
-        r.memory ? fmtBytes(r.memory) : '-',
-        r.status === 'online' ? fmtCpu(r.cpu) : '-',
-        fmtPorts(r.ports),
-        fmtUrl(r),
-        r.runtime ? cut(r.runtime, 32) : '-',
-        cut(r.description.split('\n')[0], 40),
-      ]),
-    ]),
+      { width, flex: [8 + o, 9 + o, 10 + o, 11 + o], mode: 'wrap' }
+    ),
     ...unreachable,
     ...errors.map((e) => `${e.host}: ${e.message}`),
   ].join('\n');
@@ -294,38 +301,45 @@ export function renderPorts(
     port: number | null;
     listeners: Array<Listener & { app: string | null }>;
   },
-  host: string
+  host: string,
+  width?: number
 ): string {
   if (rep.listeners.length === 0)
     return `host: ${host}\n${rep.port ? `nothing listens on port ${rep.port}` : 'no listening sockets visible'}`;
   return (
     `host: ${host}\n` +
-    table([
-      ['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'],
-      ...rep.listeners.map((l) => [
-        l.proto,
-        l.addr,
-        String(l.port),
-        l.pid === null ? '?' : String(l.pid),
-        l.command ?? '?',
-        l.app ?? '-',
-        l.container ?? '-',
-      ]),
-    ])
+    table(
+      [
+        ['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'],
+        ...rep.listeners.map((l) => [
+          l.proto,
+          l.addr,
+          String(l.port),
+          l.pid === null ? '?' : String(l.pid),
+          l.command ?? '?',
+          l.app ?? '-',
+          l.container ?? '-',
+        ]),
+      ],
+      { width, flex: [4], mode: 'wrap' }
+    )
   );
 }
-export function renderHosts(info: HostInfo[]): string {
-  return table([
-    ['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME', 'APPS'],
-    ...info.map((h) => [
-      h.name,
-      h.transport,
-      h.cwd,
-      h.readonly ? 'yes' : 'no',
-      h.pm2_home ?? '-',
-      h.apps.length ? h.apps.join(', ') : '-',
-    ]),
-  ]);
+export function renderHosts(info: HostInfo[], width?: number): string {
+  return table(
+    [
+      ['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME', 'APPS'],
+      ...info.map((h) => [
+        h.name,
+        h.transport,
+        h.cwd,
+        h.readonly ? 'yes' : 'no',
+        h.pm2_home ?? '-',
+        h.apps.length ? h.apps.join(', ') : '-',
+      ]),
+    ],
+    { width, flex: [1, 2, 4, 5], mode: 'wrap' }
+  );
 }
 /** `container (docker), hostname ws-01`, or `no container, hostname dev-box` */
 export function fmtEnv(e: HostEnv): string {
@@ -680,7 +694,7 @@ export function queuedNote(rows: LsRow[]): string {
 }
 
 /** The queue as a table, oldest first, with the host's memory and the watcher's state above it. */
-export function renderLeases(v: LeasesView): string {
+export function renderLeases(v: LeasesView, width?: number): string {
   const head = [
     `state: ${v.state_dir}`,
     v.memory
@@ -706,20 +720,23 @@ export function renderLeases(v: LeasesView): string {
   ]);
   return [
     ...head,
-    table([
+    table(
       [
-        'POS',
-        'STATE',
-        'KIND',
-        'PROJECT',
-        'TARGET',
-        'EST → NEED',
-        'FROM',
-        'WAITING FOR / ERROR',
-        'ID',
+        [
+          'POS',
+          'STATE',
+          'KIND',
+          'PROJECT',
+          'TARGET',
+          'EST → NEED',
+          'FROM',
+          'WAITING FOR / ERROR',
+          'ID',
+        ],
+        ...rows,
       ],
-      ...rows,
-    ]),
+      { width, flex: [4, 7], mode: 'wrap' }
+    ),
   ].join('\n');
 }
 
@@ -728,7 +745,8 @@ export function renderMutation(
   rows: LsRow[],
   fallback: string,
   act: string,
-  waits: WaitRecord[] = []
+  waits: WaitRecord[] = [],
+  width?: number
 ): { text: string; failed: boolean } {
   const bad = rows.filter((r) => r.error);
   const notes = [
@@ -741,7 +759,10 @@ export function renderMutation(
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`
     : '';
   return {
-    text: head + renderLs(rows, fallback) + notes.map((n) => `\n${n}`).join(''),
+    text:
+      head +
+      renderLs(rows, fallback, [], width) +
+      notes.map((n) => `\n${n}`).join(''),
     failed: bad.length > 0,
   };
 }
@@ -806,18 +827,21 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
 }
 
 /** Every checkout of the repository as a table, slot 0 marked as the main one. */
-export function renderWorktrees(rows: WorktreeRow[]): string {
-  return table([
-    ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
-    ...rows.map((r) => [
-      r.main ? `${r.slot} (main)` : String(r.slot),
-      r.project,
-      r.branch ?? '(detached)',
-      String(r.online),
-      r.lease ?? '-',
-      r.path,
-    ]),
-  ]);
+export function renderWorktrees(rows: WorktreeRow[], width?: number): string {
+  return table(
+    [
+      ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
+      ...rows.map((r) => [
+        r.main ? `${r.slot} (main)` : String(r.slot),
+        r.project,
+        r.branch ?? '(detached)',
+        String(r.online),
+        r.lease ?? '-',
+        r.path,
+      ]),
+    ],
+    { width, flex: [2, 5], mode: 'wrap' }
+  );
 }
 
 /** A removed worktree in one line: its path, the slot it freed, the branch it kept and the apps it stopped. */

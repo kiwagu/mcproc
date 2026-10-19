@@ -35,6 +35,8 @@ import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import { VERSION } from '../../src/version.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
+import type { LeasesView } from '../../src/core/leases/view.js';
+import { displayWidth } from '../../src/monit/screentext.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (n: string) => path.join(here, '..', 'fixtures', 'projects', n);
@@ -1572,5 +1574,66 @@ describe('worktree renderers', () => {
     ).toBe(
       'removed /w/demo.worktrees/a: slot 1 is free, branch a kept; stopped db'
     );
+  });
+});
+
+describe('width-aware CLI tables', () => {
+  const lease = {
+    id: 'l_ztwaectxgu',
+    position: null,
+    state: 'cancelled',
+    kind: 'exec',
+    project: 'demo',
+    slot: 0,
+    target:
+      'bun run scripts/gates/record-after.ts e2e -- bun tests/e2e/scripts/run-e2e.ts',
+    estimate_mib: 4096,
+    need_mib: 4506,
+    sources: {},
+    waiting_for: null,
+    error:
+      'NOT_STARTED: cannot launch the lease watcher: this mcproc runs from /home/u/.local/bin/mcproc, not from a built cli.js',
+  };
+  const view = {
+    state_dir: '/home/u/.local/state/mcproc',
+    memory: null,
+    watcher: null,
+    leases: [lease],
+  } as unknown as LeasesView;
+
+  it('leases keeps every line within the width, wrapping TARGET and WAITING FOR / ERROR in their columns; ID stays on the first line', () => {
+    for (const width of [120, 200]) {
+      const lines = renderLeases(view, width).split('\n').slice(2);
+      for (const l of lines) expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      expect(lines[0]).toMatch(/^POS\s+STATE/);
+      expect(lines[1]).toMatch(/l_ztwaectxgu$/);
+      expect(lines.length).toBeGreaterThan(2); // the error went on to more lines
+      const col = lines[0].indexOf('WAITING FOR');
+      for (const l of lines.slice(2))
+        if (l.trim())
+          expect(l.slice(0, col).trim()).not.toMatch(/exec|cancelled/); // continuation lines: other cells blank
+    }
+  });
+  it('without a width the leases table is one line per lease, as before', () => {
+    const lines = renderLeases(view).split('\n');
+    expect(lines).toHaveLength(4); // state, memory, header, the lease
+    expect(lines[3]).toContain('not from a built cli.js');
+  });
+  it('hosts wraps its CWD within a narrow width', () => {
+    const info = [
+      {
+        name: 'local',
+        transport: 'local',
+        readonly: false,
+        cwd: '/home/u/a/very/long/checkout/path/of/the/project',
+        runtime: 'path',
+        pm2: null,
+        pm2_home: null,
+        apps: [],
+      },
+    ];
+    for (const l of renderHosts(info, 60).split('\n'))
+      expect(displayWidth(l)).toBeLessThanOrEqual(60);
+    expect(renderHosts(info).split('\n')).toHaveLength(2);
   });
 });
