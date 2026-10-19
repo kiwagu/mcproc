@@ -1,0 +1,55 @@
+name: release
+
+# A pushed annotated vX.Y.Z tag is a release: npm through trusted publishing (no token; npm adds provenance), then a
+# GitHub Release with the commits since the previous one. A re-run picks up where a failed run stopped. GitHub starts
+# no run for a push of more than three tags, so a release tag goes out in a push of its own.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # the GitHub Release
+  id-token: write # npm trusted publishing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # main and the earlier tags: the check and the notes read them
+
+      - name: The tag names the version in package.json, on main
+        run: sh scripts/release-check.sh "$GITHUB_REF_NAME" origin/main
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: An npm that publishes through trusted publishing
+        run: npm install -g npm@11.6.2
+
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run check
+      - run: npx vitest run test/unit
+      - run: bun run build
+
+      - name: Integration tests against a real pm2
+        run: npx vitest run test/integration
+        env:
+          MCPROC_IT: '1'
+          MCPROC_CLI: ${{ github.workspace }}/dist/cli.js
+
+      - name: Publish to npm
+        run: sh scripts/release-publish.sh "$GITHUB_REF_NAME"
+
+      - name: GitHub Release
+        run: sh scripts/release-github.sh "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
