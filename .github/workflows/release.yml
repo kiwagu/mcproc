@@ -1,7 +1,8 @@
 name: release
 
-# A pushed vX.Y.Z tag is a release: checked against package.json and main, tested, published to npm through
-# trusted publishing (no token; npm adds provenance), and given a GitHub Release listing the commits since the last one.
+# A pushed annotated vX.Y.Z tag is a release: npm through trusted publishing (no token; npm adds provenance), then a
+# GitHub Release with the commits since the previous one. A re-run picks up where a failed run stopped. GitHub starts
+# no run for a push of more than three tags, so a release tag goes out in a push of its own.
 on:
   push:
     tags: ['v*']
@@ -46,11 +47,9 @@ jobs:
           MCPROC_CLI: ${{ github.workspace }}/dist/cli.js
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: sh scripts/release-publish.sh "$GITHUB_REF_NAME"
 
       - name: GitHub Release
-        run: |
-          sh scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+        run: sh scripts/release-github.sh "$GITHUB_REF_NAME"
         env:
           GH_TOKEN: ${{ github.token }}
