@@ -13,6 +13,7 @@ import {
 } from '../reloads.js';
 import {
   collapse,
+  cutContext,
   compileRules,
   detect,
   stampOf,
@@ -436,12 +437,13 @@ function processEvents(
   prev: AppMark | undefined,
   errLines: string[]
 ): Incident[] {
-  const tail = errLines.slice(-EVENT_TAIL);
+  const last = errLines.slice(-EVENT_TAIL);
   const time =
-    [...tail]
+    [...last]
       .reverse()
       .map(stampOf)
       .find((t) => t !== null) ?? null;
+  const tail = last.map(cutContext); // context, cut like any other incident's
   const event = (
     kind: 'crashed' | 'restarted',
     count: number,

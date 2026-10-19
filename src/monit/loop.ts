@@ -278,7 +278,11 @@ export class MonitLoop {
       }
       this.dispatch({
         type: 'incidents',
-        incidents: answer.incidents,
+        // each with where this read ended in its file: what tells one stamped like the agent's last line from a later one
+        incidents: answer.incidents.map((i) => {
+          const m = next.apps[markKey(i.host, i.app)]?.[i.stream];
+          return m ? { ...i, end: { path: m.path, offset: m.offset } } : i;
+        }),
         cleared_at: answer.cleared_at,
         errors: [
           ...answer.errors.map((e) => `${e.host}: ${e.message}`),

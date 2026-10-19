@@ -791,7 +791,15 @@ describe('incidents the agent has taken', () => {
     });
     return reduce(s, {
       type: 'taken',
-      taken: { 'local/api': { err: '2026-10-15T10:00:02.000' } },
+      taken: {
+        'local/api': {
+          err: {
+            stamp: '2026-10-15T10:00:02.500',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
     });
   };
   it('t hides and shows them, only on the incidents screen', () => {
@@ -814,12 +822,73 @@ describe('incidents the agent has taken', () => {
     let s = reduce(opened(), { type: 'hideTaken' });
     s = reduce(s, {
       type: 'taken',
-      taken: { 'local/api': { err: '2026-10-15T10:00:09.000' } },
+      taken: {
+        'local/api': {
+          err: {
+            stamp: '2026-10-15T10:00:09.000',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
     });
     expect(s.incidentsTaken).toEqual({
-      'local/api': { err: '2026-10-15T10:00:09.000' },
+      'local/api': {
+        err: { stamp: '2026-10-15T10:00:09.000', path: '/l/x-err', offset: 0 },
+      },
     });
     expect(visibleIncidents(s)).toEqual([]);
+  });
+  it('an incident stamped like the last line of a take is taken only when its read ended within the take', () => {
+    const at = '2026-10-15T10:00:02.500';
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    const same = (offset: number) => ({
+      ...inc(9),
+      time: at,
+      end: { path: '/l/x-err', offset },
+    });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [
+        { ...same(150), line: 'later' },
+        { ...same(100), line: 'within' },
+      ],
+      cleared_at: null,
+      errors: [],
+    });
+    s = reduce(s, {
+      type: 'taken',
+      taken: {
+        'local/api': { err: { stamp: at, path: '/l/x-err', offset: 120 } },
+      },
+    });
+    s = reduce(s, { type: 'hideTaken' });
+    expect(visibleIncidents(s).map((i) => i.line)).toEqual(['later']);
+  });
+  it('a take that hides incidents under a scrolled view keeps the ones in view where they are', () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(5), inc(4), inc(3)],
+      cleared_at: null,
+      errors: [],
+    }); // shown: 3, 4, 5
+    s = reduce(s, { type: 'hideTaken' });
+    s = reduce(s, { type: 'scroll', delta: 1 }); // 5 under the view
+    expect(s.logScroll).toBe(1);
+    s = reduce(s, {
+      type: 'taken',
+      taken: {
+        'local/api': {
+          err: {
+            stamp: '2026-10-15T10:00:05.500',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
+    }); // everything taken: 5 is gone from under the view
+    expect(s.logScroll).toBe(0);
   });
   it('the scroll counts what is shown: hidden incidents take no room', () => {
     let s = reduce(opened(), { type: 'hideTaken' });

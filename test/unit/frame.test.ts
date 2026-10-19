@@ -701,7 +701,15 @@ describe('the incidents view', () => {
   it('shows what the agent has taken in muted colors, marked taken; its title counts them; t hides them', () => {
     const taken = reduce(open([inc(2), inc(1)]), {
       type: 'taken',
-      taken: { 'local/web': { err: '2026-10-15T10:00:01.000' } },
+      taken: {
+        'local/web': {
+          err: {
+            stamp: '2026-10-15T10:00:01.500',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
     });
     const f = renderFrame(taken, { width: 120, height: 30 });
     expect(f.logs).toEqual([
@@ -732,7 +740,15 @@ describe('the incidents view', () => {
     const s = reduce(
       reduce(open([inc(1)]), {
         type: 'taken',
-        taken: { 'local/web': { err: '2026-10-15T10:00:05.000' } },
+        taken: {
+          'local/web': {
+            err: {
+              stamp: '2026-10-15T10:00:05.000',
+              path: '/l/x-err',
+              offset: 0,
+            },
+          },
+        },
       }),
       { type: 'hideTaken' }
     );

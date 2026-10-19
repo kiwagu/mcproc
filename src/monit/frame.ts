@@ -20,6 +20,7 @@ import {
   type MonitState,
   type ReloadInfo,
   visibleIncidents,
+  type ShownIncident,
 } from './state.js';
 import type { LogLine } from '../core/logfollow.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
@@ -97,9 +98,13 @@ function paneSpec(
       logH: Math.max(3, size.height - 3 - s.incidentsErrors.length),
       rowsOf: (e) =>
         incidentRows(
-          e as Incident,
+          e as ShownIncident,
           w,
-          isTaken(e as Incident, s.incidentsTaken)
+          isTaken(
+            e as ShownIncident,
+            s.incidentsTaken,
+            (e as ShownIncident).end
+          )
         ),
     };
   if (s.view === 'flat') {
@@ -486,7 +491,7 @@ export function logsTitle(
       ? ` · since the clear ${clearedAt(s.incidentsCleared, now)}`
       : '';
     const taken = s.incidents.filter((i) =>
-      isTaken(i, s.incidentsTaken)
+      isTaken(i, s.incidentsTaken, i.end)
     ).length;
     const marked = taken
       ? ` · ${taken} taken${s.hideTaken ? ' hidden' : ''}`
