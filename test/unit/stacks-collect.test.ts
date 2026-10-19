@@ -139,6 +139,46 @@ describe('StacksCollector', () => {
     });
   });
 
+  it('a manifest that does not load leaves the namespace an orphan with a note naming its error', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const bad = checkout(base, 'bad', 'version: 1\nproject: x\napps: {}\n');
+    const local = probeOf([proc('x-a', 'x', bad, 22)]);
+    const v = await new StacksCollector(
+      deps(path.join(base, 'state'), () => local)
+    ).collect({ all: false });
+    expect(v.answer.orphans[0]).toMatchObject({
+      namespace: 'x',
+      note: `manifest at ${path.join(bad, '.mcproc', 'mcproc.yaml')}: MANIFEST_INVALID`,
+    });
+  });
+
+  it('the walk up from an orphan cwd is read once until the registry is read again, its note kept', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const other = checkout(
+      base,
+      'other',
+      'version: 1\nproject: other\napps:\n  a: { description: a, run: "node a.js" }\n'
+    );
+    const local = probeOf([proc('x-a', 'x', other, 23)]);
+    const d = deps(path.join(base, 'state'), () => local);
+    let parsed = 0;
+    d.loadManifest = (root) => {
+      if (root === other) parsed++;
+      return loadManifest(root);
+    };
+    const c = new StacksCollector(d);
+    await c.collect({ all: false });
+    const v = await c.collect({ all: false });
+    expect(parsed).toBe(1);
+    expect(v.answer.orphans[0].note).toBe(
+      `manifest at ${path.join(other, '.mcproc', 'mcproc.yaml')} names other`
+    );
+    for (let i = 2; i < REGISTRY_EVERY; i++) await c.collect({ all: false });
+    expect(parsed).toBe(1);
+    await c.collect({ all: false }); // the registry is read again: the walk with it
+    expect(parsed).toBe(2);
+  });
+
   it('probes a remote endpoint at most every 10 s, and every 30 s after a failure, keeping the last data with its age', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
     const state = path.join(base, 'state');

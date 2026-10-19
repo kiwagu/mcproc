@@ -18,21 +18,19 @@ export async function stopStack(
   m: Manifest,
   connector: Connector = defaultConnector()
 ): Promise<StackStop> {
-  const fleet = new Fleet(m, undefined, connector);
-  const ro = new Map<string, string[]>();
-  const names = fleet.select(['all']).filter((a) => {
-    const h = fleet.hostOf(a);
-    if (!pickHost(m, h).readonly) return true;
-    ro.set(h, [...(ro.get(h) ?? []), a]);
-    return false;
-  });
-  const out: StackStop = {
-    stopped: [],
-    readonly: [...ro].map(([host, apps]) => ({ host, apps })),
-    failed: [],
-  };
-  if (names.length === 0) return out;
+  const out: StackStop = { stopped: [], readonly: [], failed: [] };
+  // a host the manifest cannot give (pickHost) is reported like any other failure, never thrown
   try {
+    const fleet = new Fleet(m, undefined, connector);
+    const ro = new Map<string, string[]>();
+    const names = fleet.select(['all']).filter((a) => {
+      const h = fleet.hostOf(a);
+      if (!pickHost(m, h).readonly) return true;
+      ro.set(h, [...(ro.get(h) ?? []), a]);
+      return false;
+    });
+    out.readonly = [...ro].map(([host, apps]) => ({ host, apps }));
+    if (names.length === 0) return out;
     for (const r of await actOn(fleet, names, 'stop'))
       if (r.error)
         out.failed.push({ host: r.host, message: `${r.app}: ${r.error}` });

@@ -94,6 +94,9 @@ interface Cached {
   next: number;
 }
 
+/** What the walk up from a cwd found: a checkout to adopt, or the note an orphan carries (null: none). */
+type Walk = { manifest: Manifest } | { note: string | null };
+
 const short = (e: unknown) => describeError(e).split('\n')[0].slice(0, 120);
 
 /** The stacks of this host, refresh after refresh: one probe per endpoint, remote ones at their own pace. */
@@ -107,6 +110,8 @@ export class StacksCollector {
   private hosts = new Map<string, Host>();
   /** the real roots of the checkouts this collector found on the daemon: they stay daemon-found for its life */
   private readonly adopted = new Set<string>();
+  /** the walks that made no stack, by namespace and cwd, with the note each leaves; cleared with each registry read */
+  private readonly misses = new Map<string, string | null>();
   private readonly links = new Map<string, Promise<HostLink>>();
   private readonly cache = new Map<string, Cached>();
 
@@ -239,6 +244,7 @@ export class StacksCollector {
     const { entries, error } = listProjects(this.deps.stateDir);
     this.registryError = error;
     this.hosts = new Map([[this.localKey, this.local]]);
+    this.misses.clear();
     const byRoot = new Map<string, ProjectInput>();
     for (const e of entries) {
       const source = this.adopted.has(realOf(e.root)) ? 'daemon' : 'registry';
@@ -324,8 +330,9 @@ export class StacksCollector {
 
   /**
    * The local daemon's namespaces no known checkout claims: a manifest above a process's cwd that names the namespace
-   * makes it a stack, recorded from then on. One that names another project leaves a note on the orphan; a checkout
-   * known already (its apps run elsewhere) is never a second stack.
+   * makes it a stack, recorded from then on. One that names another project, or does not load, leaves a note on the
+   * orphan; a checkout known already (its apps run elsewhere) is never a second stack. A walk that made no stack is
+   * kept with its note until the registry is read again: a refresh does not parse the same manifest twice.
    */
   private adopt(read: EndpointRead | undefined): Map<string, string> {
     const notes = new Map<string, string>();
@@ -343,28 +350,39 @@ export class StacksCollector {
     for (const [ns, dirs] of cwds) {
       const note = claimKey(this.localKey, ns);
       for (const cwd of dirs) {
-        const found = this.deps.findManifest(cwd);
-        if (!found) continue;
-        let m: Manifest;
-        try {
-          m = this.deps.loadManifest(found.root);
-        } catch {
-          continue; // a manifest that does not load leaves the namespace an orphan
+        const missed = `${ns}\0${cwd}`;
+        const r: Walk = this.misses.has(missed)
+          ? { note: this.misses.get(missed) ?? null }
+          : this.walk(ns, cwd, roots);
+        if ('manifest' in r) {
+          const real = realOf(r.manifest.root);
+          recordProject(r.manifest, this.deps.stateDir);
+          this.adopted.add(real);
+          roots.add(real);
+          this.known.push(this.inputOf(r.manifest, 'daemon'));
+          notes.delete(note);
+          break;
         }
-        if (m.project !== ns) {
-          notes.set(note, `manifest at ${found.path} names ${m.project}`);
-          continue;
-        }
-        const real = realOf(m.root);
-        if (roots.has(real)) continue;
-        recordProject(m, this.deps.stateDir);
-        this.adopted.add(real);
-        roots.add(real);
-        this.known.push(this.inputOf(m, 'daemon'));
-        notes.delete(note);
-        break;
+        this.misses.set(missed, r.note);
+        if (r.note !== null) notes.set(note, r.note);
       }
     }
     return notes;
+  }
+
+  /** The walk up from one cwd of namespace `ns`: the manifest that makes it a stack, or the note it leaves (null: none). */
+  private walk(ns: string, cwd: string, roots: Set<string>): Walk {
+    const found = this.deps.findManifest(cwd);
+    if (!found) return { note: null };
+    let m: Manifest;
+    try {
+      m = this.deps.loadManifest(found.root);
+    } catch (e) {
+      return { note: `manifest at ${found.path}: ${stackError(e).code}` };
+    }
+    if (m.project !== ns)
+      return { note: `manifest at ${found.path} names ${m.project}` };
+    if (roots.has(realOf(m.root))) return { note: null };
+    return { manifest: m };
   }
 }

@@ -257,6 +257,16 @@ describe('actOn: changes reach each app at its host', () => {
       "box: pm2 'stop' '3'",
     ]);
   });
+  it('a start of a list is refused before any host is touched: a queued start is replayed by one name', async () => {
+    const h = fakeFleet(undefined, {});
+    await expect(
+      actOn(h.fleet, ['watch', 'web'], 'start')
+    ).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      hint: 'Start one app or profile; a list of targets is for stop, restart and delete.',
+    });
+    expect(h.connected).toEqual([]);
+  });
 });
 
 describe('stopStack', () => {
@@ -284,6 +294,25 @@ describe('stopStack', () => {
     expect(out.failed).toEqual([
       { host: 'box', message: expect.stringMatching(/^web: TRANSPORT_FAILED/) },
     ]);
+  });
+  it('a host that cannot be built is reported as the one failure, not thrown, and nothing is stopped', async () => {
+    const h = fakeFleet(undefined, procs);
+    const bad = {
+      ...m,
+      hosts: {
+        ...m.hosts,
+        box: { ...m.hosts.box, pm2_home: `/${'h'.repeat(95)}` },
+      },
+    };
+    const out = await stopStack(bad, h.connector);
+    expect(out).toEqual({
+      stopped: [],
+      readonly: [],
+      failed: [
+        { host: '-', message: expect.stringContaining('PM2_HOME_TOO_LONG') },
+      ],
+    });
+    expect(h.connected).toEqual([]);
   });
   it('when no host answers, the error is the one failure', async () => {
     const h = fakeFleet(undefined, procs, ['local', 'box']);
