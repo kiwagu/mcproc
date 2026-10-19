@@ -1,9 +1,40 @@
 {
   "name": "mcproc",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "pm2 process control for agents over MCP: local and remote hosts, per-app ports, one manifest per project",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "pm2",
+    "process-manager",
+    "ai-agents",
+    "coding-agents",
+    "claude-code",
+    "developer-tools",
+    "cli",
+    "tui",
+    "terminal-dashboard",
+    "typescript",
+    "nodejs",
+    "ssh",
+    "docker",
+    "dev-server",
+    "log-monitoring",
+    "monorepo",
+    "turborepo"
+  ],
+  "homepage": "https://github.com/kiwagu/mcproc#readme",
+  "bugs": {
+    "url": "https://github.com/kiwagu/mcproc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kiwagu/mcproc.git"
+  },
   "type": "module",
   "license": "MIT",
+  "author": "Kiwagu",
   "bin": {
     "mcproc": "dist/cli.js"
   },
