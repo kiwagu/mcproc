@@ -270,11 +270,12 @@ function failedRows(fleet: Fleet, r: HostApps, e: unknown): LsRow[] {
  * lease gate first (a queued run answers queued rows for the apps the gate counted, the real rows of the others, and
  * holds back the dependents of the queued ones in later runs), and a start the watcher admitted ends its lease once,
  * over every local row. A local stop or delete first cancels the checkout's queued and starting leases it overlaps
- * (ending a starting one's child), then acts, then frees the running leases that no longer hold anything.
+ * (ending a starting one's child), then acts, then frees the running leases that no longer hold anything. A list of
+ * targets is one change over all of their apps, each once.
  */
 export async function actOn(
   fleet: Fleet,
-  target: string,
+  target: string | string[],
   act: Act,
   opts: {
     reload?: boolean;
@@ -289,7 +290,7 @@ export async function actOn(
     gate?: GateDeps;
   } = {}
 ): Promise<LsRow[]> {
-  const named = fleet.select([target]);
+  const named = fleet.select(Array.isArray(target) ? target : [target]);
   const names = act === 'start' ? fleet.withDeps(named) : named;
   const runs = fleet.runs(names);
   assertWritableRuns(fleet, runs, named);
@@ -336,7 +337,7 @@ export async function actOn(
           ctx,
           r.apps,
           {
-            target,
+            target: Array.isArray(target) ? target.join(' ') : target,
             host: fleet.requested ?? null,
             reload: opts.reload,
             note: opts.note,

@@ -90,7 +90,7 @@ function ownProcs(
 }
 
 /** An error as a stack carries it: an mcproc error's code, message and hint; ERROR and the message for anything else. */
-function stackError(e: unknown): StackError {
+export function stackError(e: unknown): StackError {
   if (!isMcprocError(e)) return { code: 'ERROR', message: describeError(e) };
   return e.hint
     ? { code: e.code, message: e.message, hint: e.hint }

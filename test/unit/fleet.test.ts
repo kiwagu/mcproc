@@ -10,7 +10,9 @@ import {
   actOn,
   listFleet,
   describeFleetApp,
+  type Connector,
 } from '../../src/core/fleet.js';
+import { stopStack } from '../../src/core/stacks/stop.js';
 import { describeProject } from '../../src/core/list.js';
 import { renderMutation } from '../../src/mcp/render.js';
 import { listWithReloads } from '../../src/core/reloadcount.js';
@@ -162,7 +164,7 @@ function fakeFleet(
   const log: string[] = [];
   const connected: string[] = [];
   const ctxs: Record<string, ReturnType<typeof fakeCtx>> = {};
-  const fleet = new Fleet(m, requested, async (_m, host, fallback) => {
+  const connector: Connector = async (_m, host, fallback) => {
     connected.push(host);
     if (down.includes(host))
       throw new McprocError(
@@ -185,12 +187,13 @@ function fakeFleet(
       fallback
     );
     return ctxs[host];
-  });
+  };
+  const fleet = new Fleet(m, requested, connector);
   const starts = () =>
     log
       .filter((l) => l.includes('startOrRestart'))
       .map((l) => `${l.split(':')[0]} ${/--only' '([^']+)'/.exec(l)![1]}`);
-  return { fleet, log, connected, ctxs, starts };
+  return { fleet, connector, log, connected, ctxs, starts };
 }
 
 describe('actOn: changes reach each app at its host', () => {
@@ -240,6 +243,54 @@ describe('actOn: changes reach each app at its host', () => {
     expect(h.log.filter((l) => l.includes("'stop'"))).toEqual([
       "local: pm2 'stop' '0'",
       "box: pm2 'stop' '3'",
+    ]);
+  });
+  it('actOn takes a list of targets: the named apps, in one change', async () => {
+    const h = fakeFleet(undefined, {
+      local: [proc('watch', 0, dir)],
+      box: [proc('web', 3, '/home/dev/fleet')],
+    });
+    const rows = await actOn(h.fleet, ['watch', 'web'], 'stop');
+    expect(rows.map((r) => r.app).sort()).toEqual(['watch', 'web']);
+    expect(h.log.filter((l) => l.includes("'stop'"))).toEqual([
+      "local: pm2 'stop' '0'",
+      "box: pm2 'stop' '3'",
+    ]);
+  });
+});
+
+describe('stopStack', () => {
+  const procs = {
+    local: [proc('watch', 0, dir), proc('tool', 1, dir)],
+    box: [proc('web', 3, '/home/dev/fleet')],
+  };
+  it('stops every app at its own host and leaves the apps of a readonly host alone, saying so', async () => {
+    const h = fakeFleet(undefined, procs);
+    const out = await stopStack(m, h.connector);
+    expect(out.stopped.sort()).toEqual(['tool', 'watch', 'web']);
+    expect(out.readonly).toEqual([{ host: 'ro', apps: ['audit'] }]);
+    expect(out.failed).toEqual([]);
+    expect(h.connected).not.toContain('ro');
+    expect(h.log.filter((l) => l.includes("'stop'")).sort()).toEqual([
+      "box: pm2 'stop' '3'",
+      "local: pm2 'stop' '0'",
+      "local: pm2 'stop' '1'",
+    ]);
+  });
+  it('a host that fails is named with each of its apps; the other hosts still stop', async () => {
+    const h = fakeFleet(undefined, procs, ['box']);
+    const out = await stopStack(m, h.connector);
+    expect(out.stopped.sort()).toEqual(['tool', 'watch']);
+    expect(out.failed).toEqual([
+      { host: 'box', message: expect.stringMatching(/^web: TRANSPORT_FAILED/) },
+    ]);
+  });
+  it('when no host answers, the error is the one failure', async () => {
+    const h = fakeFleet(undefined, procs, ['local', 'box']);
+    const out = await stopStack(m, h.connector);
+    expect(out.stopped).toEqual([]);
+    expect(out.failed).toEqual([
+      { host: '-', message: expect.stringContaining('TRANSPORT_FAILED') },
     ]);
   });
 });
