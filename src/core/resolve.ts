@@ -1,7 +1,10 @@
+import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from './errors.js';
 import {
+  DEFAULT_SHELL,
   loadManifest,
+  parseShell,
   scopeManifest,
   type Host,
   type Manifest,
@@ -38,6 +41,22 @@ export interface Context extends Prepared {
   resolution: Pm2Resolution;
   /** checks a url from this machine when url_check asks for it; tests pass a fake */
   hereCheck: HereCheck;
+}
+
+/** What a probe of a host needs: how to reach it and its pm2, no manifest. */
+export type HostLink = Pick<Context, 'host' | 'transport' | 'pm2'>;
+
+/** The local host as a manifest without `hosts.local` declares it: the login shell, pm2's default home. */
+export function bareLocalHost(): Host {
+  return {
+    name: 'local',
+    local: true,
+    ssh_args: [],
+    cwd: os.homedir(),
+    readonly: false,
+    shell: parseShell(DEFAULT_SHELL),
+    env: {},
+  };
 }
 
 export function pickHost(m: Manifest, name = 'local'): Host {
@@ -130,6 +149,20 @@ export async function connect(
     pm2,
     resolution,
     hereCheck: opts.hereCheck ?? checkHere,
+  };
+}
+
+/** A link to one host's pm2 for reading a whole daemon: the pm2 it would use, found the way connect finds it. */
+export async function connectHost(
+  host: Host,
+  opts: { spawner?: Spawner } = {}
+): Promise<HostLink> {
+  const transport = createTransport(host, opts.spawner);
+  const resolution = await resolvePm2Bin(host, transport);
+  return {
+    host,
+    transport,
+    pm2: new Pm2Client(transport, host, resolution.bin, host.pm2_home),
   };
 }
 

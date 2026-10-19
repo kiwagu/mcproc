@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +19,8 @@ import {
   describeApp,
   describeProject,
   snapshot,
+  probeHost,
+  deriveSnapshot,
   rowsFor,
   statusWord,
   unreachableRow,
@@ -250,6 +252,43 @@ describe('listApps', () => {
       code: 'TRANSPORT_FAILED',
       message: expect.stringContaining('/bin/bash: not found'),
     });
+  });
+});
+
+describe('probeHost and deriveSnapshot', () => {
+  it('one probe read by the manifest gives what snapshot gives', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); // the clock stands still: both reads see the same pm2 uptimes
+    try {
+      const ctx = fakeCtx(basic, 'local', [probeRule]);
+      const probe = await probeHost(ctx, {
+        cpuSample: true,
+        metrics: true,
+        urls: ['http://localhost:3310/health'],
+        containers: [],
+      });
+      expect(probe.procs.map((p) => p.name)).toEqual([
+        'demo-api',
+        'demo-api-build',
+      ]);
+      const derived = await deriveSnapshot(ctx, probe);
+      const wholeCtx = fakeCtx(basic, 'local', [probeRule]);
+      const whole = await snapshot(wholeCtx);
+      expect({ ...derived, sampledAt: 0 }).toEqual({ ...whole, sampledAt: 0 });
+      expect(ctx.fake.calls).toEqual(wholeCtx.fake.calls); // the same probe, asked the same way
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('probeHost needs no manifest: it reads every namespace of the daemon', async () => {
+    const ctx = fakeCtx(basic, 'local', [probeRule]);
+    const probe = await probeHost(
+      { host: ctx.host, transport: ctx.transport, pm2: ctx.pm2 },
+      { cpuSample: false, metrics: true, urls: [], containers: [] }
+    );
+    expect(new Set(probe.procs.map((p) => p.namespace))).toEqual(
+      new Set(['demo'])
+    );
+    expect(ctx.fake.calls[0].cmd).not.toContain('localhost:3310'); // no url asked
   });
 });
 
