@@ -1579,14 +1579,14 @@ describe('worktree renderers', () => {
 
 describe('width-aware CLI tables', () => {
   const lease = {
-    id: 'l_ztwaectxgu',
+    id: 'l_aaaaaaaaaa',
     position: null,
     state: 'cancelled',
     kind: 'exec',
     project: 'demo',
     slot: 0,
     target:
-      'bun run scripts/gates/record-after.ts e2e -- bun tests/e2e/scripts/run-e2e.ts',
+      'bun run test:e2e -- --project demo --workers 2 --reporter list --retries 0',
     estimate_mib: 4096,
     need_mib: 4506,
     sources: {},
@@ -1606,12 +1606,20 @@ describe('width-aware CLI tables', () => {
       const lines = renderLeases(view, width).split('\n').slice(2);
       for (const l of lines) expect(displayWidth(l)).toBeLessThanOrEqual(width);
       expect(lines[0]).toMatch(/^POS\s+STATE/);
-      expect(lines[1]).toMatch(/l_ztwaectxgu$/);
+      expect(lines[1]).toMatch(/l_aaaaaaaaaa$/);
       expect(lines.length).toBeGreaterThan(2); // the error went on to more lines
       const col = lines[0].indexOf('WAITING FOR');
       for (const l of lines.slice(2))
         if (l.trim())
           expect(l.slice(0, col).trim()).not.toMatch(/exec|cancelled/); // continuation lines: other cells blank
+      // both free-text columns went on to more lines, each within its own column
+      const target = lines[0].indexOf('TARGET');
+      const est = lines[0].indexOf('EST');
+      const more = lines.slice(2);
+      expect(more.some((l) => l.slice(target, est).trim())).toBe(true);
+      expect(more.some((l) => l.slice(col).trim())).toBe(true);
+      expect(lines[1]).not.toContain('--retries 0');
+      expect(lines[1]).not.toContain('not from a built cli.js');
     }
   });
   it('without a width the leases table is one line per lease, as before', () => {
@@ -1635,5 +1643,51 @@ describe('width-aware CLI tables', () => {
     for (const l of renderHosts(info, 60).split('\n'))
       expect(displayWidth(l)).toBeLessThanOrEqual(60);
     expect(renderHosts(info).split('\n')).toHaveLength(2);
+  });
+  it('the project summary fits its indented hosts table within the width; without one it prints as before', () => {
+    const cwd = '/home/u/a/very/long/checkout/path/of/the/project';
+    const d = {
+      project: 'demo',
+      root: '/w/demo',
+      mcproc: { manifest: null, running: '0.0.0' },
+      vars: [],
+      override: null,
+      slot: null,
+      apps: [
+        {
+          name: 'api',
+          kind: 'server',
+          description: 'HTTP API',
+          ports: [],
+          url: null,
+          depends_on: [],
+          host: null,
+        },
+      ],
+      profiles: { base: ['api'] },
+      hosts: [
+        {
+          name: 'local',
+          transport: 'local',
+          readonly: false,
+          cwd,
+          runtime: 'path',
+          pm2: null,
+          pm2_home: null,
+          apps: [],
+        },
+      ],
+      readme: null,
+    };
+    const narrow = renderProject(d, 60).split('\n');
+    for (const l of narrow) expect(displayWidth(l)).toBeLessThanOrEqual(60);
+    const hosts = narrow.slice(narrow.indexOf('hosts:') + 1);
+    expect(hosts.length).toBeGreaterThan(2); // the cwd went on to more lines
+    for (const l of hosts) expect(l.startsWith('  ')).toBe(true); // still indented under hosts:
+    const plain = renderProject(d).split('\n');
+    expect(plain.slice(plain.indexOf('hosts:') + 1)).toEqual([
+      '  HOST   TRANSPORT  CWD                                               READONLY  PM2_HOME  APPS',
+      `  local  local      ${cwd}  no        -         -`,
+    ]);
   });
 });

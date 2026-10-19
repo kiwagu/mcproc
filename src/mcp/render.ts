@@ -530,26 +530,29 @@ export function fmtDeps(deps: { app: string; condition: string }[]): string {
     .join(', ');
 }
 
-export function renderProject(d: {
-  project: string;
-  root: string;
-  mcproc: { manifest: string | null; running: string };
-  vars: VarInfo[];
-  override: string | null;
-  slot: number | null;
-  apps: {
-    name: string;
-    kind: string;
-    description: string;
-    ports: number[];
-    url: string | null;
-    depends_on: { app: string; condition: string }[];
-    host: string | null;
-  }[];
-  profiles: Record<string, string[]>;
-  hosts: HostInfo[];
-  readme: string | null;
-}): string {
+export function renderProject(
+  d: {
+    project: string;
+    root: string;
+    mcproc: { manifest: string | null; running: string };
+    vars: VarInfo[];
+    override: string | null;
+    slot: number | null;
+    apps: {
+      name: string;
+      kind: string;
+      description: string;
+      ports: number[];
+      url: string | null;
+      depends_on: { app: string; condition: string }[];
+      host: string | null;
+    }[];
+    profiles: Record<string, string[]>;
+    hosts: HostInfo[];
+    readme: string | null;
+  },
+  width?: number
+): string {
   const L = [`project: ${d.project} (${d.root})`];
   const w = d.mcproc.manifest;
   if (w)
@@ -571,9 +574,10 @@ export function renderProject(d: {
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles))
     L.push(`  ${p}: ${apps.join(', ')}`);
+  // the hosts table is indented by two columns: it fits what is left of the width
   L.push(
     'hosts:',
-    renderHosts(d.hosts)
+    renderHosts(d.hosts, width === undefined ? undefined : width - 2)
       .split('\n')
       .map((x) => `  ${x}`)
       .join('\n')

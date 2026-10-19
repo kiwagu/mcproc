@@ -724,6 +724,42 @@ describe('cli', () => {
         .some((l) => l.length > 70)
     ).toBe(true);
   });
+  it('a terminal that reports 0 columns counts as unknown: the tables print as when piped', async () => {
+    const out: string[] = [];
+    const write = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((s: string | Uint8Array) => {
+        out.push(String(s));
+        return true;
+      });
+    const saved = {
+      isTTY: Object.getOwnPropertyDescriptor(process.stdout, 'isTTY'),
+      columns: Object.getOwnPropertyDescriptor(process.stdout, 'columns'),
+    };
+    Object.defineProperty(process.stdout, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, 'columns', {
+      value: 0,
+      configurable: true,
+    });
+    try {
+      await buildProgram().parseAsync(['hosts', '--project', basic], {
+        from: 'user',
+      });
+    } finally {
+      write.mockRestore();
+      for (const [k, desc] of Object.entries(saved))
+        if (desc) Object.defineProperty(process.stdout, k, desc);
+        else delete (process.stdout as unknown as Record<string, unknown>)[k];
+    }
+    const plain = capture();
+    await buildProgram(plain.io).parseAsync(['hosts', '--project', basic], {
+      from: 'user',
+    });
+    expect(out.join('')).toBe(plain.out.map((l) => `${l}\n`).join(''));
+  });
 });
 
 describe('printLs (ls)', () => {

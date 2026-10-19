@@ -90,7 +90,8 @@ type Opts = Record<string, string | boolean | undefined>;
 const defaultIo: Io = {
   out: (s) => process.stdout.write(`${s}\n`),
   err: (s) => process.stderr.write(`${s}\n`),
-  columns: () => (process.stdout.isTTY ? process.stdout.columns : undefined),
+  columns: () =>
+    process.stdout.isTTY ? process.stdout.columns || undefined : undefined,
 };
 
 /**
@@ -315,7 +316,7 @@ export function buildProgram(io: Io = defaultIo): Command {
         const fleet = fleetOf(g);
         if (!app) {
           const d = describeProject(fleet.manifest);
-          emit(g, renderProject(d), d);
+          emit(g, renderProject(d, width(g)), d);
           return;
         }
         const d = await describeFleetApp(fleet, app);
