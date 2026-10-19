@@ -32,6 +32,7 @@ import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
 import type { Lease } from '../../src/core/leases/store.js';
 import type { DoctorReport } from '../../src/core/doctor.js';
 import { loadManifest, parseManifest } from '../../src/core/manifest.js';
+import { VERSION } from '../../src/version.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
 
@@ -391,6 +392,7 @@ describe('several hosts', () => {
           host: null,
         },
       ],
+      mcproc: { manifest: null, running: '0.0.0' },
       vars: [],
       override: null,
       slot: null,
@@ -1278,6 +1280,36 @@ it('renderProject lists the vars with their sources when there are any', () => {
   expect(
     renderProject(describeProject(loadManifest(fixture('basic'))))
   ).not.toContain('vars:');
+});
+
+describe('describe: the mcproc that wrote the manifest', () => {
+  const withVersion = (v: string | null) =>
+    describeProject(
+      parseManifest(
+        `version: 1\n${v ? `mcproc: ${v}\n` : ''}apps:\n  a: { description: d, run: y }\n`,
+        '/proj',
+        '/proj/.mcproc/mcproc.yaml'
+      )
+    );
+  it('the summary carries the manifest version and the running one', () => {
+    expect(withVersion('0.9.0').mcproc).toEqual({
+      manifest: '0.9.0',
+      running: VERSION,
+    });
+    expect(withVersion(null).mcproc).toEqual({
+      manifest: null,
+      running: VERSION,
+    });
+  });
+  it('the text names both when they differ, one when they match, nothing when the manifest has none', () => {
+    const lines = (v: string | null) =>
+      renderProject(withVersion(v)).split('\n');
+    expect(lines('0.9.0')[1]).toBe(
+      `manifest: written by mcproc 0.9.0, this is ${VERSION}`
+    );
+    expect(lines(VERSION)[1]).toBe(`manifest: written by mcproc ${VERSION}`);
+    expect(renderProject(withVersion(null))).not.toContain('written by');
+  });
 });
 
 describe('queued starts and the lease queue', () => {

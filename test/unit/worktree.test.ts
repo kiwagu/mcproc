@@ -401,6 +401,29 @@ describe('worktree', () => {
     expect(git(['status', '--porcelain'], r.path).trim()).toBe('');
   });
 
+  it('add: a branch manifest a newer mcproc wrote that does not load says so in the note', async () => {
+    git(['checkout', '-qb', 'future'], main);
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.yaml'),
+      'version: 1\nmcproc: 9.0.0\nfuture: {}\napps:\n  db: { description: db, run: node db.js }\n'
+    );
+    git(
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qam', 'future'],
+      main
+    );
+    git(['checkout', '-q', 'main'], main);
+    const logged: string[] = [];
+    await worktreeAdd(
+      loadManifest(main),
+      { branch: 'future', install: false },
+      { ...deps(), log: (l) => logged.push(l) }
+    );
+    const note = logged.find((l) => l.includes('does not load'));
+    expect(note).toContain("Unrecognized key(s) in object: 'future'");
+    expect(note).toContain('written by mcproc 9.0.0');
+    expect(note).toContain('Upgrade mcproc');
+  });
+
   it('add: refuses a branch checked out elsewhere, an existing directory and a taken slot', async () => {
     const m = loadManifest(main);
     await expect(
@@ -909,6 +932,18 @@ describe('worktree', () => {
       expect(noted[0]).toMatch(
         /does not load \(MANIFEST_INVALID: [\s\S]*\): its apps are not stopped$/
       );
+      // one a newer mcproc wrote: the note carries the upgrade hint
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        'version: 1\nmcproc: 9.0.0\nfuture: {}\napps:\n  db: { description: db, run: x }\n'
+      );
+      const newer: string[] = [];
+      await stopCheckout(dir, {
+        force: true,
+        log: (l) => newer.push(l),
+        connector,
+      });
+      expect(newer[0]).toContain('written by mcproc 9.0.0');
     });
   });
 });

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { McprocError } from './errors.js';
+import { VERSION } from '../version.js';
 import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
@@ -499,6 +500,8 @@ export function describeProject(m: Manifest) {
     project: m.project,
     root: m.root,
     manifest_path: m.path,
+    /** the mcproc that wrote the manifest (null when it names none) and the one answering */
+    mcproc: { manifest: m.mcproc, running: VERSION },
     base_project: m.base_project,
     vars: m.vars,
     override: m.override,

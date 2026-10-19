@@ -10,6 +10,7 @@ import {
   scopeManifest,
 } from '../../src/core/manifest.js';
 import { McprocError } from '../../src/core/errors.js';
+import { VERSION } from '../../src/version.js';
 import { pickHost, assertApp } from '../../src/core/resolve.js';
 import { resolveTargets } from '../../src/core/actions.js';
 
@@ -673,5 +674,86 @@ describe('vars, override and the new sections', () => {
         vars: { slut: 1 },
       })
     ).toThrowError(expect.objectContaining({ code: 'UNKNOWN_VAR' }));
+  });
+});
+
+describe('mcproc: the version that wrote the manifest', () => {
+  const newer = `${Number(VERSION.split('.')[0]) + 1}.0.0`;
+  const body = 'apps:\n  a: { description: d, run: r }\n';
+  const caught = (yaml: string): McprocError => {
+    try {
+      parse(yaml);
+    } catch (e) {
+      expect(e).toBeInstanceOf(McprocError);
+      return e as McprocError;
+    }
+    throw new Error('expected an error');
+  };
+
+  it('is read as written; a manifest without it has null', () => {
+    expect(parse(`version: 1\nmcproc: 0.9.0\n${body}`).mcproc).toBe('0.9.0');
+    expect(parse(`version: 1\nmcproc: 1.2.3-rc.1\n${body}`).mcproc).toBe(
+      '1.2.3-rc.1'
+    );
+    expect(parse(`version: 1\n${body}`).mcproc).toBeNull();
+  });
+
+  it('a value that is not a version is MANIFEST_INVALID naming the field', () => {
+    for (const v of [
+      'latest',
+      '13',
+      '0.13',
+      '"v0.13.0"',
+      '""',
+      '01.2.3',
+      '1.2.3-rc..1',
+      '1.2.3+.',
+    ])
+      expectInvalid(`version: 1\nmcproc: ${v}\n${body}`, 'mcproc: must be');
+  });
+
+  it('is never rendered as a template', () => {
+    expectInvalid(
+      `version: 1\nvars: { v: 0.13.0 }\nmcproc: "{{ v }}"\n${body}`,
+      'mcproc: must be'
+    );
+  });
+
+  it('a newer manifest that loads is fine', () => {
+    expect(parse(`version: 1\nmcproc: ${newer}\n${body}`).mcproc).toBe(newer);
+  });
+
+  it('a newer manifest that fails to load says which mcproc wrote it and suggests an upgrade', () => {
+    const e = caught(`version: 1\nmcproc: ${newer}\nfuture: {}\n${body}`);
+    expect(e.code).toBe('MANIFEST_INVALID');
+    expect(e.message).toContain("Unrecognized key(s) in object: 'future'");
+    expect(e.hint).toContain(`written by mcproc ${newer}`);
+    expect(e.hint).toContain(`this is ${VERSION}`);
+    expect(e.hint).toMatch(/upgrade mcproc/i);
+    // the checks after the schema too
+    const dep = caught(
+      `version: 1\nmcproc: ${newer}\napps:\n  a: { description: d, run: r, depends_on: [b] }\n`
+    );
+    expect(dep.message).toContain('unknown app "b"');
+    expect(dep.hint).toContain(`written by mcproc ${newer}`);
+  });
+
+  it('keeps the hint the error already had after the upgrade hint', () => {
+    const e = caught(
+      `version: 1\nmcproc: ${newer}\nproject: "{{ x }}"\n${body}`
+    );
+    expect(e.code).toBe('BAD_TEMPLATE');
+    expect(e.hint).toContain(`written by mcproc ${newer}`);
+    expect(e.hint).toContain(
+      'Set the project slug in the override file instead.'
+    );
+  });
+
+  it('a manifest from this or an older mcproc gets no upgrade hint', () => {
+    for (const v of [VERSION, '0.0.1']) {
+      const e = caught(`version: 1\nmcproc: ${v}\nfuture: {}\n${body}`);
+      expect(e.code).toBe('MANIFEST_INVALID');
+      expect(e.hint ?? '').not.toMatch(/upgrade/i);
+    }
   });
 });

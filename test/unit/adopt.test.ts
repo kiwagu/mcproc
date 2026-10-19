@@ -218,6 +218,14 @@ describe('spliceManifest', () => {
       remote: [9000, 9001],
     });
   });
+  it('keeps the mcproc that wrote the manifest: adopting ports never re-stamps it', () => {
+    const text = `version: 1\nmcproc: 0.9.0   # the mcproc that wrote this draft\napps:\n  api:\n    description: a\n    run: x\n`;
+    const after = spliced(text, [{ app: 'api', host: 'local', ports: [3000] }]);
+    expect(after).toContain(
+      'mcproc: 0.9.0   # the mcproc that wrote this draft\n'
+    );
+    expect(after).toContain('port: 3000');
+  });
   it('nothing adopted: the text is returned unchanged', () => {
     expect(spliceManifest(MANIFEST, [])).toEqual({
       text: MANIFEST,

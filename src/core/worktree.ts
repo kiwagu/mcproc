@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { describeError, McprocError } from './errors.js';
+import { describeError, describeErrorWithHint, McprocError } from './errors.js';
 import { spawnRun } from './exec.js';
 import { actOn, Fleet, type Connector } from './fleet.js';
 import { ownsManifest } from './leases/siblings.js';
@@ -193,7 +193,7 @@ function ownManifest(
     return loadManifest(target);
   } catch (e) {
     log(
-      `the manifest of ${target} does not load (${describeError(e)}): the main checkout's decides ${instead}`
+      `the manifest of ${target} does not load (${describeErrorWithHint(e)}): the main checkout's decides ${instead}`
     );
     return null;
   }
@@ -779,7 +779,7 @@ export async function stopCheckout(
   } catch (e) {
     if (!opts.force) throw e;
     opts.log(
-      `the manifest of ${root} does not load (${describeError(e)}): its apps are not stopped`
+      `the manifest of ${root} does not load (${describeErrorWithHint(e)}): its apps are not stopped`
     );
     return [];
   }

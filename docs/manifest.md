@@ -41,6 +41,10 @@ hosts:                         # "local" is implicit
     cwd: /home/node/demo
     readonly: true             # every mutating tool is refused here
 ```
+`version` is the format of the file. `mcproc` names the mcproc that wrote it: `init` records its own version there
+and nothing rewrites it later. `describe` shows it next to the running version, and a manifest from a newer mcproc
+that fails to load says so in the error's hint.
+
 Other app fields: `host` ([hosts](hosts.md)), `url_check` ([urls](urls.md)), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
 Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
 `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
