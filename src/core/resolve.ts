@@ -7,6 +7,7 @@ import {
   type Manifest,
 } from './manifest.js';
 import { Pm2Client, resolvePm2Bin, type Pm2Resolution } from './pm2.js';
+import { recordProject } from './registry.js';
 import { createTransport } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
 import { checkHere, type HereCheck } from './urlcheck.js';
@@ -81,6 +82,7 @@ export function prepare(opts: {
   roots?: string[];
 }): Prepared {
   const manifest = loadManifest(resolveProjectDir(opts.project, opts.roots));
+  recordProject(manifest); // the host's memory of its stacks: every command that reads a manifest keeps it current
   return { manifest, host: pickHost(manifest, opts.host) };
 }
 
