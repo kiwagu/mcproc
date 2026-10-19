@@ -156,6 +156,13 @@ export function overviewKey(
       if (r.kind === 'orphan')
         return notice('not an mcproc stack: no manifest to open');
       if (r.stack.manifest_error) return notice(unloaded(r.stack));
+      // its monit would only show unreachable rows: say which host failed instead
+      if (!r.stack.hosts.some((h) => h.reachable)) {
+        const why = r.stack.hosts.find((h) => h.error);
+        return notice(
+          `${r.stack.project}: no host of this stack answers${why ? ` (${why.name}: ${why.error})` : ''}`
+        );
+      }
       return { kind: 'open', root: r.stack.root };
     }
     case 'x': {

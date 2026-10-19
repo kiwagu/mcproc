@@ -88,9 +88,10 @@ describe('renderOverview', () => {
       expect(f.table[1]).toMatch(/^▶alpha/);
       expect(f.table.at(-1)).toMatch(/^ pm2 · default/);
     }
-    expect(
-      renderOverview(state(), { width: 80, height: 24 }).table[1]
-    ).toContain('…');
+    // ROOT is cut at its start, so the checkout's own folder stays visible
+    expect(renderOverview(state(), { width: 80, height: 24 }).table[1]).toMatch(
+      /^▶alpha\s+…\S*\/checkout\/alpha\s/
+    );
   });
   it('the lower pane shows the selected stack apps; the footer the legend, a notice before it', () => {
     const f = renderOverview(state(), { width: 100, height: 24 });

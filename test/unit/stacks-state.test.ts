@@ -164,6 +164,78 @@ describe('overview state', () => {
       },
     });
   });
+  it('enter refuses a stack none of whose hosts answers; one reachable host is enough to open', () => {
+    const down = (name: string) => ({
+      name,
+      endpoint: name,
+      reachable: false,
+      error: 'container stopped',
+      age_s: 30,
+    });
+    const up = {
+      name: 'local',
+      endpoint: 'local',
+      reachable: true,
+      error: null,
+      age_s: 0,
+    };
+    const s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([
+        stack('gone', '/gone', { hosts: [down('ws'), down('box')] }),
+        stack('none', '/none', { hosts: [] }),
+        stack('mixed', '/mixed', { hosts: [down('ws'), up] }),
+      ]),
+      at,
+    });
+    expect(overviewKey('enter', s)).toEqual({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: 'gone: no host of this stack answers (ws: container stopped)',
+      },
+    });
+    const none = reduceOverview(s, { type: 'select', delta: 1 });
+    expect(overviewKey('enter', none)).toEqual({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: 'none: no host of this stack answers',
+      },
+    });
+    const mixed = reduceOverview(none, { type: 'select', delta: 1 });
+    expect(overviewKey('enter', mixed)).toEqual({
+      kind: 'open',
+      root: '/mixed',
+    });
+  });
+  it('x on a stack whose manifest did not load says why; x does nothing while busy; C-c quits', () => {
+    const bad = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([
+        stack('bad', '/bad', {
+          manifest_error: { code: 'MANIFEST_INVALID', message: 'apps: bad' },
+        }),
+      ]),
+      at,
+    });
+    expect(overviewKey('x', bad)).toEqual({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: 'bad: the manifest did not load (MANIFEST_INVALID)',
+      },
+    });
+    const ok = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([stack('a', '/a')]),
+      at,
+    });
+    expect(
+      overviewKey('x', reduceOverview(ok, { type: 'busy', busy: true }))
+    ).toBeNull();
+    expect(overviewKey('C-c', ok)).toEqual({ kind: 'quit' });
+  });
   it('a refresh that moves the selection to another stack disarms x, so it never stops a stack the prompt did not name', () => {
     let s = initialOverview({ selected: '/b' });
     s = reduceOverview(s, {
