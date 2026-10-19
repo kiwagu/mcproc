@@ -3,6 +3,10 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { prepare, connect, type Context } from '../../core/resolve.js';
 import { leasesView } from '../../core/leases/view.js';
+import {
+  StacksCollector,
+  defaultCollectorDeps,
+} from '../../core/stacks/collect.js';
 import { portsReport, hostsInfo, describeProject } from '../../core/list.js';
 import { Fleet, defaultConnector, describeFleetApp } from '../../core/fleet.js';
 import { readLogs } from '../../core/logs.js';
@@ -29,6 +33,7 @@ import {
   renderIncidents,
   renderWait,
   renderLeases,
+  renderStacks,
   hostsOf,
   urlNote,
 } from '../render.js';
@@ -349,6 +354,34 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
         return {
           text: renderLeases(v),
           data: v as unknown as Record<string, unknown>,
+        };
+      })
+  );
+
+  server.registerTool(
+    'stacks',
+    {
+      title: 'Stacks',
+      description:
+        'Every mcproc stack on this host, not only this project: each checkout any mcproc call has seen or found in the local pm2 daemon, with its root, hosts, apps online/total, errors, memory, CPU and listening ports, plus pm2 processes no manifest knows. Use it to see what else runs here (another checkout holding a port or memory); act on another stack by passing its root as `project` to the other tools.',
+      inputSchema: {
+        all: z
+          .boolean()
+          .optional()
+          .describe('also the recorded checkouts with nothing in pm2'),
+      },
+      annotations: RO,
+    },
+    (args) =>
+      runTool(async () => {
+        const deps2 = defaultCollectorDeps(deps.spawner);
+        if (deps.hereCheck) deps2.hereCheck = deps.hereCheck;
+        const v = await new StacksCollector(deps2).collect({
+          all: Boolean(args.all),
+        });
+        return {
+          text: renderStacks(v.answer),
+          data: v.answer as unknown as Record<string, unknown>,
         };
       })
   );

@@ -1,3 +1,4 @@
+import os from 'node:os';
 import type { LsRow, HostInfo } from '../core/list.js';
 import type { HostError } from '../core/fleet.js';
 import type { DoctorReport, DoctorUrl } from '../core/doctor.js';
@@ -17,6 +18,7 @@ import type {
   WorktreeRemoved,
   WorktreeRow,
 } from '../core/worktree.js';
+import type { Orphan, Stack, StacksAnswer } from '../core/stacks/types.js';
 import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
@@ -851,4 +853,114 @@ export function renderWorktrees(rows: WorktreeRow[], width?: number): string {
 /** A removed worktree in one line: its path, the slot it freed, the branch it kept and the apps it stopped. */
 export function renderWorktreeRemoved(r: WorktreeRemoved): string {
   return `removed ${r.path}: slot ${r.slot} is free, branch ${r.branch ?? '(detached)'} kept; stopped ${r.stopped.length ? r.stopped.join(', ') : 'nothing'}`;
+}
+
+/** A path with the home directory as ~. */
+export function tildePath(p: string, home = os.homedir()): string {
+  return p === home || p.startsWith(`${home}/`)
+    ? `~${p.slice(home.length)}`
+    : p;
+}
+/** A stack's name: a worktree as `w<slot> <branch>` indented under its base. */
+export function stackLabel(
+  s: Pick<Stack, 'project' | 'base_project' | 'slot' | 'branch'>
+): string {
+  if (s.base_project === s.project) return s.project;
+  return `  ${s.slot !== null ? `w${s.slot} ` : ''}${s.branch ?? s.project}`;
+}
+/** `online/total`, `queued #N` while its start waits, `not running` with nothing in pm2. */
+export function stackApps(s: Stack): string {
+  if (s.queue_position !== null && s.apps.online === 0)
+    return `queued #${s.queue_position}`;
+  return s.present ? `${s.apps.online}/${s.apps.total}` : 'not running';
+}
+/** The listening ports, the first `max` and how many more. */
+export function stackPorts(s: Stack, max = 3): string {
+  const ports = [...new Set(s.ports.map((p) => p.port))].sort((a, b) => a - b);
+  if (ports.length === 0) return '-';
+  const shown = ports
+    .slice(0, max)
+    .map((p) => `:${p}`)
+    .join(' ');
+  return ports.length > max ? `${shown} +${ports.length - max}` : shown;
+}
+const stackCells = (s: Stack): string[] => [
+  stackLabel(s),
+  tildePath(s.root),
+  s.hosts.map((h) => h.name).join(','),
+  s.manifest_error ? 'manifest error' : stackApps(s),
+  String(s.apps.errored),
+  s.memory ? fmtBytes(s.memory) : '-',
+  s.cpu === null ? '-' : `${Math.round(s.cpu)}%`,
+  stackPorts(s),
+];
+const orphanCells = (o: Orphan): string[] => {
+  const mem = o.processes.reduce((a, p) => a + p.memory, 0);
+  return [
+    `pm2 · ${o.namespace}`,
+    '(no manifest)',
+    o.endpoint,
+    `${o.processes.filter((p) => p.status === 'online').length}/${o.processes.length}`,
+    '-',
+    mem ? fmtBytes(mem) : '-',
+    '-',
+    '-',
+  ];
+};
+export const STACK_HEADER = [
+  'STACK',
+  'ROOT',
+  'HOSTS',
+  'APPS',
+  'ERR',
+  'MEM',
+  'CPU',
+  'PORTS',
+];
+
+export function stacksHostLine(h: StacksAnswer['host']): string {
+  const mem = h.memory
+    ? `RAM ${fmtMib(h.memory.available_mib)} free of ${fmtMib(h.memory.total_mib)}`
+    : 'no memory reading';
+  const watcher = h.watcher
+    ? h.watcher.online
+      ? 'watcher online'
+      : 'watcher stopped'
+    : 'no watcher';
+  return `${h.name} · ${mem} · ${watcher} · queue ${h.queue}`;
+}
+
+/** Every stack of the host: a host line, the table, then a line per manifest error, note and host that did not answer. */
+export function renderStacks(a: StacksAnswer, width?: number): string {
+  const lines = [`host: ${stacksHostLine(a.host)}`, ...a.host.notes];
+  if (a.stacks.length === 0 && a.orphans.length === 0)
+    return [
+      ...lines,
+      'no stacks running on this host (--all lists the recorded ones)',
+    ].join('\n');
+  lines.push(
+    table(
+      [
+        STACK_HEADER,
+        ...a.stacks.map(stackCells),
+        ...a.orphans.map(orphanCells),
+      ],
+      { width, flex: [1, 7], mode: 'wrap' }
+    )
+  );
+  for (const s of a.stacks) {
+    if (s.manifest_error)
+      lines.push(
+        `${s.project}: ${s.manifest_error.code}: ${s.manifest_error.message}`
+      );
+    for (const n of s.notes) lines.push(`${s.project}: ${n}`);
+    for (const h of s.hosts)
+      if (h.error)
+        lines.push(
+          `${s.project} on ${h.name}: ${h.error}${h.age_s ? ` (last read ${h.age_s}s ago)` : ''}`
+        );
+  }
+  for (const o of a.orphans)
+    if (o.note) lines.push(`pm2 · ${o.namespace}: ${o.note}`);
+  return lines.join('\n');
 }

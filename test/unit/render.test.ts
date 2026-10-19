@@ -27,6 +27,9 @@ import {
   renderWorktreeAdded,
   renderWorktrees,
   renderWorktreeRemoved,
+  renderStacks,
+  stackLabel,
+  tildePath,
 } from '../../src/mcp/render.js';
 import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
 import type { Lease } from '../../src/core/leases/store.js';
@@ -36,6 +39,7 @@ import { VERSION } from '../../src/version.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
 import type { LeasesView } from '../../src/core/leases/view.js';
+import type { StacksAnswer } from '../../src/core/stacks/types.js';
 import { displayWidth } from '../../src/monit/screentext.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -1689,5 +1693,111 @@ describe('width-aware CLI tables', () => {
       '  HOST   TRANSPORT  CWD                                               READONLY  PM2_HOME  APPS',
       `  local  local      ${cwd}  no        -         -`,
     ]);
+  });
+});
+
+describe('renderStacks', () => {
+  const answer = {
+    host: {
+      name: 'box',
+      memory: { available_mib: 13600, total_mib: 31836 },
+      watcher: { online: true, pid: 9 },
+      queue: 0,
+      notes: [],
+    },
+    stacks: [
+      {
+        project: 'alpha',
+        root: '/home/u/repos/alpha',
+        base_project: 'alpha',
+        slot: 0,
+        branch: 'main',
+        source: 'registry',
+        hosts: [
+          {
+            name: 'local',
+            endpoint: 'local',
+            reachable: true,
+            error: null,
+            age_s: 0,
+          },
+        ],
+        apps: { total: 3, online: 2, errored: 0, stopped: 1, queued: 0 },
+        queue_position: null,
+        memory: 2_000_000_000,
+        cpu: 12.4,
+        ports: [
+          { app: 'web', port: 3000 },
+          { app: 'api', port: 8000 },
+        ],
+        manifest_error: null,
+        notes: [],
+        present: true,
+      },
+      {
+        project: 'alpha-w1',
+        root: '/home/u/repos/alpha.worktrees/feat/x',
+        base_project: 'alpha',
+        slot: 1,
+        branch: 'feat/x',
+        source: 'registry',
+        hosts: [
+          {
+            name: 'local',
+            endpoint: 'local',
+            reachable: true,
+            error: null,
+            age_s: 0,
+          },
+        ],
+        apps: { total: 3, online: 0, errored: 0, stopped: 0, queued: 2 },
+        queue_position: 1,
+        memory: 0,
+        cpu: null,
+        ports: [],
+        manifest_error: null,
+        notes: [],
+        present: true,
+      },
+    ],
+    orphans: [
+      {
+        namespace: 'default',
+        endpoint: 'local',
+        processes: [{ name: 'loose', status: 'online', memory: 120_000_000 }],
+        note: null,
+      },
+    ],
+  } as StacksAnswer;
+
+  it('a host line, then one row per stack (worktrees indented under their base), orphans last', () => {
+    const out = renderStacks(answer).split('\n');
+    expect(out[0]).toBe(
+      'host: box · RAM 13.3G free of 31.1G · watcher online · queue 0'
+    );
+    expect(out[1]).toMatch(
+      /^STACK\s+ROOT\s+HOSTS\s+APPS\s+ERR\s+MEM\s+CPU\s+PORTS$/
+    );
+    expect(out[2]).toMatch(
+      /^alpha\s+\/home\/u\/repos\/alpha\s+local\s+2\/3\s+0\s+\S+\s+12%\s+:3000 :8000$/
+    );
+    expect(out[3]).toMatch(/^ {2}w1 feat\/x\s+.*queued #1/);
+    expect(out[4]).toMatch(/^pm2 · default\s+\(no manifest\)\s+local\s+1\/1/);
+  });
+  it('labels and paths', () => {
+    expect(
+      stackLabel({
+        project: 'alpha-w2',
+        base_project: 'alpha',
+        slot: 2,
+        branch: null,
+      })
+    ).toBe('  w2 alpha-w2');
+    expect(tildePath('/home/u/x', '/home/u')).toBe('~/x');
+    expect(tildePath('/srv/x', '/home/u')).toBe('/srv/x');
+  });
+  it('with a width the table stays within it', () => {
+    for (const l of renderStacks(answer, 90).split('\n'))
+      expect(displayWidth(l)).toBeLessThanOrEqual(90);
   });
 });

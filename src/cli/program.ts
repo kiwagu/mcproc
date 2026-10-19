@@ -13,6 +13,7 @@ import {
   type Context,
 } from '../core/resolve.js';
 import { cancelLease, leasesView } from '../core/leases/view.js';
+import { StacksCollector } from '../core/stacks/collect.js';
 import { watcherEntry } from '../core/leases/ensure.js';
 import {
   defaultWatcherDeps,
@@ -69,6 +70,7 @@ import {
   renderWorktreeAdded,
   renderWorktreeRemoved,
   renderWorktrees,
+  renderStacks,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -624,6 +626,26 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [id]) => {
         const l = await cancelLease(id);
         emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('stacks')
+    .description(
+      'every mcproc stack on this host: the checkouts any mcproc call has seen and those found in the local pm2, with their hosts, apps, memory and ports'
+    )
+    .option('--all', 'also the recorded checkouts with nothing in pm2')
+    .action(
+      wrap(async (g, o) => {
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'stacks reads every host each stack declares; --host does not apply',
+            {
+              hint: 'Drop --host.',
+            }
+          );
+        const v = await new StacksCollector().collect({ all: Boolean(o.all) });
+        emit(g, renderStacks(v.answer, width(g)), v.answer);
       })
     );
   program

@@ -296,6 +296,14 @@ describe('cli', () => {
       fs.rmSync(base, { recursive: true, force: true });
     }
   });
+  it('stacks refuses --host: it reads every host each stack declares', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['stacks', '--host', 'local'], {
+      from: 'user',
+    });
+    expect(c.err.join('\n')).toContain('BAD_ARGUMENT');
+    expect(process.exitCode).toBe(1);
+  });
   it('worktree refuses another host before touching it', async () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(
