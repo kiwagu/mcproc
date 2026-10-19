@@ -60,7 +60,24 @@ export function forgetProject(
   } catch {}
 }
 
-/** Every recorded checkout whose manifest is still in place; the others are dropped. `error` when the directory exists but cannot be read. */
+/** An entry carries the three strings; any other content is a file this registry did not write. */
+function isEntry(v: unknown): v is ProjectEntry {
+  const e = v as Record<string, unknown> | null;
+  return (
+    typeof e === 'object' &&
+    e !== null &&
+    typeof e.project === 'string' &&
+    typeof e.root === 'string' &&
+    typeof e.manifest === 'string'
+  );
+}
+
+/**
+ * Every recorded checkout whose manifest is still in place. An entry whose manifest is gone is dropped, its file
+ * deleted, only while the folder above its root is still there; when that folder is missing too (a drive not mounted
+ * yet) the entry is skipped for this read and kept. A file that is no entry is skipped and left on disk. `error` when
+ * the directory exists but cannot be read.
+ */
 export function listProjects(dir = stateDir()): {
   entries: ProjectEntry[];
   error: string | null;
@@ -76,11 +93,13 @@ export function listProjects(dir = stateDir()): {
   for (const n of names.sort()) {
     const file = path.join(projectsDir(dir), n);
     try {
-      const e = JSON.parse(fs.readFileSync(file, 'utf8')) as ProjectEntry;
+      const e: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!isEntry(e)) continue; // a foreign file: not ours to remove
       if (fs.existsSync(e.manifest)) entries.push(e);
-      else fs.rmSync(file, { force: true });
+      else if (fs.existsSync(path.dirname(e.root)))
+        fs.rmSync(file, { force: true });
     } catch {
-      // a half-written or foreign file: not an entry
+      // a half-written file: not an entry
     }
   }
   return { entries, error: null };

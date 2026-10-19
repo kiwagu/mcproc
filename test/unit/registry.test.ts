@@ -69,6 +69,25 @@ describe('host registry', () => {
     expect(entries.map((e) => e.project)).toEqual(['alpha']);
     expect(fs.existsSync(projectFile(dir, 'beta', b))).toBe(false);
   });
+  it('keeps the entry of a checkout whose parent folder is gone too (a drive not mounted yet)', () => {
+    const dir = tmp();
+    const drive = path.join(tmp(), 'drive');
+    const g = checkout(drive, 'gamma');
+    recordProject(entry(g, 'gamma'), dir);
+    const file = projectFile(dir, 'gamma', g);
+    fs.rmSync(drive, { recursive: true });
+    expect(listProjects(dir)).toEqual({ entries: [], error: null });
+    expect(fs.existsSync(file)).toBe(true);
+  });
+  it('skips a file that is no entry and leaves it on disk', () => {
+    const dir = tmp();
+    const a = checkout(tmp(), 'alpha');
+    recordProject(entry(a, 'alpha'), dir);
+    const foreign = path.join(dir, 'projects', 'foreign.json');
+    fs.writeFileSync(foreign, '{ "x": 1 }');
+    expect(listProjects(dir).entries.map((e) => e.project)).toEqual(['alpha']);
+    expect(fs.existsSync(foreign)).toBe(true);
+  });
   it('forgets one checkout; a missing or unwritable directory never throws', () => {
     const dir = tmp();
     const a = checkout(tmp(), 'alpha');
