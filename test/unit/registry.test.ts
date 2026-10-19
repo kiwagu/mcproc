@@ -76,8 +76,10 @@ describe('host registry', () => {
     forgetProject('alpha', a, dir);
     expect(listProjects(dir).entries).toEqual([]);
     expect(listProjects(path.join(dir, 'nope')).entries).toEqual([]);
+    const blocker = path.join(tmp(), 'file');
+    fs.writeFileSync(blocker, '');
     expect(() =>
-      recordProject(entry(a, 'alpha'), '/proc/mcproc-nope')
+      recordProject(entry(a, 'alpha'), path.join(blocker, 'state'))
     ).not.toThrow();
   });
   it('prepare() records the checkout it loads (into the suite temp MCPROC_STATE_DIR)', () => {

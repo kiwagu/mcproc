@@ -22,23 +22,6 @@ export function projectFile(
   return path.join(projectsDir(dir), `${registryKey(project, root)}.json`);
 }
 
-/**
- * Creates `dir` and its missing parents one by one, and throws when one cannot be made. Node's recursive mkdir spins
- * forever where mkdir answers ENOENT under a parent that exists (/proc), and every command records its checkout.
- */
-function makeDirs(dir: string): void {
-  const missing: string[] = [];
-  for (let d = path.resolve(dir); !fs.existsSync(d); d = path.dirname(d))
-    missing.unshift(d);
-  for (const d of missing) {
-    try {
-      fs.mkdirSync(d);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; // another command made it first
-    }
-  }
-}
-
 /** Records the checkout when its file is missing or says something else. Best effort: a read-only home never fails a command. */
 export function recordProject(
   m: Pick<Manifest, 'project' | 'root' | 'path'>,
@@ -58,7 +41,7 @@ export function recordProject(
     try {
       if (fs.readFileSync(file, 'utf8') === text) return;
     } catch {}
-    makeDirs(path.dirname(file));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, text);
     fs.renameSync(tmp, file);
