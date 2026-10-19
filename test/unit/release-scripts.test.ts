@@ -193,6 +193,48 @@ describe('release-publish', () => {
     );
     expect(r.status).toBe(1);
     expect(calls(log)).toContain('stage publish --access public');
+    expect(r.stdout).not.toContain('is staged');
+    expect(r.stderr).toContain('pending stage');
+  });
+  it('refuses a version npm has whose commit it cannot tell', () => {
+    const r = runWith(
+      'release-publish.sh',
+      env({ FAKE_VERSION: '0.2.0', FAKE_HEAD: '' }),
+      'v0.2.0'
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(
+      'x@0.2.0 is already on npm from an unknown commit, not from'
+    );
+    expect(calls(log)).not.toContain('stage publish --access public');
+  });
+});
+
+describe('release-tag', () => {
+  let clone: string;
+  const g = (...args: string[]) =>
+    execFileSync('git', args, { cwd: clone, encoding: 'utf8' }).trim();
+  const inClone = (script: string, ...args: string[]) =>
+    spawnSync('sh', [path.join(scripts, script), ...args], {
+      cwd: clone,
+      encoding: 'utf8',
+    });
+  beforeEach(() => {
+    clone = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-release-clone-'));
+    execFileSync('git', ['clone', '-q', repo, clone]);
+  });
+  afterEach(() => fs.rmSync(clone, { recursive: true, force: true }));
+  it('restores the annotated tag that checkout replaced with a lightweight one', () => {
+    const commit = g('rev-parse', 'v0.2.0^{commit}');
+    g('fetch', '-q', '--no-tags', 'origin', `+${commit}:refs/tags/v0.2.0`);
+    expect(g('cat-file', '-t', 'refs/tags/v0.2.0')).toBe('commit');
+    expect(inClone('release-check.sh', 'v0.2.0', 'origin/main').status).toBe(1);
+    expect(inClone('release-tag.sh', 'v0.2.0').status).toBe(0);
+    expect(g('cat-file', '-t', 'refs/tags/v0.2.0')).toBe('tag');
+    expect(inClone('release-check.sh', 'v0.2.0', 'origin/main').status).toBe(0);
+  });
+  it('fails on a tag origin does not have', () => {
+    expect(inClone('release-tag.sh', 'v9.9.9').status).not.toBe(0);
   });
 });
 

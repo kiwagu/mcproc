@@ -2,8 +2,9 @@ name: release
 
 # A pushed annotated vX.Y.Z tag is a release: a GitHub Release with the commits since the previous one, and the package
 # staged on npm through trusted publishing (no token; npm adds provenance), for the owner to approve on npmjs.com. A
-# re-run picks up where a failed run stopped. GitHub starts no run for a push of more than three tags, so a release tag
-# goes out in a push of its own.
+# re-run picks up where a failed run stopped, except a stage npm accepted without answering: that one is approved or
+# rejected on npmjs.com first. GitHub starts no run for a push of more than three tags, so a release tag goes out in a
+# push of its own.
 on:
   push:
     tags: ['v*']
@@ -21,7 +22,7 @@ jobs:
           fetch-depth: 0 # main and the earlier tags: the check and the notes read them
 
       - name: The annotated tag, which checkout leaves as a lightweight one
-        run: git fetch --force origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+        run: sh scripts/release-tag.sh "$GITHUB_REF_NAME"
 
       - name: The tag names the version in package.json, on main
         run: sh scripts/release-check.sh "$GITHUB_REF_NAME" origin/main
