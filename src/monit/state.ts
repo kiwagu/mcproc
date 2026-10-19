@@ -3,6 +3,14 @@ import type { LsRow } from '../core/list.js';
 import { pm2Name } from '../core/pm2.js';
 import { sortByStamp, type LogLine } from '../core/logfollow.js';
 import type { Incident } from '../core/incidents/detect.js';
+import {
+  isTaken,
+  type ReadEnd,
+  type TakenPoints,
+} from '../core/incidents/taken.js';
+
+/** An incident as the incidents view keeps it: with where the read that found it ended in its file. */
+export type ShownIncident = Incident & { end?: ReadEnd };
 
 export type Stream = 'out' | 'err' | 'both';
 /**
@@ -69,13 +77,17 @@ export interface MonitState {
   /** the view `i` returns to from the incidents view */
   back: 'dashboard' | 'flat';
   /** what the incidents view has read, oldest first, at most MAX_INCIDENTS */
-  incidents: Incident[];
+  incidents: ShownIncident[];
   /** the incidents view has had its first answer (until then it says it is reading) */
   incidentsPolled: boolean;
   /** the latest clear of the apps the incidents view reads, as their store records it */
   incidentsCleared: string | null;
   /** what the last read could not do: hosts that did not answer, incidents left out */
   incidentsErrors: string[];
+  /** how far the agent's takes have read each file, as the project's store has it: what lies before is shown muted */
+  incidentsTaken: TakenPoints;
+  /** the incidents view leaves out what the agent has taken (t) */
+  hideTaken: boolean;
 }
 /** a key that asks twice: c clears the logs of the running apps in view, R reloads every app in view */
 export type Armed = 'clear' | 'reload';
@@ -107,10 +119,12 @@ export type MonitAction =
   | { type: 'reloads'; app: string; info: ReloadInfo | null } // null: the app is no longer counted
   | {
       type: 'incidents';
-      incidents: Incident[]; // one read's, newest first as the read answers
+      incidents: ShownIncident[]; // one read's, newest first as the read answers
       cleared_at: string | null;
       errors: string[];
-    };
+    }
+  | { type: 'taken'; taken: TakenPoints }
+  | { type: 'hideTaken' };
 
 export function appInfos(m: Manifest): Record<string, AppInfo> {
   return Object.fromEntries(
@@ -176,7 +190,16 @@ export function initialState(p: {
     incidentsPolled: false,
     incidentsCleared: null,
     incidentsErrors: [],
+    incidentsTaken: {},
+    hideTaken: false,
   };
+}
+
+/** What the incidents view shows, oldest first: all it has read, or only what the agent has not taken (t). */
+export function visibleIncidents(s: MonitState): ShownIncident[] {
+  return s.hideTaken
+    ? s.incidents.filter((i) => !isTaken(i, s.incidentsTaken, i.end))
+    : s.incidents;
 }
 
 /** Which view a reload covers, for its prompt: every host, the host `h` narrowed to, or nothing when there is one view only. */
@@ -270,6 +293,9 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
     case 'incidents': {
       const added = [...a.incidents].reverse();
       const shown = s.view === 'incidents';
+      const rows = s.hideTaken
+        ? added.filter((i) => !isTaken(i, s.incidentsTaken, i.end)).length
+        : added.length; // what the new ones add to the view
       const scrolled = s.logScroll > 0 || s.logRowShift > 0;
       return {
         ...s,
@@ -278,13 +304,24 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
         incidentsCleared: a.cleared_at,
         incidentsErrors: a.errors,
         // a scrolled view stays on the same incidents while new ones arrive below; at the tail it follows them
-        logScroll: !shown
-          ? s.logScroll
-          : scrolled
-            ? s.logScroll + added.length
-            : 0,
+        logScroll: !shown ? s.logScroll : scrolled ? s.logScroll + rows : 0,
       };
     }
+    case 'taken': {
+      // what hides under the view stays where it was: the view keeps the incidents it shows
+      if (s.view !== 'incidents' || !s.hideTaken || s.logScroll === 0)
+        return { ...s, incidentsTaken: a.taken }; // another view's scroll is its own
+      const below = visibleIncidents(s).slice(-s.logScroll);
+      const still = below.filter((i) => !isTaken(i, a.taken, i.end)).length;
+      return {
+        ...s,
+        incidentsTaken: a.taken,
+        logScroll: still,
+        logRowShift: still === s.logScroll ? s.logRowShift : 0,
+      };
+    }
+    case 'hideTaken':
+      return { ...s, hideTaken: !s.hideTaken, logScroll: 0, logRowShift: 0 };
     case 'scroll': {
       if (a.to)
         return { ...s, logScroll: a.to.entries, logRowShift: a.to.rows };
@@ -292,7 +329,7 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
         s.view === 'flat'
           ? Object.values(s.logs).reduce((t, l) => t + l.length, 0)
           : s.view === 'incidents'
-            ? s.incidents.length
+            ? visibleIncidents(s).length
             : (s.logs[selectedApp(s) ?? ''] ?? []).length;
       const max = a.max ?? Math.max(0, n - 1); // without the pane's ceiling, at least never beyond the oldest entry
       return {
@@ -417,6 +454,10 @@ export function keyIntent(
           view: s.view === 'incidents' ? s.back : 'incidents',
         },
       };
+    case 't':
+      return s.view === 'incidents'
+        ? { kind: 'action', action: { type: 'hideTaken' } }
+        : null;
     case 'o':
       return { kind: 'action', action: { type: 'stream', stream: 'out' } };
     case 'e':

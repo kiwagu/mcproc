@@ -264,8 +264,15 @@ export async function clearLogs(
         for (const f of await flushLogs(await fleet.ctx(g.host), g.apps)) {
           const key = markKey(g.host, f.app);
           const prev = s.apps[key];
+          // what was taken before the clear stays taken: the stamp goes on with the fresh file
           const mark = (path: string, was: FileMark | undefined) =>
-            f.failed.includes(path) ? was : { path, offset: 0 };
+            f.failed.includes(path)
+              ? was
+              : {
+                  path,
+                  offset: 0,
+                  ...(was?.stamp ? { stamp: was.stamp } : {}),
+                };
           next.apps[key] = {
             restarts: f.proc.restarts,
             status: f.proc.status,

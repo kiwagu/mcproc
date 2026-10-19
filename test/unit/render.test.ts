@@ -739,6 +739,23 @@ describe('renderIncidents', () => {
     expect(
       renderIncidents({ ...base, taken: false, incidents: [inc], more: 4 })
     ).toContain('+4 more incidents (raise max)');
+    // left out for the answer's size: raising max would not show them
+    expect(
+      renderIncidents({ ...base, incidents: [inc], more: 4, more_by: 'size' })
+    ).toContain(
+      '+4 older incidents not shown to keep this answer short, taken with these (read logs for them)'
+    );
+    expect(
+      renderIncidents({
+        ...base,
+        taken: false,
+        incidents: [inc],
+        more: 4,
+        more_by: 'size',
+      })
+    ).toContain(
+      '+4 more incidents not shown to keep this answer short (pass app for one app, or read logs)'
+    );
   });
   it('colors the marker line on request', () => {
     expect(

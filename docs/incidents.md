@@ -7,8 +7,13 @@ monitor), and read `logs` only for an incident worth a closer look. `mcproc inci
 
 A call takes what it returns: the pick-up point, kept in `.mcproc/incidents.json`, moves past those incidents for every
 session, agent and CLI call on this machine, so nobody gets the same incident twice. `peek` (`--peek`) looks without
-taking. A first call looks back 15 minutes (`since`). One poll reads at most 1 MB of new log per file (the most recent
-part) and says how much it skipped.
+taking. An agent takes once it has dealt with what it was shown: the incidents screen in `mcproc monit` then shows those
+incidents muted ([monit](monit.md)). A first call looks back 15 minutes (`since`). One poll reads at most 1 MB of new log
+per file (the most recent part) and says how much it skipped.
+
+An answer carries about 20,000 characters of incidents, newest first. The older ones past that are counted in `more`
+and, on a take, taken with the rest; `logs` shows them. An incident's own line keeps up to 2000 characters, its context
+lines and stack frames up to 300.
 
 Clearing logs starts it over: `flush`, or `c` twice in `mcproc monit` (the logs of the running apps in view), empties
 the log files and records when; nothing logged before the clear comes up again, and monit shows `cleared HH:MM` in the

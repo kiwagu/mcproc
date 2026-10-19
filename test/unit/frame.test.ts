@@ -698,6 +698,64 @@ describe('the incidents view', () => {
       }).footer
     ).toContain('o/e/b logs  i incidents  h host');
   });
+  it('shows what the agent has taken in muted colors, marked taken; its title counts them; t hides them', () => {
+    const taken = reduce(open([inc(2), inc(1)]), {
+      type: 'taken',
+      taken: {
+        'local/web': {
+          err: {
+            stamp: '2026-10-15T10:00:01.500',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
+    });
+    const f = renderFrame(taken, { width: 120, height: 30 });
+    expect(f.logs).toEqual([
+      '\x1b[90mweb@local 2026-10-15T10:00:01 error (err) · taken\x1b[0m',
+      '\x1b[90m  │ before 1\x1b[0m',
+      '\x1b[38;5;131m  ▶ TypeError: boom 1\x1b[0m',
+      'web@local 2026-10-15T10:00:02 error (err)',
+      '  │ before 2',
+      '\x1b[31m  ▶ TypeError: boom 2\x1b[0m',
+    ]);
+    expect(logsTitle(taken, 0)).toBe(
+      'incidents · last 15 min · 2 shown · 1 taken'
+    );
+    expect(f.footer).toContain('i back  f flat  t hide taken  c clear');
+    const hidden = reduce(taken, { type: 'hideTaken' });
+    const h = renderFrame(hidden, { width: 120, height: 30 });
+    expect(h.logs).toEqual([
+      'web@local 2026-10-15T10:00:02 error (err)',
+      '  │ before 2',
+      '\x1b[31m  ▶ TypeError: boom 2\x1b[0m',
+    ]);
+    expect(logsTitle(hidden, 0)).toBe(
+      'incidents · last 15 min · 1 shown · 1 taken hidden'
+    );
+    expect(h.footer).toContain('t show taken');
+  });
+  it('with every incident taken and hidden, it says so rather than that nothing happened', () => {
+    const s = reduce(
+      reduce(open([inc(1)]), {
+        type: 'taken',
+        taken: {
+          'local/web': {
+            err: {
+              stamp: '2026-10-15T10:00:05.000',
+              path: '/l/x-err',
+              offset: 0,
+            },
+          },
+        },
+      }),
+      { type: 'hideTaken' }
+    );
+    expect(renderFrame(s, { width: 120, height: 30 }).logs).toEqual([
+      'every incident here is taken (t shows them)',
+    ]);
+  });
   it('scrolls by the rows the incidents take', () => {
     const s = open([inc(3), inc(2), inc(1)]);
     const size = { width: 120, height: 6 }; // a pane of 3 rows: one incident at a time

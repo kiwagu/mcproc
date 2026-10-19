@@ -137,6 +137,10 @@ export const bodyOf = (line: string): string => line.replace(PM2_STAMP, '');
 /** A line as an answer reports it: at most MAX_LINE characters, so one huge line cannot swell the answer. */
 export const cut = (s: string): string =>
   s.length > MAX_LINE ? `${s.slice(0, MAX_LINE - 1)}…` : s;
+/** A context line or a stack frame: at most CONTEXT_LINE characters, as it only frames the incident's own line. */
+export const CONTEXT_LINE = 300;
+export const cutContext = (s: string): string =>
+  s.length > CONTEXT_LINE ? `${s.slice(0, CONTEXT_LINE - 1)}…` : s;
 /** What patterns are matched against: the line without its stamp, as far as the output shows it (a huge line stays cheap). */
 export const searched = (line: string): string =>
   bodyOf(line).slice(0, MAX_LINE);
@@ -279,7 +283,7 @@ export function detect(
       const l = lines[j];
       if (isStack(j)) {
         if (folded < MAX_FOLD) {
-          after.push(cut(l));
+          after.push(cutContext(l));
           folded++;
         } else dropped++;
         tail = 0;
@@ -289,14 +293,14 @@ export function detect(
       if (tail >= nAfter) break; // past the after-context: the next error starts its own incident
       if (isStart(j)) {
         flush();
-        after.push(cut(l));
+        after.push(cutContext(l));
         folded = 0;
         tail = 0;
         j++;
         continue;
       } // inside it: one incident
       flush();
-      after.push(cut(l));
+      after.push(cutContext(l));
       tail++;
       j++;
     }
@@ -310,7 +314,7 @@ export function detect(
       first_time: time,
       count: 1,
       line: cut(lines[start]),
-      before: lines.slice(Math.max(0, start - nBefore), start).map(cut),
+      before: lines.slice(Math.max(0, start - nBefore), start).map(cutContext),
       after,
       fingerprint: fingerprint(cut(lines[start])), // bounded like the line itself
     });

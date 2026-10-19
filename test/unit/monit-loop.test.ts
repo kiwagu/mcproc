@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import type { TakenPoints } from '../../src/core/incidents/taken.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -2158,5 +2159,79 @@ describe('MonitLoop incidents view and log clears', () => {
     expect(h.state.incidentsErrors.join(' ')).toMatch(
       /skipped .+ of api err on local/
     );
+  });
+});
+
+describe('what the agent has taken', () => {
+  it('each refresh hands the screen the taken points the store has, and only a change dispatches', async () => {
+    let taken: TakenPoints = {};
+    const h = harness(undefined, {
+      cleared: () => ({ at: {}, gen: {}, taken }),
+    });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+    taken = {
+      'local/api': {
+        err: { stamp: '2026-10-15T10:00:02.000', path: '/l/x-err', offset: 0 },
+      },
+    };
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual(taken);
+    const same = h.state;
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toBe(same.incidentsTaken); // nothing new: the same points
+  });
+  it('a store read without taken points (an older dep) leaves them as they are', async () => {
+    const h = harness(undefined, { cleared: () => ({ at: {}, gen: {} }) });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+  });
+  it('the incidents a read finds reach the screen with where that read ended in their file', async () => {
+    const h = harness(undefined, {
+      cleared: () => ({ at: {}, gen: {}, taken: {} }),
+      peekIncidents: async () => ({
+        answer: {
+          incidents: [
+            {
+              app: 'api',
+              host: 'local',
+              kind: 'error',
+              stream: 'err',
+              time: '2026-10-15T10:00:02',
+              first_time: null,
+              count: 1,
+              line: 'TypeError',
+              before: [],
+              after: [],
+              fingerprint: 'f',
+            },
+          ],
+          skipped: [],
+          errors: [],
+          more: 0,
+          apps: 1,
+          hosts: 1,
+          latest: null,
+          taken: false,
+          cleared_at: null,
+        },
+        next: {
+          v: 1,
+          apps: {
+            'local/api': {
+              restarts: 0,
+              status: 'online',
+              err: { path: '/l/api-err', offset: 77 },
+            },
+          },
+        },
+      }),
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(h.state.incidents[0].end).toEqual({
+      path: '/l/api-err',
+      offset: 77,
+    });
   });
 });

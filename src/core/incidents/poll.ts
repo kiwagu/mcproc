@@ -3,6 +3,7 @@ import { findProcess, type Pm2Process } from '../pm2.js';
 import type { Fleet, HostError } from '../fleet.js';
 import { ensureOk } from '../../transport/index.js';
 import { CLOCK_SNIPPET, hostClock, hostStamp } from '../logsince.js';
+import { laterStamp } from './taken.js';
 import {
   beforeStart,
   compileReloadRules,
@@ -12,6 +13,7 @@ import {
 } from '../reloads.js';
 import {
   collapse,
+  cutContext,
   compileRules,
   detect,
   stampOf,
@@ -35,6 +37,8 @@ export interface IncidentsAnswer {
   skipped: { app: string; host: string; stream: Stream; bytes: number }[];
   errors: HostError[];
   more: number;
+  /** why `more` incidents were left out, when any were: past `max`, or past the answer's size budget */
+  more_by?: 'max' | 'size';
   apps: number;
   hosts: number;
   latest: string | null;
@@ -53,6 +57,8 @@ export interface PollOptions {
   cursor?: CursorState;
   sinceMin?: number;
   max?: number;
+  /** the size budget of the answer's incidents, in characters (default ANSWER_CHARS; Infinity for none) */
+  chars?: number;
   context?: [number, number];
   budgetMs?: number;
   includeReloads?: boolean;
@@ -67,6 +73,11 @@ export interface PollOptions {
 
 /** How far back a first call looks, in minutes, when it names no window of its own. */
 export const DEFAULT_SINCE_MIN = 15;
+/**
+ * How many characters of incident text an answer carries, newest first: the rest are counted in `more` (and taken
+ * with the others), so one burst of huge lines never overflows a client's tool-result limit. One incident always shows.
+ */
+export const ANSWER_CHARS = 20_000;
 const EVENT_TAIL = 10;
 const STREAMS: Stream[] = ['out', 'err'];
 
@@ -173,16 +184,24 @@ export async function pollIncidents(
           };
           perApp.set(f.t.app, entry);
           if (!r) return;
+          const was = f.t.prev?.[f.stream]?.stamp; // what earlier takes have read here stays read
           if (r.short) {
-            if (f.restarted) entry.mark[f.stream] = { path: f.path, offset: 0 };
+            if (f.restarted)
+              entry.mark[f.stream] = {
+                path: f.path,
+                offset: 0,
+                ...(was ? { stamp: was } : {}),
+              };
             else if (f.t.prev?.[f.stream])
               entry.mark[f.stream] = f.t.prev[f.stream];
             return;
           } // read again next poll from where this one began: nothing analysed, nothing taken
+          const stamp = laterStamp(was, lastStamp(r.lines));
           entry.mark[f.stream] = {
             path: f.path,
             offset: r.nextOffset,
             ...(r.anchor ? { at: r.anchor.at, anchor: r.anchor.hex } : {}),
+            ...(stamp ? { stamp } : {}),
           };
           if (f.stream === 'err') entry.errLines = r.lines;
           if (r.skipped > 0)
@@ -294,6 +313,9 @@ export async function pollIncidents(
     (b.time ?? '').localeCompare(a.time ?? '')
   );
   const max = opts.max ?? 20;
+  const capped = all.slice(0, max);
+  const shown = withinBudget(capped, opts.chars ?? ANSWER_CHARS);
+  const more = all.length - shown.length;
   const latest =
     ok
       .map((r) => r.latest)
@@ -302,10 +324,13 @@ export async function pollIncidents(
       .at(-1) ?? null;
   return {
     answer: {
-      incidents: all.slice(0, max),
+      incidents: shown,
       skipped,
       errors: [...failed.map((f) => f.error), ...ok.flatMap((r) => r.stalled)],
-      more: Math.max(0, all.length - max),
+      more,
+      ...(more > 0
+        ? { more_by: shown.length < capped.length ? 'size' : 'max' }
+        : {}),
       apps: names.length,
       hosts: groups.length,
       latest,
@@ -322,6 +347,31 @@ export async function pollIncidents(
     },
     next,
   };
+}
+
+/** The newest incidents whose text fits in `chars`, in order; the first always fits. */
+function withinBudget(incidents: Incident[], chars: number): Incident[] {
+  const out: Incident[] = [];
+  let used = 0;
+  for (const i of incidents) {
+    const size =
+      i.line.length +
+      i.before.reduce((n, l) => n + l.length, 0) +
+      i.after.reduce((n, l) => n + l.length, 0);
+    if (out.length > 0 && used + size > chars) break;
+    out.push(i);
+    used += size;
+  }
+  return out;
+}
+
+/** The stamp of the last stamped line read (pm2's, as the file has it); null when none is stamped. */
+function lastStamp(lines: string[]): string | null {
+  for (let k = lines.length - 1; k >= 0; k--) {
+    const t = stampOf(lines[k]);
+    if (t) return t;
+  }
+  return null;
 }
 
 /** Index of the first line inside a first call's window; the lines before it are context only (an unstamped line goes with the one before it). */
@@ -387,12 +437,13 @@ function processEvents(
   prev: AppMark | undefined,
   errLines: string[]
 ): Incident[] {
-  const tail = errLines.slice(-EVENT_TAIL);
+  const last = errLines.slice(-EVENT_TAIL);
   const time =
-    [...tail]
+    [...last]
       .reverse()
       .map(stampOf)
       .find((t) => t !== null) ?? null;
+  const tail = last.map(cutContext); // context, cut like any other incident's
   const event = (
     kind: 'crashed' | 'restarted',
     count: number,

@@ -11,6 +11,7 @@ import {
 } from '../mcp/render.js';
 import type { Incident } from '../core/incidents/detect.js';
 import { DEFAULT_SINCE_MIN } from '../core/incidents/poll.js';
+import { isTaken } from '../core/incidents/taken.js';
 import {
   selectedRow,
   visibleFlat,
@@ -18,6 +19,8 @@ import {
   type FlatLine,
   type MonitState,
   type ReloadInfo,
+  visibleIncidents,
+  type ShownIncident,
 } from './state.js';
 import type { LogLine } from '../core/logfollow.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
@@ -90,10 +93,19 @@ function paneSpec(
   const w = Math.max(40, size.width);
   if (s.view === 'incidents')
     return {
-      entries: s.incidents,
+      entries: visibleIncidents(s),
       // header, the pane title, footer, and one line per thing the last read could not do
       logH: Math.max(3, size.height - 3 - s.incidentsErrors.length),
-      rowsOf: (e) => incidentRows(e as Incident, w),
+      rowsOf: (e) =>
+        incidentRows(
+          e as ShownIncident,
+          w,
+          isTaken(
+            e as ShownIncident,
+            s.incidentsTaken,
+            (e as ShownIncident).end
+          )
+        ),
     };
   if (s.view === 'flat') {
     const label = Math.max(1, ...Object.keys(s.apps).map((a) => a.length));
@@ -199,14 +211,26 @@ function cachedRows(
 }
 
 const incidentCache: RowCache = new WeakMap();
-/** An incident's rows as the incidents tool writes it, wrapped to the width; its own line red, each row closing its color. */
-function incidentRows(i: Incident, w: number): string[] {
-  return cachedRows(incidentCache, i, `${w}`, () =>
-    incidentLines(i).flatMap((line) => {
-      const rows = wrapText(screenText(line), w, 4);
-      return line.startsWith('  ▶ ')
-        ? rows.map((r) => `\x1b[31m${r}${RESET}`)
-        : rows;
+/** The muted colors of what the agent has taken: grey text, and a soft red for the incident's own line. */
+const TAKEN_TEXT = '\x1b[90m';
+const TAKEN_LINE = '\x1b[38;5;131m';
+/**
+ * An incident's rows as the incidents tool writes it, wrapped to the width; its own line red, each row closing its
+ * color. One the agent has taken is muted throughout and says so on its first line.
+ */
+function incidentRows(i: Incident, w: number, taken = false): string[] {
+  return cachedRows(incidentCache, i, `${w}:${taken}`, () =>
+    incidentLines(i).flatMap((line, k) => {
+      const text = taken && k === 0 ? `${line} · taken` : line;
+      const rows = wrapText(screenText(text), w, 4);
+      const color = line.startsWith('  ▶ ')
+        ? taken
+          ? TAKEN_LINE
+          : '\x1b[31m'
+        : taken
+          ? TAKEN_TEXT
+          : '';
+      return color ? rows.map((r) => `${color}${r}${RESET}`) : rows;
     })
   );
 }
@@ -328,11 +352,12 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const empty = s.incidentsPolled
-      ? `no incidents in the last ${DEFAULT_SINCE_MIN} min`
-      : 'reading incidents…';
-    const keys =
-      '↑↓ scroll  i back  f flat  c clear  R reload all  h host  q quit';
+    const empty = !s.incidentsPolled
+      ? 'reading incidents…'
+      : s.incidents.length
+        ? 'every incident here is taken (t shows them)'
+        : `no incidents in the last ${DEFAULT_SINCE_MIN} min`;
+    const keys = `↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  q quit`;
     return {
       header,
       table: [],
@@ -465,7 +490,13 @@ export function logsTitle(
     const since = s.incidentsCleared
       ? ` · since the clear ${clearedAt(s.incidentsCleared, now)}`
       : '';
-    return `incidents · last ${DEFAULT_SINCE_MIN} min${since} · ${s.incidents.length} shown${up}`;
+    const taken = s.incidents.filter((i) =>
+      isTaken(i, s.incidentsTaken, i.end)
+    ).length;
+    const marked = taken
+      ? ` · ${taken} taken${s.hideTaken ? ' hidden' : ''}`
+      : '';
+    return `incidents · last ${DEFAULT_SINCE_MIN} min${since} · ${visibleIncidents(s).length} shown${marked}${up}`;
   }
   const shown =
     s.view === 'flat'
