@@ -2160,3 +2160,25 @@ describe('MonitLoop incidents view and log clears', () => {
     );
   });
 });
+
+describe('what the agent has taken', () => {
+  it('each refresh hands the screen the taken points the store has, and only a change dispatches', async () => {
+    let taken: Record<string, { out?: string; err?: string }> = {};
+    const h = harness(undefined, {
+      cleared: () => ({ at: {}, gen: {}, taken }),
+    });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+    taken = { 'local/api': { err: '2026-10-15T10:00:02.000' } };
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual(taken);
+    const same = h.state;
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toBe(same.incidentsTaken); // nothing new: the same points
+  });
+  it('a store read without taken points (an older dep) leaves them as they are', async () => {
+    const h = harness(undefined, { cleared: () => ({ at: {}, gen: {} }) });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+  });
+});

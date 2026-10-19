@@ -10,6 +10,7 @@ import {
   visibleFlat,
   monitViews,
   viewLabel,
+  visibleIncidents,
   type MonitState,
 } from '../../src/monit/state.js';
 import type { LsRow } from '../../src/core/list.js';
@@ -763,5 +764,90 @@ describe('incidents view', () => {
     expect(s.incidentsPolled).toBe(false);
     expect(s.incidentsCleared).toBeNull();
     expect(s.incidentsErrors).toEqual([]);
+  });
+});
+
+describe('incidents the agent has taken', () => {
+  const inc = (n: number) => ({
+    app: 'api',
+    host: 'local',
+    kind: 'error' as const,
+    stream: 'err' as const,
+    time: `2026-10-15T10:00:${String(n).padStart(2, '0')}`,
+    first_time: null,
+    count: 1,
+    line: `TypeError ${n}`,
+    before: [],
+    after: [],
+    fingerprint: `f${n}`,
+  });
+  const opened = () => {
+    let s = reduce(s0(), { type: 'view', view: 'incidents' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(3), inc(2), inc(1)],
+      cleared_at: null,
+      errors: [],
+    });
+    return reduce(s, {
+      type: 'taken',
+      taken: { 'local/api': { err: '2026-10-15T10:00:02.000' } },
+    });
+  };
+  it('t hides and shows them, only on the incidents screen', () => {
+    expect(keyIntent('t', s0())).toBeNull();
+    let s = opened();
+    expect(visibleIncidents(s).map((i) => i.line)).toEqual([
+      'TypeError 1',
+      'TypeError 2',
+      'TypeError 3',
+    ]);
+    const t = keyIntent('t', s);
+    expect(t).toEqual({ kind: 'action', action: { type: 'hideTaken' } });
+    if (t?.kind === 'action') s = reduce(s, t.action);
+    expect(s.hideTaken).toBe(true);
+    expect(visibleIncidents(s).map((i) => i.line)).toEqual(['TypeError 3']);
+    s = reduce(s, { type: 'hideTaken' });
+    expect(visibleIncidents(s)).toHaveLength(3);
+  });
+  it('a later take moves the line between shown and hidden; the points are kept as the store has them', () => {
+    let s = reduce(opened(), { type: 'hideTaken' });
+    s = reduce(s, {
+      type: 'taken',
+      taken: { 'local/api': { err: '2026-10-15T10:00:09.000' } },
+    });
+    expect(s.incidentsTaken).toEqual({
+      'local/api': { err: '2026-10-15T10:00:09.000' },
+    });
+    expect(visibleIncidents(s)).toEqual([]);
+  });
+  it('the scroll counts what is shown: hidden incidents take no room', () => {
+    let s = reduce(opened(), { type: 'hideTaken' });
+    expect(s.logScroll).toBe(0);
+    s = reduce(s, { type: 'scroll', delta: Infinity });
+    expect(s.logScroll).toBe(0); // one incident shown: nothing above it
+    s = reduce(s, { type: 'hideTaken' });
+    s = reduce(s, { type: 'scroll', delta: Infinity });
+    expect(s.logScroll).toBe(2);
+    s = reduce(s, { type: 'hideTaken' }); // toggling starts at the tail again
+    expect(s.logScroll).toBe(0);
+  });
+  it('new incidents under a scrolled, hidden view move it by the ones that show', () => {
+    let s = reduce(opened(), { type: 'hideTaken' });
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(5), inc(4)],
+      cleared_at: null,
+      errors: [],
+    }); // shown: 3, 4, 5
+    s = reduce(s, { type: 'scroll', delta: 1 });
+    expect(s.logScroll).toBe(1);
+    s = reduce(s, {
+      type: 'incidents',
+      incidents: [inc(7), inc(0)],
+      cleared_at: null,
+      errors: [],
+    }); // 0 is taken: only 7 adds a row below
+    expect(s.logScroll).toBe(2);
   });
 });

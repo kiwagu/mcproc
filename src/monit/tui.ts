@@ -24,6 +24,7 @@ import { colorFor } from '../core/logstream.js';
 import { MonitLoop, peekView, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
+import { takenPoints } from '../core/incidents/taken.js';
 
 const deps = (manifest: Manifest): LoopDeps => ({
   fleet: (requested) => new Fleet(manifest, requested),
@@ -35,7 +36,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
     const s = readStore(storePath(fleet.manifest.path));
-    return { at: s.cleared, gen: s.clears };
+    return { at: s.cleared, gen: s.clears, taken: takenPoints(s) };
   },
   peekIncidents: (fleet, names, cursor, restart) =>
     peekView(fleet, names, cursor, restart),

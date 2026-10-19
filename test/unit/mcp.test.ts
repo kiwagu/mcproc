@@ -80,6 +80,11 @@ describe('mcp server', () => {
       destructiveHint: false,
       idempotentHint: false,
     }); // taking writes the local pick-up point
+    const incDesc = byName.incidents.description as string;
+    expect(incDesc).toMatch(/Take once you have dealt with them/);
+    expect(incDesc).toMatch(/monit.*muted/);
+    expect(incDesc).toMatch(/older ones past.*counted/);
+    expect(incDesc.length).toBeLessThan(1200);
     for (const n of [
       'hosts',
       'doctor',

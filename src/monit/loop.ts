@@ -24,6 +24,7 @@ import {
   type TakenAnswer,
 } from '../core/incidents/store.js';
 import { markKey, type CursorState } from '../core/incidents/cursor.js';
+import type { TakenPoints } from '../core/incidents/taken.js';
 import {
   compileReloadRules,
   historyReaches,
@@ -75,10 +76,14 @@ export interface LoopDeps {
   reloadAll(fleet: Fleet, signal: AbortSignal): Promise<LsRow[] | undefined>;
   /** truncate the apps' logs and record the clear in the project's store (incidents start there) */
   clear(fleet: Fleet, apps: string[]): Promise<Cleared[]>;
-  /** the clears recorded in the project's store, keyed host/app: when (shown in the title) and how many (a new one restarts that app's logs) */
+  /**
+   * the clears recorded in the project's store, keyed host/app: when (shown in the title) and how many (a new one
+   * restarts that app's logs); and how far the agent's takes have read each file (the incidents view mutes what lies before)
+   */
   cleared(fleet: Fleet): {
     at: Record<string, string>;
     gen: Record<string, number>;
+    taken?: TakenPoints;
   };
   /** the incidents view's read: new incidents of the apps since `cursor`, the screen's own position, never taking any */
   peekIncidents(
@@ -136,7 +141,7 @@ export const peekView = (
   takeIncidents(
     fleet,
     names,
-    { peek: true, cursor, restart, max: MAX_INCIDENTS },
+    { peek: true, cursor, restart, max: MAX_INCIDENTS, chars: Infinity }, // a screen shows them all
     file
   );
 
@@ -713,7 +718,12 @@ export class MonitLoop {
 
   /** The clears recorded in the store (by this screen, the CLI or an agent), dispatched when they changed: the log pane title shows them. */
   private readCleared(): void {
-    const { at, gen } = this.deps.cleared(this.fleet);
+    const { at, gen, taken } = this.deps.cleared(this.fleet);
+    if (
+      taken &&
+      JSON.stringify(taken) !== JSON.stringify(this.getState().incidentsTaken)
+    )
+      this.dispatch({ type: 'taken', taken });
     // a count that appears or grows is a clear; one that vanished (the store was removed) is none
     const changed = Object.keys(gen).filter(
       (key) => gen[key] !== this.seen[key]

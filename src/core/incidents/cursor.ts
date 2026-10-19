@@ -14,6 +14,8 @@ export interface FileMark {
   offset: number;
   at?: number;
   anchor?: string;
+  /** the latest pm2 stamp read in this file (ms), carried across clears: what is stamped at or before it was taken */
+  stamp?: string;
 }
 export interface Anchor {
   at: number;

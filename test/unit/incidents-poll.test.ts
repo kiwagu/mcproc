@@ -237,7 +237,9 @@ describe('pollIncidents', () => {
       expect(second.next.apps['local/watch'].out).toEqual({
         path: '/l/watch-out',
         offset: 0,
+        stamp: first.next.apps['local/watch'].out?.stamp, // what the first read passed stays read
       });
+      expect(first.next.apps['local/watch'].out?.stamp).toMatch(/^2026-/);
       state.short = [];
       const third = await pollIncidents(h.fleet, ['watch'], {
         cursor: second.next,

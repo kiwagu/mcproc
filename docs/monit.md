@@ -17,11 +17,14 @@ as text, which is what an agent or a script reads.
 | `R` twice | reload every app in view the way `mcproc start all --reload` does: in dependency order with their `depends_on` waits, running apps restart, stopped ones start, `kind: task` apps run again. A view with an app on a readonly host is refused whole; narrow it with `h` |
 | `f` | the flat view: every app's logs merged into one labeled stream, `app \| line` and `app ! line` for stderr, one color per app, like `mcproc logs -f`; `f` again returns |
 | `i` | the incidents of the apps in view: errors, crashes and restarts with their context, as the `incidents` tool shows them, from the last 15 minutes or the last clear, then new ones as they happen; `i` again returns |
+| `t` | on the incidents screen, hide or show the incidents an agent has taken |
 | `h` | cycle hosts, from `all` to each host, narrowing the screen the way `--host` narrows a command |
 | `q` | quit |
 
 The incidents screen is for you: it reads from its own position and never takes anything, so the agent's next
-`incidents` call returns exactly what it would have ([incidents](incidents.md)).
+`incidents` call returns exactly what it would have ([incidents](incidents.md)). What an agent has taken is shown in
+muted colors and marked `taken`, and the title counts it. An incident counts as taken when its time stamp is at or
+before the last line a take read in that file.
 
 ## Several hosts
 

@@ -504,12 +504,16 @@ export function renderIncidents(
   opts: { color?: boolean } = {}
 ): string {
   const tail: string[] = [];
-  if (a.more > 0)
+  if (a.more > 0) {
+    const short = a.more_by === 'size' ? ' to keep this answer short' : '';
     tail.push(
       a.taken
-        ? `+${a.more} older incidents not shown, taken with these (read logs for them)`
-        : `+${a.more} more incidents (raise max)`
+        ? `+${a.more} older incidents not shown${short}, taken with these (read logs for them)`
+        : short
+          ? `+${a.more} more incidents not shown${short} (pass app for one app, or read logs)`
+          : `+${a.more} more incidents (raise max)`
     );
+  }
   for (const s of a.skipped)
     tail.push(
       `skipped ${fmtBytes(s.bytes)} of ${s.app} ${s.stream} on ${s.host} (too much new log; the most recent 1 MB was read)`
