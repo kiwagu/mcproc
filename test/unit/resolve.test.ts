@@ -10,6 +10,7 @@ import {
   assertApp,
   connect,
   clearResolutionCache,
+  bareLocalHost,
 } from '../../src/core/resolve.js';
 import type { Spawner } from '../../src/transport/types.js';
 
@@ -102,5 +103,18 @@ describe('connect', () => {
       fresh: true,
     });
     expect(calls).toBe(2);
+  });
+});
+
+describe('bareLocalHost', () => {
+  it('bareLocalHost is the local host a manifest without hosts.local declares', () => {
+    expect(bareLocalHost()).toMatchObject({
+      name: 'local',
+      local: true,
+      readonly: false,
+      shell: { bin: '/bin/bash', flags: ['-lc'] },
+      env: {},
+    });
+    expect(bareLocalHost().pm2_home).toBeUndefined();
   });
 });

@@ -102,6 +102,17 @@ const base = () =>
   );
 
 describe('renderFrame', () => {
+  it('the legend offers esc stacks only when monit was opened from the stacks', () => {
+    const s = base();
+    for (const v of [s, reduce(s, { type: 'view', view: 'flat' })]) {
+      expect(renderFrame(v, { width: 200, height: 24 }).footer).not.toContain(
+        'esc stacks'
+      );
+      expect(
+        renderFrame({ ...v, toStacks: true }, { width: 200, height: 24 }).footer
+      ).toMatch(/^esc stacks {2}/); // first: a narrow terminal cuts the end of the legend, never this
+    }
+  });
   it('fits an 80-column terminal: no line wider than 80, marker on the selected row, ports visible', () => {
     const f = renderFrame(base(), { width: 80, height: 24 });
     for (const line of [
@@ -541,6 +552,15 @@ describe('renderFrame', () => {
     expect(flat.logs[0]).toMatch(
       /^web {2}\| 2026-10-11T13:00:07: \x1b\[38;5;66mtimestamp=/
     );
+  });
+  it('the apps table fits the width: no column falls off the edge, a long cell ends with …', () => {
+    for (const width of [80, 120]) {
+      const f = renderFrame(base(), { width, height: 24 });
+      expect(f.table[0]).toContain('RUNTIME');
+      for (const l of f.table)
+        expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      expect(f.table[1]).toMatch(/next-server.*…$/);
+    }
   });
 });
 

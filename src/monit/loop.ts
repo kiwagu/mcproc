@@ -211,6 +211,7 @@ export class MonitLoop {
 
   /** One refresh of every host of the view (or of `hosts`); a host whose refresh of this generation is still in flight shares it. */
   refresh(hosts?: string[]): Promise<void> {
+    if (this.closed) return Promise.resolve(); // the screen went away: nothing to read for it
     this.readCleared();
     this.syncWatches();
     const gen = this.gen;
@@ -339,6 +340,7 @@ export class MonitLoop {
     const probed = this.losses; // a gap numbered after this was not seen by the rows this refresh takes
     try {
       const ctx = await this.fleet.ctx(g.host);
+      if (gen !== this.gen) return; // the view changed, or the screen went away, while the host was connecting
       // the live screen never requests the apps' URLs: dev servers log every request, and this pane is where those logs are read
       const snap = await this.deps.snapshot(ctx, {
         cpu: 'none',
@@ -579,6 +581,9 @@ export class MonitLoop {
   /** The screen is going away: no follower wakes it any more, and a running reload stops waiting for dependencies. */
   close(): void {
     this.closed = true;
+    // a refresh or a host switch still in flight drops what it brings back: its generation and its switch are stale now
+    this.gen++;
+    this.switchSeq++;
     this.reloading?.abort();
     for (const q of this.wakes.values()) {
       if (q.timer) clearTimeout(q.timer);

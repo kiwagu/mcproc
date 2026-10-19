@@ -13,6 +13,7 @@ import {
   type Context,
 } from '../core/resolve.js';
 import { cancelLease, leasesView } from '../core/leases/view.js';
+import { StacksCollector } from '../core/stacks/collect.js';
 import { watcherEntry } from '../core/leases/ensure.js';
 import {
   defaultWatcherDeps,
@@ -69,6 +70,7 @@ import {
   renderWorktreeAdded,
   renderWorktreeRemoved,
   renderWorktrees,
+  renderStacks,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -77,10 +79,14 @@ import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { installShortcut } from './install.js';
 import { runMonit } from '../monit/tui.js';
+import { overviewOnce, runOverview } from '../monit/stacks-tui.js';
+import { findManifestPath } from '../core/manifest.js';
 
 export interface Io {
   out: (s: string) => void;
   err: (s: string) => void;
+  /** the terminal's columns when stdout is one; undefined when piped (text tables then keep one record per line) */
+  columns?: () => number | undefined;
 }
 type Globals = { project?: string; host?: string; json?: boolean };
 type Opts = Record<string, string | boolean | undefined>;
@@ -88,6 +94,8 @@ type Opts = Record<string, string | boolean | undefined>;
 const defaultIo: Io = {
   out: (s) => process.stdout.write(`${s}\n`),
   err: (s) => process.stderr.write(`${s}\n`),
+  columns: () =>
+    process.stdout.isTTY ? process.stdout.columns || undefined : undefined,
 };
 
 /**
@@ -170,9 +178,32 @@ export async function printLs(
   io.out(
     how.json
       ? JSON.stringify(rows, null, 2)
-      : renderLs(rows, fleet.fallback, unread)
+      : renderLs(rows, fleet.fallback, unread, io.columns?.())
   );
   if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
+}
+
+/**
+ * What `monit` opens: the stacks overview with --all, or where no manifest is found and no project was named (--project,
+ * MCPROC_PROJECT, CLAUDE_PROJECT_DIR); otherwise the project's monit, so a named folder without a manifest still fails
+ * as before. The overview starts on the checkout it was opened from, when there is one.
+ */
+export function monitMode(
+  g: { project?: string },
+  all: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd()
+): { mode: 'overview'; selected?: string } | { mode: 'project' } {
+  const named = g.project || env.MCPROC_PROJECT || env.CLAUDE_PROJECT_DIR;
+  const found = findManifestPath(
+    named ? resolveProjectDir(g.project, [], env) : cwd
+  );
+  if (all)
+    return found
+      ? { mode: 'overview', selected: found.root }
+      : { mode: 'overview' };
+  if (!named && !found) return { mode: 'overview' };
+  return { mode: 'project' };
 }
 
 export function buildProgram(io: Io = defaultIo): Command {
@@ -191,6 +222,8 @@ export function buildProgram(io: Io = defaultIo): Command {
 
   const emit = (g: Globals, text: string, data: unknown) =>
     io.out(g.json ? JSON.stringify(data, null, 2) : text);
+  /** the width text tables fit: the terminal's, none for --json or piped output */
+  const width = (g: Globals) => (g.json ? undefined : io.columns?.());
   const wrap =
     (fn: (g: Globals, opts: Opts, args: string[]) => Promise<void>) =>
     async (...all: unknown[]) => {
@@ -224,7 +257,13 @@ export function buildProgram(io: Io = defaultIo): Command {
     const fleet = fleetOf(g);
     const waits: WaitRecord[] = [];
     const rows = await actOn(fleet, target, act, { ...opts, waits });
-    const { text, failed } = renderMutation(rows, fleet.fallback, act, waits);
+    const { text, failed } = renderMutation(
+      rows,
+      fleet.fallback,
+      act,
+      waits,
+      width(g)
+    );
     emit(g, text, { ...hostsOf(rows, fleet.fallback), rows, waits });
     if (failed) process.exitCode = 1; // a host failed or was skipped: the first line says so, the exit code too
   };
@@ -261,7 +300,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest } = prepare({ project: g.project });
         const h = hostsInfo(manifest);
-        emit(g, renderHosts(h), h);
+        emit(g, renderHosts(h, width(g)), h);
       })
     );
   program
@@ -304,7 +343,7 @@ export function buildProgram(io: Io = defaultIo): Command {
         const fleet = fleetOf(g);
         if (!app) {
           const d = describeProject(fleet.manifest);
-          emit(g, renderProject(d), d);
+          emit(g, renderProject(d, width(g)), d);
           return;
         }
         const d = await describeFleetApp(fleet, app);
@@ -314,7 +353,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             `${d.app.name} [${d.app.kind}]: ${d.app.description}`,
             `run: ${d.app.run}`,
             `cwd: ${d.app.cwd}`,
-            renderLs([d.row], d.host),
+            renderLs([d.row], d.host, [], width(g)),
             urlNote(d.row),
             `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
           ]
@@ -557,7 +596,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [port]) => {
         const ctx = await ctxOf(g);
         const r = await portsReport(ctx, port ? Number(port) : undefined);
-        emit(g, renderPorts(r, ctx.host.name), r);
+        emit(g, renderPorts(r, ctx.host.name, width(g)), r);
       })
     );
   program
@@ -602,7 +641,7 @@ export function buildProgram(io: Io = defaultIo): Command {
           ctx = undefined; // no manifest here: the queue is the host's and still reads
         }
         const v = await leasesView(undefined, ctx);
-        emit(g, renderLeases(v), v);
+        emit(g, renderLeases(v, width(g)), v);
       })
     );
   leases
@@ -612,6 +651,26 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [id]) => {
         const l = await cancelLease(id);
         emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('stacks')
+    .description(
+      'every mcproc stack on this host: the checkouts any mcproc call has seen and those found in the local pm2, with their hosts, apps, memory and ports'
+    )
+    .option('--all', 'also the recorded checkouts with nothing in pm2')
+    .action(
+      wrap(async (g, o) => {
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'stacks reads every host each stack declares; --host does not apply',
+            {
+              hint: 'Drop --host.',
+            }
+          );
+        const v = await new StacksCollector().collect({ all: Boolean(o.all) });
+        emit(g, renderStacks(v.answer, width(g)), v.answer);
       })
     );
   program
@@ -746,7 +805,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest, deps } = await worktreeCtx(g);
         const rows = await worktreeLs(manifest, deps);
-        emit(g, renderWorktrees(rows), rows);
+        emit(g, renderWorktrees(rows, width(g)), rows);
       })
     );
   worktree
@@ -799,29 +858,41 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('monit')
     .description(
-      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)'
+      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame); outside a project, or with --all, every stack of this host'
+    )
+    .option(
+      '--all',
+      'the stacks overview: every stack of this host, Enter opens one'
     )
     .option('--once', 'print one frame as text and exit')
     .option('--interval <ms>', 'refresh interval', '2000')
     .option('--lines <n>', 'log lines of history', '200')
     .action(
       wrap(async (g, o) => {
-        if (o.once) {
-          io.out(
-            await monitOnce({
-              project: g.project,
-              host: g.host,
-              lines: Number(o.lines) || 200,
-            })
-          );
+        const lines = Number(o.lines) || 200;
+        const intervalMs = Math.max(500, Number(o.interval) || 2000);
+        const m = monitMode(g, Boolean(o.all));
+        if (m.mode === 'overview') {
+          if (g.host)
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              '--host names a host of one manifest; the overview reads every stack',
+              {
+                hint: 'Drop --host, or open the project: mcproc --project <root> monit --host <name>.',
+              }
+            );
+          if (o.once) {
+            io.out(await overviewOnce({ width: io.columns?.() }));
+            return;
+          }
+          await runOverview({ intervalMs, lines, selected: m.selected });
           return;
         }
-        await runMonit({
-          project: g.project,
-          host: g.host,
-          intervalMs: Math.max(500, Number(o.interval) || 2000),
-          lines: Number(o.lines) || 200,
-        });
+        if (o.once) {
+          io.out(await monitOnce({ project: g.project, host: g.host, lines }));
+          return;
+        }
+        await runMonit({ project: g.project, host: g.host, intervalMs, lines });
       })
     );
   program

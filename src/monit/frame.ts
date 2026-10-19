@@ -28,6 +28,9 @@ import { stripAnsi } from '../core/logs.js';
 import { markKey } from '../core/incidents/cursor.js';
 import { localStamp } from '../core/incidents/store.js';
 
+/** The legend's way back to the stacks overview, when monit was opened from it: first, so a narrow terminal never cuts it. */
+const stacksKey = (s: MonitState) => (s.toStacks ? 'esc stacks  ' : '');
+
 export interface Frame {
   header: string;
   table: string[];
@@ -357,7 +360,7 @@ export function renderFrame(
       : s.incidents.length
         ? 'every incident here is taken (t shows them)'
         : `no incidents in the last ${DEFAULT_SINCE_MIN} min`;
-    const keys = `↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  q quit`;
+    const keys = `${stacksKey(s)}↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  q quit`;
     return {
       header,
       table: [],
@@ -381,8 +384,7 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const keys =
-      '↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit';
+    const keys = `${stacksKey(s)}↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit`;
     return {
       header,
       table: [],
@@ -394,32 +396,37 @@ export function renderFrame(
     };
   }
   const multi = new Set(s.rows.map((r) => r.host)).size > 1; // apps of several hosts on one screen: say where each runs
-  const tableLines = table([
+  const o = multi ? 1 : 0;
+  const tableLines = table(
     [
-      '',
-      'APP',
-      ...(multi ? ['HOST'] : []),
-      'STATUS',
-      'UP',
-      'MEM',
-      'CPU',
-      'PORTS',
-      'URL',
-      'RUNTIME',
+      [
+        '',
+        'APP',
+        ...(multi ? ['HOST'] : []),
+        'STATUS',
+        'UP',
+        'MEM',
+        'CPU',
+        'PORTS',
+        'URL',
+        'RUNTIME',
+      ],
+      ...s.rows.map((r, i) => [
+        i === s.selected ? '▶' : ' ',
+        r.app,
+        ...(multi ? [r.host] : []),
+        r.status,
+        fmtUptime(r.uptime_ms),
+        r.memory ? fmtBytes(r.memory) : '-',
+        r.status === 'online' ? fmtCpu(r.cpu) : '-',
+        screenText(fmtPorts(r.ports)),
+        screenText(fmtUrl(r)),
+        r.runtime ? screenText(r.runtime) : '-',
+      ]),
     ],
-    ...s.rows.map((r, i) => [
-      i === s.selected ? '▶' : ' ',
-      r.app,
-      ...(multi ? [r.host] : []),
-      r.status,
-      fmtUptime(r.uptime_ms),
-      r.memory ? fmtBytes(r.memory) : '-',
-      r.status === 'online' ? fmtCpu(r.cpu) : '-',
-      cut(screenText(fmtPorts(r.ports)), 22),
-      cut(screenText(fmtUrl(r)), 36),
-      r.runtime ? cut(screenText(r.runtime), 40) : '-',
-    ]),
-  ])
+    // +2: the marker column's gutter is dropped below, so the table may use those two columns
+    { width: w + 2, flex: [6 + o, 7 + o, 8 + o], mode: 'fit' }
+  )
     .split('\n')
     .map((l) => cut(l.replace(/^(.)\s\s/, '$1'), w));
   const spec = paneSpec(s, size); // its height counts the table as s.rows.length + 1 lines, as drawn here
@@ -455,8 +462,7 @@ export function renderFrame(
           ),
         ]
       : ['no app selected'];
-  const keys =
-    'j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit';
+  const keys = `${stacksKey(s)}j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit`;
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return {
     header,

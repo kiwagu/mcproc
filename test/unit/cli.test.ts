@@ -4,7 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildProgram, printLs, printSince } from '../../src/cli/program.js';
+import {
+  buildProgram,
+  monitMode,
+  printLs,
+  printSince,
+} from '../../src/cli/program.js';
+import { findManifestPath } from '../../src/core/manifest.js';
 import { parseSince } from '../../src/core/logsince.js';
 import { Fleet } from '../../src/core/fleet.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
@@ -36,6 +42,38 @@ afterEach(() => {
 });
 
 describe('cli', () => {
+  it('monit opens the overview with --all or where no manifest is found, unless a project was named', () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-nomf-'));
+    const root = findManifestPath(basic)!.root;
+    expect(monitMode({}, false, {}, empty)).toEqual({ mode: 'overview' });
+    expect(monitMode({}, true, {}, basic)).toEqual({
+      mode: 'overview',
+      selected: root,
+    });
+    expect(monitMode({}, true, {}, empty)).toEqual({ mode: 'overview' });
+    expect(monitMode({}, false, {}, basic)).toEqual({ mode: 'project' });
+    // a named project without a manifest keeps failing as before (MANIFEST_NOT_FOUND)
+    expect(monitMode({ project: empty }, false, {}, empty)).toEqual({
+      mode: 'project',
+    });
+    expect(monitMode({}, false, { MCPROC_PROJECT: empty }, empty)).toEqual({
+      mode: 'project',
+    });
+    expect(monitMode({}, false, { CLAUDE_PROJECT_DIR: empty }, empty)).toEqual({
+      mode: 'project',
+    });
+    fs.rmSync(empty, { recursive: true, force: true });
+  });
+  it('monit --all refuses --host: host names belong to one manifest', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(
+      ['monit', '--all', '--host', 'local', '--once'],
+      { from: 'user' }
+    );
+    expect(c.err.join('\n')).toContain('BAD_ARGUMENT');
+    expect(c.err.join('\n')).toContain('Hint: Drop --host');
+    expect(process.exitCode).toBe(1);
+  });
   it('hosts --json prints the hosts', async () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(
@@ -295,6 +333,15 @@ describe('cli', () => {
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
+  });
+  it('stacks refuses --host: it reads every host each stack declares', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(['stacks', '--host', 'local'], {
+      from: 'user',
+    });
+    expect(c.err.join('\n')).toContain('BAD_ARGUMENT');
+    expect(c.err.join('\n')).toContain('Hint: Drop --host.');
+    expect(process.exitCode).toBe(1);
   });
   it('worktree refuses another host before touching it', async () => {
     const c = capture();
@@ -704,6 +751,61 @@ describe('cli', () => {
     const opt = cmd.options.find((o) => o.long === '--reloads');
     expect(opt?.description).toMatch(/reload/);
     expect(opt?.required || opt?.optional).toBeFalsy(); // a switch, no value
+  });
+  it('on a terminal the text tables stay within its columns; without columns they print as before', async () => {
+    const narrow = capture();
+    await buildProgram({ ...narrow.io, columns: () => 70 }).parseAsync(
+      ['hosts', '--project', basic],
+      { from: 'user' }
+    );
+    for (const l of narrow.out.join('\n').split('\n'))
+      expect(l.length).toBeLessThanOrEqual(70);
+    const plain = capture();
+    await buildProgram(plain.io).parseAsync(['hosts', '--project', basic], {
+      from: 'user',
+    });
+    expect(
+      plain.out
+        .join('\n')
+        .split('\n')
+        .some((l) => l.length > 70)
+    ).toBe(true);
+  });
+  it('a terminal that reports 0 columns counts as unknown: the tables print as when piped', async () => {
+    const out: string[] = [];
+    const write = vi
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((s: string | Uint8Array) => {
+        out.push(String(s));
+        return true;
+      });
+    const saved = {
+      isTTY: Object.getOwnPropertyDescriptor(process.stdout, 'isTTY'),
+      columns: Object.getOwnPropertyDescriptor(process.stdout, 'columns'),
+    };
+    Object.defineProperty(process.stdout, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, 'columns', {
+      value: 0,
+      configurable: true,
+    });
+    try {
+      await buildProgram().parseAsync(['hosts', '--project', basic], {
+        from: 'user',
+      });
+    } finally {
+      write.mockRestore();
+      for (const [k, desc] of Object.entries(saved))
+        if (desc) Object.defineProperty(process.stdout, k, desc);
+        else delete (process.stdout as unknown as Record<string, unknown>)[k];
+    }
+    const plain = capture();
+    await buildProgram(plain.io).parseAsync(['hosts', '--project', basic], {
+      from: 'user',
+    });
+    expect(out.join('')).toBe(plain.out.map((l) => `${l}\n`).join(''));
   });
 });
 

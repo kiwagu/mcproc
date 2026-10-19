@@ -1,3 +1,4 @@
+import os from 'node:os';
 import type { LsRow, HostInfo } from '../core/list.js';
 import type { HostError } from '../core/fleet.js';
 import type { DoctorReport, DoctorUrl } from '../core/doctor.js';
@@ -17,6 +18,7 @@ import type {
   WorktreeRemoved,
   WorktreeRow,
 } from '../core/worktree.js';
+import type { Orphan, Stack, StacksAnswer } from '../core/stacks/types.js';
 import { fmtMib } from '../core/sizes.js';
 import {
   type HostEnv,
@@ -26,6 +28,7 @@ import {
 import { formatLine } from '../core/logstream.js';
 import { bodyOf, type Incident } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
+import { cutStartWidth, cutWidth, displayWidth } from '../monit/screentext.js';
 
 export function fmtUptime(ms: number | null): string {
   if (ms === null) return '-';
@@ -61,18 +64,116 @@ export function fmtPorts(p: AppPorts): string {
   for (const u of p.undeclared) parts.push(`:${u} (undeclared)`);
   return parts.length ? parts.join(', ') : '-';
 }
-export function table(rows: string[][]): string {
-  const w = rows[0].map((_, i) =>
-    Math.max(...rows.map((r) => (r[i] ?? '').length))
+/** How a table meets a width: `wrap` continues a long cell on the next lines (the CLI on a terminal), `fit` keeps one line per row and cuts it with … (the TUI). */
+export interface TableOpts {
+  /** the terminal columns to stay within; none: no limit, the output tables always had (MCP answers, piped output) */
+  width?: number;
+  /** the free-text columns, by index: the only ones that shrink */
+  flex?: number[];
+  mode?: 'wrap' | 'fit';
+  /** `fit`: the columns cut at the start (paths, whose end says more); the others are cut at the end */
+  cutStart?: number[];
+}
+const GUTTER = 2;
+/** A free-text column never shrinks below this, or below its own longest cell. */
+export const FLEX_MIN = 12;
+
+/** The column widths for `width`: the widest free-text column loses one column at a time until the row fits or every one is at its floor. */
+export function fitWidths(
+  natural: number[],
+  flex: number[],
+  width: number
+): number[] {
+  const w = [...natural];
+  const floor = (i: number) => Math.min(FLEX_MIN, natural[i]);
+  let total = w.reduce((a, b) => a + b, 0) + GUTTER * (w.length - 1);
+  while (total > width) {
+    let pick = -1;
+    for (const i of flex)
+      if (w[i] > floor(i) && (pick < 0 || w[i] > w[pick])) pick = i;
+    if (pick < 0) break; // every free-text column at its floor: the rest is the terminal's
+    w[pick]--;
+    total--;
+  }
+  return w;
+}
+
+/** The longest start of `s` within `width` columns, at least one character. */
+function takeWidth(s: string, width: number): string {
+  let out = '';
+  for (const ch of s) {
+    if (out && displayWidth(out + ch) > width) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** `s` as lines of at most `width` columns: broken after a space, `/`, `,`, `:` or `-`; a longer run is split where it reaches the width. */
+export function wrapCell(s: string, width: number): string[] {
+  if (displayWidth(s) <= width) return [s];
+  const lines: string[] = [];
+  let line = '';
+  for (let t of s.match(/[^\s/,:-]*[\s/,:-]*/g)?.filter(Boolean) ?? []) {
+    if (displayWidth((line + t).trimEnd()) <= width) {
+      line += t;
+      continue;
+    }
+    if (line.trim()) lines.push(line.trimEnd());
+    line = '';
+    while (displayWidth(t.trimEnd()) > width) {
+      const head = takeWidth(t, width);
+      lines.push(head);
+      t = t.slice(head.length);
+    }
+    line = t;
+  }
+  if (line.trim()) lines.push(line.trimEnd());
+  return lines;
+}
+
+/** The table every renderer prints. Without a width: each column as wide as its longest cell. With one: see TableOpts. */
+export function table(rows: string[][], opts: TableOpts = {}): string {
+  if (opts.width === undefined) {
+    const w = rows[0].map((_, i) =>
+      Math.max(...rows.map((r) => (r[i] ?? '').length))
+    );
+    return rows
+      .map((r) =>
+        r
+          .map((c, i) => (c ?? '').padEnd(w[i]))
+          .join('  ')
+          .trimEnd()
+      )
+      .join('\n');
+  }
+  const at = (r: string[], i: number) => r[i] ?? '';
+  const natural = rows[0].map((_, i) =>
+    Math.max(...rows.map((r) => displayWidth(at(r, i))))
   );
-  return rows
-    .map((r) =>
-      r
-        .map((c, i) => (c ?? '').padEnd(w[i]))
-        .join('  ')
-        .trimEnd()
-    )
-    .join('\n');
+  const widths = fitWidths(natural, opts.flex ?? [], opts.width);
+  const flex = new Set(opts.flex ?? []);
+  const starts = new Set(opts.cutStart ?? []);
+  const pad = (s: string, w: number) =>
+    s + ' '.repeat(Math.max(0, w - displayWidth(s)));
+  const out: string[] = [];
+  for (const r of rows) {
+    const cells = widths.map((w, i) => {
+      const s = at(r, i);
+      if (!flex.has(i) || displayWidth(s) <= w) return [s];
+      if (opts.mode === 'fit')
+        return [starts.has(i) ? cutStartWidth(s, w) : cutWidth(s, w)];
+      return wrapCell(s, w);
+    });
+    const height = Math.max(...cells.map((c) => c.length));
+    for (let k = 0; k < height; k++)
+      out.push(
+        cells
+          .map((c, i) => pad(c[k] ?? '', widths[i]))
+          .join(' '.repeat(GUTTER))
+          .trimEnd()
+      );
+  }
+  return out.join('\n');
 }
 export function fmtCpu(c: number | null): string {
   return c === null ? '-' : `${c.toFixed(1)}%`;
@@ -116,7 +217,8 @@ function fmtRestarts(r: LsRow): string {
 export function renderLs(
   rows: LsRow[],
   host: string,
-  errors: HostError[] = []
+  errors: HostError[] = [],
+  width?: number
 ): string {
   const hosts = [...new Set(rows.map((r) => r.host))];
   const multi = hosts.length > 1;
@@ -128,40 +230,46 @@ export function renderLs(
       rows.filter((r) => r.error).map((r) => [r.host, `${r.host}: ${r.error}`])
     ).values(),
   ];
+  const o = multi ? 1 : 0;
+  // without a width the long cells keep their caps (MCP answers, piped output); a terminal wraps them instead
+  const cap = (s: string, n: number) => (width === undefined ? cut(s, n) : s);
   return [
     head,
-    table([
+    table(
       [
-        'APP',
-        ...(multi ? ['HOST'] : []),
-        'KIND',
-        'STATUS',
-        'PID',
-        'UPTIME',
-        'RESTARTS',
-        'MEM',
-        'CPU',
-        'PORTS',
-        'URL',
-        'RUNTIME',
-        'DESCRIPTION',
+        [
+          'APP',
+          ...(multi ? ['HOST'] : []),
+          'KIND',
+          'STATUS',
+          'PID',
+          'UPTIME',
+          'RESTARTS',
+          'MEM',
+          'CPU',
+          'PORTS',
+          'URL',
+          'RUNTIME',
+          'DESCRIPTION',
+        ],
+        ...rows.map((r) => [
+          r.app,
+          ...(multi ? [r.host] : []),
+          r.kind,
+          r.status,
+          r.pid === null ? '-' : String(r.pid),
+          fmtUptime(r.uptime_ms),
+          fmtRestarts(r),
+          r.memory ? fmtBytes(r.memory) : '-',
+          r.status === 'online' ? fmtCpu(r.cpu) : '-',
+          fmtPorts(r.ports),
+          fmtUrl(r),
+          r.runtime ? cap(r.runtime, 32) : '-',
+          cap(r.description.split('\n')[0], 40),
+        ]),
       ],
-      ...rows.map((r) => [
-        r.app,
-        ...(multi ? [r.host] : []),
-        r.kind,
-        r.status,
-        r.pid === null ? '-' : String(r.pid),
-        fmtUptime(r.uptime_ms),
-        fmtRestarts(r),
-        r.memory ? fmtBytes(r.memory) : '-',
-        r.status === 'online' ? fmtCpu(r.cpu) : '-',
-        fmtPorts(r.ports),
-        fmtUrl(r),
-        r.runtime ? cut(r.runtime, 32) : '-',
-        cut(r.description.split('\n')[0], 40),
-      ]),
-    ]),
+      { width, flex: [8 + o, 9 + o, 10 + o, 11 + o], mode: 'wrap' }
+    ),
     ...unreachable,
     ...errors.map((e) => `${e.host}: ${e.message}`),
   ].join('\n');
@@ -195,38 +303,45 @@ export function renderPorts(
     port: number | null;
     listeners: Array<Listener & { app: string | null }>;
   },
-  host: string
+  host: string,
+  width?: number
 ): string {
   if (rep.listeners.length === 0)
     return `host: ${host}\n${rep.port ? `nothing listens on port ${rep.port}` : 'no listening sockets visible'}`;
   return (
     `host: ${host}\n` +
-    table([
-      ['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'],
-      ...rep.listeners.map((l) => [
-        l.proto,
-        l.addr,
-        String(l.port),
-        l.pid === null ? '?' : String(l.pid),
-        l.command ?? '?',
-        l.app ?? '-',
-        l.container ?? '-',
-      ]),
-    ])
+    table(
+      [
+        ['PROTO', 'ADDR', 'PORT', 'PID', 'COMMAND', 'APP', 'CONTAINER'],
+        ...rep.listeners.map((l) => [
+          l.proto,
+          l.addr,
+          String(l.port),
+          l.pid === null ? '?' : String(l.pid),
+          l.command ?? '?',
+          l.app ?? '-',
+          l.container ?? '-',
+        ]),
+      ],
+      { width, flex: [4], mode: 'wrap' }
+    )
   );
 }
-export function renderHosts(info: HostInfo[]): string {
-  return table([
-    ['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME', 'APPS'],
-    ...info.map((h) => [
-      h.name,
-      h.transport,
-      h.cwd,
-      h.readonly ? 'yes' : 'no',
-      h.pm2_home ?? '-',
-      h.apps.length ? h.apps.join(', ') : '-',
-    ]),
-  ]);
+export function renderHosts(info: HostInfo[], width?: number): string {
+  return table(
+    [
+      ['HOST', 'TRANSPORT', 'CWD', 'READONLY', 'PM2_HOME', 'APPS'],
+      ...info.map((h) => [
+        h.name,
+        h.transport,
+        h.cwd,
+        h.readonly ? 'yes' : 'no',
+        h.pm2_home ?? '-',
+        h.apps.length ? h.apps.join(', ') : '-',
+      ]),
+    ],
+    { width, flex: [1, 2, 4, 5], mode: 'wrap' }
+  );
 }
 /** `container (docker), hostname ws-01`, or `no container, hostname dev-box` */
 export function fmtEnv(e: HostEnv): string {
@@ -417,26 +532,29 @@ export function fmtDeps(deps: { app: string; condition: string }[]): string {
     .join(', ');
 }
 
-export function renderProject(d: {
-  project: string;
-  root: string;
-  mcproc: { manifest: string | null; running: string };
-  vars: VarInfo[];
-  override: string | null;
-  slot: number | null;
-  apps: {
-    name: string;
-    kind: string;
-    description: string;
-    ports: number[];
-    url: string | null;
-    depends_on: { app: string; condition: string }[];
-    host: string | null;
-  }[];
-  profiles: Record<string, string[]>;
-  hosts: HostInfo[];
-  readme: string | null;
-}): string {
+export function renderProject(
+  d: {
+    project: string;
+    root: string;
+    mcproc: { manifest: string | null; running: string };
+    vars: VarInfo[];
+    override: string | null;
+    slot: number | null;
+    apps: {
+      name: string;
+      kind: string;
+      description: string;
+      ports: number[];
+      url: string | null;
+      depends_on: { app: string; condition: string }[];
+      host: string | null;
+    }[];
+    profiles: Record<string, string[]>;
+    hosts: HostInfo[];
+    readme: string | null;
+  },
+  width?: number
+): string {
   const L = [`project: ${d.project} (${d.root})`];
   const w = d.mcproc.manifest;
   if (w)
@@ -458,9 +576,10 @@ export function renderProject(d: {
   L.push('profiles:');
   for (const [p, apps] of Object.entries(d.profiles))
     L.push(`  ${p}: ${apps.join(', ')}`);
+  // the hosts table is indented by two columns: it fits what is left of the width
   L.push(
     'hosts:',
-    renderHosts(d.hosts)
+    renderHosts(d.hosts, width === undefined ? undefined : width - 2)
       .split('\n')
       .map((x) => `  ${x}`)
       .join('\n')
@@ -581,7 +700,7 @@ export function queuedNote(rows: LsRow[]): string {
 }
 
 /** The queue as a table, oldest first, with the host's memory and the watcher's state above it. */
-export function renderLeases(v: LeasesView): string {
+export function renderLeases(v: LeasesView, width?: number): string {
   const head = [
     `state: ${v.state_dir}`,
     v.memory
@@ -607,20 +726,23 @@ export function renderLeases(v: LeasesView): string {
   ]);
   return [
     ...head,
-    table([
+    table(
       [
-        'POS',
-        'STATE',
-        'KIND',
-        'PROJECT',
-        'TARGET',
-        'EST → NEED',
-        'FROM',
-        'WAITING FOR / ERROR',
-        'ID',
+        [
+          'POS',
+          'STATE',
+          'KIND',
+          'PROJECT',
+          'TARGET',
+          'EST → NEED',
+          'FROM',
+          'WAITING FOR / ERROR',
+          'ID',
+        ],
+        ...rows,
       ],
-      ...rows,
-    ]),
+      { width, flex: [4, 7], mode: 'wrap' }
+    ),
   ].join('\n');
 }
 
@@ -629,7 +751,8 @@ export function renderMutation(
   rows: LsRow[],
   fallback: string,
   act: string,
-  waits: WaitRecord[] = []
+  waits: WaitRecord[] = [],
+  width?: number
 ): { text: string; failed: boolean } {
   const bad = rows.filter((r) => r.error);
   const notes = [
@@ -642,7 +765,10 @@ export function renderMutation(
     ? `${act} partly failed: ${bad.map((r) => `${r.app} (${r.host}): ${r.error}`).join('; ')}\n`
     : '';
   return {
-    text: head + renderLs(rows, fallback) + notes.map((n) => `\n${n}`).join(''),
+    text:
+      head +
+      renderLs(rows, fallback, [], width) +
+      notes.map((n) => `\n${n}`).join(''),
     failed: bad.length > 0,
   };
 }
@@ -707,21 +833,160 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
 }
 
 /** Every checkout of the repository as a table, slot 0 marked as the main one. */
-export function renderWorktrees(rows: WorktreeRow[]): string {
-  return table([
-    ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
-    ...rows.map((r) => [
-      r.main ? `${r.slot} (main)` : String(r.slot),
-      r.project,
-      r.branch ?? '(detached)',
-      String(r.online),
-      r.lease ?? '-',
-      r.path,
-    ]),
-  ]);
+export function renderWorktrees(rows: WorktreeRow[], width?: number): string {
+  return table(
+    [
+      ['SLOT', 'PROJECT', 'BRANCH', 'ONLINE', 'LEASE', 'PATH'],
+      ...rows.map((r) => [
+        r.main ? `${r.slot} (main)` : String(r.slot),
+        r.project,
+        r.branch ?? '(detached)',
+        String(r.online),
+        r.lease ?? '-',
+        r.path,
+      ]),
+    ],
+    { width, flex: [2, 5], mode: 'wrap' }
+  );
 }
 
 /** A removed worktree in one line: its path, the slot it freed, the branch it kept and the apps it stopped. */
 export function renderWorktreeRemoved(r: WorktreeRemoved): string {
   return `removed ${r.path}: slot ${r.slot} is free, branch ${r.branch ?? '(detached)'} kept; stopped ${r.stopped.length ? r.stopped.join(', ') : 'nothing'}`;
+}
+
+/** A path with the home directory as ~. */
+export function tildePath(p: string, home = os.homedir()): string {
+  return p === home || p.startsWith(`${home}/`)
+    ? `~${p.slice(home.length)}`
+    : p;
+}
+/**
+ * A stack's name: a base is its project; a worktree is `w<slot> <branch>`, indented when `nested` (its base is in the
+ * same list, which puts it under that base), else after its base's name, flush left, so the row still names its project.
+ */
+export function stackLabel(
+  s: Pick<Stack, 'project' | 'base_project' | 'slot' | 'branch'>,
+  nested: boolean
+): string {
+  if (s.base_project === s.project) return s.project;
+  const wt = `${s.slot !== null ? `w${s.slot} ` : ''}${s.branch ?? s.project}`;
+  return nested ? `  ${wt}` : `${s.base_project} ${wt}`;
+}
+/** `online/total`, `queued #N` while its start waits, `not running` with nothing in pm2. */
+export function stackApps(s: Stack): string {
+  if (s.queue_position !== null && s.apps.online === 0)
+    return `queued #${s.queue_position}`;
+  return s.present ? `${s.apps.online}/${s.apps.total}` : 'not running';
+}
+/** The listening ports, the first `max` and how many more. */
+export function stackPorts(s: Stack, max = 3): string {
+  const ports = [...new Set(s.ports.map((p) => p.port))].sort((a, b) => a - b);
+  if (ports.length === 0) return '-';
+  const shown = ports
+    .slice(0, max)
+    .map((p) => `:${p}`)
+    .join(' ');
+  return ports.length > max ? `${shown} +${ports.length - max}` : shown;
+}
+/** `root`: the ROOT cell, absolute where it is read back as `project` (MCP, piped), with ~ on a terminal. */
+const stackCells = (
+  s: Stack,
+  nested: boolean,
+  root: (p: string) => string
+): string[] => [
+  stackLabel(s, nested),
+  root(s.root),
+  s.hosts.map((h) => h.name).join(','),
+  s.manifest_error ? 'manifest error' : stackApps(s),
+  String(s.apps.errored),
+  s.memory ? fmtBytes(s.memory) : '-',
+  s.cpu === null ? '-' : `${Math.round(s.cpu)}%`,
+  stackPorts(s),
+];
+/** A pm2 namespace no manifest claims, as a row under STACK_HEADER. */
+export const orphanCells = (o: Orphan): string[] => {
+  const mem = o.processes.reduce((a, p) => a + p.memory, 0);
+  return [
+    `pm2 · ${o.namespace}`,
+    '(no manifest)',
+    o.endpoint,
+    `${o.processes.filter((p) => p.status === 'online').length}/${o.processes.length}`,
+    '-',
+    mem ? fmtBytes(mem) : '-',
+    '-',
+    '-',
+  ];
+};
+export const STACK_HEADER = [
+  'STACK',
+  'ROOT',
+  'HOSTS',
+  'APPS',
+  'ERR',
+  'MEM',
+  'CPU',
+  'PORTS',
+];
+
+export function stacksHostLine(h: StacksAnswer['host']): string {
+  const mem = h.memory
+    ? `RAM ${fmtMib(h.memory.available_mib)} free of ${fmtMib(h.memory.total_mib)}`
+    : 'no memory reading';
+  const watcher = h.watcher
+    ? h.watcher.online
+      ? 'watcher online'
+      : 'watcher stopped'
+    : 'no watcher';
+  return `${h.name} · ${mem} · ${watcher} · queue ${h.queue}`;
+}
+
+/**
+ * Every stack of the host: a host line, the table, then a line per manifest error, note and host that did not answer.
+ * Without a width (MCP, piped) ROOT is the absolute path, which passes back as `project`; on a terminal the home is ~.
+ */
+export function renderStacks(
+  a: StacksAnswer,
+  width?: number,
+  home = os.homedir()
+): string {
+  const lines = [`host: ${stacksHostLine(a.host)}`, ...a.host.notes];
+  if (a.stacks.length === 0 && a.orphans.length === 0)
+    return [
+      ...lines,
+      'no stacks running on this host (--all lists the recorded ones)',
+    ].join('\n');
+  const bases = new Set(a.stacks.map((s) => s.project));
+  const root = (p: string) => (width === undefined ? p : tildePath(p, home));
+  lines.push(
+    table(
+      [
+        STACK_HEADER,
+        ...a.stacks.map((s) =>
+          stackCells(
+            s,
+            s.base_project !== s.project && bases.has(s.base_project),
+            root
+          )
+        ),
+        ...a.orphans.map(orphanCells),
+      ],
+      { width, flex: [1, 7], mode: 'wrap' }
+    )
+  );
+  for (const s of a.stacks) {
+    if (s.manifest_error)
+      lines.push(
+        `${s.project}: ${s.manifest_error.code}: ${s.manifest_error.message}${s.manifest_error.hint ? ` (${s.manifest_error.hint})` : ''}`
+      );
+    for (const n of s.notes) lines.push(`${s.project}: ${n}`);
+    for (const h of s.hosts)
+      if (h.error)
+        lines.push(
+          `${s.project} on ${h.name}: ${h.error}${h.age_s ? ` (last read ${h.age_s}s ago)` : ''}`
+        );
+  }
+  for (const o of a.orphans)
+    if (o.note) lines.push(`pm2 · ${o.namespace}: ${o.note}`);
+  return lines.join('\n');
 }

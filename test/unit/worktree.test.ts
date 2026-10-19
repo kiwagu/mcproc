@@ -14,6 +14,7 @@ import { MARK } from '../../src/shell/snippets.js';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
+import { projectFile, recordProject } from '../../src/core/registry.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
   excludePattern,
@@ -603,10 +604,13 @@ describe('worktree', () => {
       worktreeRemove(m, 'a', { force: false }, deps())
     ).rejects.toMatchObject({ code: 'WORKTREE_DIRTY' });
     expect(stopped).toEqual([]);
+    recordProject(loadManifest(a.path), state);
+    expect(fs.existsSync(projectFile(state, 'demo-w1', a.path))).toBe(true);
     const r = await worktreeRemove(m, '1', { force: true }, deps());
     expect(r).toEqual({ path: a.path, slot: 1, branch: 'a', stopped: ['db'] });
     expect(stopped).toEqual([a.path]);
     expect(fs.existsSync(a.path)).toBe(false);
+    expect(fs.existsSync(projectFile(state, 'demo-w1', a.path))).toBe(false);
     // the linked folder of the main checkout survives the removal of its link
     expect(fs.readFileSync(path.join(main, 'notes', 'n.md'), 'utf8')).toBe(
       'note'

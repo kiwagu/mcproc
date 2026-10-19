@@ -38,3 +38,30 @@ is shown next to it in the details. CPU is per core over the refresh interval. L
 continuations. The selected app's detail line counts its in-process reloads since its pm2 start
 ([reloads](reloads.md)). The screen shows an app's URL but never requests it, so your dev servers' request logs
 stay yours ([urls](urls.md)). How lines reach the screen: [live logs](logs.md#live-logs).
+
+## Every stack of the host
+
+`mcproc monit` run where no manifest is found (from your home directory, say), or `mcproc monit --all` from
+anywhere, opens the list of every stack on this machine. A stack is a checkout with its manifest. mcproc remembers
+every checkout any of its commands has read, in its state directory (`~/.local/state/mcproc/projects`), and it also
+looks at the namespaces of the local pm2 daemon, finding the checkout of an unknown one from its processes' working
+directory. So a stack left running after the editor was closed is listed too. A pm2 namespace that no manifest
+claims is shown at the bottom as `pm2 · <namespace>` and is read-only.
+
+Each row shows the hosts the stack runs on, its apps online out of all, errors, the memory and CPU of its process
+trees, and its listening ports. A worktree is listed under its main checkout as `w<slot> <branch>`. The lower pane
+shows the selected stack's apps. The local pm2 daemons (the default one and each own `pm2_home`) are read on every
+refresh; hosts reached over ssh or docker at most every 10 seconds, and a host that does not answer is marked on its
+stacks and tried again after 30 seconds. Warnings about the host (an unreadable state directory, a local pm2 that
+does not answer) stay in the header.
+
+| key | does |
+|---|---|
+| `j` `k` `↑` `↓` | select a stack |
+| `Enter` | open the stack's monit; `esc` there comes back to the list, `q` quits |
+| `x` `x` | stop every app of the stack (the second `x` within 3 seconds); apps on readonly hosts are left alone |
+| `a` | also list the remembered stacks with nothing running |
+| `q` | quit |
+
+`mcproc stacks` (MCP `stacks`) prints the same list; `--json` gives every field. `monit --all --once` prints one frame
+of the list as text.

@@ -2235,3 +2235,87 @@ describe('what the agent has taken', () => {
     });
   });
 });
+
+describe('MonitLoop after close (the screen went away, e.g. esc back to the stacks)', () => {
+  it('a refresh still in flight publishes nothing once the loop is closed', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness('local', {
+      snapshot: async () => {
+        snaps++;
+        await gate.promise;
+        return snap();
+      },
+    });
+    const pending = h.loop.refresh();
+    await tick();
+    const before = h.actions.length;
+    h.loop.close();
+    gate.resolve();
+    await pending;
+    await tick();
+    expect(h.actions.slice(before)).toEqual([]);
+    expect(snaps).toBe(1);
+  });
+  it('a refresh asked after close reads nothing', async () => {
+    let snaps = 0;
+    const h = harness('local', {
+      snapshot: async () => {
+        snaps++;
+        return snap();
+      },
+    });
+    h.loop.close();
+    await h.loop.refresh();
+    expect(snaps).toBe(0);
+    expect(h.actions).toEqual([]);
+  });
+  it('a host switch still connecting when the loop closes neither replaces the view nor reads it', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness(
+      undefined,
+      {
+        snapshot: async () => {
+          snaps++;
+          return snap();
+        },
+      },
+      { dir: fleetDir, gate: (host) => (host === 'box' ? gate.promise : null) }
+    );
+    const switching = h.loop.switchView('box');
+    await tick();
+    const before = h.actions.length;
+    h.loop.close();
+    gate.resolve();
+    await switching;
+    await tick();
+    expect(h.actions.slice(before)).toEqual([]);
+    expect(snaps).toBe(0);
+    expect(h.state.host).not.toBe('box');
+  });
+});
+
+describe('MonitLoop closed while a host is still connecting', () => {
+  it('starts no probe once the loop closed during the connect', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness(
+      'local',
+      {
+        snapshot: async () => {
+          snaps++;
+          return snap();
+        },
+      },
+      { gate: (host) => (host === 'local' ? gate.promise : null) }
+    );
+    const pending = h.loop.refresh();
+    await tick();
+    h.loop.close();
+    gate.resolve();
+    await pending;
+    await tick();
+    expect(snaps).toBe(0);
+  });
+});

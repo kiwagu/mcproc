@@ -27,6 +27,9 @@ import {
   renderWorktreeAdded,
   renderWorktrees,
   renderWorktreeRemoved,
+  renderStacks,
+  stackLabel,
+  tildePath,
 } from '../../src/mcp/render.js';
 import { describeProject, queuedRow, type LsRow } from '../../src/core/list.js';
 import type { Lease } from '../../src/core/leases/store.js';
@@ -35,6 +38,9 @@ import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import { VERSION } from '../../src/version.js';
 import type { PortCheck } from '../../src/core/ports.js';
 import type { SinceAnswer } from '../../src/core/logsince.js';
+import type { LeasesView } from '../../src/core/leases/view.js';
+import type { StacksAnswer } from '../../src/core/stacks/types.js';
+import { displayWidth } from '../../src/monit/screentext.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (n: string) => path.join(here, '..', 'fixtures', 'projects', n);
@@ -1572,5 +1578,293 @@ describe('worktree renderers', () => {
     ).toBe(
       'removed /w/demo.worktrees/a: slot 1 is free, branch a kept; stopped db'
     );
+  });
+});
+
+describe('width-aware CLI tables', () => {
+  const lease = {
+    id: 'l_aaaaaaaaaa',
+    position: null,
+    state: 'cancelled',
+    kind: 'exec',
+    project: 'demo',
+    slot: 0,
+    target:
+      'bun run test:e2e -- --project demo --workers 2 --reporter list --retries 0',
+    estimate_mib: 4096,
+    need_mib: 4506,
+    sources: {},
+    waiting_for: null,
+    error:
+      'NOT_STARTED: cannot launch the lease watcher: this mcproc runs from /home/u/.local/bin/mcproc, not from a built cli.js',
+  };
+  const view = {
+    state_dir: '/home/u/.local/state/mcproc',
+    memory: null,
+    watcher: null,
+    leases: [lease],
+  } as unknown as LeasesView;
+
+  it('leases keeps every line within the width, wrapping TARGET and WAITING FOR / ERROR in their columns; ID stays on the first line', () => {
+    for (const width of [120, 200]) {
+      const lines = renderLeases(view, width).split('\n').slice(2);
+      for (const l of lines) expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      expect(lines[0]).toMatch(/^POS\s+STATE/);
+      expect(lines[1]).toMatch(/l_aaaaaaaaaa$/);
+      expect(lines.length).toBeGreaterThan(2); // the error went on to more lines
+      const col = lines[0].indexOf('WAITING FOR');
+      for (const l of lines.slice(2))
+        if (l.trim())
+          expect(l.slice(0, col).trim()).not.toMatch(/exec|cancelled/); // continuation lines: other cells blank
+      // both free-text columns went on to more lines, each within its own column
+      const target = lines[0].indexOf('TARGET');
+      const est = lines[0].indexOf('EST');
+      const more = lines.slice(2);
+      expect(more.some((l) => l.slice(target, est).trim())).toBe(true);
+      expect(more.some((l) => l.slice(col).trim())).toBe(true);
+      expect(lines[1]).not.toContain('--retries 0');
+      expect(lines[1]).not.toContain('not from a built cli.js');
+    }
+  });
+  it('without a width the leases table is one line per lease, as before', () => {
+    const lines = renderLeases(view).split('\n');
+    expect(lines).toHaveLength(4); // state, memory, header, the lease
+    expect(lines[3]).toContain('not from a built cli.js');
+  });
+  it('hosts wraps its CWD within a narrow width', () => {
+    const info = [
+      {
+        name: 'local',
+        transport: 'local',
+        readonly: false,
+        cwd: '/home/u/a/very/long/checkout/path/of/the/project',
+        runtime: 'path',
+        pm2: null,
+        pm2_home: null,
+        apps: [],
+      },
+    ];
+    for (const l of renderHosts(info, 60).split('\n'))
+      expect(displayWidth(l)).toBeLessThanOrEqual(60);
+    expect(renderHosts(info).split('\n')).toHaveLength(2);
+  });
+  it('the project summary fits its indented hosts table within the width; without one it prints as before', () => {
+    const cwd = '/home/u/a/very/long/checkout/path/of/the/project';
+    const d = {
+      project: 'demo',
+      root: '/w/demo',
+      mcproc: { manifest: null, running: '0.0.0' },
+      vars: [],
+      override: null,
+      slot: null,
+      apps: [
+        {
+          name: 'api',
+          kind: 'server',
+          description: 'HTTP API',
+          ports: [],
+          url: null,
+          depends_on: [],
+          host: null,
+        },
+      ],
+      profiles: { base: ['api'] },
+      hosts: [
+        {
+          name: 'local',
+          transport: 'local',
+          readonly: false,
+          cwd,
+          runtime: 'path',
+          pm2: null,
+          pm2_home: null,
+          apps: [],
+        },
+      ],
+      readme: null,
+    };
+    const narrow = renderProject(d, 60).split('\n');
+    for (const l of narrow) expect(displayWidth(l)).toBeLessThanOrEqual(60);
+    const hosts = narrow.slice(narrow.indexOf('hosts:') + 1);
+    expect(hosts.length).toBeGreaterThan(2); // the cwd went on to more lines
+    for (const l of hosts) expect(l.startsWith('  ')).toBe(true); // still indented under hosts:
+    const plain = renderProject(d).split('\n');
+    expect(plain.slice(plain.indexOf('hosts:') + 1)).toEqual([
+      '  HOST   TRANSPORT  CWD                                               READONLY  PM2_HOME  APPS',
+      `  local  local      ${cwd}  no        -         -`,
+    ]);
+  });
+});
+
+describe('renderStacks', () => {
+  const answer = {
+    host: {
+      name: 'box',
+      memory: { available_mib: 13600, total_mib: 31836 },
+      watcher: { online: true, pid: 9 },
+      queue: 0,
+      notes: [],
+    },
+    stacks: [
+      {
+        project: 'alpha',
+        root: '/home/u/repos/alpha',
+        base_project: 'alpha',
+        slot: 0,
+        branch: 'main',
+        source: 'registry',
+        hosts: [
+          {
+            name: 'local',
+            endpoint: 'local',
+            reachable: true,
+            error: null,
+            age_s: 0,
+          },
+        ],
+        apps: { total: 3, online: 2, errored: 0, stopped: 1, queued: 0 },
+        queue_position: null,
+        memory: 2_000_000_000,
+        cpu: 12.4,
+        ports: [
+          { app: 'web', port: 3000 },
+          { app: 'api', port: 8000 },
+        ],
+        manifest_error: null,
+        notes: [],
+        present: true,
+      },
+      {
+        project: 'alpha-w1',
+        root: '/home/u/repos/alpha.worktrees/feat/x',
+        base_project: 'alpha',
+        slot: 1,
+        branch: 'feat/x',
+        source: 'registry',
+        hosts: [
+          {
+            name: 'local',
+            endpoint: 'local',
+            reachable: true,
+            error: null,
+            age_s: 0,
+          },
+        ],
+        apps: { total: 3, online: 0, errored: 0, stopped: 0, queued: 2 },
+        queue_position: 1,
+        memory: 0,
+        cpu: null,
+        ports: [],
+        manifest_error: null,
+        notes: [],
+        present: true,
+      },
+    ],
+    orphans: [
+      {
+        namespace: 'default',
+        endpoint: 'local',
+        processes: [{ name: 'loose', status: 'online', memory: 120_000_000 }],
+        note: null,
+      },
+    ],
+  } as StacksAnswer;
+
+  it('a host line, then one row per stack (worktrees indented under their base), orphans last', () => {
+    const out = renderStacks(answer).split('\n');
+    expect(out[0]).toBe(
+      'host: box · RAM 13.3G free of 31.1G · watcher online · queue 0'
+    );
+    expect(out[1]).toMatch(
+      /^STACK\s+ROOT\s+HOSTS\s+APPS\s+ERR\s+MEM\s+CPU\s+PORTS$/
+    );
+    expect(out[2]).toMatch(
+      /^alpha\s+\/home\/u\/repos\/alpha\s+local\s+2\/3\s+0\s+\S+\s+12%\s+:3000 :8000$/
+    );
+    expect(out[3]).toMatch(/^ {2}w1 feat\/x\s+.*queued #1/);
+    expect(out[4]).toMatch(/^pm2 · default\s+\(no manifest\)\s+local\s+1\/1/);
+  });
+  it('labels and paths', () => {
+    expect(
+      stackLabel(
+        {
+          project: 'alpha-w2',
+          base_project: 'alpha',
+          slot: 2,
+          branch: null,
+        },
+        true
+      )
+    ).toBe('  w2 alpha-w2');
+    expect(tildePath('/home/u/x', '/home/u')).toBe('~/x');
+    expect(tildePath('/srv/x', '/home/u')).toBe('/srv/x');
+  });
+  it('a worktree under its listed base is indented; one whose base is not listed names its base, flush left; a base is its project', () => {
+    const wt = {
+      project: 'alpha-w2',
+      base_project: 'alpha',
+      slot: 2,
+      branch: 'feat/y',
+    };
+    expect(stackLabel(wt, true)).toBe('  w2 feat/y');
+    expect(stackLabel(wt, false)).toBe('alpha w2 feat/y');
+    expect(
+      stackLabel(
+        { project: 'alpha', base_project: 'alpha', slot: 0, branch: 'main' },
+        false
+      )
+    ).toBe('alpha');
+    const alone = renderStacks({
+      ...answer,
+      stacks: [answer.stacks[1]],
+      orphans: [],
+    }).split('\n');
+    expect(alone[2]).toMatch(
+      /^alpha w1 feat\/x\s+\/home\/u\/repos\/alpha\.worktrees/
+    );
+  });
+  it('ROOT is the absolute path without a width (MCP, piped: it passes back as project); a terminal shows the home as ~', () => {
+    const plain = renderStacks(answer, undefined, '/home/u').split('\n');
+    expect(plain[2]).toMatch(/^alpha\s+\/home\/u\/repos\/alpha\s/);
+    expect(plain.join('\n')).not.toContain('~');
+    const tty = renderStacks(answer, 200, '/home/u').split('\n');
+    expect(tty[2]).toMatch(/^alpha\s+~\/repos\/alpha\s/);
+    expect(tty[3]).toMatch(
+      /^ {2}w1 feat\/x\s+~\/repos\/alpha\.worktrees\/feat\/x\s/
+    );
+  });
+  it('a manifest error is a line with its code, message and hint', () => {
+    const broken = (hint?: string) =>
+      renderStacks({
+        ...answer,
+        stacks: [
+          {
+            ...answer.stacks[0],
+            project: 'beta',
+            base_project: 'beta',
+            root: '/srv/beta',
+            manifest_error: {
+              code: 'MANIFEST_INVALID',
+              message: 'apps.web: run is required',
+              ...(hint ? { hint } : {}),
+            },
+          },
+        ],
+        orphans: [],
+      }).split('\n');
+    const withHint = broken('Fix .mcproc/mcproc.yaml.');
+    expect(withHint[2]).toMatch(
+      /^beta\s+\/srv\/beta\s+local\s+manifest error\s/
+    );
+    expect(withHint[3]).toBe(
+      'beta: MANIFEST_INVALID: apps.web: run is required (Fix .mcproc/mcproc.yaml.)'
+    );
+    expect(broken()[3]).toBe(
+      'beta: MANIFEST_INVALID: apps.web: run is required'
+    );
+  });
+  it('with a width the table stays within it', () => {
+    for (const l of renderStacks(answer, 90).split('\n'))
+      expect(displayWidth(l)).toBeLessThanOrEqual(90);
   });
 });

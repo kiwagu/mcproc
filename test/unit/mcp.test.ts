@@ -48,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 21 tools with annotations and short instructions', async () => {
+  it('registers the 22 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -67,6 +67,7 @@ describe('mcp server', () => {
       'ls',
       'ports',
       'restart',
+      'stacks',
       'start',
       'stop',
       'unpack',
@@ -95,8 +96,11 @@ describe('mcp server', () => {
       'wait',
       'leases',
       'worktree_ls',
+      'stacks',
     ])
       expect(byName[n].annotations?.readOnlyHint).toBe(true);
+    expect(byName.stacks.description).toMatch(/project/);
+    expect((byName.stacks.description as string).length).toBeLessThan(1200);
     // add makes a checkout and never discards anything; remove discards a worktree (with force, its changes too)
     expect(byName.worktree_add.annotations).toMatchObject({
       readOnlyHint: false,

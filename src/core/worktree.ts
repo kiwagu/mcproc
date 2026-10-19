@@ -13,6 +13,7 @@ import {
   type VarInfo,
 } from './manifest.js';
 import { NAME_RE } from './names.js';
+import { forgetProject } from './registry.js';
 import { loadOverride, writeOverride } from './override.js';
 import { isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
@@ -756,6 +757,7 @@ export async function worktreeRemove(
     }
   }
   await free();
+  forgetProject(e.project, e.path, deps.stateDir);
   return { path: e.path, slot: Number(k), branch: e.branch, stopped };
 }
 

@@ -938,3 +938,19 @@ describe('incidents the agent has taken', () => {
     expect(s.logScroll).toBe(2);
   });
 });
+
+describe('opened from the stacks overview', () => {
+  it('escape returns to the stacks when monit was opened from them, and quits otherwise', () => {
+    const p = { project: 'p', host: 'local', hosts: ['local'], apps: {} };
+    expect(keyIntent('escape', initialState({ ...p, toStacks: true }))).toEqual(
+      { kind: 'back' }
+    );
+    expect(keyIntent('escape', initialState(p))).toEqual({ kind: 'quit' });
+    expect(keyIntent('q', initialState({ ...p, toStacks: true }))).toEqual({
+      kind: 'quit',
+    });
+    expect(keyIntent('C-c', initialState({ ...p, toStacks: true }))).toEqual({
+      kind: 'quit',
+    });
+  });
+});
