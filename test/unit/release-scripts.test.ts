@@ -137,7 +137,7 @@ describe('release-publish', () => {
         '  "view version") [ -n "$FAKE_VERSION" ] && echo "$FAKE_VERSION"; exit "$FAKE_VIEW_EXIT" ;;',
         '  "view gitHead") echo "$FAKE_HEAD" ;;',
         'esac',
-        '[ "$1" = publish ] && exit "$FAKE_PUBLISH_EXIT"',
+        '[ "$1 $2" = "stage publish" ] && exit "$FAKE_PUBLISH_EXIT"',
       ].join('\n')
     );
   const calls = (log: string) =>
@@ -155,15 +155,15 @@ describe('release-publish', () => {
     FAKE_PUBLISH_EXIT: '0',
     ...extra,
   });
-  it('publishes a version npm does not have', () => {
+  it('stages a version npm does not have, for the owner to approve', () => {
     const r = runWith('release-publish.sh', env({}), 'v0.2.0');
     expect(r.status).toBe(0);
     expect(calls(log)).toEqual([
       'view x@0.2.0 version',
-      'publish --access public',
+      'stage publish --access public',
     ]);
   });
-  it('skips a version npm has from the same commit: a re-run goes on to the next step', () => {
+  it('skips a version npm has from the same commit: approved earlier, or published by hand', () => {
     const head = git('rev-parse', 'v0.2.0^{commit}');
     const r = runWith(
       'release-publish.sh',
@@ -172,7 +172,7 @@ describe('release-publish', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`x@0.2.0 is already on npm from ${head}`);
-    expect(calls(log)).not.toContain('publish --access public');
+    expect(calls(log)).not.toContain('stage publish --access public');
   });
   it('refuses a version npm has from another commit', () => {
     const r = runWith(
@@ -185,13 +185,14 @@ describe('release-publish', () => {
       'x@0.2.0 is already on npm from abc123, not from'
     );
   });
-  it('a failing publish fails the step', () => {
+  it('a failing stage fails the step', () => {
     const r = runWith(
       'release-publish.sh',
       env({ FAKE_PUBLISH_EXIT: '1' }),
       'v0.2.0'
     );
     expect(r.status).toBe(1);
+    expect(calls(log)).toContain('stage publish --access public');
   });
 });
 

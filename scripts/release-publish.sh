@@ -1,6 +1,7 @@
 #!/bin/sh
-# Publishes the package at the tagged commit, unless npm already has this version from that same commit (a re-run of
-# a release whose later step failed). The version published from another commit is an error, as is any npm failure.
+# Stages the package at the tagged commit on npm, for the owner to approve on npmjs.com, unless npm already has this
+# version from that same commit (approved earlier, or published by hand). The version published from another commit
+# is an error, as is any npm failure.
 #   sh scripts/release-publish.sh <tag>        (NPM: the npm to run, default npm)
 set -eu
 tag=${1:?usage: release-publish.sh <tag>}
@@ -17,4 +18,5 @@ if [ -n "$($npm view "$name@$version" version 2>/dev/null || true)" ]; then
   echo "$name@$version is already on npm from ${head:-an unknown commit}, not from $commit" >&2
   exit 1
 fi
-$npm publish --access public
+$npm stage publish --access public
+echo "$name@$version is staged: it reaches npm once approved on npmjs.com"

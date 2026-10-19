@@ -1,8 +1,9 @@
 name: release
 
-# A pushed annotated vX.Y.Z tag is a release: npm through trusted publishing (no token; npm adds provenance), then a
-# GitHub Release with the commits since the previous one. A re-run picks up where a failed run stopped. GitHub starts
-# no run for a push of more than three tags, so a release tag goes out in a push of its own.
+# A pushed annotated vX.Y.Z tag is a release: a GitHub Release with the commits since the previous one, and the package
+# staged on npm through trusted publishing (no token; npm adds provenance), for the owner to approve on npmjs.com. A
+# re-run picks up where a failed run stopped. GitHub starts no run for a push of more than three tags, so a release tag
+# goes out in a push of its own.
 on:
   push:
     tags: ['v*']
@@ -19,6 +20,9 @@ jobs:
         with:
           fetch-depth: 0 # main and the earlier tags: the check and the notes read them
 
+      - name: The annotated tag, which checkout leaves as a lightweight one
+        run: git fetch --force origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+
       - name: The tag names the version in package.json, on main
         run: sh scripts/release-check.sh "$GITHUB_REF_NAME" origin/main
 
@@ -31,8 +35,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: An npm that publishes through trusted publishing
-        run: npm install -g npm@11.6.2
+      - name: An npm that stages through trusted publishing
+        run: npm install -g npm@12.2.0
 
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
@@ -46,10 +50,10 @@ jobs:
           MCPROC_IT: '1'
           MCPROC_CLI: ${{ github.workspace }}/dist/cli.js
 
-      - name: Publish to npm
-        run: sh scripts/release-publish.sh "$GITHUB_REF_NAME"
-
       - name: GitHub Release
         run: sh scripts/release-github.sh "$GITHUB_REF_NAME"
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Stage on npm
+        run: sh scripts/release-publish.sh "$GITHUB_REF_NAME"
