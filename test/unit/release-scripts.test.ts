@@ -137,7 +137,7 @@ describe('release-publish', () => {
         '  "view version") [ -n "$FAKE_VERSION" ] && echo "$FAKE_VERSION"; exit "$FAKE_VIEW_EXIT" ;;',
         '  "view gitHead") echo "$FAKE_HEAD" ;;',
         'esac',
-        '[ "$1" = publish ] && exit "$FAKE_PUBLISH_EXIT"',
+        '[ "$1 $2" = "stage publish" ] && exit "$FAKE_PUBLISH_EXIT"',
       ].join('\n')
     );
   const calls = (log: string) =>
@@ -155,15 +155,15 @@ describe('release-publish', () => {
     FAKE_PUBLISH_EXIT: '0',
     ...extra,
   });
-  it('publishes a version npm does not have', () => {
+  it('stages a version npm does not have, for the owner to approve', () => {
     const r = runWith('release-publish.sh', env({}), 'v0.2.0');
     expect(r.status).toBe(0);
     expect(calls(log)).toEqual([
       'view x@0.2.0 version',
-      'publish --access public',
+      'stage publish --access public',
     ]);
   });
-  it('skips a version npm has from the same commit: a re-run goes on to the next step', () => {
+  it('skips a version npm has from the same commit: approved earlier, or published by hand', () => {
     const head = git('rev-parse', 'v0.2.0^{commit}');
     const r = runWith(
       'release-publish.sh',
@@ -172,7 +172,7 @@ describe('release-publish', () => {
     );
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`x@0.2.0 is already on npm from ${head}`);
-    expect(calls(log)).not.toContain('publish --access public');
+    expect(calls(log)).not.toContain('stage publish --access public');
   });
   it('refuses a version npm has from another commit', () => {
     const r = runWith(
@@ -185,13 +185,56 @@ describe('release-publish', () => {
       'x@0.2.0 is already on npm from abc123, not from'
     );
   });
-  it('a failing publish fails the step', () => {
+  it('a failing stage fails the step', () => {
     const r = runWith(
       'release-publish.sh',
       env({ FAKE_PUBLISH_EXIT: '1' }),
       'v0.2.0'
     );
     expect(r.status).toBe(1);
+    expect(calls(log)).toContain('stage publish --access public');
+    expect(r.stdout).not.toContain('is staged');
+    expect(r.stderr).toContain('pending stage');
+  });
+  it('refuses a version npm has whose commit it cannot tell', () => {
+    const r = runWith(
+      'release-publish.sh',
+      env({ FAKE_VERSION: '0.2.0', FAKE_HEAD: '' }),
+      'v0.2.0'
+    );
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain(
+      'x@0.2.0 is already on npm from an unknown commit, not from'
+    );
+    expect(calls(log)).not.toContain('stage publish --access public');
+  });
+});
+
+describe('release-tag', () => {
+  let clone: string;
+  const g = (...args: string[]) =>
+    execFileSync('git', args, { cwd: clone, encoding: 'utf8' }).trim();
+  const inClone = (script: string, ...args: string[]) =>
+    spawnSync('sh', [path.join(scripts, script), ...args], {
+      cwd: clone,
+      encoding: 'utf8',
+    });
+  beforeEach(() => {
+    clone = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-release-clone-'));
+    execFileSync('git', ['clone', '-q', repo, clone]);
+  });
+  afterEach(() => fs.rmSync(clone, { recursive: true, force: true }));
+  it('restores the annotated tag that checkout replaced with a lightweight one', () => {
+    const commit = g('rev-parse', 'v0.2.0^{commit}');
+    g('fetch', '-q', '--no-tags', 'origin', `+${commit}:refs/tags/v0.2.0`);
+    expect(g('cat-file', '-t', 'refs/tags/v0.2.0')).toBe('commit');
+    expect(inClone('release-check.sh', 'v0.2.0', 'origin/main').status).toBe(1);
+    expect(inClone('release-tag.sh', 'v0.2.0').status).toBe(0);
+    expect(g('cat-file', '-t', 'refs/tags/v0.2.0')).toBe('tag');
+    expect(inClone('release-check.sh', 'v0.2.0', 'origin/main').status).toBe(0);
+  });
+  it('fails on a tag origin does not have', () => {
+    expect(inClone('release-tag.sh', 'v9.9.9').status).not.toBe(0);
   });
 });
 
