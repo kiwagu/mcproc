@@ -88,6 +88,8 @@ export interface MonitState {
   incidentsTaken: TakenPoints;
   /** the incidents view leaves out what the agent has taken (t) */
   hideTaken: boolean;
+  /** opened from the stacks overview: esc goes back there */
+  toStacks: boolean;
 }
 /** a key that asks twice: c clears the logs of the running apps in view, R reloads every app in view */
 export type Armed = 'clear' | 'reload';
@@ -160,6 +162,7 @@ export function initialState(p: {
   hosts: string[];
   apps: Record<string, AppInfo>;
   maxLogs?: number;
+  toStacks?: boolean;
 }): MonitState {
   return {
     project: p.project,
@@ -192,6 +195,7 @@ export function initialState(p: {
     incidentsErrors: [],
     incidentsTaken: {},
     hideTaken: false,
+    toStacks: p.toStacks ?? false,
   };
 }
 
@@ -404,6 +408,7 @@ export type KeyIntent =
   | { kind: 'reload-all' }
   | { kind: 'host-next' }
   | { kind: 'quit' }
+  | { kind: 'back' }
   | null;
 
 /** How long a first c or R waits for the second one. */
@@ -507,8 +512,9 @@ export function keyIntent(
     }
     case 'q':
     case 'C-c':
-    case 'escape':
       return { kind: 'quit' };
+    case 'escape':
+      return s.toStacks ? { kind: 'back' } : { kind: 'quit' };
     default:
       return null;
   }

@@ -4,7 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildProgram, printLs, printSince } from '../../src/cli/program.js';
+import {
+  buildProgram,
+  monitMode,
+  printLs,
+  printSince,
+} from '../../src/cli/program.js';
+import { findManifestPath } from '../../src/core/manifest.js';
 import { parseSince } from '../../src/core/logsince.js';
 import { Fleet } from '../../src/core/fleet.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
@@ -36,6 +42,38 @@ afterEach(() => {
 });
 
 describe('cli', () => {
+  it('monit opens the overview with --all or where no manifest is found, unless a project was named', () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-nomf-'));
+    const root = findManifestPath(basic)!.root;
+    expect(monitMode({}, false, {}, empty)).toEqual({ mode: 'overview' });
+    expect(monitMode({}, true, {}, basic)).toEqual({
+      mode: 'overview',
+      selected: root,
+    });
+    expect(monitMode({}, true, {}, empty)).toEqual({ mode: 'overview' });
+    expect(monitMode({}, false, {}, basic)).toEqual({ mode: 'project' });
+    // a named project without a manifest keeps failing as before (MANIFEST_NOT_FOUND)
+    expect(monitMode({ project: empty }, false, {}, empty)).toEqual({
+      mode: 'project',
+    });
+    expect(monitMode({}, false, { MCPROC_PROJECT: empty }, empty)).toEqual({
+      mode: 'project',
+    });
+    expect(monitMode({}, false, { CLAUDE_PROJECT_DIR: empty }, empty)).toEqual({
+      mode: 'project',
+    });
+    fs.rmSync(empty, { recursive: true, force: true });
+  });
+  it('monit --all refuses --host: host names belong to one manifest', async () => {
+    const c = capture();
+    await buildProgram(c.io).parseAsync(
+      ['monit', '--all', '--host', 'local', '--once'],
+      { from: 'user' }
+    );
+    expect(c.err.join('\n')).toContain('BAD_ARGUMENT');
+    expect(c.err.join('\n')).toContain('Hint: Drop --host');
+    expect(process.exitCode).toBe(1);
+  });
   it('hosts --json prints the hosts', async () => {
     const c = capture();
     await buildProgram(c.io).parseAsync(

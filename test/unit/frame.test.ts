@@ -102,6 +102,17 @@ const base = () =>
   );
 
 describe('renderFrame', () => {
+  it('the legend offers esc stacks only when monit was opened from the stacks', () => {
+    const s = base();
+    for (const v of [s, reduce(s, { type: 'view', view: 'flat' })]) {
+      expect(renderFrame(v, { width: 200, height: 24 }).footer).not.toContain(
+        'esc stacks'
+      );
+      expect(
+        renderFrame({ ...v, toStacks: true }, { width: 200, height: 24 }).footer
+      ).toContain('esc stacks');
+    }
+  });
   it('fits an 80-column terminal: no line wider than 80, marker on the selected row, ports visible', () => {
     const f = renderFrame(base(), { width: 80, height: 24 });
     for (const line of [

@@ -79,6 +79,8 @@ import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { installShortcut } from './install.js';
 import { runMonit } from '../monit/tui.js';
+import { overviewOnce, runOverview } from '../monit/stacks-tui.js';
+import { findManifestPath } from '../core/manifest.js';
 
 export interface Io {
   out: (s: string) => void;
@@ -179,6 +181,29 @@ export async function printLs(
       : renderLs(rows, fleet.fallback, unread, io.columns?.())
   );
   if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
+}
+
+/**
+ * What `monit` opens: the stacks overview with --all, or where no manifest is found and no project was named (--project,
+ * MCPROC_PROJECT, CLAUDE_PROJECT_DIR); otherwise the project's monit, so a named folder without a manifest still fails
+ * as before. The overview starts on the checkout it was opened from, when there is one.
+ */
+export function monitMode(
+  g: { project?: string },
+  all: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd()
+): { mode: 'overview'; selected?: string } | { mode: 'project' } {
+  const named = g.project || env.MCPROC_PROJECT || env.CLAUDE_PROJECT_DIR;
+  const found = findManifestPath(
+    named ? resolveProjectDir(g.project, [], env) : cwd
+  );
+  if (all)
+    return found
+      ? { mode: 'overview', selected: found.root }
+      : { mode: 'overview' };
+  if (!named && !found) return { mode: 'overview' };
+  return { mode: 'project' };
 }
 
 export function buildProgram(io: Io = defaultIo): Command {
@@ -833,29 +858,41 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('monit')
     .description(
-      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)'
+      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame); outside a project, or with --all, every stack of this host'
+    )
+    .option(
+      '--all',
+      'the stacks overview: every stack of this host, Enter opens one'
     )
     .option('--once', 'print one frame as text and exit')
     .option('--interval <ms>', 'refresh interval', '2000')
     .option('--lines <n>', 'log lines of history', '200')
     .action(
       wrap(async (g, o) => {
-        if (o.once) {
-          io.out(
-            await monitOnce({
-              project: g.project,
-              host: g.host,
-              lines: Number(o.lines) || 200,
-            })
-          );
+        const lines = Number(o.lines) || 200;
+        const intervalMs = Math.max(500, Number(o.interval) || 2000);
+        const m = monitMode(g, Boolean(o.all));
+        if (m.mode === 'overview') {
+          if (g.host)
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              '--host names a host of one manifest; the overview reads every stack',
+              {
+                hint: 'Drop --host, or open the project: mcproc --project <root> monit --host <name>.',
+              }
+            );
+          if (o.once) {
+            io.out(await overviewOnce({ width: io.columns?.() }));
+            return;
+          }
+          await runOverview({ intervalMs, lines, selected: m.selected });
           return;
         }
-        await runMonit({
-          project: g.project,
-          host: g.host,
-          intervalMs: Math.max(500, Number(o.interval) || 2000),
-          lines: Number(o.lines) || 200,
-        });
+        if (o.once) {
+          io.out(await monitOnce({ project: g.project, host: g.host, lines }));
+          return;
+        }
+        await runMonit({ project: g.project, host: g.host, intervalMs, lines });
       })
     );
   program
