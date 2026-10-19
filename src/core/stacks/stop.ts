@@ -1,7 +1,9 @@
 import { actOn, defaultConnector, Fleet, type Connector } from '../fleet.js';
 import { describeError } from '../errors.js';
-import type { Manifest } from '../manifest.js';
+import type { Host, Manifest } from '../manifest.js';
 import { pickHost } from '../resolve.js';
+import { appCwd } from '../ecosystem.js';
+import { findProcess, type Pm2Process } from '../pm2.js';
 
 /** What a stop of a whole stack did: the apps it stopped, the apps of readonly hosts it left alone, what failed. */
 export interface StackStop {
@@ -12,7 +14,8 @@ export interface StackStop {
 
 /**
  * Stops every app of the stack at its own host, the way `stop all` does, leaving the apps of readonly hosts alone and
- * saying so.
+ * saying so. pm2 names are `<slug>-<app>`, so two checkouts declaring one slug on one daemon share them: a process that
+ * runs from another checkout's folder is left alone and named, never stopped on this stack's behalf.
  */
 export async function stopStack(
   m: Manifest,
@@ -30,8 +33,9 @@ export async function stopStack(
       return false;
     });
     out.readonly = [...ro].map(([host, apps]) => ({ host, apps }));
-    if (names.length === 0) return out;
-    for (const r of await actOn(fleet, names, 'stop'))
+    const mine = await ownApps(m, fleet, names, out);
+    if (mine.length === 0) return out;
+    for (const r of await actOn(fleet, mine, 'stop'))
       if (r.error)
         out.failed.push({ host: r.host, message: `${r.app}: ${r.error}` });
       else out.stopped.push(r.app);
@@ -39,4 +43,39 @@ export async function stopStack(
     out.failed.push({ host: '-', message: describeError(e) });
   }
   return out;
+}
+
+/** The apps whose pm2 process, when there is one, runs from this checkout's folder; the others go to `failed`. A host
+ * that cannot be read keeps its apps: the stop itself then reports why. */
+async function ownApps(
+  m: Manifest,
+  fleet: Fleet,
+  names: string[],
+  out: StackStop
+): Promise<string[]> {
+  const keep: string[] = [];
+  for (const g of fleet.groups(names)) {
+    let procs: Pm2Process[];
+    let host: Host;
+    try {
+      const ctx = await fleet.ctx(g.host);
+      host = ctx.host;
+      procs = await ctx.pm2.jlist();
+    } catch {
+      keep.push(...g.apps);
+      continue;
+    }
+    for (const a of g.apps) {
+      const p = findProcess(procs, m.project, a);
+      const own = appCwd(host, m.apps[a]);
+      if (p?.cwd && p.cwd !== own)
+        out.failed.push({
+          host: g.host,
+          message: `${a}: runs from another checkout (${p.cwd}), left alone`,
+        });
+      else keep.push(a);
+    }
+  }
+  // the stop goes in the manifest's order, as `stop all` does
+  return names.filter((a) => keep.includes(a));
 }

@@ -133,6 +133,15 @@ export function reduceOverview(
   }
 }
 
+/**
+ * Why a stack whose slug another checkout declares on the same pm2 daemon is not opened or stopped from here: pm2 names
+ * are `<slug>-<app>`, so its monit and its stop would reach the other checkout's processes as well.
+ */
+function sharedSlug(st: StackView, what: 'open' | 'stop'): string {
+  const n = st.rivals.length + 1;
+  return `${st.project}: ${n} checkouts share this slug on one pm2, so ${what === 'open' ? 'its monit' : 'a stop'} could reach another one's processes; give each checkout its own project slug`;
+}
+
 export function overviewKey(
   key: string,
   s: OverviewState,
@@ -156,6 +165,7 @@ export function overviewKey(
       if (r.kind === 'orphan')
         return notice('not an mcproc stack: no manifest to open');
       if (r.stack.manifest_error) return notice(unloaded(r.stack));
+      if (r.stack.rivals?.length) return notice(sharedSlug(r.stack, 'open'));
       // its monit would only show unreachable rows: say which host failed instead
       if (!r.stack.hosts.some((h) => h.reachable)) {
         const why = r.stack.hosts.find((h) => h.error);
@@ -170,6 +180,7 @@ export function overviewKey(
       if (!r || s.busy) return null;
       if (r.kind === 'orphan') return notice('not an mcproc stack: read-only');
       if (r.stack.manifest_error) return notice(unloaded(r.stack));
+      if (r.stack.rivals?.length) return notice(sharedSlug(r.stack, 'stop'));
       if (s.armedAt !== null && now - s.armedAt <= CONFIRM_MS)
         return { kind: 'stop', root: r.stack.root };
       return { kind: 'action', action: { type: 'arm', at: now } };

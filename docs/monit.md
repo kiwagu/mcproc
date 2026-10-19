@@ -50,8 +50,10 @@ claims is shown at the bottom as `pm2 · <namespace>` and is read-only.
 
 Each row shows the hosts the stack runs on, its apps online out of all, errors, the memory and CPU of its process
 trees, and its listening ports. A worktree is listed under its main checkout as `w<slot> <branch>`. The lower pane
-shows the selected stack's apps. Hosts reached over ssh, docker or another `pm2_home` are read every 10 seconds at
-most; a host that does not answer is marked on its stacks and tried again after 30 seconds.
+shows the selected stack's apps. The local pm2 daemons (the default one and each own `pm2_home`) are read on every
+refresh; hosts reached over ssh or docker at most every 10 seconds, and a host that does not answer is marked on its
+stacks and tried again after 30 seconds. Warnings about the host (an unreadable state directory, a local pm2 that
+does not answer) stay in the header.
 
 | key | does |
 |---|---|

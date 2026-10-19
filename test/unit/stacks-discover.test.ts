@@ -78,6 +78,26 @@ function input(
 }
 
 describe('endpoints', () => {
+  it('ssh arguments that can reach another daemon (port, user, HostName) make another endpoint; identical declarations share one', () => {
+    const box = {
+      ...bareLocalHost(),
+      local: false,
+      name: 'box',
+      ssh: 'box',
+      cwd: '/srv/app',
+    };
+    const plain = endpointKey({ ...box, ssh_args: [] });
+    const port = endpointKey({ ...box, ssh_args: ['-p', '2222'] });
+    const other = endpointKey({
+      ...box,
+      ssh_args: ['-o', 'HostName=10.0.0.9'],
+    });
+    expect(new Set([plain, port, other]).size).toBe(3);
+    expect(
+      endpointKey({ ...box, name: 'again', ssh_args: ['-p', '2222'] })
+    ).toBe(port);
+    expect(endpointKey({ ...box, ssh_args: [] })).toBe(plain);
+  });
   it('projects without pm2_home share the local endpoint; an own pm2_home, docker or ssh is another', () => {
     const local = bareLocalHost();
     expect(endpointKey(local)).toBe('local|');
@@ -218,6 +238,9 @@ describe('buildStacks', () => {
     expect(byRoot[two].apps.online).toBe(1);
     expect(byRoot[one].apps.online).toBe(0);
     expect(byRoot[one].notes).toContain('slug shared by 2 checkouts');
+    // each knows the other checkout: the overview neither opens nor stops a stack whose pm2 names are shared
+    expect(byRoot[one].rivals).toEqual([two]);
+    expect(byRoot[two].rivals).toEqual([one]);
   });
 
   it('a checkout nested in another of the same slug keeps the processes that run under it', async () => {

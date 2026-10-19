@@ -2295,3 +2295,27 @@ describe('MonitLoop after close (the screen went away, e.g. esc back to the stac
     expect(h.state.host).not.toBe('box');
   });
 });
+
+describe('MonitLoop closed while a host is still connecting', () => {
+  it('starts no probe once the loop closed during the connect', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness(
+      'local',
+      {
+        snapshot: async () => {
+          snaps++;
+          return snap();
+        },
+      },
+      { gate: (host) => (host === 'local' ? gate.promise : null) }
+    );
+    const pending = h.loop.refresh();
+    await tick();
+    h.loop.close();
+    gate.resolve();
+    await pending;
+    await tick();
+    expect(snaps).toBe(0);
+  });
+});

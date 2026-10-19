@@ -72,6 +72,25 @@ const state = () =>
   });
 
 describe('renderOverview', () => {
+  it('the header keeps the host warnings when stacks are listed too', () => {
+    const noted = {
+      ...view,
+      answer: {
+        ...view.answer,
+        host: { ...view.answer.host, notes: ['registry unreadable: EACCES'] },
+      },
+    } as unknown as StacksView;
+    const f = renderOverview(
+      reduceOverview(initialOverview({}), {
+        type: 'view',
+        view: noted,
+        at: new Date(),
+      }),
+      { width: 160, height: 24 }
+    );
+    expect(f.header).toContain('registry unreadable: EACCES');
+    expect(f.table.length).toBeGreaterThan(1);
+  });
   it('fits 80 and 120 columns: the marker on the selected stack, ROOT cut at its start, the orphan last', () => {
     for (const width of [80, 120]) {
       const f = renderOverview(state(), { width, height: 24 });

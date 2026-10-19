@@ -171,7 +171,7 @@ export class StacksCollector {
           localRead?.error ? `local pm2: ${localRead.error}` : '',
         ].filter(Boolean),
       },
-      stacks: stacks.map(({ rows: _rows, ...s }) => s),
+      stacks: stacks.map(({ rows: _rows, rivals: _rivals, ...s }) => s),
       orphans: built.orphans,
     };
     const manifests = new Map(

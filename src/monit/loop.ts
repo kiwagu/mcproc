@@ -340,6 +340,7 @@ export class MonitLoop {
     const probed = this.losses; // a gap numbered after this was not seen by the rows this refresh takes
     try {
       const ctx = await this.fleet.ctx(g.host);
+      if (gen !== this.gen) return; // the view changed, or the screen went away, while the host was connecting
       // the live screen never requests the apps' URLs: dev servers log every request, and this pane is where those logs are read
       const snap = await this.deps.snapshot(ctx, {
         cpu: 'none',

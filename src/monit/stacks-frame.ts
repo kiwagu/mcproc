@@ -76,7 +76,7 @@ export function renderOverview(
   const header = cut(
     screenText(
       a
-        ? `mcproc · ${stacksHostLine(a.host)}${at}`
+        ? `mcproc · ${stacksHostLine(a.host)}${at}${a.host.notes.map((n) => ` · ${n}`).join('')}`
         : 'mcproc · reading the stacks…'
     ),
     w

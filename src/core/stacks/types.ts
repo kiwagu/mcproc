@@ -65,6 +65,8 @@ export interface StacksAnswer {
 /** A stack with the app rows the overview's lower pane shows (not part of the JSON answer). */
 export interface StackView extends Stack {
   rows: LsRow[];
+  /** the roots of the other checkouts that declare this slug on one of its pm2 daemons: they share pm2 names with it */
+  rivals: string[];
 }
 
 /** A checkout as discovery sees it, before any probe. */

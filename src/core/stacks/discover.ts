@@ -27,9 +27,14 @@ import type {
 
 type Prev = Map<string, { sample: StatSample; at: number }>;
 
-/** Where one pm2 daemon is reached: the transport plus the home it runs from (none: that transport's default). */
+/**
+ * Where one pm2 daemon is reached: the transport plus the home it runs from (none: that transport's default). The ssh
+ * arguments count too: a port, a user or a HostName option can reach another machine through the same alias.
+ */
 export function endpointKey(host: Host): string {
-  return `${describeHost(host)}|${host.pm2_home ?? ''}`;
+  const args =
+    host.ssh && host.ssh_args.length ? ` [${host.ssh_args.join(' ')}]` : '';
+  return `${describeHost(host)}${args}|${host.pm2_home ?? ''}`;
 }
 /** How an endpoint is named on screen: a remote host by its name, the local daemon by its home when it has its own. */
 export function endpointLabel(host: Host): string {
@@ -223,6 +228,14 @@ async function stackOf(
     ...Object.values(p.endpoints).map((k) => claimantsOn(k).length)
   );
   const notes = shared > 1 ? [`slug shared by ${shared} checkouts`] : [];
+  const rivals = [
+    ...new Set(
+      Object.values(p.endpoints)
+        .flatMap((k) => claimantsOn(k))
+        .filter((c) => c !== p)
+        .map((c) => c.root)
+    ),
+  ];
 
   // no rows to read (the manifest did not load, or reading with it failed): its namespace on the local daemon says what runs
   const fromNamespace = (error: StackError | null): StackView => {
@@ -244,6 +257,7 @@ async function stackOf(
       notes,
       present: procs.length > 0,
       rows: [],
+      rivals,
     };
   };
   if (!p.manifest) return fromNamespace(p.error);
@@ -261,6 +275,7 @@ async function stackOf(
     manifest_error: null,
     notes,
     rows,
+    rivals,
   };
 }
 

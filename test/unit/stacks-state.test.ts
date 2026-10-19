@@ -236,6 +236,22 @@ describe('overview state', () => {
     ).toBeNull();
     expect(overviewKey('C-c', ok)).toEqual({ kind: 'quit' });
   });
+  it('enter and x refuse a stack whose slug another checkout declares on the same pm2: they share pm2 names', () => {
+    const s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([stack('demo', '/b', { rivals: ['/a'] })]),
+      at,
+    });
+    const why = (what: string) => ({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: `demo: 2 checkouts share this slug on one pm2, so ${what} could reach another one's processes; give each checkout its own project slug`,
+      },
+    });
+    expect(overviewKey('enter', s)).toEqual(why('its monit'));
+    expect(overviewKey('x', s)).toEqual(why('a stop'));
+  });
   it('a refresh that moves the selection to another stack disarms x, so it never stops a stack the prompt did not name', () => {
     let s = initialOverview({ selected: '/b' });
     s = reduceOverview(s, {

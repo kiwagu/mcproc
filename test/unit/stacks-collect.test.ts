@@ -109,6 +109,11 @@ describe('StacksCollector', () => {
     ]);
     const c = new StacksCollector(deps(state, () => local));
     const v = await c.collect({ all: false });
+    // the answer is the JSON both surfaces print: the overview's rows and rivals stay out of it
+    for (const s of v.answer.stacks) {
+      expect(s).not.toHaveProperty('rows');
+      expect(s).not.toHaveProperty('rivals');
+    }
     expect(v.answer.stacks.map((s) => [s.project, s.source])).toEqual([
       ['alpha', 'daemon'],
       ['beta', 'registry'],

@@ -287,6 +287,25 @@ describe('stopStack', () => {
       "local: pm2 'stop' '1'",
     ]);
   });
+  it('a process of the slug that runs from another checkout is not stopped, and the answer says whose it is', async () => {
+    const h = fakeFleet(undefined, {
+      local: [proc('watch', 0, '/elsewhere/fleet'), proc('tool', 1, dir)],
+      box: [proc('web', 3, '/home/dev/fleet')],
+    });
+    const out = await stopStack(m, h.connector);
+    expect(out.stopped.sort()).toEqual(['tool', 'web']);
+    expect(out.failed).toEqual([
+      {
+        host: 'local',
+        message:
+          'watch: runs from another checkout (/elsewhere/fleet), left alone',
+      },
+    ]);
+    expect(h.log.filter((l) => l.includes("'stop'")).sort()).toEqual([
+      "box: pm2 'stop' '3'",
+      "local: pm2 'stop' '1'",
+    ]);
+  });
   it('a host that fails is named with each of its apps; the other hosts still stop', async () => {
     const h = fakeFleet(undefined, procs, ['box']);
     const out = await stopStack(m, h.connector);
