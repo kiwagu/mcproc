@@ -32,6 +32,25 @@ describe('watcherEntry and ensureWatcher', () => {
     expect(watcherEntry({}, ['node', '/opt/mcproc/dist/cli.js'])).toBe(
       '/opt/mcproc/dist/cli.js'
     );
+    // an npm global bin is a symlink to dist/cli.js, and node keeps the link's path in argv[1]
+    const cli = path.join(dir, 'lib', 'mcproc', 'dist', 'cli.js');
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, '');
+    const bin = path.join(dir, 'bin', 'mcproc');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.symlinkSync(path.relative(path.dirname(bin), cli), bin);
+    expect(watcherEntry({}, ['node', bin])).toBe(fs.realpathSync(cli));
+    expect(watcherEntry({}, ['node', path.relative(process.cwd(), bin)])).toBe(
+      fs.realpathSync(cli)
+    );
+    // a link to the sources is still a dev checkout: refused with the hint
+    const src = path.join(dir, 'src', 'cli.ts');
+    fs.mkdirSync(path.dirname(src), { recursive: true });
+    fs.writeFileSync(src, '');
+    fs.symlinkSync(src, path.join(dir, 'bin', 'dev'));
+    expect(() =>
+      watcherEntry({}, ['node', path.join(dir, 'bin', 'dev')])
+    ).toThrowError(expect.objectContaining({ code: 'NOT_STARTED' }));
     expect(() =>
       watcherEntry({}, ['node', '/w/mcproc/src/cli.ts'])
     ).toThrowError(
