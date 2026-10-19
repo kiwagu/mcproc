@@ -71,6 +71,12 @@ export function isMcprocError(e: unknown): e is McprocError {
   );
 }
 
+/** describeError plus the error's hint: for a note that stands in for an error the caller goes on past. */
+export const describeErrorWithHint = (e: unknown): string =>
+  isMcprocError(e) && e.hint
+    ? `${describeError(e)}; ${e.hint}`
+    : describeError(e);
+
 /** `CODE: message` for mcproc errors, the bare message for anything else: the one-line form screens and partial results show. */
 export const describeError = (e: unknown): string =>
   isMcprocError(e)

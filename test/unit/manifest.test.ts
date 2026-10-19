@@ -699,7 +699,16 @@ describe('mcproc: the version that wrote the manifest', () => {
   });
 
   it('a value that is not a version is MANIFEST_INVALID naming the field', () => {
-    for (const v of ['latest', '13', '0.13', '"v0.13.0"', '""'])
+    for (const v of [
+      'latest',
+      '13',
+      '0.13',
+      '"v0.13.0"',
+      '""',
+      '01.2.3',
+      '1.2.3-rc..1',
+      '1.2.3+.',
+    ])
       expectInvalid(`version: 1\nmcproc: ${v}\n${body}`, 'mcproc: must be');
   });
 
