@@ -26,6 +26,7 @@ import {
 import { formatLine } from '../core/logstream.js';
 import { bodyOf, type Incident } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
+import { cutStartWidth, cutWidth, displayWidth } from '../monit/screentext.js';
 
 export function fmtUptime(ms: number | null): string {
   if (ms === null) return '-';
@@ -61,18 +62,116 @@ export function fmtPorts(p: AppPorts): string {
   for (const u of p.undeclared) parts.push(`:${u} (undeclared)`);
   return parts.length ? parts.join(', ') : '-';
 }
-export function table(rows: string[][]): string {
-  const w = rows[0].map((_, i) =>
-    Math.max(...rows.map((r) => (r[i] ?? '').length))
+/** How a table meets a width: `wrap` continues a long cell on the next lines (the CLI on a terminal), `fit` keeps one line per row and cuts it with … (the TUI). */
+export interface TableOpts {
+  /** the terminal columns to stay within; none: no limit, the output tables always had (MCP answers, piped output) */
+  width?: number;
+  /** the free-text columns, by index: the only ones that shrink */
+  flex?: number[];
+  mode?: 'wrap' | 'fit';
+  /** `fit`: the columns cut at the start (paths, whose end says more); the others are cut at the end */
+  cutStart?: number[];
+}
+const GUTTER = 2;
+/** A free-text column never shrinks below this, or below its own longest cell. */
+export const FLEX_MIN = 12;
+
+/** The column widths for `width`: the widest free-text column loses one column at a time until the row fits or every one is at its floor. */
+export function fitWidths(
+  natural: number[],
+  flex: number[],
+  width: number
+): number[] {
+  const w = [...natural];
+  const floor = (i: number) => Math.min(FLEX_MIN, natural[i]);
+  let total = w.reduce((a, b) => a + b, 0) + GUTTER * (w.length - 1);
+  while (total > width) {
+    let pick = -1;
+    for (const i of flex)
+      if (w[i] > floor(i) && (pick < 0 || w[i] > w[pick])) pick = i;
+    if (pick < 0) break; // every free-text column at its floor: the rest is the terminal's
+    w[pick]--;
+    total--;
+  }
+  return w;
+}
+
+/** The longest start of `s` within `width` columns, at least one character. */
+function takeWidth(s: string, width: number): string {
+  let out = '';
+  for (const ch of s) {
+    if (out && displayWidth(out + ch) > width) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** `s` as lines of at most `width` columns: broken after a space, `/`, `,`, `:` or `-`; a longer run is split where it reaches the width. */
+export function wrapCell(s: string, width: number): string[] {
+  if (displayWidth(s) <= width) return [s];
+  const lines: string[] = [];
+  let line = '';
+  for (let t of s.match(/[^\s/,:-]*[\s/,:-]*/g)?.filter(Boolean) ?? []) {
+    if (displayWidth((line + t).trimEnd()) <= width) {
+      line += t;
+      continue;
+    }
+    if (line.trim()) lines.push(line.trimEnd());
+    line = '';
+    while (displayWidth(t.trimEnd()) > width) {
+      const head = takeWidth(t, width);
+      lines.push(head);
+      t = t.slice(head.length);
+    }
+    line = t;
+  }
+  if (line.trim()) lines.push(line.trimEnd());
+  return lines;
+}
+
+/** The table every renderer prints. Without a width: each column as wide as its longest cell. With one: see TableOpts. */
+export function table(rows: string[][], opts: TableOpts = {}): string {
+  if (opts.width === undefined) {
+    const w = rows[0].map((_, i) =>
+      Math.max(...rows.map((r) => (r[i] ?? '').length))
+    );
+    return rows
+      .map((r) =>
+        r
+          .map((c, i) => (c ?? '').padEnd(w[i]))
+          .join('  ')
+          .trimEnd()
+      )
+      .join('\n');
+  }
+  const at = (r: string[], i: number) => r[i] ?? '';
+  const natural = rows[0].map((_, i) =>
+    Math.max(...rows.map((r) => displayWidth(at(r, i))))
   );
-  return rows
-    .map((r) =>
-      r
-        .map((c, i) => (c ?? '').padEnd(w[i]))
-        .join('  ')
-        .trimEnd()
-    )
-    .join('\n');
+  const widths = fitWidths(natural, opts.flex ?? [], opts.width);
+  const flex = new Set(opts.flex ?? []);
+  const starts = new Set(opts.cutStart ?? []);
+  const pad = (s: string, w: number) =>
+    s + ' '.repeat(Math.max(0, w - displayWidth(s)));
+  const out: string[] = [];
+  for (const r of rows) {
+    const cells = widths.map((w, i) => {
+      const s = at(r, i);
+      if (!flex.has(i) || displayWidth(s) <= w) return [s];
+      if (opts.mode === 'fit')
+        return [starts.has(i) ? cutStartWidth(s, w) : cutWidth(s, w)];
+      return wrapCell(s, w);
+    });
+    const height = Math.max(...cells.map((c) => c.length));
+    for (let k = 0; k < height; k++)
+      out.push(
+        cells
+          .map((c, i) => pad(c[k] ?? '', widths[i]))
+          .join(' '.repeat(GUTTER))
+          .trimEnd()
+      );
+  }
+  return out.join('\n');
 }
 export function fmtCpu(c: number | null): string {
   return c === null ? '-' : `${c.toFixed(1)}%`;

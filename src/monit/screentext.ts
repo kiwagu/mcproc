@@ -172,3 +172,15 @@ export function cutWidth(s: string, width: number): string {
   }
   return `${out}…`;
 }
+
+/** Cut screen text to `width` from the start, an ellipsis in front when something was cut: for paths, whose end says more. */
+export function cutStartWidth(s: string, width: number): string {
+  if (displayWidth(s) <= width) return s;
+  const all = [...s];
+  let out = '';
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (displayWidth(all[i] + out) > width - 1) break;
+    out = all[i] + out;
+  }
+  return `…${out}`;
+}
