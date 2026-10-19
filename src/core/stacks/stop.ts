@@ -45,8 +45,11 @@ export async function stopStack(
   return out;
 }
 
-/** The apps whose pm2 process, when there is one, runs from this checkout's folder; the others go to `failed`. A host
- * that cannot be read keeps its apps: the stop itself then reports why. */
+/**
+ * The apps whose pm2 process, when there is one, runs from this checkout's folder; the others go to `failed`. A host
+ * whose pm2 list cannot be read stops nothing: its apps go to `failed` with the reason, since a stop without the check
+ * could reach another checkout's process of the same name.
+ */
 async function ownApps(
   m: Manifest,
   fleet: Fleet,
@@ -61,8 +64,9 @@ async function ownApps(
       const ctx = await fleet.ctx(g.host);
       host = ctx.host;
       procs = await ctx.pm2.jlist();
-    } catch {
-      keep.push(...g.apps);
+    } catch (e) {
+      for (const a of g.apps)
+        out.failed.push({ host: g.host, message: `${a}: ${describeError(e)}` });
       continue;
     }
     for (const a of g.apps) {

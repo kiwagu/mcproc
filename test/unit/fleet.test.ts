@@ -333,12 +333,36 @@ describe('stopStack', () => {
     });
     expect(h.connected).toEqual([]);
   });
-  it('when no host answers, the error is the one failure', async () => {
+  it('when no host answers, every app is named with its host and nothing is stopped', async () => {
     const h = fakeFleet(undefined, procs, ['local', 'box']);
     const out = await stopStack(m, h.connector);
     expect(out.stopped).toEqual([]);
-    expect(out.failed).toEqual([
-      { host: '-', message: expect.stringContaining('TRANSPORT_FAILED') },
+    expect(
+      out.failed.map((f) => `${f.host} ${f.message.split(':')[0]}`).sort()
+    ).toEqual(['box web', 'local tool', 'local watch']);
+    for (const f of out.failed) expect(f.message).toContain('TRANSPORT_FAILED');
+  });
+  it('a host whose pm2 list cannot be read before the stop stops nothing, even when a later read would succeed', async () => {
+    const h = fakeFleet(undefined, {
+      local: [proc('watch', 0, '/elsewhere/fleet'), proc('tool', 1, dir)],
+      box: [proc('web', 3, '/home/dev/fleet')],
+    });
+    let first = true;
+    const flaky: Connector = async (mm, host, fallback) => {
+      if (host === 'local' && first) {
+        first = false;
+        throw new McprocError('TRANSPORT_FAILED', 'local: busy');
+      }
+      return h.connector(mm, host, fallback);
+    };
+    const out = await stopStack(m, flaky);
+    expect(out.stopped).toEqual(['web']);
+    expect(out.failed.map((f) => f.message).sort()).toEqual([
+      'tool: TRANSPORT_FAILED: local: busy',
+      'watch: TRANSPORT_FAILED: local: busy',
+    ]);
+    expect(h.log.filter((l) => l.includes("'stop'"))).toEqual([
+      "box: pm2 'stop' '3'",
     ]);
   });
 });
