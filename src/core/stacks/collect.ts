@@ -50,6 +50,8 @@ const ASK: ProbeAsk = {
   urls: [],
   containers: [],
 };
+/** An endpoint's first probe: with no earlier sample to diff against, it takes the inline pair so its cpu shows at once. */
+const FIRST_ASK: ProbeAsk = { ...ASK, cpuSample: true };
 
 export interface CollectorDeps {
   stateDir: string;
@@ -215,9 +217,13 @@ export class StacksCollector {
         link = this.deps.connectHost(host);
         this.links.set(key, link);
       }
-      const probe = await this.deps.probeHost(await link, ASK);
       const last = c?.probe;
-      const sample = last?.data.stats.samples[0];
+      const probe = await this.deps.probeHost(
+        await link,
+        last ? ASK : FIRST_ASK
+      );
+      // the next refresh diffs against the latest sample: the second of an inline pair
+      const sample = last?.data.stats.samples.at(-1);
       entry = {
         probe,
         prev: last && sample ? { sample, at: last.sampledAt } : undefined,

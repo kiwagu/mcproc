@@ -1786,15 +1786,82 @@ describe('renderStacks', () => {
   });
   it('labels and paths', () => {
     expect(
-      stackLabel({
-        project: 'alpha-w2',
-        base_project: 'alpha',
-        slot: 2,
-        branch: null,
-      })
+      stackLabel(
+        {
+          project: 'alpha-w2',
+          base_project: 'alpha',
+          slot: 2,
+          branch: null,
+        },
+        true
+      )
     ).toBe('  w2 alpha-w2');
     expect(tildePath('/home/u/x', '/home/u')).toBe('~/x');
     expect(tildePath('/srv/x', '/home/u')).toBe('/srv/x');
+  });
+  it('a worktree under its listed base is indented; one whose base is not listed names its base, flush left; a base is its project', () => {
+    const wt = {
+      project: 'alpha-w2',
+      base_project: 'alpha',
+      slot: 2,
+      branch: 'feat/y',
+    };
+    expect(stackLabel(wt, true)).toBe('  w2 feat/y');
+    expect(stackLabel(wt, false)).toBe('alpha w2 feat/y');
+    expect(
+      stackLabel(
+        { project: 'alpha', base_project: 'alpha', slot: 0, branch: 'main' },
+        false
+      )
+    ).toBe('alpha');
+    const alone = renderStacks({
+      ...answer,
+      stacks: [answer.stacks[1]],
+      orphans: [],
+    }).split('\n');
+    expect(alone[2]).toMatch(
+      /^alpha w1 feat\/x\s+\/home\/u\/repos\/alpha\.worktrees/
+    );
+  });
+  it('ROOT is the absolute path without a width (MCP, piped: it passes back as project); a terminal shows the home as ~', () => {
+    const plain = renderStacks(answer, undefined, '/home/u').split('\n');
+    expect(plain[2]).toMatch(/^alpha\s+\/home\/u\/repos\/alpha\s/);
+    expect(plain.join('\n')).not.toContain('~');
+    const tty = renderStacks(answer, 200, '/home/u').split('\n');
+    expect(tty[2]).toMatch(/^alpha\s+~\/repos\/alpha\s/);
+    expect(tty[3]).toMatch(
+      /^ {2}w1 feat\/x\s+~\/repos\/alpha\.worktrees\/feat\/x\s/
+    );
+  });
+  it('a manifest error is a line with its code, message and hint', () => {
+    const broken = (hint?: string) =>
+      renderStacks({
+        ...answer,
+        stacks: [
+          {
+            ...answer.stacks[0],
+            project: 'beta',
+            base_project: 'beta',
+            root: '/srv/beta',
+            manifest_error: {
+              code: 'MANIFEST_INVALID',
+              message: 'apps.web: run is required',
+              ...(hint ? { hint } : {}),
+            },
+          },
+        ],
+        orphans: [],
+      }).split('\n');
+    const withHint = broken('Fix .mcproc/mcproc.yaml.');
+    expect(withHint[2]).toMatch(
+      /^beta\s+\/srv\/beta\s+local\s+manifest error\s/
+    );
+    expect(withHint[3]).toBe(
+      'beta: MANIFEST_INVALID: apps.web: run is required (Fix .mcproc/mcproc.yaml.)'
+    );
+    expect(broken()[3]).toBe(
+      'beta: MANIFEST_INVALID: apps.web: run is required'
+    );
   });
   it('with a width the table stays within it', () => {
     for (const l of renderStacks(answer, 90).split('\n'))

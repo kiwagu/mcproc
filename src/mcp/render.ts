@@ -861,12 +861,17 @@ export function tildePath(p: string, home = os.homedir()): string {
     ? `~${p.slice(home.length)}`
     : p;
 }
-/** A stack's name: a worktree as `w<slot> <branch>` indented under its base. */
+/**
+ * A stack's name: a base is its project; a worktree is `w<slot> <branch>`, indented when `nested` (its base is in the
+ * same list, which puts it under that base), else after its base's name, flush left, so the row still names its project.
+ */
 export function stackLabel(
-  s: Pick<Stack, 'project' | 'base_project' | 'slot' | 'branch'>
+  s: Pick<Stack, 'project' | 'base_project' | 'slot' | 'branch'>,
+  nested: boolean
 ): string {
   if (s.base_project === s.project) return s.project;
-  return `  ${s.slot !== null ? `w${s.slot} ` : ''}${s.branch ?? s.project}`;
+  const wt = `${s.slot !== null ? `w${s.slot} ` : ''}${s.branch ?? s.project}`;
+  return nested ? `  ${wt}` : `${s.base_project} ${wt}`;
 }
 /** `online/total`, `queued #N` while its start waits, `not running` with nothing in pm2. */
 export function stackApps(s: Stack): string {
@@ -884,9 +889,14 @@ export function stackPorts(s: Stack, max = 3): string {
     .join(' ');
   return ports.length > max ? `${shown} +${ports.length - max}` : shown;
 }
-const stackCells = (s: Stack): string[] => [
-  stackLabel(s),
-  tildePath(s.root),
+/** `root`: the ROOT cell, absolute where it is read back as `project` (MCP, piped), with ~ on a terminal. */
+const stackCells = (
+  s: Stack,
+  nested: boolean,
+  root: (p: string) => string
+): string[] => [
+  stackLabel(s, nested),
+  root(s.root),
   s.hosts.map((h) => h.name).join(','),
   s.manifest_error ? 'manifest error' : stackApps(s),
   String(s.apps.errored),
@@ -930,19 +940,34 @@ export function stacksHostLine(h: StacksAnswer['host']): string {
   return `${h.name} · ${mem} · ${watcher} · queue ${h.queue}`;
 }
 
-/** Every stack of the host: a host line, the table, then a line per manifest error, note and host that did not answer. */
-export function renderStacks(a: StacksAnswer, width?: number): string {
+/**
+ * Every stack of the host: a host line, the table, then a line per manifest error, note and host that did not answer.
+ * Without a width (MCP, piped) ROOT is the absolute path, which passes back as `project`; on a terminal the home is ~.
+ */
+export function renderStacks(
+  a: StacksAnswer,
+  width?: number,
+  home = os.homedir()
+): string {
   const lines = [`host: ${stacksHostLine(a.host)}`, ...a.host.notes];
   if (a.stacks.length === 0 && a.orphans.length === 0)
     return [
       ...lines,
       'no stacks running on this host (--all lists the recorded ones)',
     ].join('\n');
+  const bases = new Set(a.stacks.map((s) => s.project));
+  const root = (p: string) => (width === undefined ? p : tildePath(p, home));
   lines.push(
     table(
       [
         STACK_HEADER,
-        ...a.stacks.map(stackCells),
+        ...a.stacks.map((s) =>
+          stackCells(
+            s,
+            s.base_project !== s.project && bases.has(s.base_project),
+            root
+          )
+        ),
         ...a.orphans.map(orphanCells),
       ],
       { width, flex: [1, 7], mode: 'wrap' }
@@ -951,7 +976,7 @@ export function renderStacks(a: StacksAnswer, width?: number): string {
   for (const s of a.stacks) {
     if (s.manifest_error)
       lines.push(
-        `${s.project}: ${s.manifest_error.code}: ${s.manifest_error.message}`
+        `${s.project}: ${s.manifest_error.code}: ${s.manifest_error.message}${s.manifest_error.hint ? ` (${s.manifest_error.hint})` : ''}`
       );
     for (const n of s.notes) lines.push(`${s.project}: ${n}`);
     for (const h of s.hosts)

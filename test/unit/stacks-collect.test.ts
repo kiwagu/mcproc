@@ -41,13 +41,14 @@ const proc = (name: string, ns: string, cwd: string, pid: number) => ({
 });
 const probeOf = (
   procs: object[],
-  extra: { stat?: string; at?: number } = {}
+  extra: { stat?: string; stat2?: string; at?: number } = {}
 ): HostProbe => {
   const data = parseProbe(
     probeOut({
       jlist: JSON.stringify(procs),
       mem: 'MemTotal: 8000000 kB\nMemAvailable: 4000000 kB\n',
       stat: extra.stat,
+      stat2: extra.stat2,
     })
   );
   return {
@@ -61,15 +62,18 @@ function deps(
   state: string,
   byHost: (h: Host) => HostProbe | Error,
   clock = { t: 1_000_000 }
-): CollectorDeps & { probes: string[] } {
+): CollectorDeps & { probes: string[]; asks: [string, boolean][] } {
   const probes: string[] = [];
+  const asks: [string, boolean][] = [];
   return {
     probes,
+    asks,
     stateDir: state,
     now: () => clock.t,
     connectHost: async (host) => ({ host }) as unknown as HostLink,
-    probeHost: async (link) => {
+    probeHost: async (link, ask) => {
       probes.push(link.host.name + (link.host.pm2_home ?? ''));
+      asks.push([link.host.name, ask.cpuSample]);
       const r = byHost(link.host);
       if (r instanceof Error) throw r;
       return r;
@@ -253,6 +257,53 @@ describe('StacksCollector', () => {
     const v = await c.collect({ all: true }); // not due: the same probe, 2 s old
     expect(v.answer.stacks[0].hosts[0].age_s).toBe(2);
     expect(v.answer.stacks[0].cpu).toBe(50);
+  });
+
+  it('the first read of each endpoint takes the inline cpu sample, so a one-shot collect has its cpu; later reads use the last probe', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const state = path.join(base, 'state');
+    const gamma = checkout(
+      base,
+      'gamma',
+      'version: 1\nproject: gamma\nhosts:\n  ws: { docker: { container: c1 }, cwd: /w }\napps:\n  api: { description: a, run: "node a.js", host: ws }\n'
+    );
+    recordProject(loadManifest(gamma), state);
+    const clock = { t: 1_000_000 };
+    let n = 0;
+    const d = deps(
+      state,
+      (h) => {
+        if (h.local) return probeOf([]);
+        n++;
+        // the first probe: two inline samples 0.5 s apart (25 ticks of 100/s: 50%); then one sample per probe
+        return n === 1
+          ? probeOf([proc('gamma-api', 'gamma', '/w', 31)], {
+              stat: 'CLK 100\n31 1 100',
+              stat2: 'CLK 100\n31 1 125',
+              at: clock.t,
+            })
+          : probeOf([proc('gamma-api', 'gamma', '/w', 31)], {
+              stat: 'CLK 100\n31 1 225', // 1 s of cpu over 10 s since the last sample: 10%
+              at: clock.t,
+            });
+      },
+      clock
+    );
+    const c = new StacksCollector(d);
+    const first = await c.collect({ all: true });
+    expect(d.asks.sort()).toEqual([
+      ['local', true],
+      ['ws', true],
+    ]);
+    expect(first.answer.stacks[0].cpu).toBe(50);
+    d.asks.length = 0;
+    clock.t += REMOTE_EVERY_MS;
+    const next = await c.collect({ all: true });
+    expect(d.asks.sort()).toEqual([
+      ['local', false],
+      ['ws', false],
+    ]);
+    expect(next.answer.stacks[0].cpu).toBe(10);
   });
 
   it('probes the local daemon on every refresh, after a failure too', async () => {

@@ -302,6 +302,7 @@ describe('cli', () => {
       from: 'user',
     });
     expect(c.err.join('\n')).toContain('BAD_ARGUMENT');
+    expect(c.err.join('\n')).toContain('Hint: Drop --host.');
     expect(process.exitCode).toBe(1);
   });
   it('worktree refuses another host before touching it', async () => {
