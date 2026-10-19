@@ -890,6 +890,24 @@ describe('incidents the agent has taken', () => {
     }); // everything taken: 5 is gone from under the view
     expect(s.logScroll).toBe(0);
   });
+  it('a take while another view is open leaves the scroll of that view alone', () => {
+    let s = reduce(opened(), { type: 'hideTaken' });
+    s = reduce(s, { type: 'view', view: 'dashboard' });
+    s = { ...s, logScroll: 7 }; // scrolled up in the dashboard's log pane
+    s = reduce(s, {
+      type: 'taken',
+      taken: {
+        'local/api': {
+          err: {
+            stamp: '2026-10-15T10:00:09.000',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
+    });
+    expect(s.logScroll).toBe(7);
+  });
   it('the scroll counts what is shown: hidden incidents take no room', () => {
     let s = reduce(opened(), { type: 'hideTaken' });
     expect(s.logScroll).toBe(0);

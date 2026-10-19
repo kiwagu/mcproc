@@ -309,8 +309,8 @@ export function reduce(s: MonitState, a: MonitAction): MonitState {
     }
     case 'taken': {
       // what hides under the view stays where it was: the view keeps the incidents it shows
-      if (!s.hideTaken || s.logScroll === 0)
-        return { ...s, incidentsTaken: a.taken };
+      if (s.view !== 'incidents' || !s.hideTaken || s.logScroll === 0)
+        return { ...s, incidentsTaken: a.taken }; // another view's scroll is its own
       const below = visibleIncidents(s).slice(-s.logScroll);
       const still = below.filter((i) => !isTaken(i, a.taken, i.end)).length;
       return {
