@@ -27,10 +27,10 @@ describe('table', () => {
     expect(table(rows, { width: 20, flex: [1], mode: 'fit' })).toBe(
       ['ID  NOTE           X', 'a1  alpha beta g…  z'].join('\n')
     );
-    const paths = [['ROOT'], ['/home/u/repos/surreal/demo']];
+    const paths = [['ROOT'], ['/home/u/repos/alpha/demo']];
     expect(
       table(paths, { width: 13, flex: [0], mode: 'fit', cutStart: [0] })
-    ).toBe('ROOT\n…surreal/demo');
+    ).toBe('ROOT\n…s/alpha/demo');
   });
   it('a free-text column never shrinks below FLEX_MIN (or its own width); the rest is left to the terminal', () => {
     const long = [
@@ -93,10 +93,8 @@ describe('wrapCell', () => {
 
 describe('cutStartWidth', () => {
   it('keeps the end of the text and marks the cut at the start', () => {
-    expect(cutStartWidth('/home/u/repos/surreal/demo', 13)).toBe(
-      '…surreal/demo'
-    );
-    expect(displayWidth(cutStartWidth('/home/u/repos/surreal/demo', 13))).toBe(
+    expect(cutStartWidth('/home/u/repos/alpha/demo', 13)).toBe('…s/alpha/demo');
+    expect(displayWidth(cutStartWidth('/home/u/repos/alpha/demo', 13))).toBe(
       13
     );
     expect(cutStartWidth('short', 13)).toBe('short');
