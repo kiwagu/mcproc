@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { McprocError } from './errors.js';
+import { VERSION } from '../version.js';
 import {
   DEP_TIMEOUT_MAX_S,
   defaultProject,
@@ -762,7 +763,12 @@ export function renderDraft(
     '# host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.',
   ];
   for (const n of d.notes) L.push(`# note: ${n}`);
-  L.push('version: 1', `project: ${yamlStr(project)}`, 'apps:');
+  L.push(
+    'version: 1',
+    `mcproc: ${VERSION}   # the mcproc that wrote this draft`,
+    `project: ${yamlStr(project)}`,
+    'apps:'
+  );
   if (d.candidates.length === 0)
     L.push(
       '  # no launch candidates found; add apps by hand, e.g.',

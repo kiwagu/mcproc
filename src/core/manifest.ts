@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { McprocError } from './errors.js';
+import { VERSION, VERSION_PATTERN, compareVersions } from '../version.js';
 import { repeatsARepeat } from './incidents/detect.js';
 import { NAME_RE } from './names.js';
 import { loadOverride, type Override } from './override.js';
@@ -170,9 +171,16 @@ const execSchema = z.object({ env: z.record(varValue).default({}) }).strict();
 const orEmpty = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess((v) => (v === null || v === undefined ? {} : v), schema);
 
+const WRITTEN_BY =
+  'must be the version of the mcproc that wrote this manifest, like 0.13.0';
+
 export const manifestSchema = z
   .object({
     version: z.literal(1),
+    mcproc: z
+      .string({ invalid_type_error: WRITTEN_BY })
+      .regex(VERSION_PATTERN, WRITTEN_BY)
+      .optional(),
     project: name.optional(),
     vars: orEmpty(z.record(varName, varValue)),
     resources: orEmpty(resourcesSchema),
@@ -273,6 +281,8 @@ export interface Host {
 export interface Manifest {
   root: string;
   path: string;
+  /** the version of the mcproc that wrote the manifest (init records it); null when it names none */
+  mcproc: string | null;
   project: string;
   /** the manifest's own slug (declared, else from the main checkout's directory name), before any override: the registry of worktree slots is keyed by it */
   base_project: string;
@@ -416,7 +426,13 @@ function templateError(field: string, e: unknown): McprocError {
 }
 
 /** Keys whose string values are never templates: structure, not configuration. */
-const NO_TEMPLATE_KEYS = new Set(['version', 'project', 'profiles', 'vars']);
+const NO_TEMPLATE_KEYS = new Set([
+  'version',
+  'mcproc',
+  'project',
+  'profiles',
+  'vars',
+]);
 
 /**
  * Every string leaf of the raw manifest rendered with the resolved vars, except the structural keys; `port`/`ports`
@@ -475,11 +491,42 @@ export function parseManifest(
       `YAML parse error in ${manifestPath}: ${(e as Error).message}`
     );
   }
-  // project and vars come first: everything else is rendered with them
   const top = (raw && typeof raw === 'object' ? raw : {}) as Record<
     string,
     unknown
   >;
+  try {
+    return checkManifest(raw, top, root, manifestPath, override);
+  } catch (e) {
+    throw upgradeHint(e, top.mcproc);
+  }
+}
+
+/** An error from a manifest that a newer mcproc wrote says so: what it trips on may be newer than this build. */
+function upgradeHint(e: unknown, writtenBy: unknown): unknown {
+  if (
+    !(e instanceof McprocError) ||
+    typeof writtenBy !== 'string' ||
+    !VERSION_PATTERN.test(writtenBy) ||
+    compareVersions(writtenBy, VERSION) <= 0
+  )
+    return e;
+  const hint = `This manifest was written by mcproc ${writtenBy}, this is ${VERSION}: it may use what this build does not know yet. Upgrade mcproc.`;
+  return new McprocError(e.code, e.message, {
+    hint: e.hint ? `${hint} ${e.hint}` : hint,
+    details: e.details,
+  });
+}
+
+/** Everything parseManifest checks once the YAML has parsed: templates, the schema, the cross-field rules. */
+function checkManifest(
+  raw: unknown,
+  top: Record<string, unknown>,
+  root: string,
+  manifestPath: string,
+  override: Override | null
+): Manifest {
+  // project and vars come first: everything else is rendered with them
   if (typeof top.project === 'string' && /\{\{/.test(top.project))
     throw new McprocError('BAD_TEMPLATE', 'project: must not be a template', {
       hint: 'Set the project slug in the override file instead.',
@@ -764,6 +811,7 @@ export function parseManifest(
   return {
     root,
     path: manifestPath,
+    mcproc: m.mcproc ?? null,
     project,
     base_project,
     vars,

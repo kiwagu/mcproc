@@ -420,6 +420,7 @@ export function fmtDeps(deps: { app: string; condition: string }[]): string {
 export function renderProject(d: {
   project: string;
   root: string;
+  mcproc: { manifest: string | null; running: string };
   vars: VarInfo[];
   override: string | null;
   slot: number | null;
@@ -437,6 +438,11 @@ export function renderProject(d: {
   readme: string | null;
 }): string {
   const L = [`project: ${d.project} (${d.root})`];
+  const w = d.mcproc.manifest;
+  if (w)
+    L.push(
+      `manifest: written by mcproc ${w}${w === d.mcproc.running ? '' : `, this is ${d.mcproc.running}`}`
+    );
   if (d.vars.some((v) => v.source !== 'built-in') || d.override) {
     L.push(
       `vars:${d.override ? ` (override ${d.override})` : ''}${d.slot !== null ? ` slot ${d.slot}` : ''}`

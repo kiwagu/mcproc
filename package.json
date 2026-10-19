@@ -1,6 +1,6 @@
 {
   "name": "mcproc",
-  "version": "0.12.2",
+  "version": "0.13.0",
   "description": "pm2 process control for agents over MCP: local and remote hosts, per-app ports, one manifest per project",
   "keywords": [
     "mcp",
