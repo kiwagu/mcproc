@@ -1,0 +1,56 @@
+name: release
+
+# A pushed vX.Y.Z tag is a release: checked against package.json and main, tested, published to npm through
+# trusted publishing (no token; npm adds provenance), and given a GitHub Release listing the commits since the last one.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # the GitHub Release
+  id-token: write # npm trusted publishing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # main and the earlier tags: the check and the notes read them
+
+      - name: The tag names the version in package.json, on main
+        run: sh scripts/release-check.sh "$GITHUB_REF_NAME" origin/main
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: An npm that publishes through trusted publishing
+        run: npm install -g npm@11.6.2
+
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run check
+      - run: npx vitest run test/unit
+      - run: bun run build
+
+      - name: Integration tests against a real pm2
+        run: npx vitest run test/integration
+        env:
+          MCPROC_IT: '1'
+          MCPROC_CLI: ${{ github.workspace }}/dist/cli.js
+
+      - name: Publish to npm
+        run: npm publish --access public
+
+      - name: GitHub Release
+        run: |
+          sh scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+        env:
+          GH_TOKEN: ${{ github.token }}
