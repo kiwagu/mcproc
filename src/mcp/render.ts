@@ -904,7 +904,8 @@ const stackCells = (
   s.cpu === null ? '-' : `${Math.round(s.cpu)}%`,
   stackPorts(s),
 ];
-const orphanCells = (o: Orphan): string[] => {
+/** A pm2 namespace no manifest claims, as a row under STACK_HEADER. */
+export const orphanCells = (o: Orphan): string[] => {
   const mem = o.processes.reduce((a, p) => a + p.memory, 0);
   return [
     `pm2 · ${o.namespace}`,

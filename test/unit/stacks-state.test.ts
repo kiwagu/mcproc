@@ -1,0 +1,195 @@
+import { describe, it, expect } from 'vitest';
+import { CONFIRM_MS } from '../../src/monit/state.js';
+import {
+  initialOverview,
+  overviewKey,
+  overviewRows,
+  reduceOverview,
+  selectedOverviewRow,
+  type OverviewIntent,
+} from '../../src/monit/stacks-state.js';
+import type { StacksView } from '../../src/core/stacks/collect.js';
+
+const stack = (project: string, root: string, extra: object = {}) => ({
+  project,
+  root,
+  base_project: project,
+  slot: null,
+  branch: null,
+  source: 'registry',
+  hosts: [
+    {
+      name: 'local',
+      endpoint: 'local',
+      reachable: true,
+      error: null,
+      age_s: 0,
+    },
+  ],
+  apps: { total: 2, online: 2, errored: 0, stopped: 0, queued: 0 },
+  queue_position: null,
+  memory: 1,
+  cpu: 1,
+  ports: [],
+  manifest_error: null,
+  notes: [],
+  present: true,
+  rows: [
+    { app: 'web', pm_id: 1, status: 'online' },
+    { app: 'job', pm_id: 2, status: 'stopped' },
+  ],
+  ...extra,
+});
+const view = (stacks: object[], orphans: object[] = []) =>
+  ({
+    answer: { host: {}, stacks, orphans },
+    stacks,
+    manifests: new Map(),
+  }) as unknown as StacksView;
+const at = new Date('2026-10-19T10:00:00');
+
+describe('overview state', () => {
+  it('the selection follows a stack by root across refreshes, and falls back to the same index', () => {
+    let s = initialOverview({ selected: '/b' });
+    s = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('a', '/a'), stack('b', '/b')]),
+      at,
+    });
+    expect(selectedOverviewRow(s)?.key).toBe('/b');
+    s = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('b', '/b'), stack('a', '/a')]),
+      at,
+    });
+    expect(selectedOverviewRow(s)?.key).toBe('/b');
+    s = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('c', '/c'), stack('a', '/a')]),
+      at,
+    });
+    expect(selectedOverviewRow(s)?.key).toBe('/c'); // /b gone: the row now at its index
+  });
+  it('rows are the stacks, then the orphans', () => {
+    const s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view(
+        [stack('a', '/a')],
+        [{ namespace: 'default', endpoint: 'local', processes: [], note: null }]
+      ),
+      at,
+    });
+    expect(overviewRows(s).map((r) => r.key)).toEqual([
+      '/a',
+      'orphan:local:default',
+    ]);
+  });
+  it('keys: j/k select, enter opens, a toggles all, q and escape quit', () => {
+    const s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([stack('a', '/a'), stack('b', '/b')]),
+      at,
+    });
+    expect(overviewKey('j', s)).toEqual({
+      kind: 'action',
+      action: { type: 'select', delta: 1 },
+    });
+    expect(overviewKey('up', s)).toEqual({
+      kind: 'action',
+      action: { type: 'select', delta: -1 },
+    });
+    expect(overviewKey('enter', s)).toEqual({ kind: 'open', root: '/a' });
+    expect(overviewKey('a', s)).toEqual({
+      kind: 'action',
+      action: { type: 'toggle-all' },
+    });
+    expect(overviewKey('q', s)).toEqual({ kind: 'quit' });
+    expect(overviewKey('escape', s)).toEqual({ kind: 'quit' });
+  });
+  it('x arms with a prompt naming the running apps; a second x in time stops; late, it arms again', () => {
+    let s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view([stack('a', '/a')]),
+      at,
+    });
+    const first = overviewKey('x', s, 1000);
+    expect(first).toEqual({
+      kind: 'action',
+      action: { type: 'arm', at: 1000 },
+    });
+    s = reduceOverview(
+      s,
+      (first as Extract<OverviewIntent, { kind: 'action' }>).action
+    );
+    expect(s.notice).toBe('press x again to stop 1 app of a');
+    expect(overviewKey('x', s, 1000 + CONFIRM_MS)).toEqual({
+      kind: 'stop',
+      root: '/a',
+    });
+    expect(overviewKey('x', s, 1001 + CONFIRM_MS)).toEqual({
+      kind: 'action',
+      action: { type: 'arm', at: 1001 + CONFIRM_MS },
+    });
+  });
+  it('enter and x refuse an orphan and a stack whose manifest did not load, saying why', () => {
+    const s = reduceOverview(initialOverview({}), {
+      type: 'view',
+      view: view(
+        [
+          stack('bad', '/bad', {
+            manifest_error: { code: 'MANIFEST_INVALID', message: 'apps: bad' },
+          }),
+        ],
+        [{ namespace: 'default', endpoint: 'local', processes: [], note: null }]
+      ),
+      at,
+    });
+    expect(overviewKey('enter', s)).toEqual({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: 'bad: the manifest did not load (MANIFEST_INVALID)',
+      },
+    });
+    const o = reduceOverview(s, { type: 'select', delta: 1 });
+    expect(overviewKey('x', o)).toEqual({
+      kind: 'action',
+      action: { type: 'notice', message: 'not an mcproc stack: read-only' },
+    });
+    expect(overviewKey('enter', o)).toEqual({
+      kind: 'action',
+      action: {
+        type: 'notice',
+        message: 'not an mcproc stack: no manifest to open',
+      },
+    });
+  });
+  it('a refresh that moves the selection to another stack disarms x, so it never stops a stack the prompt did not name', () => {
+    let s = initialOverview({ selected: '/b' });
+    s = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('a', '/a'), stack('b', '/b')]),
+      at,
+    });
+    s = reduceOverview(s, { type: 'arm', at: 1000 });
+    expect(s.notice).toBe('press x again to stop 1 app of b');
+    const kept = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('b', '/b'), stack('a', '/a')]),
+      at,
+    });
+    expect(overviewKey('x', kept, 1500)).toEqual({ kind: 'stop', root: '/b' });
+    s = reduceOverview(s, {
+      type: 'view',
+      view: view([stack('a', '/a'), stack('c', '/c')]),
+      at,
+    });
+    expect(selectedOverviewRow(s)?.key).toBe('/c');
+    expect(s.armedAt).toBeNull();
+    expect(s.notice).toBeNull();
+    expect(overviewKey('x', s, 1500)).toEqual({
+      kind: 'action',
+      action: { type: 'arm', at: 1500 },
+    });
+  });
+});
