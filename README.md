@@ -99,12 +99,13 @@ fields, the kinds and the process naming: [the manifest](docs/manifest.md).
 | `hosts`, `doctor` | the hosts and the apps bound to each; per-host readiness, which pm2 a host would use and why, where each url answers ([hosts](docs/hosts.md)) |
 | `unpack` | bring pm2, and Node when the host has none, to a host ([hosts](docs/hosts.md#hosts-without-pm2-unpack)) |
 | `leases`, `lease_cancel` (CLI `leases cancel <id>`) | this machine's memory lease queue; cancel a pending lease ([memory](docs/memory.md)) |
+| `stacks` | every mcproc stack on this machine, not only this project: the checkouts any mcproc call has seen and those found in the local pm2, with their hosts, apps, memory and ports, plus pm2 processes no manifest knows; `all` adds the recorded ones with nothing running ([monit](docs/monit.md#every-stack-of-the-host)) |
 | `exec -- <command>` | a one-off command from the project root with the manifest's `exec.env`, under a lease with `--memory` |
 | `worktree_add`, `worktree_ls`, `worktree_remove` (CLI `worktree add \| ls \| remove`) | an isolated checkout per branch with its own slot, slug and ports ([worktrees](docs/worktrees.md)) |
 
 Every tool takes `project`; the tools that act on apps take `host` too, and without it each app is reached where it
 runs ([hosts](docs/hosts.md)). Leases, `exec` and worktrees are local to this machine. Read-only tools are annotated as such; mutating tools refuse `readonly` hosts and unknown app names before touching
-any host. `mcproc monit` is the terminal dashboard on the same data ([monit](docs/monit.md)).
+any host. `mcproc monit` is the terminal dashboard on the same data; outside a project, or with `--all`, it lists every stack of the machine ([monit](docs/monit.md)). Text tables fit the terminal's width, wrapping long cells inside their column.
 
 ## Documentation
 
