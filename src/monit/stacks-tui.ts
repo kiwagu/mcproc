@@ -77,8 +77,11 @@ export async function runOverview(opts: {
   let state: OverviewState = initialOverview({ selected: opts.selected });
   /** false while monit has the screen: the overview neither paints nor takes keys */
   let active = true;
+  /** the overview has quit: a stop or a refresh finishing later neither paints nor reads again */
+  let closed = false;
+  let armTimer: NodeJS.Timeout | null = null;
   const paint = () => {
-    if (!active) return;
+    if (!active || closed) return;
     const f = renderOverview(state, {
       width: screen.width as number,
       height: screen.height as number,
@@ -104,7 +107,7 @@ export async function runOverview(opts: {
   };
   let inflight = false;
   const refresh = async () => {
-    if (inflight) return; // a slow probe delays the next tick instead of overlapping it
+    if (inflight || closed) return; // a slow probe delays the next tick instead of overlapping it
     inflight = true;
     try {
       const view = await collector.collect({ all: state.all });
@@ -119,7 +122,9 @@ export async function runOverview(opts: {
 
   return new Promise<void>((resolve) => {
     const quit = () => {
+      closed = true;
       clearInterval(timer);
+      if (armTimer) clearTimeout(armTimer);
       screen.destroy();
       resolve();
     };
@@ -138,9 +143,11 @@ export async function runOverview(opts: {
         act(intent.action);
         if (intent.action.type === 'arm' && intent.action.at !== null) {
           const at = intent.action.at;
-          setTimeout(() => {
+          if (armTimer) clearTimeout(armTimer);
+          armTimer = setTimeout(() => {
             if (state.armedAt === at) act({ type: 'arm', at: null });
-          }, CONFIRM_MS + 50).unref();
+          }, CONFIRM_MS + 50);
+          armTimer.unref();
         }
         if (intent.action.type === 'toggle-all') void refresh();
         return;
@@ -153,6 +160,7 @@ export async function runOverview(opts: {
       if (intent.kind === 'stop') {
         act({ type: 'busy', busy: true });
         const r = await stopStack(m);
+        if (closed) return;
         act({ type: 'busy', busy: false });
         act({ type: 'notice', message: stopNotice(m.project, r) });
         return void refresh();

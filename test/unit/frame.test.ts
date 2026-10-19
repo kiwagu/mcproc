@@ -110,7 +110,7 @@ describe('renderFrame', () => {
       );
       expect(
         renderFrame({ ...v, toStacks: true }, { width: 200, height: 24 }).footer
-      ).toContain('esc stacks');
+      ).toMatch(/^esc stacks {2}/); // first: a narrow terminal cuts the end of the legend, never this
     }
   });
   it('fits an 80-column terminal: no line wider than 80, marker on the selected row, ports visible', () => {

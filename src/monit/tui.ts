@@ -123,7 +123,10 @@ export async function runMonit(opts: {
     width: screen.width as number,
     height: screen.height as number,
   });
+  /** monit has left the screen: a paint that a late dispatch or the first refresh still asks for touches nothing */
+  let left = false;
   const show = (f: Frame) => {
+    if (left) return;
     const { width: w, height: h } = size();
     header.setContent(f.header);
     footer.setContent(f.footer);
@@ -177,6 +180,7 @@ export async function runMonit(opts: {
     }, opts.intervalMs);
     // a screen of its own goes with monit; the overview's screen is left as monit found it, its own boxes taken off
     const leave = (why: 'quit' | 'back') => {
+      left = true;
       clearInterval(timer);
       loop.close();
       screen.removeListener('keypress', onKey);

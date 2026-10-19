@@ -28,7 +28,7 @@ import { stripAnsi } from '../core/logs.js';
 import { markKey } from '../core/incidents/cursor.js';
 import { localStamp } from '../core/incidents/store.js';
 
-/** The legend's way back to the stacks overview, when monit was opened from it. */
+/** The legend's way back to the stacks overview, when monit was opened from it: first, so a narrow terminal never cuts it. */
 const stacksKey = (s: MonitState) => (s.toStacks ? 'esc stacks  ' : '');
 
 export interface Frame {
@@ -360,7 +360,7 @@ export function renderFrame(
       : s.incidents.length
         ? 'every incident here is taken (t shows them)'
         : `no incidents in the last ${DEFAULT_SINCE_MIN} min`;
-    const keys = `↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  ${stacksKey(s)}q quit`;
+    const keys = `${stacksKey(s)}↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  q quit`;
     return {
       header,
       table: [],
@@ -384,7 +384,7 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const keys = `↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  ${stacksKey(s)}q quit`;
+    const keys = `${stacksKey(s)}↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit`;
     return {
       header,
       table: [],
@@ -462,7 +462,7 @@ export function renderFrame(
           ),
         ]
       : ['no app selected'];
-  const keys = `j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  ${stacksKey(s)}q quit`;
+  const keys = `${stacksKey(s)}j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit`;
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return {
     header,
