@@ -14,6 +14,9 @@ import {
 } from '../../src/core/pm2.js';
 import { FakeTransport, type Rule } from '../helpers/fake-transport.js';
 import type { Host } from '../../src/core/manifest.js';
+import { createTransport } from '../../src/transport/index.js';
+import { ENV_LOGIN, ENV_PLAIN } from '../../src/transport/loginenv.js';
+import type { Spawner } from '../../src/transport/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fx = (p: string) =>
@@ -427,5 +430,103 @@ describe('Pm2Client over the socket', () => {
       if (saved === undefined) delete process.env.PM2_HOME;
       else process.env.PM2_HOME = saved;
     }
+  });
+});
+
+describe('Pm2Client: a daemon on TCP ports', () => {
+  it('PM2_RPC_PORT in the login environment: the CLI lists, the socket lister is never asked', async () => {
+    let asked = 0;
+    const t = new EnvTransport(
+      [{ match: /pm2 'jlist'/, result: { stdout: JSON.stringify([RAW]) } }],
+      { PM2_HOME: '/x/.pm2', PM2_RPC_PORT: '6666', PM2_PUB_PORT: '6667' }
+    );
+    const c = new Pm2Client(t, here_, 'pm2', undefined, async () => {
+      asked++;
+      return null;
+    });
+    expect((await c.jlist()).map((p) => p.name)).toEqual(['p-web']);
+    expect(asked).toBe(0);
+    expect(t.calls).toHaveLength(1);
+    expect(t.calls[0]).toMatchObject({ cmd: `pm2 'jlist'`, read: true });
+  });
+  it("no login environment: this process's PM2_RPC_PORT decides", async () => {
+    const saved = process.env.PM2_RPC_PORT;
+    let asked = 0;
+    const t = new EnvTransport(
+      [{ match: /pm2 'jlist'/, result: { stdout: '[]' } }],
+      null
+    );
+    const c = new Pm2Client(t, here_, 'pm2', '/own', async () => {
+      asked++;
+      return [];
+    });
+    try {
+      process.env.PM2_RPC_PORT = '6666';
+      await c.jlist();
+      expect(asked).toBe(0);
+      expect(t.calls).toHaveLength(1);
+      delete process.env.PM2_RPC_PORT;
+      await c.jlist();
+      expect(asked).toBe(1);
+      expect(t.calls).toHaveLength(1);
+    } finally {
+      if (saved === undefined) delete process.env.PM2_RPC_PORT;
+      else process.env.PM2_RPC_PORT = saved;
+    }
+  });
+});
+
+/** captureScript's output in the NUL form, for a transport with an injected spawner. */
+const capturedEnv = (
+  plain: Record<string, string>,
+  login: Record<string, string>
+) => {
+  const dump = (e: Record<string, string>) =>
+    `__MCPROC_ENV0__\n${Object.entries(e)
+      .map(([k, v]) => `${k}=${v}\0`)
+      .join('')}`;
+  return `${ENV_PLAIN}\n${dump(plain)}\n${ENV_LOGIN}\n${dump(login)}`;
+};
+
+describe('resolvePm2Bin: a pm2 only the host shell finds', () => {
+  /** plain sh finds no pm2; the host's own shell does (a profile function, a wrapper it defines) */
+  function shellOnlyPm2() {
+    const probes = { plain: 0, host: 0 };
+    const spawner: Spawner = async (argv) => {
+      const cmd = argv.at(-1) as string;
+      if (cmd.includes(ENV_PLAIN))
+        return {
+          code: 0,
+          stdout: capturedEnv({ PATH: '/bin' }, { PATH: '/bin', HOME: '/h' }),
+          stderr: '',
+        };
+      const viaHost =
+        argv[0] === '/bin/bash' || cmd.startsWith(`'/bin/bash' '-lc'`);
+      probes[viaHost ? 'host' : 'plain']++;
+      return {
+        code: 0,
+        stdout: viaHost
+          ? 'PATH_OK\n7.0.4\n\nv22.11.0\n'
+          : 'PATH_NONE\nv22.11.0\n',
+        stderr: '',
+      };
+    };
+    return { spawner, probes };
+  }
+  it('another host: PATH_NONE in plain sh reads the environment again, then asks the host shell', async () => {
+    const w = shellOnlyPm2();
+    const r = await resolvePm2Bin(remote, createTransport(remote, w.spawner));
+    expect(r).toMatchObject({
+      bin: 'pm2',
+      source: 'path',
+      pm2Version: '7.0.4',
+    });
+    expect(w.probes).toEqual({ plain: 2, host: 1 });
+  });
+  it('this machine: PATH_NONE is final, the bundled pm2 answers', async () => {
+    const w = shellOnlyPm2();
+    const r = await resolvePm2Bin(local, createTransport(local, w.spawner));
+    expect(r.source).toBe('bundled');
+    expect(w.probes).toEqual({ plain: 1, host: 0 });
   });
 });

@@ -144,10 +144,23 @@ const forget = (file: string, c: Conn) => {
   if (pool.get(file) === c) pool.delete(file);
 };
 
+/** Whether the socket file is there; false only when it is not (ENOENT), a throw naming the code when it cannot be looked at. */
+function socketThere(file: string): boolean {
+  try {
+    return fs.statSync(file, { throwIfNoEntry: false }) !== undefined;
+  } catch (e) {
+    // a home this user may not search (EACCES) hides a daemon, which must not read as "no processes"
+    throw new Error(
+      `looking for pm2's socket failed: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`
+    );
+  }
+}
+
 /**
  * pm2's process list from the daemon at `home`, over its rpc socket: `getMonitorData`, what `pm2 jlist` calls and
  * prints. null when no daemon answers there (no socket, or nothing listening on it); nothing is ever started. Throws
- * when the daemon errs or does not answer within `ms`: the caller falls back to the CLI.
+ * when the daemon errs or does not answer within `ms`, on a connect error other than ENOENT and ECONNREFUSED, and on a
+ * home whose socket cannot be looked at: the caller falls back to the CLI.
  */
 export async function listDaemon(
   home: string,
@@ -157,7 +170,7 @@ export async function listDaemon(
   let conn = pool.get(file);
   if (!conn?.usable) {
     conn?.close();
-    if (!fs.existsSync(file)) {
+    if (!socketThere(file)) {
       pool.delete(file);
       return null;
     }

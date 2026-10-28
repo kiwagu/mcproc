@@ -91,6 +91,22 @@ describe('listDaemon', () => {
       d.close();
     }
   );
+  it.skipIf(process.getuid?.() === 0)(
+    'a home this user may not search: throws with the code, never "no daemon"',
+    async () => {
+      const h = home();
+      const d = daemon(h, (cb) => cb(null, [PROC]));
+      await d.ready;
+      fs.chmodSync(h, 0o000); // the socket inside cannot even be looked at
+      try {
+        await expect(listDaemon(h, 1000)).rejects.toThrow(/EACCES/);
+        expect(d.connections()).toBe(0);
+      } finally {
+        fs.chmodSync(h, 0o700); // afterEach removes it
+        d.close();
+      }
+    }
+  );
   it('a daemon that does not answer: throws within the bound, and the next call connects afresh', async () => {
     const h = home();
     const d = daemon(h, () => {});

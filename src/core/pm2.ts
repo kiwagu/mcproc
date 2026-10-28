@@ -126,15 +126,20 @@ export class Pm2Client {
   listsOverSocket(): boolean {
     return this.lister !== null;
   }
+  /** the environment pm2 runs with here: the login one, else this process's own */
+  private async daemonEnv(): Promise<Record<string, string | undefined>> {
+    return (await this.transport.loginEnv()) ?? process.env;
+  }
   /** the daemon's home: hosts.<h>.pm2_home, else PM2_HOME of the login environment, else ~/.pm2 of it */
   async home(): Promise<string> {
     if (this.pm2Home) return this.pm2Home;
-    const env = (await this.transport.loginEnv()) ?? process.env;
+    const env = await this.daemonEnv();
     return env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
   }
   /** pm2's processes; null when no daemon runs (only the socket can tell: `pm2 jlist` starts one and answers) */
   async daemonList(): Promise<Pm2Process[] | null> {
-    if (this.lister) {
+    // a daemon on TCP ports (PM2_RPC_PORT) has no rpc.sock: only the CLI finds it
+    if (this.lister && !(await this.daemonEnv()).PM2_RPC_PORT) {
       try {
         const list = await this.lister(await this.home());
         return list === null ? null : (list as RawProc[]).map(normalize);
@@ -232,6 +237,17 @@ export function nodeMajor(v: string | null): number {
   return m ? Number(m[1]) : 0;
 }
 
+const RESOLVED = /^(RUNTIME|PATH_OK|PATH_NONE)$/m;
+/** this machine: only a missing marker retries; PATH_NONE is a real answer, the bundled pm2 takes over */
+const resolutionRetryHere = (r: ExecResult): boolean =>
+  !RESOLVED.test(r.stdout);
+/**
+ * another host: "pm2 not found" retries too, so the environment is read again and then the host shell asked: a pm2
+ * that only the login shell defines (a profile function, a wrapper) is still found
+ */
+const resolutionRetryRemote = (r: ExecResult): boolean =>
+  resolutionRetryHere(r) || /^PATH_NONE$/m.test(r.stdout);
+
 export async function resolvePm2Bin(
   host: Host,
   transport: Transport
@@ -254,8 +270,7 @@ export async function resolvePm2Bin(
   const res = ensureOk(
     await transport.read(probe, {
       env: host.pm2_home ? { PM2_HOME: host.pm2_home } : undefined,
-      // only a missing marker retries: PATH_NONE is a real answer on a host that uses the bundled or the runtime pm2
-      retryIf: (r) => !/^(RUNTIME|PATH_OK|PATH_NONE)$/m.test(r.stdout),
+      retryIf: host.local ? resolutionRetryHere : resolutionRetryRemote,
     }),
     host,
     'pm2 probe'
