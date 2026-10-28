@@ -62,17 +62,17 @@ host is read through `shell` itself for the next 5 minutes. A host whose environ
 directly. `mcproc doctor` says which way each host is read.
 
 On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
-`pm2 jlist` each time. Asking for the list never starts a daemon, and `doctor` shows `daemon: not running` when
-none runs; `start` starts one.
+`pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own). Asking for the list never starts a daemon,
+and `doctor` shows `daemon: not running` when none runs; `start` starts one.
 
 ## How ports are found
 
-`ls` runs one command on the host: `pm2 jlist`, `ps -eo pid,ppid` and `ss -ltnp` / `ss -lunp`
-(falling back to `/proc/net/tcp` and `/proc/*/fd` when `ss` is missing or fails). pm2's pid plus its
-descendants are matched to listening sockets, then compared with the declared ports:
-`listening`, `declared-not-listening` (naming the process that holds the port, if any), `undeclared`.
-Ports of processes owned by other users show without a pid, as the kernel reports them.
-Ports published by Docker containers show the container name instead of a pid.
+`ls` runs one command on the host: `ps -eo pid,ppid`, `ss -ltnp` / `ss -lunp` (falling back to `/proc/net/tcp` and
+`/proc/*/fd` when `ss` is missing or fails) and `pm2 jlist`, unless pm2's list comes from the daemon's socket
+([above](#how-mcproc-reads-a-host)). pm2's pid plus its descendants are matched to listening sockets, then compared
+with the declared ports: `listening`, `declared-not-listening` (naming the process that holds the port, if any),
+`undeclared`. Ports of processes owned by other users show without a pid, as the kernel reports them. Ports published
+by Docker containers show the container name instead of a pid.
 
 ## Hosts without pm2: `unpack`
 
