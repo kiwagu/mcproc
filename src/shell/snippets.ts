@@ -177,6 +177,15 @@ export const listenerLines = (withPids: boolean): string[] => {
   ];
 };
 
+/** What a listening wait reads on a tick: pm2's list unless it comes from the socket, and the ports that listen, without their processes. */
+export function listenScript(pm2Bin: string, jlist: boolean): string {
+  return [
+    ...(jlist ? jlistLines(pm2Bin) : []),
+    `echo ${MARK.CLOCK}`,
+    ...listenerLines(false),
+  ].join('\n');
+}
+
 /** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, the host's
  * memory (/proc/meminfo), the memory of the declared `containers` that run (docker stats, only when names are given), and one HTTP
  * request per declared url, with the host's environment (container, hostname, own addresses) when there is one. `metrics: false` is the light form

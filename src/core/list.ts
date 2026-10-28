@@ -30,7 +30,12 @@ import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
 import { leasesCovering, type LeaseView } from './leases/view.js';
 import { stateDir } from './state.js';
-import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
+import {
+  MARK,
+  listenScript,
+  probeScript,
+  probeTimeoutMs,
+} from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
 import type { ExecResult } from '../transport/types.js';
 
@@ -179,6 +184,9 @@ const probeRetry = (r: ExecResult): boolean =>
   !r.stdout.includes(MARK.JLIST) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
 /** A probe without pm2's list that the plain shell could not run: it never reached the clock. */
 const clockRetry = (r: ExecResult): boolean => !r.stdout.includes(MARK.CLOCK);
+/** A listen check with pm2's list that the plain shell could not run, or whose pm2 it could not find. */
+const listenRetry = (r: ExecResult): boolean =>
+  clockRetry(r) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
 
 /** The shell on the host did not run the probe script: the last lines it printed, and where to look. */
 const notRun = (link: HostLink, res: ExecResult) => {
@@ -265,6 +273,30 @@ export async function probeHost(
   if (!res.stdout.includes(MARK.JLIST)) throw notRun(link, res);
   const data = parseProbe(res.stdout);
   return { data, procs: jlistOf(link, data, res), sampledAt };
+}
+
+/** What a listening wait reads on a tick: pm2's list and every port something listens on, whoever holds it. */
+export interface ListenCheck {
+  procs: Pm2Process[];
+  ports: Set<number>;
+}
+/** The cheap look of a listening wait: no fd walk; who holds a port is the light probe's question, once all listen. */
+export async function listenCheck(link: HostLink): Promise<ListenCheck> {
+  const socket = link.pm2.listsOverSocket();
+  const [res, listed] = await Promise.all([
+    link.transport.read(listenScript(link.pm2.bin, !socket), {
+      env: link.pm2.env(),
+      retryIf: socket ? clockRetry : listenRetry,
+    }),
+    socket ? link.pm2.jlist() : Promise.resolve(null),
+  ]);
+  ensureOk(res, link.host, 'listen check');
+  if (!res.stdout.includes(MARK.CLOCK)) throw notRun(link, res);
+  const data = parseProbe(res.stdout);
+  return {
+    procs: listed ?? jlistOf(link, data, res),
+    ports: new Set(data.listeners.map((l) => l.port)),
+  };
 }
 
 /** The apps whose url this read asks for (see SnapshotOptions.urls). */
