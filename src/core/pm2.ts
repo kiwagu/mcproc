@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from './errors.js';
 import type { Host } from './manifest.js';
@@ -110,13 +111,39 @@ export function findProcess(
   return procs.find((p) => p.namespace === project && p.name === name);
 }
 
+/** Lists the daemon at a home over its socket; null when none runs there (src/core/pm2socket.ts). */
+export type DaemonLister = (home: string) => Promise<unknown[] | null>;
+
 export class Pm2Client {
   constructor(
     readonly transport: Transport,
     readonly host: Host,
     readonly bin: string,
-    readonly pm2Home?: string
+    readonly pm2Home?: string,
+    private readonly lister: DaemonLister | null = null
   ) {}
+  /** whether pm2's list comes from the daemon's socket (this machine) rather than from `pm2 jlist` */
+  listsOverSocket(): boolean {
+    return this.lister !== null;
+  }
+  /** the daemon's home: hosts.<h>.pm2_home, else PM2_HOME of the login environment, else ~/.pm2 of it */
+  async home(): Promise<string> {
+    if (this.pm2Home) return this.pm2Home;
+    const env = (await this.transport.loginEnv()) ?? process.env;
+    return env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
+  }
+  /** pm2's processes; null when no daemon runs (only the socket can tell: `pm2 jlist` starts one and answers) */
+  async daemonList(): Promise<Pm2Process[] | null> {
+    if (this.lister) {
+      try {
+        const list = await this.lister(await this.home());
+        return list === null ? null : (list as RawProc[]).map(normalize);
+      } catch {
+        /* a daemon that errs or hangs: the CLI answers this once */
+      }
+    }
+    return parseJlist((await this.run(['jlist'], { read: true })).stdout);
+  }
   env(): Record<string, string> | undefined {
     return this.pm2Home ? { PM2_HOME: this.pm2Home } : undefined;
   }
@@ -159,7 +186,7 @@ export class Pm2Client {
     return res;
   }
   async jlist(): Promise<Pm2Process[]> {
-    return parseJlist((await this.run(['jlist'], { read: true })).stdout);
+    return (await this.daemonList()) ?? [];
   }
   startOrRestart(file: string, app: string) {
     return this.run(['startOrRestart', file, '--only', app, '--update-env'], {

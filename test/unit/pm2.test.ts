@@ -10,8 +10,9 @@ import {
   Pm2Client,
   resolvePm2Bin,
   bundledPm2Bin,
+  type DaemonLister,
 } from '../../src/core/pm2.js';
-import { FakeTransport } from '../helpers/fake-transport.js';
+import { FakeTransport, type Rule } from '../helpers/fake-transport.js';
 import type { Host } from '../../src/core/manifest.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -311,5 +312,120 @@ describe('resolvePm2Bin', () => {
     expect(r.source).toBe('bundled');
     expect(r.bin).toBe(bundledPm2Bin());
     expect(bundledPm2Bin()).toMatch(/node_modules\/pm2\/bin\/pm2'$/);
+  });
+});
+
+const here_: Host = {
+  name: 'local',
+  local: true,
+  ssh_args: [],
+  cwd: '/p',
+  readonly: false,
+  shell: { bin: '/bin/bash', flags: ['-lc'] },
+  env: {},
+};
+// stopped: no uptime, so two normalizations of it are equal whenever they run
+const RAW = {
+  pid: 0,
+  name: 'p-web',
+  pm_id: 0,
+  pm2_env: { status: 'stopped', namespace: 'p', pm_uptime: 1000 },
+};
+/** A fake transport whose login environment is given. */
+class EnvTransport extends FakeTransport {
+  constructor(
+    rules: Rule[],
+    private readonly env: Record<string, string> | null
+  ) {
+    super(rules);
+  }
+  override async loginEnv() {
+    return this.env;
+  }
+}
+
+describe('Pm2Client over the socket', () => {
+  it('lists the daemon over the socket, normalized as jlist is, with no command', async () => {
+    const t = new FakeTransport([]);
+    const c = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => [RAW]);
+    expect(c.listsOverSocket()).toBe(true);
+    expect(await c.daemonList()).toEqual(parseJlist(JSON.stringify([RAW])));
+    expect(t.calls).toEqual([]);
+  });
+  it('no daemon: null, and nothing runs', async () => {
+    const t = new FakeTransport([]);
+    const c = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => null);
+    expect(await c.daemonList()).toBeNull();
+    expect(await c.jlist()).toEqual([]);
+    expect(t.calls).toEqual([]);
+  });
+  it('a socket that fails: the CLI answers, as a read', async () => {
+    const t = new FakeTransport([
+      { match: /pm2 'jlist'/, result: { stdout: JSON.stringify([RAW]) } },
+    ]);
+    const c = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => {
+      throw new Error('hung');
+    });
+    expect((await c.jlist()).map((p) => p.name)).toEqual(['p-web']);
+    expect(t.calls.map((x) => x.read)).toEqual([true]);
+  });
+  it('no lister: the CLI', async () => {
+    const t = new FakeTransport([
+      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+    ]);
+    const c = new Pm2Client(t, here_, 'pm2');
+    expect(c.listsOverSocket()).toBe(false);
+    await c.jlist();
+    expect(t.calls).toHaveLength(1);
+  });
+  it('the socket home follows the login PM2_HOME; pm2_home wins', async () => {
+    const homes: string[] = [];
+    const lister: DaemonLister = async (h) => {
+      homes.push(h);
+      return [];
+    };
+    await new Pm2Client(
+      new EnvTransport([], { PM2_HOME: '/x/.pm2', HOME: '/h' }),
+      here_,
+      'pm2',
+      undefined,
+      lister
+    ).jlist();
+    await new Pm2Client(
+      new EnvTransport([], { HOME: '/h' }),
+      here_,
+      'pm2',
+      undefined,
+      lister
+    ).jlist();
+    await new Pm2Client(
+      new EnvTransport([], { PM2_HOME: '/x/.pm2' }),
+      here_,
+      'pm2',
+      '/own',
+      lister
+    ).jlist();
+    expect(homes).toEqual(['/x/.pm2', '/h/.pm2', '/own']);
+  });
+  it("no login environment: this process's PM2_HOME, else ~/.pm2", async () => {
+    const saved = process.env.PM2_HOME;
+    const c = new Pm2Client(
+      new EnvTransport([], null),
+      here_,
+      'pm2',
+      undefined,
+      async () => []
+    );
+    try {
+      process.env.PM2_HOME = '/proc-home';
+      expect(await c.home()).toBe('/proc-home');
+      delete process.env.PM2_HOME;
+      expect(await c.home()).toBe(
+        path.join(process.env.HOME || os.homedir(), '.pm2')
+      );
+    } finally {
+      if (saved === undefined) delete process.env.PM2_HOME;
+      else process.env.PM2_HOME = saved;
+    }
   });
 });

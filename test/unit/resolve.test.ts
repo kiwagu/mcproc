@@ -11,7 +11,10 @@ import {
   connect,
   clearResolutionCache,
   bareLocalHost,
+  daemonFor,
 } from '../../src/core/resolve.js';
+import { listDaemon } from '../../src/core/pm2socket.js';
+import type { Pm2Resolution } from '../../src/core/pm2.js';
 import type { Spawner } from '../../src/transport/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -104,6 +107,44 @@ describe('connect', () => {
       fresh: true,
     });
     expect(calls).toBe(2);
+  });
+  it('a daemon override stands in for how the list is read; without one an injected spawner keeps the CLI', async () => {
+    const spawner: Spawner = async () => ({
+      code: 0,
+      stdout: 'PATH_OK\n7.0.4\nv22.0.0\n',
+      stderr: '',
+    });
+    const prep = prepare({ project: basic });
+    expect((await connect(prep, { spawner })).pm2.listsOverSocket()).toBe(
+      false
+    );
+    const over = await connect(prep, { spawner, daemon: async () => [] });
+    expect(over.pm2.listsOverSocket()).toBe(true);
+  });
+});
+
+describe('daemonFor', () => {
+  const res = (source: Pm2Resolution['source']): Pm2Resolution => ({
+    bin: 'pm2',
+    source,
+    node: null,
+    pm2Version: null,
+    reason: 'test',
+  });
+  const mine = bareLocalHost();
+  const other = { ...mine, name: 'stand', local: false, ssh: 'stand' };
+  it('this machine reads its daemon over the socket, unless a wrapper stands in for pm2 or a test fakes the world', () => {
+    for (const s of ['path', 'bundled', 'runtime'] as const)
+      expect(daemonFor(mine, res(s))).toBe(listDaemon);
+    expect(daemonFor(mine, res('explicit'))).toBeNull();
+    expect(daemonFor(other, res('path'))).toBeNull();
+    expect(
+      daemonFor(mine, res('path'), async () => ({
+        code: 0,
+        stdout: '',
+        stderr: '',
+      }))
+    ).toBeNull();
   });
 });
 

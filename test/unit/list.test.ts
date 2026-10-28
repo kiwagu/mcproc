@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
-import { MARK } from '../../src/shell/snippets.js';
+import { MARK, probeScript } from '../../src/shell/snippets.js';
+import { Pm2Client } from '../../src/core/pm2.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
@@ -972,5 +973,73 @@ describe('queued and starting rows', () => {
       else process.env.MCPROC_STATE_DIR = prev;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+// stopped: no uptime, so two normalizations of it are equal whenever they run
+const RAW = {
+  pid: 0,
+  name: 'p-web',
+  pm_id: 0,
+  pm2_env: { status: 'stopped', namespace: 'p', pm_uptime: 1000 },
+};
+const quiet = { cpuSample: false, metrics: false, urls: [], containers: [] };
+describe('the probe beside the socket', () => {
+  it('probeScript without jlist has no jlist section and keeps the clock; the default is unchanged', () => {
+    expect(probeScript('pm2', { jlist: false })).not.toContain(MARK.JLIST);
+    expect(probeScript('pm2', { jlist: false })).toContain(MARK.CLOCK);
+    expect(probeScript('pm2')).toContain(MARK.JLIST);
+  });
+  it('a link that lists over the socket: one read without jlist, the procs from the socket', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => [
+        RAW,
+      ]),
+    };
+    const p = await probeHost(link, quiet);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].read).toBe(true);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
+    expect(p.procs.map((x) => x.name)).toEqual(['p-web']);
+  });
+  it('that probe without the clock marker: the shell did not run it', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: { code: 2, stdout: '', stderr: 'sh: 1: syntax error' },
+      },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => []),
+    };
+    await expect(probeHost(link, quiet)).rejects.toMatchObject({
+      code: 'TRANSPORT_FAILED',
+    });
+  });
+  it('no daemon: no process, and pm2 was never asked', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const c = {
+      ...ctx,
+      pm2: new Pm2Client(
+        ctx.fake,
+        ctx.host,
+        'pm2',
+        undefined,
+        async () => null
+      ),
+    };
+    const snap = await snapshot(c, { urls: 'none', leases: 'none' });
+    expect(snap.procs).toEqual([]);
+    expect(ctx.fake.calls.some((x) => /'jlist'/.test(x.cmd))).toBe(false);
+    // nor did the probe script carry its own jlist section
+    expect(ctx.fake.calls.some((x) => x.cmd.includes(MARK.JLIST))).toBe(false);
   });
 });

@@ -1,6 +1,7 @@
 import type {
   ExecOptions,
   ExecResult,
+  ReadMode,
   ReadOptions,
   Transport,
 } from '../../src/transport/types.js';
@@ -28,10 +29,11 @@ export class FakeTransport implements Transport {
   async read(cmd: string, opts: ReadOptions = {}): Promise<ExecResult> {
     return this.answer(cmd, opts, true);
   }
-  async loginEnv() {
+  /** typed as the Transport member, so a subclass can give a login environment */
+  async loginEnv(): Promise<Record<string, string> | null> {
     return null;
   }
-  readMode() {
+  readMode(): ReadMode | null {
     return null;
   }
   private async answer(

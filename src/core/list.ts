@@ -168,41 +168,40 @@ export interface HostProbe {
 /** The parts of a context that read a probe for one manifest. */
 export type ManifestView = Pick<Context, 'manifest' | 'host' | 'hereCheck'>;
 
+/** The host's side of a probe without pm2's list: the script once, its sections parsed, when it was taken. */
+export interface HostScan {
+  data: ProbeData;
+  sampledAt: number;
+}
+
 /** A probe the plain shell could not run, or whose pm2 it could not find where the host shell might. */
 const probeRetry = (r: ExecResult): boolean =>
   !r.stdout.includes(MARK.JLIST) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
+/** A probe without pm2's list that the plain shell could not run: it never reached the clock. */
+const clockRetry = (r: ExecResult): boolean => !r.stdout.includes(MARK.CLOCK);
 
-/** Runs the probe script once on the host: the exit checks of snapshot, no manifest involved. */
-export async function probeHost(
-  link: HostLink,
-  ask: ProbeAsk
-): Promise<HostProbe> {
-  const res = ensureOk(
-    await link.transport.read(probeScript(link.pm2.bin, ask), {
-      env: link.pm2.env(),
-      // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
-      timeoutMs: probeTimeoutMs(ask.urls.length),
-      retryIf: probeRetry,
-    }),
-    link.host,
-    'probe'
+/** The shell on the host did not run the probe script: the last lines it printed, and where to look. */
+const notRun = (link: HostLink, res: ExecResult) => {
+  const tail = (res.stderr || res.stdout)
+    .trim()
+    .split('\n')
+    .slice(-5)
+    .join('\n');
+  return new McprocError(
+    'TRANSPORT_FAILED',
+    `the shell on ${link.transport.describe()} did not run the probe (exit ${res.code}): ${tail}`,
+    {
+      hint: `Check hosts.${link.host.name}.shell (default /bin/bash -lc) exists on that host.`,
+    }
   );
-  const sampledAt = Date.now();
-  if (!res.stdout.includes(MARK.JLIST)) {
-    const tail = (res.stderr || res.stdout)
-      .trim()
-      .split('\n')
-      .slice(-5)
-      .join('\n');
-    throw new McprocError(
-      'TRANSPORT_FAILED',
-      `the shell on ${link.transport.describe()} did not run the probe (exit ${res.code}): ${tail}`,
-      {
-        hint: `Check hosts.${link.host.name}.shell (default /bin/bash -lc) exists on that host.`,
-      }
-    );
-  }
-  const data = parseProbe(res.stdout);
+};
+
+/** pm2's list as the probe's jlist section printed it, with its exit checks. */
+function jlistOf(
+  link: HostLink,
+  data: ProbeData,
+  res: ExecResult
+): Pm2Process[] {
   if (data.jlistRc === 127)
     throw new McprocError(
       'PM2_NOT_FOUND',
@@ -215,7 +214,57 @@ export async function probeHost(
       `pm2 jlist exited ${data.jlistRc} on ${link.transport.describe()}`,
       { details: res.stderr.slice(-500) }
     );
-  return { data, procs: parseJlist(data.jlistRaw), sampledAt };
+  return parseJlist(data.jlistRaw);
+}
+
+/** Runs the probe script without pm2's list: for a link whose pm2 lists over the daemon's socket. */
+export async function scanHost(
+  link: HostLink,
+  ask: ProbeAsk
+): Promise<HostScan> {
+  const res = ensureOk(
+    await link.transport.read(
+      probeScript(link.pm2.bin, { ...ask, jlist: false }),
+      {
+        env: link.pm2.env(),
+        timeoutMs: probeTimeoutMs(ask.urls.length),
+        retryIf: clockRetry,
+      }
+    ),
+    link.host,
+    'probe'
+  );
+  const sampledAt = Date.now();
+  if (!res.stdout.includes(MARK.CLOCK)) throw notRun(link, res);
+  return { data: parseProbe(res.stdout), sampledAt };
+}
+
+/** Runs the probe once on the host: the script, and pm2's list from the daemon's socket or from the script's own jlist. */
+export async function probeHost(
+  link: HostLink,
+  ask: ProbeAsk
+): Promise<HostProbe> {
+  if (link.pm2.listsOverSocket()) {
+    const [scan, procs] = await Promise.all([
+      scanHost(link, ask),
+      link.pm2.jlist(),
+    ]);
+    return { ...scan, procs };
+  }
+  const res = ensureOk(
+    await link.transport.read(probeScript(link.pm2.bin, ask), {
+      env: link.pm2.env(),
+      // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
+      timeoutMs: probeTimeoutMs(ask.urls.length),
+      retryIf: probeRetry,
+    }),
+    link.host,
+    'probe'
+  );
+  const sampledAt = Date.now();
+  if (!res.stdout.includes(MARK.JLIST)) throw notRun(link, res);
+  const data = parseProbe(res.stdout);
+  return { data, procs: jlistOf(link, data, res), sampledAt };
 }
 
 /** The apps whose url this read asks for (see SnapshotOptions.urls). */
