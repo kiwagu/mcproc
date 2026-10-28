@@ -146,7 +146,7 @@ export async function pollIncidents(
           })
         );
         const res = ensureOk(
-          await ctx.transport.exec(
+          await ctx.transport.read(
             [
               NOW_SNIPPET,
               ...(opts.includeReloads ? [CLOCK_SNIPPET] : []), // the host's zone puts pm2's start in the stamps' wall time

@@ -86,8 +86,9 @@ describe('connect', () => {
   beforeEach(() => clearResolutionCache());
   it('resolves pm2 once per project+host and caches it', async () => {
     let calls = 0;
-    const spawner: Spawner = async () => {
-      calls++;
+    // counts the resolution probe only: a read also reads the host's login environment first
+    const spawner: Spawner = async (argv) => {
+      if (argv.some((a) => a.includes('PATH_OK'))) calls++;
       return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
     };
     const ctx = await connect(prepare({ project: basic, host: 'stand' }), {

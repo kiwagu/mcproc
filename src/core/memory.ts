@@ -58,7 +58,7 @@ export async function readHostMemory(
   transport: Transport,
   host: Host
 ): Promise<HostMemory | null> {
-  const res = ensureOk(await transport.exec(MEM_SNIPPET), host, 'meminfo');
+  const res = ensureOk(await transport.read(MEM_SNIPPET), host, 'meminfo');
   const i = res.stdout.indexOf(MARK.MEM);
   return i < 0 ? null : parseMeminfo(res.stdout.slice(i + MARK.MEM.length));
 }

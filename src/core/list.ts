@@ -32,6 +32,7 @@ import { leasesCovering, type LeaseView } from './leases/view.js';
 import { stateDir } from './state.js';
 import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
+import type { ExecResult } from '../transport/types.js';
 
 export interface LsRow {
   app: string;
@@ -167,16 +168,21 @@ export interface HostProbe {
 /** The parts of a context that read a probe for one manifest. */
 export type ManifestView = Pick<Context, 'manifest' | 'host' | 'hereCheck'>;
 
+/** A probe the plain shell could not run, or whose pm2 it could not find where the host shell might. */
+const probeRetry = (r: ExecResult): boolean =>
+  !r.stdout.includes(MARK.JLIST) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
+
 /** Runs the probe script once on the host: the exit checks of snapshot, no manifest involved. */
 export async function probeHost(
   link: HostLink,
   ask: ProbeAsk
 ): Promise<HostProbe> {
   const res = ensureOk(
-    await link.transport.exec(probeScript(link.pm2.bin, ask), {
+    await link.transport.read(probeScript(link.pm2.bin, ask), {
       env: link.pm2.env(),
       // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
       timeoutMs: probeTimeoutMs(ask.urls.length),
+      retryIf: probeRetry,
     }),
     link.host,
     'probe'

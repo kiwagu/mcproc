@@ -122,14 +122,15 @@ export class Pm2Client {
   }
   async run(
     args: string[],
-    opts: { timeoutMs?: number } = {}
+    opts: { timeoutMs?: number; read?: boolean } = {}
   ): Promise<ExecResult> {
     const cmd = `${this.bin} ${args.map(shq).join(' ')}`;
+    const how = { env: this.env(), timeoutMs: opts.timeoutMs };
     const res = ensureOk(
-      await this.transport.exec(cmd, {
-        env: this.env(),
-        timeoutMs: opts.timeoutMs,
-      }),
+      // a list or a version is a read; start, stop and delete keep the host shell, whose environment pm2 hands to the app
+      await (opts.read
+        ? this.transport.read(cmd, how)
+        : this.transport.exec(cmd, how)),
       this.host,
       `pm2 ${args[0]}`
     );
@@ -158,7 +159,7 @@ export class Pm2Client {
     return res;
   }
   async jlist(): Promise<Pm2Process[]> {
-    return parseJlist((await this.run(['jlist'])).stdout);
+    return parseJlist((await this.run(['jlist'], { read: true })).stdout);
   }
   startOrRestart(file: string, app: string) {
     return this.run(['startOrRestart', file, '--only', app, '--update-env'], {
@@ -172,7 +173,12 @@ export class Pm2Client {
     return this.run(['delete', String(id)]);
   }
   async version(): Promise<string> {
-    return (await this.run(['-v'])).stdout.trim().split('\n').pop() ?? '';
+    return (
+      (await this.run(['-v'], { read: true })).stdout
+        .trim()
+        .split('\n')
+        .pop() ?? ''
+    );
   }
 }
 
@@ -219,8 +225,10 @@ export async function resolvePm2Bin(
     `node -v 2>/dev/null || echo NODE_NONE`,
   ].join('; ');
   const res = ensureOk(
-    await transport.exec(probe, {
+    await transport.read(probe, {
       env: host.pm2_home ? { PM2_HOME: host.pm2_home } : undefined,
+      // only a missing marker retries: PATH_NONE is a real answer on a host that uses the bundled or the runtime pm2
+      retryIf: (r) => !/^(RUNTIME|PATH_OK|PATH_NONE)$/m.test(r.stdout),
     }),
     host,
     'pm2 probe'

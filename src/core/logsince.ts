@@ -341,7 +341,7 @@ export async function readSince(
           ...files.map((f, i) => readSnippet(i, f.path, f.offset, f.anchor)),
         ].join('; ');
         const res = ensureOk(
-          await ctx.transport.exec(script),
+          await ctx.transport.read(script),
           ctx.host,
           'read logs since'
         );
