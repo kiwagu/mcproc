@@ -95,7 +95,10 @@ afterAll(() => {
 
 describe('probe cost, on real pm2', () => {
   it('listing a PM2_HOME with no daemon starts none', async () => {
-    const rows = await listApps(await ctxOf());
+    const ctx = await ctxOf();
+    // a pm2 on the stand-in PATH (/usr/bin) would be resolved with `pm2 -v`, which starts a daemon by itself
+    expect(ctx.resolution.source).toBe('bundled');
+    const rows = await listApps(ctx);
     expect(rows.map((r) => r.status)).toEqual(['not-started', 'not-started']);
     expect(fs.existsSync(path.join(home, 'pm2.pid'))).toBe(false);
     expect(fs.existsSync(path.join(home, 'rpc.sock'))).toBe(false);
@@ -158,6 +161,8 @@ describe('probe cost, on real pm2', () => {
   it.skipIf(!process.env.MCPROC_CLI)(
     'a spawned mcproc ls exits at once',
     () => {
+      // a daemon is up (the cases before started it): an ls with a pooled connection to it must still exit
+      expect(fs.existsSync(path.join(home, 'rpc.sock'))).toBe(true);
       const t = Date.now();
       const r = spawnSync(
         process.execPath,

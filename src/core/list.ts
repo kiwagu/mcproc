@@ -180,7 +180,7 @@ export interface HostScan {
 }
 
 /** A probe the plain shell could not run, or whose pm2 it could not find where the host shell might. */
-const probeRetry = (r: ExecResult): boolean =>
+export const probeRetry = (r: ExecResult): boolean =>
   !r.stdout.includes(MARK.JLIST) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
 /** A probe without pm2's list that the plain shell could not run: it never reached the clock. */
 const clockRetry = (r: ExecResult): boolean => !r.stdout.includes(MARK.CLOCK);

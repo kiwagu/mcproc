@@ -11,6 +11,7 @@ import { actOn, Fleet } from '../../src/core/fleet.js';
 import { forgetProject, listProjects } from '../../src/core/registry.js';
 import { StacksCollector } from '../../src/core/stacks/collect.js';
 import { stopStack } from '../../src/core/stacks/stop.js';
+import { clearLoginEnvCache } from '../../src/transport/index.js';
 
 const SERVER = `require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, () => console.log('listening', process.env.PORT));`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -46,6 +47,8 @@ const saved = {
 beforeAll(async () => {
   base = fs.mkdtempSync('/tmp/mcproc-st-'); // short: unix socket paths are capped at 108 bytes
   process.env.PM2_HOME = path.join(base, 'ha'); // the default daemon of the mcproc under test
+  // reads take PM2_HOME from the login environment, read once per process: read it again with this one
+  clearLoginEnvCache();
   process.env.MCPROC_STATE_DIR = path.join(base, 'state');
   project(path.join(base, 'a'), 'sta', A);
   project(path.join(base, 'b'), 'stb', B, path.join(base, 'hb'));
@@ -67,6 +70,8 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const home of ['ha', 'hb']) {
     process.env.PM2_HOME = path.join(base, home);
+    // without this, the pass for hb would resolve pm2 with ha's cached PM2_HOME and could start a daemon there
+    clearLoginEnvCache();
     try {
       await (await connectHost(bareLocalHost())).pm2.run(['kill']);
     } catch {
@@ -75,6 +80,7 @@ afterAll(async () => {
   }
   if (saved.home === undefined) delete process.env.PM2_HOME;
   else process.env.PM2_HOME = saved.home;
+  clearLoginEnvCache();
   if (saved.state === undefined) delete process.env.MCPROC_STATE_DIR;
   else process.env.MCPROC_STATE_DIR = saved.state;
   fs.rmSync(base, { recursive: true, force: true });

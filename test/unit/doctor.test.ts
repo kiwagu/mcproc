@@ -585,7 +585,8 @@ describe('renderDoctor: the daemon and how reads run', () => {
     // the fake world prints no login environment, so the reads went through the host shell
     expect(local.reads).toMatchObject({
       shell: 'host',
-      age_s: 0,
+      // whole seconds since the capture: 0 unless the run crossed a second
+      age_s: expect.any(Number),
       reason: expect.stringContaining('printed no environment'),
     });
     expect(stand.reads).toBeNull();

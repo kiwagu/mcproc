@@ -26,6 +26,7 @@ import {
   rowsFor,
   statusWord,
   unreachableRow,
+  probeRetry,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -1098,5 +1099,30 @@ describe('the listening pre-check', () => {
     expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
     expect([...c.ports]).toEqual([3010]);
     expect(c.procs.map((p) => p.name)).toEqual(['p-web']);
+  });
+});
+
+describe('probeRetry', () => {
+  const res = (stdout: string) => ({ code: 0, stdout, stderr: '' });
+  it.each([
+    { what: 'a good probe', stdout: probeOut({ jlist: '[]' }), retry: false },
+    {
+      what: 'a probe whose pm2 exited non-zero',
+      stdout: probeOut({ rc: 1 }),
+      retry: false,
+    },
+    {
+      what: 'no JLIST marker (the plain shell did not run it)',
+      stdout: 'sh: 1: oops\n',
+      retry: true,
+    },
+    { what: 'an empty answer', stdout: '', retry: true },
+    {
+      what: 'pm2 not found in plain sh (JLIST_RC 127)',
+      stdout: probeOut({ rc: 127 }),
+      retry: true,
+    },
+  ])('$what: retry $retry', ({ stdout, retry }) => {
+    expect(probeRetry(res(stdout))).toBe(retry);
   });
 });
