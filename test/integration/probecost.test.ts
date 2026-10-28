@@ -18,11 +18,21 @@ import { clearLoginEnvCache } from '../../src/transport/index.js';
 const SERVER = `require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, () => console.log('listening', process.env.PORT));`;
 const PORT = 38331;
 const pm2Bin = createRequire(import.meta.url).resolve('pm2/bin/pm2');
-let base: string;
-let home: string;
-let project: string;
+/** set once beforeAll made them: empty, the teardown touches no daemon and no directory */
+let base = '';
+let home = '';
+let project = '';
 const saved = process.env.PM2_HOME;
 const ctxOf = () => connect(prepare({ project }));
+
+/** Stops the daemon of the throwaway home, only when one runs there: without a home pm2 would reach ~/.pm2. */
+function killDaemon(at: string) {
+  if (!at || !fs.existsSync(path.join(at, 'pm2.pid'))) return;
+  execFileSync(process.execPath, [pm2Bin, 'kill'], {
+    env: { ...process.env, PM2_HOME: at },
+    stdio: 'ignore',
+  });
+}
 
 beforeAll(() => {
   base = fs.mkdtempSync('/tmp/mcproc-pc-'); // short: unix socket paths are capped at 108 bytes
@@ -73,17 +83,14 @@ beforeAll(() => {
 afterAll(() => {
   closeDaemons();
   try {
-    execFileSync(process.execPath, [pm2Bin, 'kill'], {
-      env: { ...process.env, PM2_HOME: home },
-      stdio: 'ignore',
-    });
+    killDaemon(home);
   } catch {
     /* no daemon left */
   }
   if (saved === undefined) delete process.env.PM2_HOME;
   else process.env.PM2_HOME = saved;
   clearLoginEnvCache();
-  fs.rmSync(base, { recursive: true, force: true });
+  if (base) fs.rmSync(base, { recursive: true, force: true });
 });
 
 describe('probe cost, on real pm2', () => {
