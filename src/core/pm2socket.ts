@@ -69,17 +69,26 @@ const bounded = <T>(
     );
   });
 
-/** One connection to a daemon's rpc socket; `up` is false when nothing listens there. */
+/**
+ * The connect errors that mean no daemon there now: ENOENT, no socket file; ECONNREFUSED, a socket file nothing listens
+ * on (a plain file at that path gives it too). Any other (EACCES on a socket this user may not write, EINVAL for a path
+ * past the unix limit) is a daemon this process cannot reach, which must not read as "no processes".
+ */
+const NO_DAEMON = new Set(['ENOENT', 'ECONNREFUSED']);
+
+/** One connection to a daemon's rpc socket; `up` is false when nothing listens there, and rejects when unreachable. */
 class Conn {
   private readonly sock: AxonSocket;
   private readonly client: RpcClient;
   readonly up: Promise<boolean>;
   closed = false;
+  /** The code of the last error on the socket. */
+  private code: string | undefined;
   constructor(file: string) {
     const { axon, rpc } = pm2Rpc();
     this.sock = axon.socket('req');
     this.client = new rpc.Client(this.sock);
-    this.up = new Promise((resolve) => {
+    this.up = new Promise((resolve, reject) => {
       this.sock.on('connect', () => {
         // axon reconnects right after the retry that closed this connection: a daemon back by then gets it closed again
         if (this.closed) {
@@ -89,13 +98,19 @@ class Conn {
         for (const s of this.sock.socks ?? []) s.unref(); // an open connection never keeps a one-shot command alive
         resolve(true);
       });
-      // axon retries a refused or dropped connection for ever: the first retry means no daemon answers there now
+      // axon retries a failed or dropped connection for ever: the first retry ends this one. Before any connect, the
+      // last error tells no daemon (null) from one this process cannot reach (a throw: the caller falls back to the CLI)
       this.sock.on('reconnect attempt', () => {
         this.close();
-        resolve(false);
+        if (!this.code || NO_DAEMON.has(this.code)) resolve(false);
+        else reject(new Error(`connecting to pm2 failed: ${this.code}`));
+      });
+      // axon emits `socket error` for every error, and `error` only for the codes it does not ignore
+      this.sock.on('socket error', (e) => {
+        this.code = (e as NodeJS.ErrnoException | undefined)?.code;
       });
       this.sock.on('error', () => {
-        /* a refused connect or a dropped daemon: the retry above follows */
+        /* the code is kept from `socket error` above; the retry follows */
       });
     });
     this.sock.connect(file);

@@ -79,6 +79,18 @@ describe('listDaemon', () => {
     fs.writeFileSync(path.join(h, 'rpc.sock'), '');
     expect(await listDaemon(h, 1000)).toBeNull();
   });
+  it.skipIf(process.getuid?.() === 0)(
+    'a daemon this user may not reach: throws with the code, never "no daemon"',
+    async () => {
+      const h = home();
+      const d = daemon(h, (cb) => cb(null, [PROC]));
+      await d.ready;
+      fs.chmodSync(path.join(h, 'rpc.sock'), 0o000); // a root-owned socket left by `sudo pm2 …`
+      await expect(listDaemon(h, 1000)).rejects.toThrow(/EACCES/);
+      expect(d.connections()).toBe(0);
+      d.close();
+    }
+  );
   it('a daemon that does not answer: throws within the bound, and the next call connects afresh', async () => {
     const h = home();
     const d = daemon(h, () => {});
