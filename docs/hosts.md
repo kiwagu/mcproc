@@ -50,6 +50,21 @@ or from `unpack`. mcproc itself is only installed where the agent runs; locally 
 pm2. `doctor` tells you which pm2 a host would use and why, or why none is usable.
 `curl` or `wget` for URL checks on the host (optional: without them a url is checked from this machine under `url_check: auto`, and reads `unchecked` under `url_check: host`), and `getent` to report where a url's name resolves there.
 
+## How mcproc reads a host
+
+`shell` is what mcproc launches your apps with. By default it is a login shell, so the apps get the PATH your
+profile sets up (nvm, nodenv, bun). Replaying a profile costs a few hundred milliseconds of CPU, so mcproc does it
+once per host: everything that only reads (the probes behind `ls` and monit, log reads, port checks) runs in a plain
+`sh` with the environment that shell set up. The environment is read again every 5 minutes, and at once when a
+command is not found; if the plain shell still cannot run it, or `sh` does not start with that environment, that
+host is read through `shell` itself for the next 5 minutes. A host whose environment cannot be read is read through
+`shell` and tried again after 30 seconds, and one whose `shell` is already a plain `sh -c` is read through it
+directly. `mcproc doctor` says which way each host is read.
+
+On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
+`pm2 jlist` each time. Asking for the list never starts a daemon, and `doctor` shows `daemon: not running` when
+none runs; `start` starts one.
+
 ## How ports are found
 
 `ls` runs one command on the host: `pm2 jlist`, `ps -eo pid,ppid` and `ss -ltnp` / `ss -lunp`

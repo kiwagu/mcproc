@@ -46,8 +46,9 @@ and nothing rewrites it later. `describe` shows it next to the running version, 
 that fails to load says so in the error's hint.
 
 Other app fields: `host` ([hosts](hosts.md)), `url_check` ([urls](urls.md)), `watch_delay`, `ignore_watch`, `autorestart`, `pm2:` (raw pm2 fields merged last).
-Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`), `pm2` (binary or command), `pm2_home`,
-`runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
+Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`: apps are launched with it, and its environment is
+read once for everything that only reads, see [hosts](hosts.md#how-mcproc-reads-a-host)), `pm2` (binary or command),
+`pm2_home`, `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
 
 The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
 checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
