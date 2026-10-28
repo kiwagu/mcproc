@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   createTransport,
   clearLoginEnvCache,
+  ensureOk,
 } from '../../src/transport/index.js';
 import { ENV_PLAIN, ENV_LOGIN } from '../../src/transport/loginenv.js';
 import { McprocError } from '../../src/core/errors.js';
@@ -403,6 +404,25 @@ describe('Transport.read', () => {
     const w = world();
     const t = createTransport(local, w.spawner, undefined, w.clock);
     expect(await t.loginEnv()).toEqual(LOGIN);
+  });
+  it('an ssh capture cut off mid-dump keeps none of the dump: the read and its error carry no environment', async () => {
+    const dump = `${ENV_PLAIN}\n__MCPROC_ENV0__\nPATH=/bin\0API_TOKEN=s3cr3t-value\0HO`;
+    const w = world();
+    w.setCapture(dump, 255, '');
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    const r = await t.read('probe');
+    expect(r).toEqual({ code: 255, stdout: '', stderr: '' });
+    let err: McprocError | null = null;
+    try {
+      ensureOk(r, ssh, 'probe');
+    } catch (e) {
+      err = e as McprocError;
+    }
+    expect(err).toMatchObject({ code: 'TRANSPORT_FAILED' });
+    expect(err?.message).toMatch(/^ssh to stand failed while running probe/);
+    expect(err?.message).not.toContain('s3cr3t');
+    expect(err?.message).not.toContain('API_TOKEN');
+    expect(JSON.stringify(t.readMode())).not.toContain('s3cr3t');
   });
 });
 

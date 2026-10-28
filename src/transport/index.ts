@@ -100,8 +100,9 @@ export function describeHost(host: Host): string {
 
 /**
  * A host's login environment as reads use it: null when they use the host shell (and why), until when it holds.
- * `failure` is the capture's own result when the link failed (ssh did not connect, the container is not running):
- * reads answer with it until the entry runs out, rather than paying a second connection that fails the same way.
+ * `failure` is the capture's own result, without its output, when the link failed (ssh did not connect, the container
+ * is not running): reads answer with it until the entry runs out, rather than paying a second connection that fails
+ * the same way.
  */
 interface Entry {
   env: LoginEnv | null;
@@ -164,13 +165,15 @@ export function createTransport(
         // as an environment with variables missing
         const env = res.code === 0 ? parseCapture(res.stdout) : null;
         if (env) return { env, at, until: at + LOGIN_ENV_TTL_MS, reason: null };
+        // what the dump printed before the link dropped is the host's environment, secrets and all: it never goes into
+        // an error's text
         if (isTransportFailure(host, res))
           return {
             env: null,
             at,
             until: at + CAPTURE_RETRY_MS,
             reason: `the host did not answer: ${firstLine(res.stderr) ?? `exit ${res.code}`}`,
-            failure: res,
+            failure: { ...res, stdout: '' },
           };
         return {
           env: null,
