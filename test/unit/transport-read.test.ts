@@ -25,6 +25,13 @@ const ssh: Host = {
   ssh: 'stand',
   cwd: '/srv/p',
 };
+const docker: Host = {
+  ...local,
+  name: 'box',
+  local: false,
+  docker: { container: 'app-1' },
+  cwd: '/srv/p',
+};
 
 /** captureScript's output in the NUL form. */
 const captured = (
@@ -170,6 +177,52 @@ describe('Transport.read', () => {
       retryIf: (res) => !res.stdout.includes('MARK'),
     });
     expect(r.stdout).toBe('MARK ok');
+  });
+  it('a dropped ssh connection comes back as it is: no second capture, no host shell, reads stay plain', async () => {
+    const refused = {
+      code: 255,
+      stdout: '',
+      stderr: 'ssh: connect to host stand port 22: Connection refused',
+    };
+    let down = true;
+    const w = world(() => (down ? refused : { stdout: 'MARK ok' }));
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    const probe = {
+      retryIf: (res: ExecResult) => !res.stdout.includes('MARK'),
+    };
+    expect(await t.read('probe', probe)).toEqual(refused);
+    expect(w.captures()).toBe(1);
+    expect(w.calls).toHaveLength(1);
+    expect(t.readMode()).toMatchObject({ shell: 'plain', reason: null });
+    // the host is back: its next read is plain sh again, on the environment already read
+    down = false;
+    w.advance(30_000);
+    expect((await t.read('probe', probe)).stdout).toBe('MARK ok');
+    expect(w.captures()).toBe(1);
+    expect(w.calls[1].argv.at(-1)).toBe(
+      shjoin([
+        'sh',
+        '-c',
+        "export FROM_PROFILE='yes'; export PATH='/opt/n/bin:/bin'; probe",
+      ])
+    );
+    expect(t.readMode()).toMatchObject({ shell: 'plain', reason: null });
+  });
+  it('a docker container that is not running comes back as it is too', async () => {
+    const stopped = {
+      code: 1,
+      stdout: '',
+      stderr: 'Error response from daemon: container app-1 is not running',
+    };
+    const w = world(() => stopped);
+    const t = createTransport(docker, w.spawner, undefined, w.clock);
+    const r = await t.read('probe', {
+      retryIf: (res) => !res.stdout.includes('MARK'),
+    });
+    expect(r).toEqual(stopped);
+    expect(w.captures()).toBe(1);
+    expect(w.calls).toHaveLength(1);
+    expect(t.readMode()).toMatchObject({ shell: 'plain', reason: null });
   });
   it('a capture that fails leaves reads on the host shell, and is tried again after 30 s', async () => {
     const w = world();

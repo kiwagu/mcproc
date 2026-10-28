@@ -251,7 +251,9 @@ export function createTransport(
       // a plain sh that does not start is the environment's fault: reading it again would bring the same one back
       const res = await tryPlain(e.env, cmd, opts);
       if (typeof res === 'string') return fallBack(res, cmd, opts);
-      if (!retryIf(res)) return res;
+      // a dropped connection or a stopped container is the link's failure, not plain sh's: it goes back as it is,
+      // for ensureOk to report, and the host's next read tries plain sh again
+      if (isTransportFailure(host, res) || !retryIf(res)) return res;
       const s = slotOf();
       // a failure reads the environment again at most once per LOGIN_ENV_TTL_MS: a host that lacks the command for
       // good must not pay a capture on every read
@@ -262,7 +264,7 @@ export function createTransport(
         if (e.env) {
           const again = await tryPlain(e.env, cmd, opts);
           if (typeof again === 'string') return fallBack(again, cmd, opts);
-          if (!retryIf(again)) return again;
+          if (isTransportFailure(host, again) || !retryIf(again)) return again;
         }
       }
       return fallBack(
@@ -282,18 +284,32 @@ export function createTransport(
   };
 }
 
+const sshFailed = (host: Host, res: ExecResult): boolean =>
+  Boolean(host.ssh) && res.code === 255;
+const DOCKER_FAILED =
+  /No such container|is not running|Cannot connect to the Docker daemon|permission denied while trying to connect|OCI runtime exec failed|executable file not found|unable to find user/i;
+
+/** Whether a result is the connection's failure (ssh, docker exec) rather than the command's own answer. */
+export function isTransportFailure(host: Host, res: ExecResult): boolean {
+  return (
+    sshFailed(host, res) ||
+    (Boolean(host.docker) && DOCKER_FAILED.test(res.stderr))
+  );
+}
+
 /** Turns transport-level failures into TRANSPORT_FAILED; leaves command exit codes to the caller. */
 export function ensureOk(
   res: ExecResult,
   host: Host,
   what: string
 ): ExecResult {
+  if (!isTransportFailure(host, res)) return res;
   const tail = (res.stderr || res.stdout)
     .trim()
     .split('\n')
     .slice(-5)
     .join('\n');
-  if (host.ssh && res.code === 255) {
+  if (sshFailed(host, res)) {
     throw new McprocError(
       'TRANSPORT_FAILED',
       `ssh to ${host.ssh} failed while running ${what}: ${tail}`,
@@ -302,16 +318,8 @@ export function ensureOk(
       }
     );
   }
-  if (
-    host.docker &&
-    /No such container|is not running|Cannot connect to the Docker daemon|permission denied while trying to connect|OCI runtime exec failed|executable file not found|unable to find user/i.test(
-      res.stderr
-    )
-  ) {
-    throw new McprocError(
-      'TRANSPORT_FAILED',
-      `docker exec into ${host.docker.container} failed while running ${what}: ${tail}`
-    );
-  }
-  return res;
+  throw new McprocError(
+    'TRANSPORT_FAILED',
+    `docker exec into ${host.docker?.container} failed while running ${what}: ${tail}`
+  );
 }

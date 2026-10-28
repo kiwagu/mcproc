@@ -78,7 +78,13 @@ describe('reads run through Transport.read', () => {
   it('logs since, incidents and reload counts', async () => {
     const h = fakeHosts({
       files: { '/l/watch-out': `${S(1)}a\n`, '/l/web-out': `${S(2)}b\n` },
-      procs: { local: [proc('watch', 0)], box: [proc('web', 3)] },
+      // web counts reloads (the fleet fixture sets `reloads` on it) once pm2 says when it started it
+      procs: {
+        local: [proc('watch', 0)],
+        box: [
+          proc('web', 3, { pm_uptime: Date.parse('2026-10-12T11:00:00Z') }),
+        ],
+      },
       now: '2026-10-12T11:00:59',
       zone: '+0000',
     });
@@ -91,6 +97,7 @@ describe('reads run through Transport.read', () => {
     expect(inc.length).toBeGreaterThan(0);
     expect(inc.every(Boolean)).toBe(true);
     expect(reads(all, /__MCPROC_JLIST__/).every(Boolean)).toBe(true);
+    expect(reads(all, /__MCPROC_RL_UNREAD_END__/)).toEqual([true]); // the reload count's own read, on box
   });
   it("the host's memory", async () => {
     const { host } = prepare({ project: readiness });
