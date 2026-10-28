@@ -98,12 +98,17 @@ export function describeHost(host: Host): string {
   return parts.length ? parts.join(' → ') : 'local';
 }
 
-/** A host's login environment as reads use it: null when they use the host shell (and why), until when it holds. */
+/**
+ * A host's login environment as reads use it: null when they use the host shell (and why), until when it holds.
+ * `failure` is the capture's own result when the link failed (ssh did not connect, the container is not running):
+ * reads answer with it until the entry runs out, rather than paying a second connection that fails the same way.
+ */
 interface Entry {
   env: LoginEnv | null;
   at: number;
   until: number;
   reason: string | null;
+  failure?: ExecResult;
 }
 /** One host's entry, and when a failed read last made it read the environment again. */
 interface Slot {
@@ -158,14 +163,21 @@ export function createTransport(
         // only a capture that ran to its end counts: a dump cut short, or a login PATH without `env`, still parses,
         // as an environment with variables missing
         const env = res.code === 0 ? parseCapture(res.stdout) : null;
-        return env
-          ? { env, at, until: at + LOGIN_ENV_TTL_MS, reason: null }
-          : {
-              env: null,
-              at,
-              until: at + CAPTURE_RETRY_MS,
-              reason: `${host.shell.bin} printed no environment (exit ${res.code})`,
-            };
+        if (env) return { env, at, until: at + LOGIN_ENV_TTL_MS, reason: null };
+        if (isTransportFailure(host, res))
+          return {
+            env: null,
+            at,
+            until: at + CAPTURE_RETRY_MS,
+            reason: `the host did not answer: ${firstLine(res.stderr) ?? `exit ${res.code}`}`,
+            failure: res,
+          };
+        return {
+          env: null,
+          at,
+          until: at + CAPTURE_RETRY_MS,
+          reason: `${host.shell.bin} printed no environment (exit ${res.code})`,
+        };
       } catch (e) {
         const at = clock();
         return {
@@ -247,6 +259,8 @@ export function createTransport(
       const retryIf = opts.retryIf ?? ((r) => r.code === 127);
       let e = await current();
       note(e);
+      // a host that did not answer the capture would not answer the read either: its failure goes back as it is
+      if (e.failure) return { ...e.failure };
       if (!e.env) return exec(cmd, opts);
       // a plain sh that does not start is the environment's fault: reading it again would bring the same one back
       const res = await tryPlain(e.env, cmd, opts);
@@ -261,6 +275,8 @@ export function createTransport(
         s.failAt = clock();
         e = await capture(s);
         note(e);
+        // the connection dropped meanwhile: that is the answer, and the host is not pinned to its shell for it
+        if (e.failure) return { ...e.failure };
         if (e.env) {
           const again = await tryPlain(e.env, cmd, opts);
           if (typeof again === 'string') return fallBack(again, cmd, opts);
@@ -283,6 +299,13 @@ export function createTransport(
     stream: (cmd: string) => streamer(buildArgv(host, cmd, PLAIN_SH)),
   };
 }
+
+/** The first line of a command's output that says anything; undefined when none does. */
+const firstLine = (s: string): string | undefined =>
+  s
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
 
 const sshFailed = (host: Host, res: ExecResult): boolean =>
   Boolean(host.ssh) && res.code === 255;

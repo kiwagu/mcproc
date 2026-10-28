@@ -58,13 +58,14 @@ function world(answer: (argv: string[]) => Partial<ExecResult> = () => ({})) {
   let captures = 0;
   let captureOut = captured(PLAIN, LOGIN);
   let captureCode = 0;
+  let captureErr = '';
   let onCapture: () => void = () => {};
   const spawner: Spawner = async (argv, opts) => {
     const cmd = argv[argv.length - 1];
     if (cmd.includes(ENV_PLAIN)) {
       captures++;
       onCapture();
-      return { code: captureCode, stdout: captureOut, stderr: '' };
+      return { code: captureCode, stdout: captureOut, stderr: captureErr };
     }
     calls.push({ argv, env: opts.env });
     return { code: 0, stdout: '', stderr: '', ...answer(argv) };
@@ -74,9 +75,10 @@ function world(answer: (argv: string[]) => Partial<ExecResult> = () => ({})) {
     spawner,
     calls,
     captures: () => captures,
-    setCapture: (s: string, code = 0) => {
+    setCapture: (s: string, code = 0, stderr = '') => {
       captureOut = s;
       captureCode = code;
+      captureErr = stderr;
     },
     /** runs on every capture before it answers: it may move the clock or throw */
     onCapture: (f: () => void) => {
@@ -223,6 +225,82 @@ describe('Transport.read', () => {
     expect(w.captures()).toBe(1);
     expect(w.calls).toHaveLength(1);
     expect(t.readMode()).toMatchObject({ shell: 'plain', reason: null });
+  });
+  it('an ssh host that does not answer the capture: its result comes back as it is, with no second connection', async () => {
+    const refused =
+      'ssh: connect to host stand port 22: Connection timed out\nmore';
+    const w = world(() => ({ stdout: 'MARK ok' }));
+    w.setCapture('', 255, refused);
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    expect(await t.read('probe')).toEqual({
+      code: 255,
+      stdout: '',
+      stderr: refused,
+    });
+    // the capture was the only spawn: no read through the host shell after it
+    expect(w.captures()).toBe(1);
+    expect(w.calls).toHaveLength(0);
+    expect(t.readMode()).toEqual({
+      shell: 'host',
+      at: 1_000_000,
+      reason:
+        'the host did not answer: ssh: connect to host stand port 22: Connection timed out',
+    });
+    // the next read within 30 s gets the same answer at once; after them the host is asked again
+    expect((await t.read('probe')).code).toBe(255);
+    expect(w.captures()).toBe(1);
+    w.setCapture(captured(PLAIN, LOGIN));
+    w.advance(30_000);
+    expect((await t.read('probe')).stdout).toBe('MARK ok');
+    expect(w.captures()).toBe(2);
+    expect(t.readMode()).toMatchObject({ shell: 'plain' });
+  });
+  it('a docker container that is not running at the capture comes back as it is too', async () => {
+    const stopped =
+      'Error response from daemon: container app-1 is not running';
+    const w = world(() => ({ stdout: 'MARK ok' }));
+    w.setCapture('', 1, stopped);
+    const t = createTransport(docker, w.spawner, undefined, w.clock);
+    expect(await t.read('probe')).toEqual({
+      code: 1,
+      stdout: '',
+      stderr: stopped,
+    });
+    expect(w.calls).toHaveLength(0);
+    expect(t.readMode()).toMatchObject({
+      shell: 'host',
+      reason: `the host did not answer: ${stopped}`,
+    });
+  });
+  it('a retry whose re-capture finds the connection dropped returns that failure, without pinning the host shell', async () => {
+    const refused = 'ssh: connect to host stand port 22: Connection refused';
+    const w = world((argv) =>
+      argv.at(-1)!.includes('not-found-yet') ? { code: 127 } : {}
+    );
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    // the read is not found in plain sh, and the connection drops before the environment is read again
+    w.onCapture(() => {
+      if (w.captures() === 2) w.setCapture('', 255, refused);
+    });
+    expect(await t.read('not-found-yet')).toEqual({
+      code: 255,
+      stdout: '',
+      stderr: refused,
+    });
+    expect(w.captures()).toBe(2);
+    // one plain read, and no host-shell read after the failed re-capture
+    expect(w.calls).toHaveLength(1);
+    expect(t.readMode()).toMatchObject({
+      shell: 'host',
+      reason: `the host did not answer: ${refused}`,
+    });
+    // not pinned for 5 minutes: 30 s on, the host is asked for its environment again
+    w.setCapture(captured(PLAIN, LOGIN));
+    w.advance(30_000);
+    await t.read('later');
+    expect(w.captures()).toBe(3);
+    expect(w.calls.at(-1)!.argv.at(-1)).toMatch(/^'sh' '-c' .*later'$/);
+    expect(t.readMode()).toMatchObject({ shell: 'plain' });
   });
   it('a capture that fails leaves reads on the host shell, and is tried again after 30 s', async () => {
     const w = world();
