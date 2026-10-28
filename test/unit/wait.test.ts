@@ -1965,7 +1965,7 @@ describe('waitFor: the listening pre-check', () => {
     });
     expect(h.calls.probes).toBe(0);
   });
-  it("the pre-check's own text when the wait times out", async () => {
+  it('a wait that times out on a pre-check tick looks once with the light probe', async () => {
     const h = harness([probe(proc('api', 'online'))]);
     h.deps.listening = async () => pre([proc('api', 'online')], []);
     const r = await waitFor(
@@ -1976,7 +1976,54 @@ describe('waitFor: the listening pre-check', () => {
     );
     expect(r).toMatchObject({ ok: false, reason: 'timeout' });
     expect(r.observed).toBe('status online, :3100 ✗ nothing listens');
-    expect(h.calls.probes).toBe(0);
+    // the pre-check ticks never probed; the giving-up tick did, once
+    expect(h.calls.probes).toBe(1);
+  });
+  it('a timeout on a pre-check tick still names the port the app took instead (undeclared)', async () => {
+    // api (pid 100) listens on 3105 through its child 101, never on its declared 3100
+    const h = harness([probe(proc('api', 'online'), ss(3105, 101))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], [3105]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', status: 'online' });
+    expect(r.observed).toBe(
+      'status online, :3100 ✗ nothing listens, :3105 (undeclared)'
+    );
+    expect(h.calls.probes).toBe(1);
+  });
+  it('an aborted wait on a pre-check tick names the undeclared port too', async () => {
+    const h = harness([probe(proc('api', 'online'), ss(3105, 101))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], [3105]);
+    const ac = new AbortController();
+    h.deps.sleep = async () => ac.abort();
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, signal: ac.signal }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'aborted' });
+    expect(r.observed).toContain(':3105 (undeclared)');
+    expect(h.calls.probes).toBe(1);
+  });
+  it("a giving-up probe that fails keeps the pre-check's own text", async () => {
+    const h = harness([probe(proc('api', 'online'))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], []);
+    h.deps.snapshot = async () => {
+      throw new Error('probe failed');
+    };
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.observed).toBe('status online, :3100 ✗ nothing listens');
   });
   it('a port held by another process passes the pre-check and still times out', async () => {
     const h = harness([probe(proc('api', 'online'), ss(3100, 999))]);

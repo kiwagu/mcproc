@@ -393,6 +393,40 @@ export async function waitFor(
     observed?: string
   ): WaitResult =>
     answer({ ok: false, reason, status: statusWord(p, a), observed });
+  /** the light probe of a listening or url-ok tick: no CPU, no metrics, no leases */
+  const light: SnapshotOptions = {
+    cpu: 'none',
+    metrics: 'none',
+    // the option names apps, not urls: the probe checks this app's url
+    urls: until.kind === 'url-ok' ? [app] : 'none',
+    // read below through deps.leases, and only while the app is not running
+    leases: 'none',
+  };
+  /**
+   * a listening wait that gives up on a tick the pre-check stopped: one light probe, so the answer still names what
+   * listens (a port the app took instead, undeclared, and the declared ones already up); a probe that fails keeps the
+   * pre-check's own text
+   */
+  const giveUpProbed = async (
+    reason: 'timeout' | 'aborted',
+    p: Pm2Process | undefined,
+    observed?: string
+  ): Promise<WaitResult> => {
+    let snap: Snapshot;
+    try {
+      snap = await deps.snapshot(ctx, light);
+    } catch {
+      return giveUp(reason, p, observed);
+    }
+    const ports = snap.ports[app];
+    if (!ports) return giveUp(reason, p, observed);
+    const q = findProcess(snap.procs, ctx.manifest.project, app);
+    return giveUp(
+      reason,
+      q,
+      `status ${q?.status ?? 'not-started'}, ${fmtPorts(ports)}`
+    );
+  };
   /** sleeps until the next poll or the deadline, whichever is first; false when the wait was aborted */
   const pause = async (): Promise<boolean> => {
     await deps.sleep(
@@ -439,6 +473,8 @@ export async function waitFor(
   for (;;) {
     let p: Pm2Process | undefined;
     let observed: string | undefined;
+    // a listening tick that stopped at the pre-check: the light probe did not look
+    let precheckOnly = false;
     if (until.kind === 'exited') {
       p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
       if (p) first = false;
@@ -471,14 +507,7 @@ export async function waitFor(
           p = findProcess(pre.procs, ctx.manifest.project, app);
       }
       if (missing.length === 0) {
-        snap = await deps.snapshot(ctx, {
-          cpu: 'none',
-          metrics: 'none',
-          // the option names apps, not urls: the probe checks this app's url
-          urls: until.kind === 'url-ok' ? [app] : 'none',
-          // read below through deps.leases, and only while the app is not running
-          leases: 'none',
-        });
+        snap = await deps.snapshot(ctx, light);
         p = findProcess(snap.procs, ctx.manifest.project, app);
       }
       if (p) first = false;
@@ -491,6 +520,7 @@ export async function waitFor(
       let met: boolean;
       if (!snap) {
         met = false;
+        precheckOnly = true;
         observed = `status ${p?.status ?? 'not-started'}, ${missing.map((port) => `:${port} ✗ nothing listens`).join(', ')}`;
       } else if (until.kind === 'listening') {
         const ports = snap.ports[app];
@@ -515,8 +545,12 @@ export async function waitFor(
         observed = `status ${p.status}, ${observed}`;
       }
     }
-    if (deps.now() >= deadline) return giveUp('timeout', p, observed);
-    if (!(await pause())) return giveUp('aborted', p, observed);
+    const end =
+      deps.now() >= deadline ? 'timeout' : (await pause()) ? null : 'aborted';
+    if (end === null) continue;
+    return precheckOnly
+      ? giveUpProbed(end, p, observed)
+      : giveUp(end, p, observed);
   }
 }
 
