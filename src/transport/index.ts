@@ -111,10 +111,14 @@ interface Entry {
   reason: string | null;
   failure?: ExecResult;
 }
-/** One host's entry, and when a failed read last made it read the environment again. */
+/**
+ * One host's entry, when a failed read last made it read the environment again, and the last environment a capture
+ * read: what pm2 runs with there, kept while reads use the host shell.
+ */
 interface Slot {
   entry: Promise<Entry> | null;
   failAt: number | null;
+  known: LoginEnv | null;
 }
 /** The login environments of the hosts the real spawner reaches, shared by every transport of this process. */
 const SHARED = new Map<string, Slot>();
@@ -146,7 +150,7 @@ export function createTransport(
   const slotOf = (): Slot => {
     let s = store.get(key);
     if (!s) {
-      s = { entry: null, failAt: null };
+      s = { entry: null, failAt: null, known: null };
       store.set(key, s);
     }
     return s;
@@ -164,7 +168,10 @@ export function createTransport(
         // only a capture that ran to its end counts: a dump cut short, or a login PATH without `env`, still parses,
         // as an environment with variables missing
         const env = res.code === 0 ? parseCapture(res.stdout) : null;
-        if (env) return { env, at, until: at + LOGIN_ENV_TTL_MS, reason: null };
+        if (env) {
+          s.known = env;
+          return { env, at, until: at + LOGIN_ENV_TTL_MS, reason: null };
+        }
         // what the dump printed before the link dropped is the host's environment, secrets and all: it never goes into
         // an error's text
         if (isTransportFailure(host, res))
@@ -294,9 +301,9 @@ export function createTransport(
     },
     async loginEnv() {
       if (plainHost) return null;
-      const e = await current();
-      note(e);
-      return e.env?.login ?? null;
+      note(await current());
+      // the environment the host's pm2 runs with, also while reads use the host shell
+      return slotOf().known?.login ?? null;
     },
     readMode: () => mode,
     stream: (cmd: string) => streamer(buildArgv(host, cmd, PLAIN_SH)),

@@ -2044,7 +2044,7 @@ describe('waitFor: the listening pre-check', () => {
     let i = 0;
     const ctx = {
       ...h.ctx,
-      pm2: new Pm2Client(h.ctx.fake, h.ctx.host, 'pm2', undefined, async () =>
+      pm2: new Pm2Client(h.ctx.fake, h.ctx.host, 'pm2', '/h/.pm2', async () =>
         JSON.parse(answers[Math.min(i++, answers.length - 1)])
       ),
     };

@@ -999,7 +999,7 @@ describe('the probe beside the socket', () => {
     ]);
     const link = {
       ...ctx,
-      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => [
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
         RAW,
       ]),
     };
@@ -1034,7 +1034,7 @@ describe('the probe beside the socket', () => {
         ctx.fake,
         ctx.host,
         'pm2',
-        undefined,
+        '/h/.pm2',
         async () => null
       ),
     };
@@ -1089,7 +1089,7 @@ describe('the listening pre-check', () => {
     ]);
     const link = {
       ...ctx,
-      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => [
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
         RAW,
       ]),
     };

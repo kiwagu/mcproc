@@ -5,6 +5,7 @@ import { McprocError } from './errors.js';
 import type { Host } from './manifest.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
+import { isPlainShell } from '../transport/loginenv.js';
 import type { ExecResult, Transport } from '../transport/types.js';
 
 export interface Pm2Process {
@@ -126,25 +127,35 @@ export class Pm2Client {
   listsOverSocket(): boolean {
     return this.lister !== null;
   }
-  /** the environment pm2 runs with here: the login one, else this process's own */
-  private async daemonEnv(): Promise<Record<string, string | undefined>> {
-    return (await this.transport.loginEnv()) ?? process.env;
+  /**
+   * the environment pm2 runs with here: the login one; this process's own where the host shell is a plain sh, which
+   * inherits it; null when the login environment could not be read
+   */
+  private async daemonEnv(): Promise<NodeJS.ProcessEnv | null> {
+    return (
+      (await this.transport.loginEnv()) ??
+      (isPlainShell(this.host.shell) ? process.env : null)
+    );
   }
   /** the daemon's home: hosts.<h>.pm2_home, else PM2_HOME of the login environment, else ~/.pm2 of it */
   async home(): Promise<string> {
     if (this.pm2Home) return this.pm2Home;
-    const env = await this.daemonEnv();
+    const env = (await this.daemonEnv()) ?? process.env;
     return env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
   }
   /** pm2's processes; null when no daemon runs (only the socket can tell: `pm2 jlist` starts one and answers) */
   async daemonList(): Promise<Pm2Process[] | null> {
-    // a daemon on TCP ports (PM2_RPC_PORT) has no rpc.sock: only the CLI finds it
-    if (this.lister && !(await this.daemonEnv()).PM2_RPC_PORT) {
-      try {
-        const list = await this.lister(await this.home());
-        return list === null ? null : (list as RawProc[]).map(normalize);
-      } catch {
-        /* a daemon that errs or hangs: the CLI answers this once */
+    if (this.lister) {
+      const env = await this.daemonEnv();
+      // the socket only for a daemon whose home is known and that listens at <home>/rpc.sock: PM2_DAEMON_RPC_PORT
+      // moves that endpoint, and an environment that could not be read leaves the home unknown; the CLI finds both
+      if ((this.pm2Home || env) && !(env ?? process.env).PM2_DAEMON_RPC_PORT) {
+        try {
+          const list = await this.lister(await this.home());
+          return list === null ? null : (list as RawProc[]).map(normalize);
+        } catch {
+          /* a daemon that errs or hangs: the CLI answers this once */
+        }
       }
     }
     return parseJlist((await this.run(['jlist'], { read: true })).stdout);

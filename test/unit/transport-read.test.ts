@@ -405,6 +405,47 @@ describe('Transport.read', () => {
     const t = createTransport(local, w.spawner, undefined, w.clock);
     expect(await t.loginEnv()).toEqual(LOGIN);
   });
+  it('a plain sh that cannot start: loginEnv still gives the captured environment while reads use the host shell', async () => {
+    const w = world();
+    const spawner: Spawner = async (argv, opts) => {
+      if (argv[0] === 'sh' && opts.env)
+        throw new McprocError(
+          'TRANSPORT_FAILED',
+          'Cannot spawn sh: spawn sh ENOENT'
+        );
+      return w.spawner(argv, opts);
+    };
+    const t = createTransport(local, spawner, undefined, w.clock);
+    await t.read('a');
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+    expect(await t.loginEnv()).toEqual(LOGIN);
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+  });
+  it('a read that still fails after the retry: loginEnv still gives the captured environment', async () => {
+    const w = world((argv) => (argv[0] === 'sh' ? { code: 127 } : {}));
+    const t = createTransport(local, w.spawner, undefined, w.clock);
+    await t.read('x');
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+    expect(await t.loginEnv()).toEqual(LOGIN);
+  });
+  it('a capture that never worked: loginEnv is null', async () => {
+    const w = world();
+    w.setCapture('bash: no such file\n');
+    const t = createTransport(local, w.spawner, undefined, w.clock);
+    await t.read('a');
+    expect(await t.loginEnv()).toBeNull();
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+  });
+  it('a capture that fails after one that worked: loginEnv keeps the last environment read', async () => {
+    const w = world();
+    const t = createTransport(local, w.spawner, undefined, w.clock);
+    await t.read('a');
+    w.setCapture('bash: no such file\n');
+    w.advance(300_000);
+    await t.read('b');
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+    expect(await t.loginEnv()).toEqual(LOGIN);
+  });
   it('an ssh capture cut off mid-dump keeps none of the dump: the read and its error carry no environment', async () => {
     const dump = `${ENV_PLAIN}\n__MCPROC_ENV0__\nPATH=/bin\0API_TOKEN=s3cr3t-value\0HO`;
     const w = world();

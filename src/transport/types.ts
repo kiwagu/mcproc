@@ -27,7 +27,10 @@ export interface Transport {
   describe(): string;
   exec(cmd: string, opts?: ExecOptions): Promise<ExecResult>;
   read(cmd: string, opts?: ReadOptions): Promise<ExecResult>;
-  /** the login environment reads use (the `login` side); null when reads use the host shell */
+  /**
+   * the host's login environment as last read (the `login` side), also while reads use the host shell; null when none
+   * was ever read
+   */
   loginEnv(): Promise<Record<string, string> | null>;
   /** how reads run now; null before the first read */
   readMode(): ReadMode | null;

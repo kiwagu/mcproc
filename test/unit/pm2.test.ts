@@ -13,6 +13,7 @@ import {
   type DaemonLister,
 } from '../../src/core/pm2.js';
 import { FakeTransport, type Rule } from '../helpers/fake-transport.js';
+import { McprocError } from '../../src/core/errors.js';
 import type { Host } from '../../src/core/manifest.js';
 import { createTransport } from '../../src/transport/index.js';
 import { ENV_LOGIN, ENV_PLAIN } from '../../src/transport/loginenv.js';
@@ -433,24 +434,44 @@ describe('Pm2Client over the socket', () => {
   });
 });
 
-describe('Pm2Client: a daemon on TCP ports', () => {
-  it('PM2_RPC_PORT in the login environment: the CLI lists, the socket lister is never asked', async () => {
-    let asked = 0;
-    const t = new EnvTransport(
-      [{ match: /pm2 'jlist'/, result: { stdout: JSON.stringify([RAW]) } }],
-      { PM2_HOME: '/x/.pm2', PM2_RPC_PORT: '6666', PM2_PUB_PORT: '6667' }
-    );
-    const c = new Pm2Client(t, here_, 'pm2', undefined, async () => {
-      asked++;
-      return null;
+describe('Pm2Client: a daemon whose RPC endpoint is moved', () => {
+  it.each([
+    { what: 'a TCP port', port: '6666' },
+    { what: 'another socket', port: '/elsewhere/rpc.sock' },
+  ])(
+    'PM2_DAEMON_RPC_PORT ($what) in the login environment: the CLI lists, the socket lister is never asked',
+    async ({ port }) => {
+      let asked = 0;
+      const t = new EnvTransport(
+        [{ match: /pm2 'jlist'/, result: { stdout: JSON.stringify([RAW]) } }],
+        { PM2_HOME: '/x/.pm2', PM2_DAEMON_RPC_PORT: port }
+      );
+      const c = new Pm2Client(t, here_, 'pm2', undefined, async () => {
+        asked++;
+        return null;
+      });
+      expect((await c.jlist()).map((p) => p.name)).toEqual(['p-web']);
+      expect(asked).toBe(0);
+      expect(t.calls).toHaveLength(1);
+      expect(t.calls[0]).toMatchObject({ cmd: `pm2 'jlist'`, read: true });
+    }
+  );
+  it('PM2_RPC_PORT is not a pm2 variable: the socket still lists', async () => {
+    const homes: string[] = [];
+    const t = new EnvTransport([], {
+      PM2_HOME: '/x/.pm2',
+      PM2_RPC_PORT: '6666',
+    });
+    const c = new Pm2Client(t, here_, 'pm2', undefined, async (h) => {
+      homes.push(h);
+      return [RAW];
     });
     expect((await c.jlist()).map((p) => p.name)).toEqual(['p-web']);
-    expect(asked).toBe(0);
-    expect(t.calls).toHaveLength(1);
-    expect(t.calls[0]).toMatchObject({ cmd: `pm2 'jlist'`, read: true });
+    expect(homes).toEqual(['/x/.pm2']);
+    expect(t.calls).toEqual([]);
   });
-  it("no login environment: this process's PM2_RPC_PORT decides", async () => {
-    const saved = process.env.PM2_RPC_PORT;
+  it("no login environment, pm2_home set: this process's PM2_DAEMON_RPC_PORT decides", async () => {
+    const saved = process.env.PM2_DAEMON_RPC_PORT;
     let asked = 0;
     const t = new EnvTransport(
       [{ match: /pm2 'jlist'/, result: { stdout: '[]' } }],
@@ -461,18 +482,97 @@ describe('Pm2Client: a daemon on TCP ports', () => {
       return [];
     });
     try {
-      process.env.PM2_RPC_PORT = '6666';
+      process.env.PM2_DAEMON_RPC_PORT = '6666';
       await c.jlist();
       expect(asked).toBe(0);
       expect(t.calls).toHaveLength(1);
-      delete process.env.PM2_RPC_PORT;
+      delete process.env.PM2_DAEMON_RPC_PORT;
       await c.jlist();
       expect(asked).toBe(1);
       expect(t.calls).toHaveLength(1);
     } finally {
-      if (saved === undefined) delete process.env.PM2_RPC_PORT;
-      else process.env.PM2_RPC_PORT = saved;
+      if (saved === undefined) delete process.env.PM2_DAEMON_RPC_PORT;
+      else process.env.PM2_DAEMON_RPC_PORT = saved;
     }
+  });
+});
+
+describe('Pm2Client: a daemon whose environment is not known', () => {
+  /** runs `f` with this process's PM2_HOME set to `home`, and puts it back */
+  async function withProcessHome<T>(home: string, f: () => Promise<T>) {
+    const saved = process.env.PM2_HOME;
+    process.env.PM2_HOME = home;
+    try {
+      return await f();
+    } finally {
+      if (saved === undefined) delete process.env.PM2_HOME;
+      else process.env.PM2_HOME = saved;
+    }
+  }
+  it('no login environment on a login host shell: one CLI read, the lister is never called', async () => {
+    let asked = 0;
+    const t = new EnvTransport(
+      [{ match: /pm2 'jlist'/, result: { stdout: JSON.stringify([RAW]) } }],
+      null
+    );
+    const c = new Pm2Client(t, here_, 'pm2', undefined, async () => {
+      asked++;
+      return [];
+    });
+    await withProcessHome('/proc-home', async () => {
+      expect((await c.daemonList())?.map((p) => p.name)).toEqual(['p-web']);
+    });
+    expect(asked).toBe(0);
+    expect(t.calls).toHaveLength(1);
+    expect(t.calls[0]).toMatchObject({ cmd: `pm2 'jlist'`, read: true });
+  });
+  it("a plain sh as the host shell: the lister, with this process's home", async () => {
+    const homes: string[] = [];
+    const t = new EnvTransport([], null);
+    const c = new Pm2Client(
+      t,
+      { ...here_, shell: { bin: '/bin/sh', flags: ['-c'] } },
+      'pm2',
+      undefined,
+      async (h) => {
+        homes.push(h);
+        return [];
+      }
+    );
+    await withProcessHome('/proc-home', () => c.jlist());
+    expect(homes).toEqual(['/proc-home']);
+    expect(t.calls).toEqual([]);
+  });
+  it("reads that fell back to the host shell: the lister gets the profile's PM2_HOME, not this process's", async () => {
+    // the profile sets PM2_HOME, and its PATH has no sh: the capture works, plain sh does not start
+    const spawner: Spawner = async (argv, opts) => {
+      const cmd = argv.at(-1) as string;
+      if (cmd.includes(ENV_PLAIN))
+        return {
+          code: 0,
+          stdout: capturedEnv(
+            { PATH: '/bin', HOME: '/h' },
+            { PATH: '/nosh', HOME: '/h', PM2_HOME: '/profile/.pm2' }
+          ),
+          stderr: '',
+        };
+      if (argv[0] === 'sh' && opts.env)
+        throw new McprocError(
+          'TRANSPORT_FAILED',
+          'Cannot spawn sh: spawn sh ENOENT'
+        );
+      return { code: 0, stdout: 'via login', stderr: '' };
+    };
+    const t = createTransport(here_, spawner);
+    expect((await t.read('x')).stdout).toBe('via login');
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+    const homes: string[] = [];
+    const c = new Pm2Client(t, here_, 'pm2', undefined, async (h) => {
+      homes.push(h);
+      return [];
+    });
+    await withProcessHome('/proc-home', () => c.jlist());
+    expect(homes).toEqual(['/profile/.pm2']);
   });
 });
 
