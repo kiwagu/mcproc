@@ -63,9 +63,11 @@ second connection), and one whose `shell` is already a plain `sh -c` is read thr
 says which way each host is read.
 
 On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
-`pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own). Asking for the list never starts a daemon;
-`start` does. When pm2 comes from your PATH, though, mcproc checks its version with `pm2 -v` first, and pm2 starts a
-daemon for that, so `doctor` shows `daemon: not running` only where mcproc uses its own pm2 or the runtime bundle.
+`pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own, `PM2_DAEMON_RPC_PORT` moves the daemon's
+socket, or the host's login environment cannot be read and no `pm2_home` is set; then mcproc asks `pm2 jlist`, which
+starts a daemon where none runs). Asking over the socket never starts a daemon; `start` does. When pm2 comes from your
+PATH, though, mcproc checks its version with `pm2 -v` first, and pm2 starts a daemon for that, so `doctor` shows
+`daemon: not running` only where mcproc uses its own pm2 or the runtime bundle.
 
 ## How ports are found
 
