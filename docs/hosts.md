@@ -58,12 +58,14 @@ once per host: everything that only reads (the probes behind `ls` and monit, log
 `sh` with the environment that shell set up. The environment is read again every 5 minutes, and at once when a
 command is not found; if the plain shell still cannot run it, or `sh` does not start with that environment, that
 host is read through `shell` itself for the next 5 minutes. A host whose environment cannot be read is read through
-`shell` and tried again after 30 seconds, and one whose `shell` is already a plain `sh -c` is read through it
-directly. `mcproc doctor` says which way each host is read.
+`shell` and tried again after 30 seconds (one that does not answer at all reads as unreachable until then, without a
+second connection), and one whose `shell` is already a plain `sh -c` is read through it directly. `mcproc doctor`
+says which way each host is read.
 
 On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
-`pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own). Asking for the list never starts a daemon,
-and `doctor` shows `daemon: not running` when none runs; `start` starts one.
+`pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own). Asking for the list never starts a daemon;
+`start` does. When pm2 comes from your PATH, though, mcproc checks its version with `pm2 -v` first, and pm2 starts a
+daemon for that, so `doctor` shows `daemon: not running` only where mcproc uses its own pm2 or the runtime bundle.
 
 ## How ports are found
 
