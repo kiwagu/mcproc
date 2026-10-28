@@ -78,6 +78,10 @@ function deps(
       if (r instanceof Error) throw r;
       return r;
     },
+    scanHost: async () => {
+      throw new Error('scanHost is not used here');
+    },
+    sharesScan: () => false,
     loadManifest,
     findManifest: findManifestPath,
     hostname: () => 'box',
@@ -406,5 +410,55 @@ describe('StacksCollector', () => {
       all: false,
     });
     expect(fresh.answer.stacks.map((s) => s.source)).toEqual(['registry']);
+  });
+
+  it('local daemons share one scan per refresh, each with its own list; a remote endpoint keeps its probe', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const state = path.join(base, 'state');
+    const hb = path.join(base, 'hb');
+    const beta = checkout(
+      base,
+      'beta',
+      `version: 1\nproject: beta\napps:\n  api: { description: a, run: "node a.js" }\nhosts:\n  local: { pm2_home: ${hb} }\n`
+    );
+    const gamma = checkout(
+      base,
+      'gamma',
+      'version: 1\nproject: gamma\napps:\n  job: { description: j, run: "node j.js", host: box }\nhosts:\n  box: { ssh: box, cwd: /srv/g }\n'
+    );
+    recordProject(loadManifest(beta), state);
+    recordProject(loadManifest(gamma), state);
+    let scans = 0;
+    const asked: string[] = [];
+    const d = deps(state, (h) =>
+      h.local ? new Error('a local endpoint is not probed alone') : probeOf([])
+    );
+    d.sharesScan = (l) => l.host.local;
+    d.scanHost = async () => {
+      scans++;
+      const p = probeOf([]);
+      return { data: p.data, sampledAt: p.sampledAt };
+    };
+    d.connectHost = async (host) =>
+      ({
+        host,
+        pm2: {
+          listsOverSocket: () => true,
+          jlist: async () => {
+            asked.push(host.pm2_home ?? 'default');
+            return host.pm2_home === hb
+              ? parseJlist(JSON.stringify([proc('beta-api', 'beta', beta, 12)]))
+              : [];
+          },
+        },
+      }) as unknown as HostLink;
+    const c = new StacksCollector(d);
+    const v = await c.collect({ all: true });
+    await c.collect({ all: true });
+    expect(scans).toBe(2); // one per refresh, for both local daemons
+    expect(asked.sort()).toEqual(['default', 'default', hb, hb].sort());
+    expect(d.probes).toEqual(['box']); // remote: its own probe, at most every 10 s
+    expect(v.answer.stacks.find((s) => s.project === 'beta')).toBeTruthy();
+    fs.rmSync(base, { recursive: true, force: true });
   });
 });
