@@ -1,6 +1,7 @@
 import type {
   ExecOptions,
   ExecResult,
+  ReadOptions,
   Transport,
 } from '../../src/transport/types.js';
 
@@ -12,7 +13,7 @@ export type Rule = {
 };
 
 export class FakeTransport implements Transport {
-  calls: { cmd: string; opts: ExecOptions }[] = [];
+  calls: { cmd: string; opts: ExecOptions; read?: boolean }[] = [];
   constructor(
     private rules: Rule[] = [],
     private name = 'fake'
@@ -21,7 +22,24 @@ export class FakeTransport implements Transport {
     return this.name;
   }
   async exec(cmd: string, opts: ExecOptions = {}): Promise<ExecResult> {
-    this.calls.push({ cmd, opts });
+    return this.answer(cmd, opts, false);
+  }
+  /** a read answers from the same rules; the call is marked so a test can tell a read from an exec */
+  async read(cmd: string, opts: ReadOptions = {}): Promise<ExecResult> {
+    return this.answer(cmd, opts, true);
+  }
+  async loginEnv() {
+    return null;
+  }
+  readMode() {
+    return null;
+  }
+  private async answer(
+    cmd: string,
+    opts: ExecOptions,
+    read: boolean
+  ): Promise<ExecResult> {
+    this.calls.push(read ? { cmd, opts, read } : { cmd, opts });
     for (const r of this.rules) {
       const hit =
         typeof r.match === 'string' ? cmd.includes(r.match) : r.match.test(cmd);

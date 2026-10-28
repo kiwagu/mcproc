@@ -68,13 +68,17 @@ function parseDump(part: string): Env | null {
   return env;
 }
 
-/** Both environments from captureScript's output; null when a dump is missing (the host shell did not run). */
+/**
+ * Both environments from captureScript's output; null when a dump is missing (the host shell did not run). The login
+ * marker counts only as a line of its own: a plain variable can hold the script's text (ssh puts a forced command's
+ * original one in SSH_ORIGINAL_COMMAND), and there the marker follows an `echo`.
+ */
 export function parseCapture(stdout: string): LoginEnv | null {
   const p = stdout.indexOf(ENV_PLAIN);
-  const g = p < 0 ? -1 : stdout.indexOf(ENV_LOGIN, p);
+  const g = p < 0 ? -1 : stdout.indexOf(`\n${ENV_LOGIN}\n`, p);
   if (g < 0) return null;
   const plain = parseDump(stdout.slice(p, g));
-  const login = parseDump(stdout.slice(g));
+  const login = parseDump(stdout.slice(g + 1));
   return plain && login ? { plain, login } : null;
 }
 

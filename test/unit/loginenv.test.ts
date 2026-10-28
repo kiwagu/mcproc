@@ -11,12 +11,15 @@ import {
   type ShellSpec,
 } from '../../src/transport/loginenv.js';
 
-/** A stand-in login shell: prints a line of noise, sets two variables as a profile would, then runs its command. */
+/**
+ * A stand-in login shell: prints a line that looks like a variable, sets two variables as a profile would, then runs
+ * its command.
+ */
 const fakeLogin: ShellSpec = {
   bin: 'sh',
   flags: [
     '-c',
-    'echo noise from the profile; export FROM_PROFILE=yes; export PATH="/opt/tool/bin:$PATH"; eval "$1"',
+    'echo NOISE=1; export FROM_PROFILE=yes; export PATH="/opt/tool/bin:$PATH"; eval "$1"',
     'login',
   ],
 };
@@ -32,8 +35,17 @@ describe('captureScript + parseCapture on this host', () => {
     expect(e).not.toBeNull();
     expect(e!.plain.FROM_PROFILE).toBeUndefined();
     expect(e!.login.FROM_PROFILE).toBe('yes');
+    expect(e!.login.NOISE).toBeUndefined();
     expect(e!.login.PATH).toBe('/opt/tool/bin:/usr/bin:/bin');
     expect(e!.plain.HOME).toBe('/home/t');
+  });
+  it('a plain variable that holds the capture script itself (a forced command over ssh) cuts nothing', () => {
+    const script = captureScript(fakeLogin);
+    const e = parseCapture(run(script, { SSH_ORIGINAL_COMMAND: script }));
+    expect(e!.plain.HOME).toBe('/home/t');
+    expect(e!.plain.SSH_ORIGINAL_COMMAND).toBe(script);
+    expect(e!.login.FROM_PROFILE).toBe('yes');
+    expect(e!.login.PATH).toBe('/opt/tool/bin:/usr/bin:/bin');
   });
   it('keeps a value with a newline and quotes whole (NUL form)', () => {
     const e = parseCapture(run(captureScript(fakeLogin), { ODD: "a\nb'c" }));
@@ -52,7 +64,7 @@ describe('parseCapture', () => {
       'two',
       '',
       ENV_LOGIN,
-      'noise',
+      'NOISE=1',
       '__MCPROC_ENVL__',
       'A=1',
       'B=2',
