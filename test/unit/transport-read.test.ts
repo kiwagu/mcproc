@@ -4,6 +4,7 @@ import {
   clearLoginEnvCache,
 } from '../../src/transport/index.js';
 import { ENV_PLAIN, ENV_LOGIN } from '../../src/transport/loginenv.js';
+import { McprocError } from '../../src/core/errors.js';
 import { shjoin } from '../../src/transport/quote.js';
 import type { Host } from '../../src/core/manifest.js';
 import type { ExecResult, Spawner } from '../../src/transport/types.js';
@@ -50,10 +51,12 @@ function world(answer: (argv: string[]) => Partial<ExecResult> = () => ({})) {
   let captures = 0;
   let captureOut = captured(PLAIN, LOGIN);
   let captureCode = 0;
+  let onCapture: () => void = () => {};
   const spawner: Spawner = async (argv, opts) => {
     const cmd = argv[argv.length - 1];
     if (cmd.includes(ENV_PLAIN)) {
       captures++;
+      onCapture();
       return { code: captureCode, stdout: captureOut, stderr: '' };
     }
     calls.push({ argv, env: opts.env });
@@ -67,6 +70,10 @@ function world(answer: (argv: string[]) => Partial<ExecResult> = () => ({})) {
     setCapture: (s: string, code = 0) => {
       captureOut = s;
       captureCode = code;
+    },
+    /** runs on every capture before it answers: it may move the clock or throw */
+    onCapture: (f: () => void) => {
+      onCapture = f;
     },
     clock: () => t,
     advance: (ms: number) => {
@@ -183,6 +190,61 @@ describe('Transport.read', () => {
     await t.read('a');
     expect(w.calls[0].argv).toEqual(['/bin/bash', '-lc', 'a']);
     expect(t.readMode()).toMatchObject({ shell: 'host' });
+  });
+  it('a capture that times out waits its 30 s from when it gave up, not from when it began', async () => {
+    const w = world();
+    w.onCapture(() => {
+      w.advance(30_000);
+      throw new McprocError('TIMEOUT', 'Command timed out after 30000 ms');
+    });
+    const t = createTransport(local, w.spawner, undefined, w.clock);
+    await t.read('a');
+    w.advance(1_000);
+    await t.read('b');
+    await Promise.all([t.read('c'), t.read('d')]);
+    expect(w.captures()).toBe(1);
+    expect(w.calls.map((c) => c.argv[0])).toEqual([
+      '/bin/bash',
+      '/bin/bash',
+      '/bin/bash',
+      '/bin/bash',
+    ]);
+    expect(t.readMode()).toMatchObject({ shell: 'host' });
+  });
+  it('a plain sh that cannot start with the login environment: the host shell, with no second capture', async () => {
+    const w = world((argv) =>
+      argv[0] === '/bin/bash' ? { stdout: 'via login' } : {}
+    );
+    const spawner: Spawner = async (argv, opts) => {
+      if (argv[0] === 'sh' && opts.env)
+        throw new McprocError(
+          'TRANSPORT_FAILED',
+          'Cannot spawn sh: spawn sh ENOENT'
+        );
+      return w.spawner(argv, opts);
+    };
+    const t = createTransport(local, spawner, undefined, w.clock);
+    expect((await t.read('a')).stdout).toBe('via login');
+    expect(w.calls.map((c) => c.argv)).toEqual([['/bin/bash', '-lc', 'a']]);
+    expect(t.readMode()).toMatchObject({
+      shell: 'host',
+      reason: expect.stringContaining('Cannot spawn sh'),
+    });
+    expect(w.captures()).toBe(1);
+    expect((await t.read('b')).stdout).toBe('via login');
+    expect(w.captures()).toBe(1);
+    expect(w.calls.at(-1)!.argv).toEqual(['/bin/bash', '-lc', 'b']);
+  });
+  it('a plain read that times out fails as it would through the host shell', async () => {
+    const w = world();
+    const spawner: Spawner = async (argv, opts) => {
+      if (argv[0] === 'sh' && opts.env)
+        throw new McprocError('TIMEOUT', 'Command timed out after 30000 ms');
+      return w.spawner(argv, opts);
+    };
+    const t = createTransport(local, spawner, undefined, w.clock);
+    await expect(t.read('a')).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(w.calls).toEqual([]);
   });
   it('a plain host shell: read is exec, nothing is captured', async () => {
     const w = world();

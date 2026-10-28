@@ -1,5 +1,5 @@
 import type { Host } from '../core/manifest.js';
-import { McprocError } from '../core/errors.js';
+import { isMcprocError, McprocError } from '../core/errors.js';
 import {
   CAPTURE_RETRY_MS,
   captureScript,
@@ -147,12 +147,14 @@ export function createTransport(
   };
   const capture = (s: Slot): Promise<Entry> => {
     s.entry = (async (): Promise<Entry> => {
-      const at = clock();
+      // an entry holds from when its capture settled: one that timed out would otherwise be stale on arrival, and a
+      // host whose shell hangs would pay the whole timeout on every read
       try {
         const res = await spawner(
           buildArgv(host, captureScript(host.shell), PLAIN_SH),
           { timeoutMs: DEFAULT_TIMEOUT_MS }
         );
+        const at = clock();
         // only a capture that ran to its end counts: a dump cut short, or a login PATH without `env`, still parses,
         // as an environment with variables missing
         const env = res.code === 0 ? parseCapture(res.stdout) : null;
@@ -165,6 +167,7 @@ export function createTransport(
               reason: `${host.shell.bin} printed no environment (exit ${res.code})`,
             };
       } catch (e) {
+        const at = clock();
         return {
           env: null,
           at,
@@ -206,6 +209,36 @@ export function createTransport(
         ...(host.local ? { env: childEnv(env) } : {}),
       }
     );
+  /** this host's reads go through its own shell for LOGIN_ENV_TTL_MS, this one first */
+  const fallBack = (reason: string, cmd: string, opts: ReadOptions) => {
+    const at = clock();
+    const fallback: Entry = {
+      env: null,
+      at,
+      until: at + LOGIN_ENV_TTL_MS,
+      reason,
+    };
+    slotOf().entry = Promise.resolve(fallback);
+    note(fallback);
+    return exec(cmd, opts);
+  };
+  /**
+   * The read in plain sh, or why plain sh could not even start: the login PATH may lack sh's own directory, and the
+   * spawn resolves sh through it. A timeout or any other failure is the read's own, as it would be through exec.
+   */
+  const tryPlain = async (
+    env: LoginEnv,
+    cmd: string,
+    opts: ReadOptions
+  ): Promise<ExecResult | string> => {
+    try {
+      return await plain(env, cmd, opts);
+    } catch (err) {
+      if (isMcprocError(err) && err.code === 'TRANSPORT_FAILED')
+        return `plain sh did not start with the login environment: ${err.message.split('\n')[0]}`;
+      throw err;
+    }
+  };
   return {
     describe: () => describeHost(host),
     exec,
@@ -215,7 +248,9 @@ export function createTransport(
       let e = await current();
       note(e);
       if (!e.env) return exec(cmd, opts);
-      const res = await plain(e.env, cmd, opts);
+      // a plain sh that does not start is the environment's fault: reading it again would bring the same one back
+      const res = await tryPlain(e.env, cmd, opts);
+      if (typeof res === 'string') return fallBack(res, cmd, opts);
       if (!retryIf(res)) return res;
       const s = slotOf();
       // a failure reads the environment again at most once per LOGIN_ENV_TTL_MS: a host that lacks the command for
@@ -225,20 +260,16 @@ export function createTransport(
         e = await capture(s);
         note(e);
         if (e.env) {
-          const again = await plain(e.env, cmd, opts);
+          const again = await tryPlain(e.env, cmd, opts);
+          if (typeof again === 'string') return fallBack(again, cmd, opts);
           if (!retryIf(again)) return again;
         }
       }
-      const at = clock();
-      const fallback: Entry = {
-        env: null,
-        at,
-        until: at + LOGIN_ENV_TTL_MS,
-        reason: 'a read did not work in plain sh with the login environment',
-      };
-      s.entry = Promise.resolve(fallback);
-      note(fallback);
-      return exec(cmd, opts);
+      return fallBack(
+        'a read did not work in plain sh with the login environment',
+        cmd,
+        opts
+      );
     },
     async loginEnv() {
       if (plainHost) return null;
