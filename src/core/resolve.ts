@@ -9,7 +9,13 @@ import {
   type Host,
   type Manifest,
 } from './manifest.js';
-import { Pm2Client, resolvePm2Bin, type Pm2Resolution } from './pm2.js';
+import {
+  Pm2Client,
+  resolvePm2Bin,
+  type DaemonLister,
+  type Pm2Resolution,
+} from './pm2.js';
+import { listDaemon } from './pm2socket.js';
 import { recordProject } from './registry.js';
 import { createTransport } from '../transport/index.js';
 import type { Spawner, Transport } from '../transport/types.js';
@@ -105,6 +111,20 @@ export function prepare(opts: {
   return { manifest, host: pickHost(manifest, opts.host) };
 }
 
+/**
+ * How a host's pm2 list is read: over the daemon's socket on this machine, unless a hosts.local.pm2 wrapper stands in
+ * for pm2 (mcproc cannot know what it wraps) or a test injected a spawner (its fake world has no daemon of ours).
+ */
+export function daemonFor(
+  host: Host,
+  resolution: Pm2Resolution,
+  spawner?: Spawner
+): DaemonLister | null {
+  return host.local && resolution.source !== 'explicit' && !spawner
+    ? listDaemon
+    : null;
+}
+
 const cache = new Map<string, Pm2Resolution>();
 export function clearResolutionCache(): void {
   cache.clear();
@@ -123,6 +143,8 @@ export async function connect(
     fresh?: boolean;
     fallback?: string;
     hereCheck?: HereCheck;
+    /** how the pm2 list is read, in place of daemonFor's choice (tests) */
+    daemon?: DaemonLister | null;
   } = {}
 ): Promise<Context> {
   const transport = createTransport(prep.host, opts.spawner);
@@ -136,7 +158,10 @@ export async function connect(
     transport,
     prep.host,
     resolution.bin,
-    prep.host.pm2_home
+    prep.host.pm2_home,
+    opts.daemon !== undefined
+      ? opts.daemon
+      : daemonFor(prep.host, resolution, opts.spawner)
   );
   return {
     manifest: scopeManifest(
@@ -155,14 +180,22 @@ export async function connect(
 /** A link to one host's pm2 for reading a whole daemon: the pm2 it would use, found the way connect finds it. */
 export async function connectHost(
   host: Host,
-  opts: { spawner?: Spawner } = {}
+  opts: { spawner?: Spawner; daemon?: DaemonLister | null } = {}
 ): Promise<HostLink> {
   const transport = createTransport(host, opts.spawner);
   const resolution = await resolvePm2Bin(host, transport);
   return {
     host,
     transport,
-    pm2: new Pm2Client(transport, host, resolution.bin, host.pm2_home),
+    pm2: new Pm2Client(
+      transport,
+      host,
+      resolution.bin,
+      host.pm2_home,
+      opts.daemon !== undefined
+        ? opts.daemon
+        : daemonFor(host, resolution, opts.spawner)
+    ),
   };
 }
 

@@ -24,10 +24,12 @@ function descendants(root: number): number[] {
   return out;
 }
 
-export const nodeSpawner: Spawner = (argv, { stdin, timeoutMs }) =>
+export const nodeSpawner: Spawner = (argv, { stdin, timeoutMs, env }) =>
   new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       stdio: ['pipe', 'pipe', 'pipe'],
+      // a read on this machine runs with the host's login environment; otherwise this process's own
+      ...(env ? { env } : {}),
     });
     let out = '',
       err = '',

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest, type Manifest } from '../../src/core/manifest.js';
-import { doctor } from '../../src/core/doctor.js';
+import { doctor, type DoctorReport } from '../../src/core/doctor.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
 import { renderDoctor } from '../../src/mcp/render.js';
 import type { Spawner } from '../../src/transport/types.js';
@@ -513,5 +513,82 @@ describe('doctor: environment and urls', () => {
     expect(renderDoctor([box])).toContain(
       '  url web: localhost → ::1 on box; answers from this machine (200); on box: no curl or wget'
     );
+  });
+});
+
+describe('renderDoctor: the daemon and how reads run', () => {
+  const rep: DoctorReport = {
+    host: 'local',
+    transport: 'local',
+    reachable: true,
+    error: null,
+    node: 'v22.1.0',
+    pm2: {
+      source: 'path',
+      bin: 'pm2',
+      version: '7.0.4',
+      reason: 'pm2 on the login-shell PATH',
+    },
+    tools: { ps: true, ss: true, tar: true },
+    pm2_home: null,
+    runtime_dir: '/p/.mcproc/runtime',
+    runtime_present: false,
+    runtime_pm2: null,
+    runtime_node: null,
+    daemon: 'answers',
+    processes: 2,
+    in_namespace: 1,
+    state_dir: null,
+    watcher: null,
+    memory: null,
+    recommendations: [],
+    environment: null,
+    urls: [],
+    reads: null,
+  };
+  it('a daemon that does not run', () => {
+    expect(
+      renderDoctor([
+        { ...rep, daemon: 'not-running', processes: 0, in_namespace: 0 },
+      ])
+    ).toContain('daemon: not running');
+  });
+  it('reads in plain sh, or through the host shell and why; nothing before any read', () => {
+    expect(
+      renderDoctor([
+        { ...rep, reads: { shell: 'plain', age_s: 3, reason: null } },
+      ])
+    ).toContain(
+      '\n  reads: plain sh with the login environment (read 3 s ago)'
+    );
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          reads: {
+            shell: 'host',
+            age_s: null,
+            reason: 'the host shell is a plain sh',
+          },
+        },
+      ])
+    ).toContain('\n  reads: the host shell (the host shell is a plain sh)');
+    expect(renderDoctor([rep])).not.toContain('reads:');
+  });
+  it('doctor says how the reads ran on a host it reached; an unreachable host has no reads', async () => {
+    const [local, stand] = await doctor(
+      loadManifest(basic),
+      undefined,
+      spawner,
+      neverHere
+    );
+    // the fake world prints no login environment, so the reads went through the host shell
+    expect(local.reads).toMatchObject({
+      shell: 'host',
+      // whole seconds since the capture: 0 unless the run crossed a second
+      age_s: expect.any(Number),
+      reason: expect.stringContaining('printed no environment'),
+    });
+    expect(stand.reads).toBeNull();
   });
 });

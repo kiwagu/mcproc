@@ -385,11 +385,17 @@ export function renderDoctor(reps: DoctorReport[]): string {
           `  node: ${r.node ?? 'missing'}  tools: ps=${r.tools.ps} ss=${r.tools.ss} tar=${r.tools.tar}`
         );
         L.push(
-          `  pm2: ${r.pm2 ? `${r.pm2.source} (${r.pm2.reason})${r.pm2.version ? ` ${r.pm2.version}` : ''}` : 'none'}  daemon: ${r.daemon}, ${r.processes} processes, ${r.in_namespace} in this project`
+          `  pm2: ${r.pm2 ? `${r.pm2.source} (${r.pm2.reason})${r.pm2.version ? ` ${r.pm2.version}` : ''}` : 'none'}  daemon: ${r.daemon === 'not-running' ? 'not running' : r.daemon}, ${r.processes} processes, ${r.in_namespace} in this project`
         );
         L.push(
           `  PM2_HOME: ${r.pm2_home ?? 'default (~/.pm2)'}  runtime: ${r.runtime_present ? `${r.runtime_dir} (pm2 ${r.runtime_pm2 ?? '?'}${r.runtime_node ? `, node ${r.runtime_node}` : ''})` : 'not unpacked'}`
         );
+        if (r.reads)
+          L.push(
+            r.reads.shell === 'plain'
+              ? `  reads: plain sh with the login environment (read ${r.reads.age_s} s ago)`
+              : `  reads: the host shell (${r.reads.reason})`
+          );
         if (r.runtime_present)
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`

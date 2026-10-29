@@ -152,6 +152,40 @@ export function urlSection(urls: string[], env = urls.length > 0): string[] {
   ];
 }
 
+/** pm2's list and its exit status, after the JLIST marker. */
+export const jlistLines = (pm2Bin: string): string[] => [
+  `echo ${MARK.JLIST}`,
+  `${pm2Bin} jlist 2>/dev/null; echo "${MARK.JLIST_RC} $?"`,
+];
+
+/**
+ * The listeners: ss where it works, else /proc/net. `withPids` asks ss for the processes (-p, a walk over every
+ * process's fds) and adds the fd scan /proc needs to name them; without it only the ports are listed.
+ */
+export const listenerLines = (withPids: boolean): string[] => {
+  const p = withPids ? 'p' : '';
+  return [
+    // F=1 once /proc is used for either protocol: an ss that is missing or fails (old iproute2) must not read as "no listeners"
+    `F=0`,
+    `echo ${MARK.TCP}`,
+    `if command -v ss >/dev/null 2>&1 && T=$(ss -ltn${p} 2>/dev/null); then printf '%s\\n' "$T"; else F=1; echo ${MARK.PROC}; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; fi`,
+    `echo ${MARK.UDP}`,
+    `if [ "$F" = 0 ] && U=$(ss -lun${p} 2>/dev/null); then printf '%s\\n' "$U"; else F=1; echo ${MARK.PROC}; cat /proc/net/udp /proc/net/udp6 2>/dev/null; fi`,
+    ...(withPids
+      ? [`echo ${MARK.FD}`, `if [ "$F" = 1 ]; then ${FD_SCAN}; fi`]
+      : []),
+  ];
+};
+
+/** What a listening wait reads on a tick: pm2's list unless it comes from the socket, and the ports that listen, without their processes. */
+export function listenScript(pm2Bin: string, jlist: boolean): string {
+  return [
+    ...(jlist ? jlistLines(pm2Bin) : []),
+    `echo ${MARK.CLOCK}`,
+    ...listenerLines(false),
+  ].join('\n');
+}
+
 /** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, the host's
  * memory (/proc/meminfo), the memory of the declared `containers` that run (docker stats, only when names are given), and one HTTP
  * request per declared url, with the host's environment (container, hostname, own addresses) when there is one. `metrics: false` is the light form
@@ -163,24 +197,18 @@ export function probeScript(
     urls?: string[];
     metrics?: boolean;
     containers?: string[];
+    /** false: no pm2 list, for a host whose daemon is listed over its socket */
+    jlist?: boolean;
   } = {}
 ): string {
   return [
-    `echo ${MARK.JLIST}`,
-    `${pm2Bin} jlist 2>/dev/null; echo "${MARK.JLIST_RC} $?"`,
+    ...(opts.jlist === false ? [] : jlistLines(pm2Bin)),
     // pm2 keeps start times as epoch ms and stamps log lines in the host's wall time: the offset turns one into the other
     `echo ${MARK.CLOCK}`,
     `date '+%z' 2>/dev/null`,
     `echo ${MARK.PS}`,
     `if command -v ps >/dev/null 2>&1; then ps -eo pid,ppid 2>/dev/null || ps -o pid,ppid 2>/dev/null; else ${PS_FALLBACK}; fi`,
-    // F=1 once /proc is used for either protocol: an ss that is missing or fails (old iproute2) must not read as "no listeners"
-    `F=0`,
-    `echo ${MARK.TCP}`,
-    `if command -v ss >/dev/null 2>&1 && T=$(ss -ltnp 2>/dev/null); then printf '%s\\n' "$T"; else F=1; echo ${MARK.PROC}; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; fi`,
-    `echo ${MARK.UDP}`,
-    `if [ "$F" = 0 ] && U=$(ss -lunp 2>/dev/null); then printf '%s\\n' "$U"; else F=1; echo ${MARK.PROC}; cat /proc/net/udp /proc/net/udp6 2>/dev/null; fi`,
-    `echo ${MARK.FD}`,
-    `if [ "$F" = 1 ]; then ${FD_SCAN}; fi`,
+    ...listenerLines(true),
     ...(opts.metrics === false
       ? []
       : [

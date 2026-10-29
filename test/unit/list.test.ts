@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
-import { MARK } from '../../src/shell/snippets.js';
+import { MARK, listenScript, probeScript } from '../../src/shell/snippets.js';
+import { Pm2Client } from '../../src/core/pm2.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
@@ -20,10 +21,12 @@ import {
   describeProject,
   snapshot,
   probeHost,
+  listenCheck,
   deriveSnapshot,
   rowsFor,
   statusWord,
   unreachableRow,
+  probeRetry,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -972,5 +975,154 @@ describe('queued and starting rows', () => {
       else process.env.MCPROC_STATE_DIR = prev;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+// stopped: no uptime, so two normalizations of it are equal whenever they run
+const RAW = {
+  pid: 0,
+  name: 'p-web',
+  pm_id: 0,
+  pm2_env: { status: 'stopped', namespace: 'p', pm_uptime: 1000 },
+};
+const quiet = { cpuSample: false, metrics: false, urls: [], containers: [] };
+describe('the probe beside the socket', () => {
+  it('probeScript without jlist has no jlist section and keeps the clock; the default is unchanged', () => {
+    expect(probeScript('pm2', { jlist: false })).not.toContain(MARK.JLIST);
+    expect(probeScript('pm2', { jlist: false })).toContain(MARK.CLOCK);
+    expect(probeScript('pm2')).toContain(MARK.JLIST);
+  });
+  it('a link that lists over the socket: one read without jlist, the procs from the socket', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        RAW,
+      ]),
+    };
+    const p = await probeHost(link, quiet);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].read).toBe(true);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
+    expect(p.procs.map((x) => x.name)).toEqual(['p-web']);
+  });
+  it('that probe without the clock marker: the shell did not run it', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: { code: 2, stdout: '', stderr: 'sh: 1: syntax error' },
+      },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => []),
+    };
+    await expect(probeHost(link, quiet)).rejects.toMatchObject({
+      code: 'TRANSPORT_FAILED',
+    });
+  });
+  it('no daemon: no process, and pm2 was never asked', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const c = {
+      ...ctx,
+      pm2: new Pm2Client(
+        ctx.fake,
+        ctx.host,
+        'pm2',
+        '/h/.pm2',
+        async () => null
+      ),
+    };
+    const snap = await snapshot(c, { urls: 'none', leases: 'none' });
+    expect(snap.procs).toEqual([]);
+    expect(ctx.fake.calls.some((x) => /'jlist'/.test(x.cmd))).toBe(false);
+    // nor did the probe script carry its own jlist section
+    expect(ctx.fake.calls.some((x) => x.cmd.includes(MARK.JLIST))).toBe(false);
+  });
+});
+
+describe('the listening pre-check', () => {
+  it('listenScript asks ss for ports only: no -p, no fd scan; jlist only when asked', () => {
+    const s = listenScript('pm2', false);
+    expect(s).toContain('ss -ltn 2>');
+    expect(s).toContain('ss -lun 2>');
+    expect(s).not.toContain('-ltnp');
+    expect(s).not.toContain(MARK.FD);
+    expect(s).not.toContain(MARK.JLIST);
+    expect(listenScript('pm2', true)).toContain(MARK.JLIST);
+  });
+  it('listenCheck: the ports that listen, whoever holds them, and the list from the script', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: {
+          stdout: probeOut({
+            jlist: JSON.stringify([RAW]),
+            tcp: 'LISTEN 0 511 *:3010 *:*\n',
+          }),
+        },
+      },
+    ]);
+    const c = await listenCheck(ctx);
+    expect([...c.ports]).toEqual([3010]);
+    expect(c.procs.map((p) => p.name)).toEqual(['p-web']);
+  });
+  it('listenCheck: /proc/net where ss is missing gives the same ports', async () => {
+    // 0BC2 = 3010, state 0A = LISTEN
+    const proc = `${MARK.PROC}\n  sl  local_address rem_address   st\n   0: 00000000:0BC2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242\n`;
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({ tcp: proc }) } },
+    ]);
+    expect([...(await listenCheck(ctx)).ports]).toEqual([3010]);
+  });
+  it('listenCheck over the socket: one plain read without jlist, the list from the socket', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: { stdout: probeOut({ tcp: 'LISTEN 0 511 *:3010 *:*\n' }) },
+      },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        RAW,
+      ]),
+    };
+    const c = await listenCheck(link);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].read).toBe(true);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
+    expect([...c.ports]).toEqual([3010]);
+    expect(c.procs.map((p) => p.name)).toEqual(['p-web']);
+  });
+});
+
+describe('probeRetry', () => {
+  const res = (stdout: string) => ({ code: 0, stdout, stderr: '' });
+  it.each([
+    { what: 'a good probe', stdout: probeOut({ jlist: '[]' }), retry: false },
+    {
+      what: 'a probe whose pm2 exited non-zero',
+      stdout: probeOut({ rc: 1 }),
+      retry: false,
+    },
+    {
+      what: 'no JLIST marker (the plain shell did not run it)',
+      stdout: 'sh: 1: oops\n',
+      retry: true,
+    },
+    { what: 'an empty answer', stdout: '', retry: true },
+    {
+      what: 'pm2 not found in plain sh (JLIST_RC 127)',
+      stdout: probeOut({ rc: 127 }),
+      retry: true,
+    },
+  ])('$what: retry $retry', ({ stdout, retry }) => {
+    expect(probeRetry(res(stdout))).toBe(retry);
   });
 });

@@ -316,6 +316,9 @@ function counted(t: Transport) {
   const scripts: string[] = [];
   const wrapped: Transport = {
     ...t,
+    read: (c, o) => t.exec(c, o),
+    loginEnv: async () => null,
+    readMode: () => null,
     stream: (cmd) => {
       scripts.push(cmd);
       const p = t.stream!(cmd);
@@ -386,12 +389,16 @@ describe('a remote follower', () => {
     fs.writeFileSync(files.err, '');
     const real = createTransport(stand);
     let execs = 0;
+    const exec: Transport['exec'] = (cmd, o) => {
+      execs++;
+      return real.exec(cmd, o);
+    };
     const transport: Transport = {
       ...real,
-      exec: (cmd, o) => {
-        execs++;
-        return real.exec(cmd, o);
-      },
+      exec,
+      read: (c, o) => exec(c, o),
+      loginEnv: async () => null,
+      readMode: () => null,
     };
     const ctx = { ...fakeCtx(basic, 'local', []), host: stand, transport };
     const f = new LogFollower(ctx, files, 5);
@@ -414,20 +421,24 @@ describe('a follower fed by both reads', () => {
   it('a shell read the stream overtook meanwhile is not applied twice', async () => {
     let release: (stdout: string) => void = () => {};
     let calls = 0;
+    const exec: Transport['exec'] = () =>
+      new Promise((resolve) => {
+        calls++;
+        if (calls === 1)
+          resolve({
+            code: 0,
+            stdout:
+              '__MCPROC_LF_out__\n6 0 H\nfirst\n__MCPROC_LF_err__\n0 0 H\n',
+            stderr: '',
+          });
+        else release = (stdout) => resolve({ code: 0, stdout, stderr: '' });
+      });
     const transport: Transport = {
       describe: () => 'stand',
-      exec: () =>
-        new Promise((resolve) => {
-          calls++;
-          if (calls === 1)
-            resolve({
-              code: 0,
-              stdout:
-                '__MCPROC_LF_out__\n6 0 H\nfirst\n__MCPROC_LF_err__\n0 0 H\n',
-              stderr: '',
-            });
-          else release = (stdout) => resolve({ code: 0, stdout, stderr: '' });
-        }),
+      exec,
+      read: (c, o) => exec(c, o),
+      loginEnv: async () => null,
+      readMode: () => null,
     };
     const ctx = { ...fakeCtx(basic, 'local', []), host: stand, transport };
     const f = new LogFollower(ctx, { out: '/l/out.log', err: '/l/err.log' }, 5);

@@ -2,9 +2,14 @@ import { McprocError } from './errors.js';
 import { watcherIn } from './leases/view.js';
 import { type Host, type Manifest, scopeManifest } from './manifest.js';
 import { type HostMemory, parseMeminfo } from './memory.js';
-import { Pm2Client, resolvePm2Bin, runtimeDir } from './pm2.js';
+import {
+  Pm2Client,
+  type Pm2Resolution,
+  resolvePm2Bin,
+  runtimeDir,
+} from './pm2.js';
 import { parseUrlProbe } from './ports.js';
-import { pickHost } from './resolve.js';
+import { daemonFor, pickHost } from './resolve.js';
 import { stateDir } from './state.js';
 import {
   checkHere,
@@ -58,7 +63,8 @@ export interface DoctorReport {
   runtime_present: boolean;
   runtime_pm2: string | null;
   runtime_node: string | null;
-  daemon: 'answers' | 'error' | 'unknown';
+  /** answers: pm2 listed its processes; not-running: no daemon at its home (only the socket can tell) */
+  daemon: 'answers' | 'not-running' | 'error' | 'unknown';
   processes: number;
   in_namespace: number;
   /** the state directory that holds this machine's leases; null on another host */
@@ -71,6 +77,12 @@ export interface DoctorReport {
   /** the host's own account of itself (container, hostname, own addresses); null when not read */
   environment: HostEnv | null;
   urls: DoctorUrl[];
+  /** how mcproc's reads run there: plain sh with the login environment (read age_s ago), or the host shell and why; null before any read */
+  reads: {
+    shell: 'plain' | 'host';
+    age_s: number | null;
+    reason: string | null;
+  } | null;
 }
 
 const MARKER = '__MCPROC_DOCTOR__';
@@ -107,6 +119,7 @@ export async function doctorHost(
     recommendations: [],
     environment: null,
     urls: [],
+    reads: null,
   };
   const probe = [
     `echo ${MARKER}`,
@@ -169,32 +182,36 @@ export async function doctorHost(
     );
     return r;
   }
+  let resolution: Pm2Resolution | null = null;
   try {
-    const res = await resolvePm2Bin(host, transport);
+    resolution = await resolvePm2Bin(host, transport);
     r.pm2 = {
-      source: res.source,
-      bin: res.bin,
-      version: res.pm2Version,
-      reason: res.reason,
+      source: resolution.source,
+      bin: resolution.bin,
+      version: resolution.pm2Version,
+      reason: resolution.reason,
     };
   } catch (e) {
     r.recommendations.push(
       `no usable pm2: ${(e as Error).message}. Run unpack for this host (brings pm2 along), or set hosts.${host.name}.pm2`
     );
   }
-  if (r.pm2) {
+  if (resolution) {
     try {
       const procs = await new Pm2Client(
         transport,
         host,
-        r.pm2.bin,
-        host.pm2_home
-      ).jlist();
-      r.daemon = 'answers';
-      r.processes = procs.length;
-      r.in_namespace = procs.filter((p) => p.namespace === m.project).length;
-      if (host.local) r.watcher = watcherIn(procs);
-      if (procs.length === 0)
+        resolution.bin,
+        host.pm2_home,
+        daemonFor(host, resolution, spawner)
+      ).daemonList();
+      r.daemon = procs === null ? 'not-running' : 'answers';
+      r.processes = procs?.length ?? 0;
+      r.in_namespace = (procs ?? []).filter(
+        (p) => p.namespace === m.project
+      ).length;
+      if (host.local) r.watcher = watcherIn(procs ?? []);
+      if (!procs?.length)
         r.recommendations.push(
           `pm2 daemon is empty here: if ${m.project} should already run on this host under another user or PM2_HOME, set hosts.${host.name}.pm2_home`
         );
@@ -203,6 +220,13 @@ export async function doctorHost(
       r.recommendations.push(`pm2 jlist failed: ${(e as Error).message}`);
     }
   }
+  // the resolution read, and so may the list: how reads run on this host now
+  const mode = transport.readMode();
+  r.reads = mode && {
+    shell: mode.shell,
+    age_s: mode.at === null ? null : Math.round((Date.now() - mode.at) / 1000),
+    reason: mode.reason,
+  };
   const major = Number(/^v(\d+)/.exec(r.node ?? '')?.[1] ?? 0);
   if (major < 18)
     r.recommendations.push(
@@ -341,6 +365,7 @@ export async function doctor(
         recommendations: [],
         environment: null,
         urls: [],
+        reads: null,
       });
     }
   }

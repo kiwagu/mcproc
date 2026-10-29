@@ -20,7 +20,7 @@ import {
 } from '../../src/core/wait.js';
 import { snapshot, type Snapshot } from '../../src/core/list.js';
 import { loadManifest } from '../../src/core/manifest.js';
-import { parseJlist, type Pm2Process } from '../../src/core/pm2.js';
+import { parseJlist, Pm2Client, type Pm2Process } from '../../src/core/pm2.js';
 import type { AppPorts } from '../../src/core/ports.js';
 import { EMPTY_STATS } from '../../src/core/stats.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
@@ -74,6 +74,11 @@ function harness(probes: string[], jlists: string[] = probes) {
   const deps: WaitDeps = {
     jlist: (c) => c.pm2.jlist(),
     snapshot: (c, o) => snapshot(c, o),
+    // every declared port listens: the light probe decides, as it did before the pre-check
+    listening: async (c) => ({
+      procs: [],
+      ports: new Set(Object.values(c.manifest.apps).flatMap((a) => a.ports)),
+    }),
     follower: () => {
       throw new Error('not used here');
     },
@@ -143,6 +148,10 @@ const fakeDeps = (over: Partial<WaitDeps> = {}): WaitDeps => {
   return {
     jlist: async () => [],
     snapshot: async () => snapWith(),
+    listening: async (c) => ({
+      procs: [],
+      ports: new Set(Object.values(c.manifest.apps).flatMap((a) => a.ports)),
+    }),
     follower: () => {
       throw new Error('not used here');
     },
@@ -1237,6 +1246,9 @@ describe('waitFor: url-ok follows the url_check decision', () => {
     const deps: WaitDeps = {
       jlist: (c) => c.pm2.jlist(),
       snapshot: (c, o) => snapshot(c, o),
+      listening: async () => {
+        throw new Error('not used here');
+      },
       follower: () => {
         throw new Error('not used here');
       },
@@ -1908,5 +1920,138 @@ describe('waitFor: a start that is queued (lease-aware)', () => {
       else process.env.MCPROC_STATE_DIR = prev;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('waitFor: the listening pre-check', () => {
+  const online = jl(proc('api', 'online'));
+  const pre = (procs: ReturnType<typeof proc>[], ports: number[]) => ({
+    procs: parseJlist(JSON.stringify(procs)),
+    ports: new Set(ports),
+  });
+  it('ticks whose ports do not all listen skip the light probe', async () => {
+    const h = harness([probe(proc('api', 'online'), ss(3100, 101))]);
+    const seq = [
+      pre([proc('api', 'online')], []),
+      pre([proc('api', 'online')], []),
+      pre([proc('api', 'online')], [3100]),
+    ];
+    let i = 0;
+    h.deps.listening = async () => seq[Math.min(i++, seq.length - 1)];
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({ ok: true, waited_ms: 1000 });
+    expect(h.calls.probes).toBe(1);
+    expect(h.calls.slept).toEqual([500, 500]);
+  });
+  it('a process that dies before its port listens ends the wait at the pre-check', async () => {
+    const h = harness([probe(proc('api', 'online'))]);
+    h.deps.listening = async () =>
+      pre([proc('api', 'errored', { exit_code: 1 })], []);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps }
+    );
+    expect(r).toMatchObject({
+      ok: false,
+      reason: 'crashed',
+      status: 'errored',
+    });
+    expect(h.calls.probes).toBe(0);
+  });
+  it('a wait that times out on a pre-check tick looks once with the light probe', async () => {
+    const h = harness([probe(proc('api', 'online'))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], []);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.observed).toBe('status online, :3100 ✗ nothing listens');
+    // the pre-check ticks never probed; the giving-up tick did, once
+    expect(h.calls.probes).toBe(1);
+  });
+  it('a timeout on a pre-check tick still names the port the app took instead (undeclared)', async () => {
+    // api (pid 100) listens on 3105 through its child 101, never on its declared 3100
+    const h = harness([probe(proc('api', 'online'), ss(3105, 101))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], [3105]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout', status: 'online' });
+    expect(r.observed).toBe(
+      'status online, :3100 ✗ nothing listens, :3105 (undeclared)'
+    );
+    expect(h.calls.probes).toBe(1);
+  });
+  it('an aborted wait on a pre-check tick names the undeclared port too', async () => {
+    const h = harness([probe(proc('api', 'online'), ss(3105, 101))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], [3105]);
+    const ac = new AbortController();
+    h.deps.sleep = async () => ac.abort();
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, signal: ac.signal }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'aborted' });
+    expect(r.observed).toContain(':3105 (undeclared)');
+    expect(h.calls.probes).toBe(1);
+  });
+  it("a giving-up probe that fails keeps the pre-check's own text", async () => {
+    const h = harness([probe(proc('api', 'online'))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], []);
+    h.deps.snapshot = async () => {
+      throw new Error('probe failed');
+    };
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.observed).toBe('status online, :3100 ✗ nothing listens');
+  });
+  it('a port held by another process passes the pre-check and still times out', async () => {
+    const h = harness([probe(proc('api', 'online'), ss(3100, 999))]);
+    h.deps.listening = async () => pre([proc('api', 'online')], [3100]);
+    const r = await waitFor(
+      h.ctx,
+      'api',
+      { kind: 'listening' },
+      { deps: h.deps, timeoutMs: 1200 }
+    );
+    expect(r).toMatchObject({ ok: false, reason: 'timeout' });
+    expect(r.observed).toContain(':3100 ✗ held by pid 999');
+  });
+  it('log: with the list over the socket, the process is checked every tick, not every 5 s', async () => {
+    const f = fakeFollower([{}]);
+    const h = harness([], []);
+    const answers = [online, jl(proc('api', 'stopped', { exit_code: 1 }))];
+    let i = 0;
+    const ctx = {
+      ...h.ctx,
+      pm2: new Pm2Client(h.ctx.fake, h.ctx.host, 'pm2', '/h/.pm2', async () =>
+        JSON.parse(answers[Math.min(i++, answers.length - 1)])
+      ),
+    };
+    const r = await waitFor(ctx, 'api', parseUntil('log:never'), {
+      deps: { ...h.deps, follower: () => f },
+    });
+    expect(r).toMatchObject({ ok: false, reason: 'exited', exit_code: 1 });
+    expect(r.waited_ms).toBe(1000); // one look at the start, one after the first 1 s tick
   });
 });

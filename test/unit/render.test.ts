@@ -436,6 +436,7 @@ describe('renderDoctor', () => {
         recommendations: [],
         environment: null,
         urls: [],
+        reads: null,
       },
     ]);
     expect(t).toContain('/opt/rt (pm2 7.0.4)');
@@ -521,6 +522,7 @@ describe('renderDoctor', () => {
           },
         },
       ],
+      reads: null,
     };
     const t = renderDoctor([rep]);
     expect(t).toContain('  environment: container (docker), hostname ws-01');
@@ -589,6 +591,7 @@ describe('renderDoctor', () => {
           ),
           site('bare', 'on box: no curl or wget'),
         ],
+        reads: null,
       },
     ]);
     const lines = t.split('\n');
@@ -639,6 +642,7 @@ describe('renderDoctor', () => {
             },
           },
         ],
+        reads: null,
       },
     ]);
     const line = t.split('\n').find((l) => l.startsWith('  url web:'))!;
@@ -981,6 +985,7 @@ describe('renderMutation', () => {
       recommendations: [],
       environment: null,
       urls: [],
+      reads: null,
     };
     const lines = renderDoctor([rep]).split('\n');
     expect(lines).toContain('  memory: 17.2G available of 31.1G');

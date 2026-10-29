@@ -6,7 +6,13 @@ import {
   type Host,
   type Manifest,
 } from '../manifest.js';
-import { probeHost, type HostProbe, type ProbeAsk } from '../list.js';
+import {
+  probeHost,
+  scanHost,
+  type HostProbe,
+  type HostScan,
+  type ProbeAsk,
+} from '../list.js';
 import {
   bareLocalHost,
   connectHost,
@@ -58,6 +64,9 @@ export interface CollectorDeps {
   now: () => number;
   connectHost: (host: Host) => Promise<HostLink>;
   probeHost: (link: HostLink, ask: ProbeAsk) => Promise<HostProbe>;
+  scanHost: (link: HostLink, ask: ProbeAsk) => Promise<HostScan>;
+  /** whether a link's daemon shares this machine's scan: local, and its list comes over the socket */
+  sharesScan: (link: HostLink) => boolean;
   loadManifest: (root: string) => Manifest;
   findManifest: (dir: string) => { root: string; path: string } | null;
   hostname: () => string;
@@ -69,6 +78,8 @@ export function defaultCollectorDeps(spawner?: Spawner): CollectorDeps {
     now: Date.now,
     connectHost: (host) => connectHost(host, { spawner }),
     probeHost,
+    scanHost,
+    sharesScan: (l) => l.host.local && l.pm2.listsOverSocket(),
     loadManifest,
     findManifest: findManifestPath,
     hostname: os.hostname,
@@ -116,12 +127,15 @@ export class StacksCollector {
   private readonly misses = new Map<string, string | null>();
   private readonly links = new Map<string, Promise<HostLink>>();
   private readonly cache = new Map<string, Cached>();
+  /** this machine's scan for the current refresh, shared by every local daemon whose list comes over its socket */
+  private localScan: Promise<HostScan> | null = null;
 
   constructor(private readonly deps: CollectorDeps = defaultCollectorDeps()) {}
 
   async collect(opts: { all: boolean }): Promise<StacksView> {
     if (this.refreshes % REGISTRY_EVERY === 0) this.known = this.readKnown();
     this.refreshes++;
+    this.localScan = null;
     const reads = new Map<string, EndpointRead>();
     await this.readAll(reads);
     const notes = this.adopt(reads.get(this.localKey));
@@ -218,10 +232,11 @@ export class StacksCollector {
         this.links.set(key, link);
       }
       const last = c?.probe;
-      const probe = await this.deps.probeHost(
-        await link,
-        last ? ASK : FIRST_ASK
-      );
+      const l = await link;
+      const ask = last ? ASK : FIRST_ASK;
+      const probe = this.deps.sharesScan(l)
+        ? await this.sharedProbe(l, ask)
+        : await this.deps.probeHost(l, ask);
       // the next refresh diffs against the latest sample: the second of an inline pair
       const sample = last?.data.stats.samples.at(-1);
       entry = {
@@ -243,6 +258,16 @@ export class StacksCollector {
     }
     this.cache.set(key, entry);
     return answer(entry);
+  }
+
+  /**
+   * A local daemon's probe: this machine's scan, run once per refresh for every local daemon (the first one read
+   * decides its ask: a daemon adopted later shows its cpu from its second refresh), and its own list over its socket.
+   */
+  private async sharedProbe(link: HostLink, ask: ProbeAsk): Promise<HostProbe> {
+    this.localScan ??= this.deps.scanHost(link, ask);
+    const [scan, procs] = await Promise.all([this.localScan, link.pm2.jlist()]);
+    return { ...scan, procs };
   }
 
   /** The checkouts the registry records, one per real root; an entry whose project changed follows its manifest. */
