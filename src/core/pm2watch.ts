@@ -6,6 +6,8 @@ import type { Context } from './resolve.js';
 
 /** A pids directory that is not there (no daemon has run at that home yet, or the home was removed) is looked for again after this long. */
 export const WATCH_RETRY_MS = 1_000;
+/** A watch that is up looks at its directory this often: a home moved away (an ancestor renamed) sends it no event. */
+export const WATCH_CHECK_MS = 30_000;
 /** What a subscriber hears: a process of its project started, stopped or exited (its pid file was written or removed), the watch came up, or it was lost. */
 export type FeedNote = 'event' | 'up' | 'down';
 export interface EventFeed {
@@ -44,6 +46,7 @@ class PidWatch {
   private watcher: fs.FSWatcher | null = null;
   private ino: number | null = null;
   private retry: NodeJS.Timeout | null = null;
+  private check: NodeJS.Timeout | null = null;
   private closed = false;
 
   constructor(private readonly dir: string) {
@@ -67,20 +70,28 @@ class PidWatch {
       this.saw(typeof name === 'string' ? name : null)
     );
     w.on('error', () => this.lost());
+    // a home moved away is no event of this directory's: it is found when the path names another directory, or none
+    this.check = setInterval(() => {
+      if (this.moved()) this.lost();
+    }, WATCH_CHECK_MS);
+    this.check.unref();
     this.up = true;
     this.tell('up');
+  }
+
+  /** Whether the path no longer names the directory watched: removed, or replaced by another. */
+  private moved(): boolean {
+    try {
+      return fs.statSync(this.dir).ino !== this.ino;
+    } catch {
+      return true; // gone
+    }
   }
 
   private saw(name: string | null): void {
     // an event about the directory itself: if it was removed or replaced (its home deleted), this watch hears nothing more
     if (name === null || name === path.basename(this.dir)) {
-      let ino: number | null = null;
-      try {
-        ino = fs.statSync(this.dir).ino;
-      } catch {
-        /* gone */
-      }
-      if (ino !== this.ino) {
+      if (this.moved()) {
         this.lost();
         return;
       }
@@ -92,8 +103,7 @@ class PidWatch {
   }
 
   private lost(): void {
-    this.watcher?.close();
-    this.watcher = null;
+    this.stopWatching();
     if (this.up) {
       this.up = false;
       this.tell('down');
@@ -111,12 +121,18 @@ class PidWatch {
     for (const s of [...this.subscribers]) s.on(n);
   }
 
+  private stopWatching(): void {
+    if (this.check) clearInterval(this.check);
+    this.check = null;
+    this.watcher?.close();
+    this.watcher = null;
+  }
+
   close(): void {
     this.closed = true;
     if (this.retry) clearTimeout(this.retry);
     this.retry = null;
-    this.watcher?.close();
-    this.watcher = null;
+    this.stopWatching();
     this.up = false;
   }
 }
@@ -125,9 +141,10 @@ const pool = new Map<string, PidWatch>();
 
 /**
  * Watches the pids directory `dir` for the pid files whose names start with `prefix`. `on` hears 'up' when the watch
- * is (or comes) up, 'down' when it is lost (the directory removed; it is looked for again every WATCH_RETRY_MS), and
- * 'event' when such a file is written or removed: a process started, stopped or exited. One watch per directory,
- * shared by its subscribers and closed with the last; it never keeps a process alive.
+ * is (or comes) up, 'down' when it is lost (the directory removed, or moved away: seen within WATCH_CHECK_MS; it is
+ * looked for again every WATCH_RETRY_MS), and 'event' when such a file is written or removed: a process started,
+ * stopped or exited. One watch per directory, shared by its subscribers and closed with the last; it never keeps a
+ * process alive.
  */
 export function watchPids(
   dir: string,

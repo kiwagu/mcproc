@@ -10,6 +10,7 @@ import type { App } from '../../src/core/manifest.js';
 import { Pm2Client } from '../../src/core/pm2.js';
 import { ProcReader } from '../../src/core/procfs.js';
 import {
+  WATCH_CHECK_MS,
   WATCH_RETRY_MS,
   closePidWatches,
   followPids,
@@ -123,6 +124,33 @@ describe('watchPids', () => {
     await until('an event from the new directory', () =>
       notes.includes('event')
     );
+  });
+  it('a home moved away, which sends the watch no event, is down at the next check, then up on the new directory', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }); // the check only: the retry and the waits stay real
+    try {
+      const b = base();
+      const dir = path.join(b, 'h', 'pids');
+      fs.mkdirSync(dir, { recursive: true });
+      const notes: FeedNote[] = [];
+      const f = watchPids(dir, 'demo-', (n) => notes.push(n));
+      await sleep(0);
+      // `mv ~/.pm2 ~/.pm2.bak`, then a new daemon at the old path: only an ancestor of the watched directory moved
+      fs.renameSync(path.join(b, 'h'), path.join(b, 'h.old'));
+      fs.mkdirSync(dir, { recursive: true });
+      await sleep(100);
+      expect(notes).toEqual(['up']);
+      vi.advanceTimersByTime(WATCH_CHECK_MS);
+      expect(notes).toEqual(['up', 'down']);
+      await until('up again', () => notes.length === 3, WATCH_RETRY_MS + 2000);
+      expect(notes).toEqual(['up', 'down', 'up']);
+      start(dir, 'demo-api-0.pid');
+      await until('an event from the new directory', () =>
+        notes.includes('event')
+      );
+      f.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it('one watch per directory; a subscriber that comes while it is up hears so at once; the last close ends it', async () => {
     const dir = path.join(base(), 'pids');
