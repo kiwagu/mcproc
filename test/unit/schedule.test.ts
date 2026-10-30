@@ -82,6 +82,30 @@ describe('HostSchedule', () => {
     expect(at).toEqual([2000, 4000, 6000]);
     s.stop();
   });
+  it("the CPU tick lands an interval after the last read: never right after a port check's read", async () => {
+    const { s, at, world } = harness(2000, {
+      running: true,
+      portsPending: true,
+    });
+    s.start();
+    s.setMode('events');
+    s.event();
+    await vi.advanceTimersByTimeAsync(1100);
+    world.portsPending = false; // the port listens: the check at 2 s is the last that reads
+    await vi.advanceTimersByTimeAsync(8900);
+    // not 2000 and 2100: CPU over a tenth of a second reads in steps of about 9 %
+    expect(at).toEqual([
+      EVENT_DEBOUNCE_MS,
+      500,
+      1000,
+      2000,
+      4000,
+      6000,
+      8000,
+      10_000,
+    ]);
+    s.stop();
+  });
   it("after an event, reads at 0.5, 1, 2, 4 and 8 s while a running app's declared ports do not listen", async () => {
     const { s, at } = harness(60_000, { running: true, portsPending: true });
     s.start();

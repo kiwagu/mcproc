@@ -13,10 +13,11 @@ export interface Settled {
 
 /**
  * When one host group of the monit view is read. Polled (another host, or nothing to watch): every `intervalMs`, as
- * before. Event-driven (this machine, its pid files watched): EVENT_DEBOUNCE_MS after a pm2 event; every `intervalMs`
- * while an app of the group runs (CPU is a difference of two samples; with nothing running there is none to take); at
- * PORT_CHECKS_MS after an event, or after the feed came up, while a running app's declared ports do not all listen; and
- * SAFETY_MS after the last read in any case. The reads the screen's keys ask for are the loop's own, as before.
+ * before. Event-driven (this machine, its pid files watched): EVENT_DEBOUNCE_MS after a pm2 event; `intervalMs` after
+ * the last read while an app of the group runs (CPU is a difference of two samples; with nothing running there is none
+ * to take); at PORT_CHECKS_MS after an event, or after the feed came up, while a running app's declared ports do not
+ * all listen; and SAFETY_MS after the last read in any case. The reads the screen's keys ask for are the loop's own, as
+ * before.
  */
 export class HostSchedule {
   private mode: 'polled' | 'events' = 'polled';
@@ -67,12 +68,10 @@ export class HostSchedule {
     this.last = s;
     if (this.stopped || this.mode !== 'events') return;
     this.armSafety();
-    if (s.running) {
-      if (!this.tick) this.armTick();
-    } else if (this.tick) {
-      clearTimeout(this.tick);
-      this.tick = null;
-    }
+    // the tick lands an interval after the last read, whatever asked for it: CPU over a shorter window reads in steps
+    if (this.tick) clearTimeout(this.tick);
+    this.tick = null;
+    if (s.running) this.armTick();
   }
 
   stop(): void {
