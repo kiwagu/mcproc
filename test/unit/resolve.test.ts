@@ -12,8 +12,11 @@ import {
   clearResolutionCache,
   bareLocalHost,
   daemonFor,
+  procFor,
 } from '../../src/core/resolve.js';
 import { listDaemon } from '../../src/core/pm2socket.js';
+import { localProc, ProcReader } from '../../src/core/procfs.js';
+import { procWorld } from '../helpers/procfs.js';
 import type { Pm2Resolution } from '../../src/core/pm2.js';
 import type { Spawner } from '../../src/transport/types.js';
 
@@ -145,6 +148,30 @@ describe('daemonFor', () => {
         stderr: '',
       }))
     ).toBeNull();
+  });
+});
+
+describe('procFor', () => {
+  it('this machine is read in-process where it has /proc, unless a test fakes the world; another host never', () => {
+    const mine = bareLocalHost();
+    const other = { ...mine, name: 'stand', local: false, ssh: 'stand' };
+    expect(procFor(mine)).toBe(localProc());
+    expect(
+      procFor(mine, async () => ({ code: 0, stdout: '', stderr: '' }))
+    ).toBeNull();
+    expect(procFor(other)).toBeNull();
+  });
+  it('connect: an injected spawner reads with the script; a proc override stands in', async () => {
+    clearResolutionCache();
+    const spawner: Spawner = async () => ({
+      code: 0,
+      stdout: 'PATH_OK\n7.0.4\nv22.0.0\n',
+      stderr: '',
+    });
+    const prep = prepare({ project: basic });
+    expect((await connect(prep, { spawner })).proc).toBeNull();
+    const r = new ProcReader(procWorld({ procs: [] }));
+    expect((await connect(prep, { spawner, proc: r })).proc).toBe(r);
   });
 });
 

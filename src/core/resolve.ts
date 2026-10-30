@@ -17,7 +17,7 @@ import {
 } from './pm2.js';
 import { listDaemon } from './pm2socket.js';
 import { recordProject } from './registry.js';
-import type { ProcReader } from './procfs.js';
+import { localProc, type ProcReader } from './procfs.js';
 import { createTransport } from '../transport/index.js';
 import type { ExecResult, Spawner, Transport } from '../transport/types.js';
 import { checkHere, type HereCheck } from './urlcheck.js';
@@ -148,6 +148,14 @@ export function daemonFor(
     : null;
 }
 
+/**
+ * How a host's processes are read: in-process from this machine's /proc where it has one, unless a test injected a
+ * spawner (its fake world is not this machine); every other host runs the probe script.
+ */
+export function procFor(host: Host, spawner?: Spawner): ProcReader | null {
+  return host.local && !spawner ? localProc() : null;
+}
+
 const cache = new Map<string, Pm2Resolution>();
 export function clearResolutionCache(): void {
   cache.clear();
@@ -168,6 +176,8 @@ export async function connect(
     hereCheck?: HereCheck;
     /** how the pm2 list is read, in place of daemonFor's choice (tests) */
     daemon?: DaemonLister | null;
+    /** how this machine's processes are read, in place of procFor's choice (tests) */
+    proc?: ProcReader | null;
   } = {}
 ): Promise<Context> {
   const transport = createTransport(prep.host, opts.spawner);
@@ -197,13 +207,19 @@ export async function connect(
     pm2,
     resolution,
     hereCheck: opts.hereCheck ?? checkHere,
+    proc:
+      opts.proc !== undefined ? opts.proc : procFor(prep.host, opts.spawner),
   };
 }
 
 /** A link to one host's pm2 for reading a whole daemon: the pm2 it would use, found the way connect finds it. */
 export async function connectHost(
   host: Host,
-  opts: { spawner?: Spawner; daemon?: DaemonLister | null } = {}
+  opts: {
+    spawner?: Spawner;
+    daemon?: DaemonLister | null;
+    proc?: ProcReader | null;
+  } = {}
 ): Promise<HostLink> {
   const transport = createTransport(host, opts.spawner);
   const resolution = await resolvePm2Bin(host, transport);
@@ -219,6 +235,7 @@ export async function connectHost(
         ? opts.daemon
         : daemonFor(host, resolution, opts.spawner)
     ),
+    proc: opts.proc !== undefined ? opts.proc : procFor(host, opts.spawner),
   };
 }
 

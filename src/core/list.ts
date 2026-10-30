@@ -25,6 +25,7 @@ import {
 } from './ports.js';
 import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
+import { inProcess, listenLocal, probeLocal } from './localscan.js';
 import { scriptNotRun, type Context, type HostLink } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
@@ -117,6 +118,8 @@ export interface SnapshotOptions {
   containers?: 'probe' | 'none';
   /** 'read' (the default): read this checkout's leases from the state directory, on the local host only; 'none': skip it */
   leases?: 'read' | 'none';
+  /** on this machine, whose holder a port held outside pm2's trees is named for: the declared ports (default), or every port */
+  holders?: 'declared' | 'all';
 }
 export interface HostInfo {
   name: string;
@@ -242,6 +245,11 @@ export async function probeHost(
   link: HostLink,
   ask: ProbeAsk
 ): Promise<HostProbe> {
+  // this machine is read in-process; a /proc that cannot be read leaves it to the script, as before
+  if (inProcess(link)) {
+    const local = await probeLocal(link, ask);
+    if (local) return local;
+  }
   if (link.pm2.listsOverSocket()) {
     const [scan, procs] = await Promise.all([
       scanHost(link, ask),
@@ -273,6 +281,10 @@ export interface ListenCheck {
 }
 /** The cheap look of a listening wait: no fd walk; who holds a port is the light probe's question, once all listen. */
 export async function listenCheck(link: HostLink): Promise<ListenCheck> {
+  if (inProcess(link)) {
+    const local = await listenLocal(link);
+    if (local) return local;
+  }
   const socket = link.pm2.listsOverSocket();
   const [res, listed] = await Promise.all([
     link.transport.read(listenScript(link.pm2.bin, !socket), {
@@ -385,11 +397,16 @@ export async function snapshot(
           ),
         ]
       : [];
+  const holders: number[] | 'all' =
+    opts.holders === 'all'
+      ? 'all'
+      : [...new Set(Object.values(ctx.manifest.apps).flatMap((a) => a.ports))];
   const probe = await probeHost(ctx, {
     cpuSample: (opts.cpu ?? 'inline') === 'inline' && withMetrics,
     metrics: withMetrics,
     urls,
     containers,
+    holders,
   });
   return deriveSnapshot(ctx, probe, opts);
 }
@@ -545,8 +562,8 @@ export async function portsReport(
   port: number | null;
   listeners: Array<Listener & { app: string | null }>;
 }> {
-  // no url is shown, so none is asked; the full probe stays for the docker-published ports
-  const snap = await snapshot(ctx, { urls: 'none' });
+  // no url is shown, so none is asked; every holder is named, which is what this answer is for
+  const snap = await snapshot(ctx, { urls: 'none', holders: 'all' });
   const pidToApp = new Map<number, string>();
   for (const [name, ap] of Object.entries(snap.ports))
     for (const l of ap.actual)
