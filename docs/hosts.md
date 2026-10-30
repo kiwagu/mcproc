@@ -71,12 +71,20 @@ PATH, though, mcproc checks its version with `pm2 -v` first, and pm2 starts a da
 
 ## How ports are found
 
-`ls` runs one command on the host: `ps -eo pid,ppid`, `ss -ltnp` / `ss -lunp` (falling back to `/proc/net/tcp` and
-`/proc/*/fd` when `ss` is missing or fails) and `pm2 jlist`, unless pm2's list comes from the daemon's socket
-([above](#how-mcproc-reads-a-host)). pm2's pid plus its descendants are matched to listening sockets, then compared
-with the declared ports: `listening`, `declared-not-listening` (naming the process that holds the port, if any),
-`undeclared`. Ports of processes owned by other users show without a pid, as the kernel reports them. Ports published
-by Docker containers show the container name instead of a pid.
+On this machine mcproc reads `/proc` itself, without running a command: every process's parent and CPU time from
+`/proc/<pid>/stat`, and for the process trees under pm2's processes their memory, command lines and sockets; the
+listening ports from `/proc/net/tcp`, `tcp6`, `udp` and `udp6`. pm2's pid plus its descendants are matched to
+listening sockets, then compared with the declared ports: `listening`, `declared-not-listening` (naming the process
+that holds the port, if any), `undeclared`. A declared port held by a process outside those trees is named from a look
+at every process's sockets, made only when such a port exists and at most every 30 seconds; `ports` looks every time.
+Ports of processes owned by other users show without a pid, as the kernel reports them. Ports published by Docker
+containers show the container name instead of a pid (`docker ps`, asked only for such a port, at most every 30
+seconds; `ports` asks every time, and so do `ls` and `describe` where an app declares `containers:`). A machine
+without `/proc` (macOS) runs the command below instead.
+
+On every other host `ls` runs one command there: `ps -eo pid,ppid`, `ss -ltnp` / `ss -lunp` (falling back to
+`/proc/net/tcp` and `/proc/*/fd` when `ss` is missing or fails) and `pm2 jlist`, unless pm2's list comes from the
+daemon's socket ([above](#how-mcproc-reads-a-host)), and matches the ports the same way.
 
 ## Hosts without pm2: `unpack`
 
