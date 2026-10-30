@@ -110,6 +110,8 @@ interface Entry {
   until: number;
   reason: string | null;
   failure?: ExecResult;
+  /** another host's capture that timed out or could not start: every read until `until` fails with it */
+  rejection?: unknown;
 }
 /**
  * One host's entry, when a failed read last made it read the environment again, and the last environment a capture
@@ -190,6 +192,20 @@ export function createTransport(
         };
       } catch (e) {
         const at = clock();
+        // another host whose ssh or docker outlasted the timeout, or did not start, would do the same for the read
+        // through its shell: the read fails with this at once rather than waiting the timeout out a second time
+        if (
+          !host.local &&
+          isMcprocError(e) &&
+          (e.code === 'TIMEOUT' || e.code === 'TRANSPORT_FAILED')
+        )
+          return {
+            env: null,
+            at,
+            until: at + CAPTURE_RETRY_MS,
+            reason: `the host did not answer: ${firstLine(e.message) ?? e.code}`,
+            rejection: e,
+          };
         return {
           env: null,
           at,
@@ -271,6 +287,7 @@ export function createTransport(
       note(e);
       // a host that did not answer the capture would not answer the read either: its failure goes back as it is
       if (e.failure) return { ...e.failure };
+      if (e.rejection) throw e.rejection;
       if (!e.env) return exec(cmd, opts);
       // a plain sh that does not start is the environment's fault: reading it again would bring the same one back
       const res = await tryPlain(e.env, cmd, opts);
@@ -287,6 +304,7 @@ export function createTransport(
         note(e);
         // the connection dropped meanwhile: that is the answer, and the host is not pinned to its shell for it
         if (e.failure) return { ...e.failure };
+        if (e.rejection) throw e.rejection;
         if (e.env) {
           const again = await tryPlain(e.env, cmd, opts);
           if (typeof again === 'string') return fallBack(again, cmd, opts);
