@@ -57,7 +57,7 @@ export class HostSchedule {
     if (this.stopped || this.mode !== 'events') return;
     this.soon ??= setTimeout(() => {
       this.soon = null;
-      this.o.refresh();
+      this.ownRead();
     }, EVENT_DEBOUNCE_MS);
     if (this.check) clearTimeout(this.check);
     this.armCheck(0);
@@ -69,8 +69,7 @@ export class HostSchedule {
     if (this.stopped || this.mode !== 'events') return;
     this.armSafety();
     // the tick lands an interval after the last read, whatever asked for it: CPU over a shorter window reads in steps
-    if (this.tick) clearTimeout(this.tick);
-    this.tick = null;
+    this.dropTick();
     if (s.running) this.armTick();
   }
 
@@ -115,9 +114,23 @@ export class HostSchedule {
     this.check = setTimeout(() => {
       this.check = null;
       if (!this.last.portsPending) return;
-      this.o.refresh();
+      this.ownRead();
       this.armCheck(step + 1);
     }, gap);
+  }
+
+  /**
+   * A read the schedule starts itself (an event's, a port check's): the pending tick goes with it, and its settle arms
+   * the next. A tick that came due while this read ran would read again right after it, over a few milliseconds of CPU.
+   */
+  private ownRead(): void {
+    this.dropTick();
+    this.o.refresh();
+  }
+
+  private dropTick(): void {
+    if (this.tick) clearTimeout(this.tick);
+    this.tick = null;
   }
 
   private clearAll(): void {

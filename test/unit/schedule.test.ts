@@ -31,6 +31,41 @@ function harness(
   return { s, at, world };
 }
 
+/**
+ * A schedule whose reads take `dur(start)` ms, as this machine's do, and are recorded with when each started and ended.
+ * A read asked for while one runs waits for it, then reads again: what the loop does for a group on events.
+ */
+function timedHarness(
+  intervalMs: number,
+  world: Settled,
+  dur: (start: number) => number
+) {
+  const t0 = Date.now();
+  const at: number[] = [];
+  const ended: number[] = [];
+  let inflight: Promise<void> | null = null;
+  const read = (): Promise<void> => {
+    const start = Date.now() - t0;
+    at.push(start);
+    const p = new Promise<void>((r) => setTimeout(r, dur(start))).then(() => {
+      inflight = null;
+      ended.push(Date.now() - t0);
+      s.settled({ ...world });
+    });
+    inflight = p;
+    return p;
+  };
+  const s: HostSchedule = new HostSchedule({
+    intervalMs,
+    refresh: () =>
+      void (async () => {
+        if (inflight) await inflight;
+        await read();
+      })(),
+  });
+  return { s, at, ended };
+}
+
 describe('HostSchedule', () => {
   it('polled: a read every interval, as before', async () => {
     const { s, at } = harness();
@@ -104,6 +139,29 @@ describe('HostSchedule', () => {
       8000,
       10_000,
     ]);
+    s.stop();
+  });
+  it('a read the schedule starts takes the pending tick with it: no second read right after a slow port check', async () => {
+    // the tick armed when the 2 s check ended would come due while the slower 4 s check still reads
+    const { s, at, ended } = timedHarness(
+      2000,
+      { running: true, portsPending: true },
+      (start) => (start === 4000 ? 30 : 10)
+    );
+    s.start();
+    s.setMode('events');
+    s.event();
+    await vi.advanceTimersByTimeAsync(10_500);
+    expect(at).toEqual([
+      EVENT_DEBOUNCE_MS,
+      ...PORT_CHECKS_MS.slice(0, 4),
+      6030,
+      PORT_CHECKS_MS[4],
+      10_010,
+    ]);
+    // each read starts well after the one before it ended: no gap shorter than the port checks' own steps
+    for (let i = 1; i < at.length; i++)
+      expect(at[i] - ended[i - 1]).toBeGreaterThanOrEqual(300);
     s.stop();
   });
   it("after an event, reads at 0.5, 1, 2, 4 and 8 s while a running app's declared ports do not listen", async () => {
