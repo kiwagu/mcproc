@@ -44,12 +44,15 @@ const until = async (what: string, ok: () => boolean, ms = 10_000) => {
     await sleep(50);
   }
 };
+/** A pm2 call that hangs fails its test after this long: a synchronous call blocks the timers that would time the test out. */
+const PM2_CALL_MS = 30_000;
 /** pm2 itself on the throwaway home: never without it, or it would reach ~/.pm2 */
 const pm2 = (...args: string[]) => {
   if (!home) throw new Error('no throwaway home');
   execFileSync(process.execPath, [pm2Bin, ...args], {
     env: { ...process.env, PM2_HOME: home, PORT: String(PORT + 1) },
     stdio: 'ignore',
+    timeout: PM2_CALL_MS,
   });
 };
 /** Stops the daemon of the throwaway home, only when one runs there. */
@@ -58,6 +61,7 @@ function killDaemon(at: string) {
   execFileSync(process.execPath, [pm2Bin, 'kill'], {
     env: { ...process.env, PM2_HOME: at },
     stdio: 'ignore',
+    timeout: PM2_CALL_MS,
   });
 }
 
@@ -92,14 +96,21 @@ beforeAll(() => {
 afterAll(() => {
   closePidWatches();
   closeDaemons();
+  let failure: { cause: unknown } | null = null;
   try {
     killDaemon(home);
-  } catch {
-    /* no daemon left */
+  } catch (cause) {
+    failure = { cause };
   }
   if (saved === undefined) delete process.env.PM2_HOME;
   else process.env.PM2_HOME = saved;
   clearLoginEnvCache();
+  // its daemon may still run, and web with it: removing its home would leave them out of pm2's reach
+  if (failure)
+    throw new Error(
+      `pm2 kill failed on ${home}; kept ${base}, so \`PM2_HOME=${home} pm2 kill\` can still stop its daemon`,
+      failure
+    );
   if (base) fs.rmSync(base, { recursive: true, force: true });
 });
 
@@ -120,7 +131,8 @@ describe('monit events, on real pm2', () => {
     let before = events();
     pm2('restart', 'ev-probe');
     await until('the restart', () => events() > before);
-    expect(theirs.filter((n) => n === 'event')).toEqual([]);
+    // the other project's subscriber listens (it heard the watch come up) and heard none of this project's events
+    expect(theirs).toEqual(['up']);
     pm2('kill');
     await sleep(500);
     expect(a.up).toBe(true); // pm2 kill empties the directory; it does not remove it
@@ -137,35 +149,45 @@ describe('monit events, on real pm2', () => {
   it('the in-process scan sees what the script sees', async () => {
     const fleet = new Fleet(prepare({ project }).manifest, undefined);
     await actOn(fleet, 'web', 'start');
-    const ctx = await connect(prepare({ project }));
-    expect(ctx.proc).toBeTruthy();
-    let mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
-    for (
-      let i = 0;
-      i < 40 && mine.ports.web.checks[0]?.status !== 'listening';
-      i++
-    ) {
-      await sleep(250);
-      mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
+    try {
+      const ctx = await connect(prepare({ project }));
+      expect(ctx.proc).toBeTruthy();
+      let mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
+      for (
+        let i = 0;
+        i < 40 && mine.ports.web.checks[0]?.status !== 'listening';
+        i++
+      ) {
+        await sleep(250);
+        mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
+      }
+      // web really listens: two scans that both saw no listener would agree on nothing
+      expect(mine.ports.web.checks[0]?.status).toBe('listening');
+      const script = await snapshot(
+        { ...ctx, proc: null },
+        { urls: 'none', leases: 'none' }
+      );
+      expect(script.ports.web.actual).not.toEqual([]);
+      expect(mine.ports.web.checks).toEqual(script.ports.web.checks);
+      expect(mine.ports.web.actual.map((l) => l.pid)).toEqual(
+        script.ports.web.actual.map((l) => l.pid)
+      );
+      const m = mine.metrics.web!;
+      const s = script.metrics.web!;
+      expect(m.procs).toBe(s.procs);
+      expect(Math.abs(m.memory - s.memory)).toBeLessThanOrEqual(s.memory * 0.1);
+      expect(m.runtime).toBe(s.runtime);
+    } finally {
+      // the next case starts web from stopped, and checks that it is
+      await actOn(fleet, 'web', 'stop').catch(() => undefined);
     }
-    const script = await snapshot(
-      { ...ctx, proc: null },
-      { urls: 'none', leases: 'none' }
-    );
-    expect(mine.ports.web.checks).toEqual(script.ports.web.checks);
-    expect(mine.ports.web.actual.map((l) => l.pid)).toEqual(
-      script.ports.web.actual.map((l) => l.pid)
-    );
-    const m = mine.metrics.web!;
-    const s = script.metrics.web!;
-    expect(m.procs).toBe(s.procs);
-    expect(Math.abs(m.memory - s.memory)).toBeLessThanOrEqual(s.memory * 0.1);
-    expect(m.runtime).toBe(s.runtime);
-    await actOn(fleet, 'web', 'stop');
   }, 60_000);
 
   it('monit reads on the events: a start and a stop show without a timer', async () => {
+    pm2('ping'); // so a daemon has made its pids directory and the loop's watch is up at once, even with this case alone
     const { manifest } = prepare({ project });
+    /** what the loop's own feed told it: the screen shows no sign of the feed */
+    const heard: FeedNote[] = [];
     let state: MonitState = initialState({
       project: manifest.project,
       host: viewLabel('local'),
@@ -184,7 +206,11 @@ describe('monit events, on real pm2', () => {
       peekIncidents: async () => {
         throw new Error('not opened here');
       },
-      events: followPids,
+      events: (ctx, on) =>
+        followPids(ctx, (n) => {
+          on(n);
+          heard.push(n);
+        }),
     };
     const loop = new MonitLoop(
       new Fleet(manifest, 'local'),
@@ -195,20 +221,32 @@ describe('monit events, on real pm2', () => {
         state = reduce(state, a);
       }
     );
-    // ten minutes: within this test only pm2's pid files (or a port check after one of their events) can explain a read
-    loop.start(600_000);
-    await loop.refresh();
-    await sleep(500); // the watch is up at once: the daemon of the cases above made its pids directory
     const web = () => state.rows.find((r) => r.app === 'web');
     const fleet = new Fleet(manifest, undefined);
-    await actOn(fleet, 'web', 'start');
-    await until('web online on the screen', () => web()?.status === 'online');
-    await until(
-      'its port listening on the screen',
-      () => web()?.ports.checks[0]?.status === 'listening'
-    );
-    await actOn(fleet, 'web', 'stop');
-    await until('web stopped on the screen', () => web()?.status === 'stopped');
-    loop.close();
+    try {
+      // ten minutes: within this test only pm2's pid files (or a port check after one of their events) can explain a read
+      loop.start(600_000);
+      await loop.refresh();
+      // the port checks start only on a pid-file event, so the loop's own feed must be up before the start: one that came
+      // up only after the start's pid file was written would show the port listening at the 30 s safety read
+      await until("the loop's feed up", () => heard.includes('up'));
+      // not running before the start: online can only come from the start's event
+      expect(['stopped', 'not-started']).toContain(web()?.status);
+      await actOn(fleet, 'web', 'start');
+      await until('web online on the screen', () => web()?.status === 'online');
+      await until(
+        'its port listening on the screen',
+        () => web()?.ports.checks[0]?.status === 'listening'
+      );
+      await actOn(fleet, 'web', 'stop');
+      await until(
+        'web stopped on the screen',
+        () => web()?.status === 'stopped'
+      );
+    } finally {
+      loop.close();
+      // a case that failed before its stop leaves web running for no one; after the stop above this changes nothing
+      await actOn(fleet, 'web', 'stop').catch(() => undefined);
+    }
   }, 60_000);
 });
