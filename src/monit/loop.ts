@@ -209,6 +209,8 @@ export class MonitLoop {
   private schedules = new Map<string, HostSchedule>();
   /** the event feeds of the view's groups, closed with it */
   private feeds: EventFeed[] = [];
+  /** the view's groups whose feed is up: read on pm2's events, each read after the one under way */
+  private following = new Set<string>();
   /** reads the store (clears, takes) and lets the incidents view read, without reading any host */
   private storeTimer: NodeJS.Timeout | null = null;
 
@@ -272,9 +274,14 @@ export class MonitLoop {
     if (this.intervalMs === null) return;
     const gen = this.gen;
     for (const g of this.groups) {
+      // a group on events reads after the read under way, which may predate the event (its reads are this machine's,
+      // so it costs one read at most); a polled one joins it, so a host slower than the interval is never read back to back
       const s = new HostSchedule({
         intervalMs: this.intervalMs,
-        refresh: () => void this.refresh([g.host]),
+        refresh: () =>
+          void (this.following.has(g.host)
+            ? this.refreshAfterCurrent([g.host])
+            : this.refresh([g.host])),
       });
       this.schedules.set(g.host, s);
       s.start();
@@ -287,6 +294,7 @@ export class MonitLoop {
     for (const s of this.schedules.values()) s.stop();
     this.schedules.clear();
     for (const f of this.feeds.splice(0)) f.close();
+    this.following.clear();
   }
 
   /** Follows the events of `host`'s daemon for this generation; a host that gives no feed, or fails to, stays on its timer. */
@@ -303,6 +311,8 @@ export class MonitLoop {
       const feed = await events(ctx, (n) => {
         if (gen !== this.gen) return;
         if (n === 'event') return s.event();
+        if (n === 'up') this.following.add(host);
+        else this.following.delete(host);
         s.setMode(n === 'up' ? 'events' : 'polled');
         // what happened before the feed was up, or while it was down, is read at once: by a read begun after this, since
         // one under way may predate it (the first start in a fresh pm2 home is heard as 'up' alone)

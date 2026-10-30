@@ -2490,6 +2490,69 @@ describe('MonitLoop.start: when each host group is read', () => {
     expect(reads).toHaveLength(2);
     h.loop.close();
   });
+  it("a pm2 event during a read begun before it: the event's read runs after that read and sees the change", async () => {
+    const fd = feed();
+    let status = 'stopped';
+    const seenBy = new WeakMap<Snapshot, string>(); // what pm2 said when each read began
+    let gate: { promise: Promise<void> } | null = null;
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: fd.events,
+      snapshot: async () => {
+        const s = snap();
+        seenBy.set(s, status);
+        reads.push(status);
+        if (gate) await gate.promise;
+        return s;
+      },
+      rows: (ctx, s, apps) =>
+        apps
+          .filter((a) => a !== 'api-build')
+          .map((a) => ({
+            ...row(a, ctx.host.name),
+            status: seenBy.get(s) ?? 'stopped',
+          })),
+    });
+    await upNow(h, fd);
+    expect(reads).toEqual(['stopped']);
+    const slow = deferred<void>();
+    gate = slow;
+    void h.loop.refresh(['local']); // a read under way before pm2 starts the app
+    await flush();
+    gate = null;
+    status = 'online';
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(150); // past the debounce, that read still runs
+    expect(reads).toEqual(['stopped', 'stopped']);
+    slow.resolve();
+    await flush();
+    expect(reads).toEqual(['stopped', 'stopped', 'online']);
+    expect(h.state.rows.find((r) => r.app === 'api')?.status).toBe('online');
+    h.loop.close();
+  });
+  it('a polled group whose tick lands during a read joins it: one read, not two', async () => {
+    const gate = deferred<void>();
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: async () => null,
+      rows: stopped,
+      snapshot: async (ctx) => {
+        reads.push(ctx.host.name);
+        if (reads.length === 1) await gate.promise; // a slow host: this read outlasts the interval
+        return snap();
+      },
+    });
+    h.loop.start(2000);
+    void h.loop.refresh(['local']);
+    await vi.advanceTimersByTimeAsync(2000); // the tick lands while that read is under way
+    expect(reads).toHaveLength(1);
+    gate.resolve();
+    await flush();
+    expect(reads).toHaveLength(1); // joined it, not chained after it
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(reads).toHaveLength(2);
+    h.loop.close();
+  });
   it('a remote group keeps the interval while the local one follows events', async () => {
     const fd = feed();
     const { h, reads } = counted(
