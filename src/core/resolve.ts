@@ -17,8 +17,9 @@ import {
 } from './pm2.js';
 import { listDaemon } from './pm2socket.js';
 import { recordProject } from './registry.js';
+import type { ProcReader } from './procfs.js';
 import { createTransport } from '../transport/index.js';
-import type { Spawner, Transport } from '../transport/types.js';
+import type { ExecResult, Spawner, Transport } from '../transport/types.js';
 import { checkHere, type HereCheck } from './urlcheck.js';
 
 export const MAX_PM2_HOME = 90;
@@ -47,10 +48,32 @@ export interface Context extends Prepared {
   resolution: Pm2Resolution;
   /** checks a url from this machine when url_check asks for it; tests pass a fake */
   hereCheck: HereCheck;
+  /** this machine's processes read in-process from /proc; absent or null: the probe script reads them */
+  proc?: ProcReader | null;
 }
 
-/** What a probe of a host needs: how to reach it and its pm2, no manifest. */
-export type HostLink = Pick<Context, 'host' | 'transport' | 'pm2'>;
+/** What a probe of a host needs: how to reach it, its pm2, and on this machine its /proc reader; no manifest. */
+export type HostLink = Pick<Context, 'host' | 'transport' | 'pm2' | 'proc'>;
+
+/** The shell on the host did not run a read-only script: the last lines it printed, and where to look. */
+export function scriptNotRun(
+  link: HostLink,
+  res: ExecResult,
+  what: string
+): McprocError {
+  const tail = (res.stderr || res.stdout)
+    .trim()
+    .split('\n')
+    .slice(-5)
+    .join('\n');
+  return new McprocError(
+    'TRANSPORT_FAILED',
+    `the shell on ${link.transport.describe()} did not run ${what} (exit ${res.code}): ${tail}`,
+    {
+      hint: `Check hosts.${link.host.name}.shell (default /bin/bash -lc) exists on that host.`,
+    }
+  );
+}
 
 /** The local host as a manifest without `hosts.local` declares it: the login shell, pm2's default home. */
 export function bareLocalHost(): Host {

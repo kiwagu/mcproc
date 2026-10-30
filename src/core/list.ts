@@ -25,7 +25,7 @@ import {
 } from './ports.js';
 import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
-import type { Context, HostLink } from './resolve.js';
+import { scriptNotRun, type Context, type HostLink } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
 import { leasesCovering, type LeaseView } from './leases/view.js';
@@ -163,6 +163,11 @@ export interface ProbeAsk {
   metrics: boolean;
   urls: string[];
   containers: string[];
+  /**
+   * on this machine, the ports whose holder outside pm2's trees is named (a walk over every process's fds, at most every
+   * 30 s), or 'all' (every port, every time); other hosts ignore it: their script names every holder
+   */
+  holders?: number[] | 'all';
 }
 /** One probe of a host before any manifest reads it: the parsed sections, pm2's processes of every namespace, when it was taken. */
 export interface HostProbe {
@@ -187,22 +192,6 @@ const clockRetry = (r: ExecResult): boolean => !r.stdout.includes(MARK.CLOCK);
 /** A listen check with pm2's list that the plain shell could not run, or whose pm2 it could not find. */
 const listenRetry = (r: ExecResult): boolean =>
   clockRetry(r) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
-
-/** The shell on the host did not run the probe script: the last lines it printed, and where to look. */
-const notRun = (link: HostLink, res: ExecResult) => {
-  const tail = (res.stderr || res.stdout)
-    .trim()
-    .split('\n')
-    .slice(-5)
-    .join('\n');
-  return new McprocError(
-    'TRANSPORT_FAILED',
-    `the shell on ${link.transport.describe()} did not run the probe (exit ${res.code}): ${tail}`,
-    {
-      hint: `Check hosts.${link.host.name}.shell (default /bin/bash -lc) exists on that host.`,
-    }
-  );
-};
 
 /** pm2's list as the probe's jlist section printed it, with its exit checks. */
 function jlistOf(
@@ -243,7 +232,8 @@ export async function scanHost(
     'probe'
   );
   const sampledAt = Date.now();
-  if (!res.stdout.includes(MARK.CLOCK)) throw notRun(link, res);
+  if (!res.stdout.includes(MARK.CLOCK))
+    throw scriptNotRun(link, res, 'the probe');
   return { data: parseProbe(res.stdout), sampledAt };
 }
 
@@ -270,7 +260,8 @@ export async function probeHost(
     'probe'
   );
   const sampledAt = Date.now();
-  if (!res.stdout.includes(MARK.JLIST)) throw notRun(link, res);
+  if (!res.stdout.includes(MARK.JLIST))
+    throw scriptNotRun(link, res, 'the probe');
   const data = parseProbe(res.stdout);
   return { data, procs: jlistOf(link, data, res), sampledAt };
 }
@@ -291,7 +282,8 @@ export async function listenCheck(link: HostLink): Promise<ListenCheck> {
     socket ? link.pm2.jlist() : Promise.resolve(null),
   ]);
   ensureOk(res, link.host, 'listen check');
-  if (!res.stdout.includes(MARK.CLOCK)) throw notRun(link, res);
+  if (!res.stdout.includes(MARK.CLOCK))
+    throw scriptNotRun(link, res, 'the probe');
   const data = parseProbe(res.stdout);
   return {
     procs: listed ?? jlistOf(link, data, res),
