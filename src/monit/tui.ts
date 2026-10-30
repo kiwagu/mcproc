@@ -129,6 +129,7 @@ export async function runMonit(opts: {
   });
   /** monit has left the screen: a paint that a late dispatch or the first refresh still asks for touches nothing */
   let left = false;
+  // everything this paints must be in paintedText's key (frame.ts), or a change in it alone would not be drawn
   const show = (f: Frame) => {
     if (left) return;
     const { width: w, height: h } = size();

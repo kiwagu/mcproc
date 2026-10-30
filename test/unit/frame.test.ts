@@ -804,4 +804,20 @@ describe('paintedText', () => {
     const flat = { ...a, view: 'flat' as const };
     expect(paintedText(flat, renderFrame(flat, size), size)).not.toBe(same);
   });
+  // what `show` paints, field by field: a change in any one of them alone is a different text
+  const a = { ...s0, updatedAt: new Date('2026-10-30T12:00:00') };
+  const f = renderFrame(a, size);
+  it.each([
+    ['the table', { ...f, table: [...f.table, 'web  online'] }],
+    ['the logs', { ...f, logs: [...f.logs, 'listening 3100'] }],
+    ['the details', { ...f, details: [...f.details, 'pid 4242'] }],
+    ['the footer', { ...f, footer: `${f.footer} · started web` }],
+  ])('a change in %s alone is another text', (_field, changed) => {
+    expect(paintedText(a, changed, size)).not.toBe(paintedText(a, f, size));
+  });
+  it('a change in the log title alone is another text', () => {
+    const err = { ...a, stream: 'err' as const };
+    expect(logsTitle(err, f.scroll)).not.toBe(logsTitle(a, f.scroll));
+    expect(paintedText(err, f, size)).not.toBe(paintedText(a, f, size));
+  });
 });
