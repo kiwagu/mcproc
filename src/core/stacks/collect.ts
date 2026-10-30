@@ -19,6 +19,8 @@ import {
   pickHost,
   type HostLink,
 } from '../resolve.js';
+import { inProcess, probeLocal, type LocalLink } from '../localscan.js';
+import type { ProcSweep } from '../procfs.js';
 import { forgetProject, listProjects, recordProject } from '../registry.js';
 import { readRegistry, realOf, registryPath } from '../slots.js';
 import { LeaseStore } from '../leases/store.js';
@@ -67,6 +69,12 @@ export interface CollectorDeps {
   scanHost: (link: HostLink, ask: ProbeAsk) => Promise<HostScan>;
   /** whether a link's daemon shares this machine's scan: local, and its list comes over the socket */
   sharesScan: (link: HostLink) => boolean;
+  /** this machine read in-process (null: /proc could not be read); `sweep` is the refresh's shared one */
+  probeLocal: (
+    link: LocalLink,
+    ask: ProbeAsk,
+    sweep?: ProcSweep
+  ) => Promise<HostProbe | null>;
   loadManifest: (root: string) => Manifest;
   findManifest: (dir: string) => { root: string; path: string } | null;
   hostname: () => string;
@@ -80,6 +88,7 @@ export function defaultCollectorDeps(spawner?: Spawner): CollectorDeps {
     probeHost,
     scanHost,
     sharesScan: (l) => l.host.local && l.pm2.listsOverSocket(),
+    probeLocal,
     loadManifest,
     findManifest: findManifestPath,
     hostname: os.hostname,
@@ -129,6 +138,8 @@ export class StacksCollector {
   private readonly cache = new Map<string, Cached>();
   /** this machine's scan for the current refresh, shared by every local daemon whose list comes over its socket */
   private localScan: Promise<HostScan> | null = null;
+  /** this machine's sweep for the current refresh, shared by every local daemon read in-process; null: /proc could not be read */
+  private localSweep: ProcSweep | null | undefined = undefined;
 
   constructor(private readonly deps: CollectorDeps = defaultCollectorDeps()) {}
 
@@ -136,6 +147,7 @@ export class StacksCollector {
     if (this.refreshes % REGISTRY_EVERY === 0) this.known = this.readKnown();
     this.refreshes++;
     this.localScan = null;
+    this.localSweep = undefined;
     const reads = new Map<string, EndpointRead>();
     await this.readAll(reads);
     const notes = this.adopt(reads.get(this.localKey));
@@ -234,9 +246,11 @@ export class StacksCollector {
       const last = c?.probe;
       const l = await link;
       const ask = last ? ASK : FIRST_ASK;
-      const probe = this.deps.sharesScan(l)
-        ? await this.sharedProbe(l, ask)
-        : await this.deps.probeHost(l, ask);
+      const probe =
+        (inProcess(l) ? await this.inProcessProbe(l, ask) : null) ??
+        (this.deps.sharesScan(l)
+          ? await this.sharedProbe(l, ask)
+          : await this.deps.probeHost(l, ask));
       // the next refresh diffs against the latest sample: the second of an inline pair
       const sample = last?.data.stats.samples.at(-1);
       entry = {
@@ -268,6 +282,25 @@ export class StacksCollector {
     this.localScan ??= this.deps.scanHost(link, ask);
     const [scan, procs] = await Promise.all([this.localScan, link.pm2.jlist()]);
     return { ...scan, procs };
+  }
+
+  /**
+   * A local daemon read in-process: this machine swept once per refresh for every local daemon, then its own list and
+   * trees. null when /proc could not be read, and for the rest of this refresh: the shared script scan answers then.
+   */
+  private async inProcessProbe(
+    link: LocalLink,
+    ask: ProbeAsk
+  ): Promise<HostProbe | null> {
+    if (this.localSweep === undefined) {
+      try {
+        this.localSweep = link.proc.sweep();
+      } catch {
+        this.localSweep = null;
+      }
+    }
+    if (this.localSweep === null) return null;
+    return this.deps.probeLocal(link, ask, this.localSweep);
   }
 
   /** The checkouts the registry records, one per real root; an entry whose project changed follows its manifest. */

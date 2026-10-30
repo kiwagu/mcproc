@@ -9,6 +9,7 @@ import {
 } from '../../src/core/manifest.js';
 import { parseProbe } from '../../src/core/ports.js';
 import { parseJlist } from '../../src/core/pm2.js';
+import { ProcReader, type ProcSweep } from '../../src/core/procfs.js';
 import type { HostProbe } from '../../src/core/list.js';
 import type { HostLink } from '../../src/core/resolve.js';
 import { listProjects, recordProject } from '../../src/core/registry.js';
@@ -20,6 +21,7 @@ import {
   type CollectorDeps,
 } from '../../src/core/stacks/collect.js';
 import { probeOut } from '../helpers/probe.js';
+import { procWorld } from '../helpers/procfs.js';
 
 function checkout(base: string, name: string, yaml: string): string {
   const root = path.join(base, name);
@@ -80,6 +82,9 @@ function deps(
     },
     scanHost: async () => {
       throw new Error('scanHost is not used here');
+    },
+    probeLocal: async () => {
+      throw new Error('probeLocal is not used here');
     },
     sharesScan: () => false,
     loadManifest,
@@ -459,6 +464,96 @@ describe('StacksCollector', () => {
     expect(asked.sort()).toEqual(['default', 'default', hb, hb].sort());
     expect(d.probes).toEqual(['box']); // remote: its own probe, at most every 10 s
     expect(v.answer.stacks.find((s) => s.project === 'beta')).toBeTruthy();
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it('local daemons read in-process share one sweep per refresh, each with its own list; a remote endpoint keeps its probe', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const state = path.join(base, 'state');
+    const hb = path.join(base, 'hb');
+    const beta = checkout(
+      base,
+      'beta',
+      `version: 1\nproject: beta\napps:\n  api: { description: a, run: "node a.js" }\nhosts:\n  local: { pm2_home: ${hb} }\n`
+    );
+    const gamma = checkout(
+      base,
+      'gamma',
+      'version: 1\nproject: gamma\napps:\n  job: { description: j, run: "node j.js", host: box }\nhosts:\n  box: { ssh: box, cwd: /srv/g }\n'
+    );
+    recordProject(loadManifest(beta), state);
+    recordProject(loadManifest(gamma), state);
+    let swept = 0;
+    class Counting extends ProcReader {
+      override sweep() {
+        swept++;
+        return super.sweep();
+      }
+    }
+    const reader = new Counting(
+      procWorld({ procs: [{ pid: 1, ppid: 0 }] }),
+      Date.now,
+      {
+        clkTck: 100,
+        pageSize: 4096,
+      }
+    );
+    const given: (ProcSweep | undefined)[] = [];
+    const d = deps(state, (h) =>
+      h.local
+        ? new Error('a local endpoint is not probed with the script')
+        : probeOf([])
+    );
+    d.probeLocal = async (_link, _ask, sweep) => {
+      given.push(sweep);
+      return probeOf([]);
+    };
+    d.connectHost = async (host) =>
+      ({
+        host,
+        proc: host.local ? reader : null,
+        pm2: { listsOverSocket: () => true, jlist: async () => [] },
+      }) as unknown as HostLink;
+    const c = new StacksCollector(d);
+    await c.collect({ all: true });
+    expect(swept).toBe(1);
+    expect(given).toHaveLength(2); // the default daemon and beta's own pm2_home
+    expect(given[0]).toBeDefined();
+    expect(given[1]).toBe(given[0]);
+    await c.collect({ all: true });
+    expect(swept).toBe(2);
+    expect(given[2]).not.toBe(given[0]);
+    expect(d.probes).toEqual(['box']); // remote: its own probe, at most every 10 s
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it('a sweep that cannot read /proc falls back to the shared script scan', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-col-'));
+    const state = path.join(base, 'state');
+    let scans = 0;
+    const d = deps(state, () => new Error('not probed alone'));
+    d.sharesScan = (l) => l.host.local;
+    d.scanHost = async () => {
+      scans++;
+      const p = probeOf([]);
+      return { data: p.data, sampledAt: p.sampledAt };
+    };
+    const broken = new ProcReader(
+      procWorld({ procs: [], noNet: true }),
+      Date.now,
+      {
+        clkTck: 100,
+        pageSize: 4096,
+      }
+    );
+    d.connectHost = async (host) =>
+      ({
+        host,
+        proc: broken,
+        pm2: { listsOverSocket: () => true, jlist: async () => [] },
+      }) as unknown as HostLink;
+    await new StacksCollector(d).collect({ all: false });
+    expect(scans).toBe(1);
     fs.rmSync(base, { recursive: true, force: true });
   });
 });
