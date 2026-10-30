@@ -155,6 +155,22 @@ describe('HostSchedule', () => {
     expect(at).toEqual([5000, 7000]);
     s.stop();
   });
+  it('no timer outlives its use: polled keeps only its interval, stop leaves none', async () => {
+    const { s, world } = harness(2000, { running: true, portsPending: true });
+    s.start();
+    s.setMode('events');
+    s.event();
+    await vi.advanceTimersByTimeAsync(600); // a launching app: the tick, the next port check and the safety read wait
+    expect(vi.getTimerCount()).toBe(3);
+    s.setMode('polled');
+    expect(vi.getTimerCount()).toBe(1);
+    s.setMode('events');
+    s.event();
+    s.settled({ ...world });
+    expect(vi.getTimerCount()).toBe(4); // the event's read, its first check, the tick, the safety read
+    s.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it('polled ignores events; stop ends every read', async () => {
     const { s, at } = harness();
     s.start();

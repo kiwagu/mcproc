@@ -30,6 +30,7 @@ import {
 } from '../../src/core/incidents/store.js';
 import type { CursorState } from '../../src/core/incidents/cursor.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
+import { SAFETY_MS } from '../../src/monit/schedule.js';
 import {
   appInfos,
   initialState,
@@ -2578,6 +2579,36 @@ describe('MonitLoop.start: when each host group is read', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(reads).toHaveLength(1);
     expect(fd.closed()).toBe(1);
+  });
+  it('close leaves no timer behind: no schedule, no store timer', async () => {
+    const fd = feed();
+    const { h } = counted({ events: fd.events, rows: waiting });
+    await upNow(h, fd);
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(50); // the event's read is still to come
+    expect(vi.getTimerCount()).toBeGreaterThan(1);
+    h.loop.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('a read that fails still settles: the group is read again by the safety read 30 s after each failure', async () => {
+    const fd = feed();
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: fd.events,
+      rows: stopped,
+      snapshot: async (ctx) => {
+        reads.push(ctx.host.name);
+        throw new McprocError('TRANSPORT_FAILED', 'pm2 did not answer');
+      },
+    });
+    await upNow(h, fd);
+    expect(reads).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(SAFETY_MS);
+    expect(reads).toHaveLength(2);
+    // armed again by the failed read itself: the feed coming up armed only the first
+    await vi.advanceTimersByTimeAsync(SAFETY_MS);
+    expect(reads).toHaveLength(3);
+    h.loop.close();
   });
   it('the store is read every interval while no host is', async () => {
     const fd = feed();
