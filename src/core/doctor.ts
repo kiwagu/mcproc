@@ -16,6 +16,7 @@ import {
 } from './pm2.js';
 import { parseUrlProbe } from './ports.js';
 import { ownPidFile } from './pm2watch.js';
+import type { ProcReader } from './procfs.js';
 import { daemonFor, pickHost, procFor } from './resolve.js';
 import { stateDir } from './state.js';
 import {
@@ -100,14 +101,18 @@ export interface DoctorReport {
 
 const MARKER = '__MCPROC_DOCTOR__';
 
-/** How monit reads a host whose pm2 was resolved, with `apps` the manifest's apps there (see DoctorReport.monit). */
-async function monitMode(
+/**
+ * How monit reads a host whose pm2 was resolved, with `apps` the manifest's apps there (see DoctorReport.monit);
+ * `proc` is how its processes are read, procFor's choice unless a caller (a test) passes another.
+ */
+export async function monitMode(
   host: Host,
   client: Pm2Client,
   apps: Record<string, App>,
-  spawner?: Spawner
+  spawner?: Spawner,
+  proc: ProcReader | null = procFor(host, spawner)
 ): Promise<NonNullable<DoctorReport['monit']>> {
-  const scan = procFor(host, spawner) ? 'in-process' : 'script';
+  const scan = proc ? 'in-process' : 'script';
   if (!host.local) return { mode: 'polled', scan, why: 'another host' };
   // on this machine without an injected spawner, only a missing /proc leaves the script
   if (scan === 'script' && !spawner)
@@ -117,7 +122,7 @@ async function monitMode(
     return {
       mode: 'polled',
       scan,
-      why: `${own} writes its pid file elsewhere (pm2.pid_file)`,
+      why: `${own}'s pm2.pid_file moves its pid file`,
     };
   let p: Awaited<ReturnType<Pm2Client['pids']>>;
   try {

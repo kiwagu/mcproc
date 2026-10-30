@@ -4,10 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest, type Manifest } from '../../src/core/manifest.js';
-import { doctor, type DoctorReport } from '../../src/core/doctor.js';
+import { doctor, type DoctorReport, monitMode } from '../../src/core/doctor.js';
+import type { Pm2Client } from '../../src/core/pm2.js';
+import { ProcReader } from '../../src/core/procfs.js';
+import { pickHost } from '../../src/core/resolve.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
 import { renderDoctor } from '../../src/mcp/render.js';
 import type { Spawner } from '../../src/transport/types.js';
+import { procWorld } from '../helpers/procfs.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -641,5 +645,99 @@ describe('renderDoctor: the daemon and how reads run', () => {
       scan: 'script',
       why: 'another host',
     });
+  });
+});
+
+describe('monitMode: how monit reads this machine', () => {
+  const m = loadManifest(basic);
+  const local = pickHost(m, 'local');
+  const proc = new ProcReader(procWorld({ procs: [] }));
+  /** a client whose pids() answers `p` (or throws it) */
+  const pidsGive = (p: Awaited<ReturnType<Pm2Client['pids']>> | Error) =>
+    ({
+      pids: async () => {
+        if (p instanceof Error) throw p;
+        return p;
+      },
+    }) as unknown as Pm2Client;
+  const withTmp = async (f: (dir: string) => Promise<void>) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-monit-'));
+    try {
+      await f(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  it('an app whose pm2 options set pid_file: polled, though the pids directory is there', () =>
+    withTmp(async (dir) => {
+      const apps = {
+        ...m.apps,
+        worker: { ...m.apps.worker, pm2: { pid_file: '/tmp/w.pid' } },
+      };
+      expect(
+        await monitMode(
+          local,
+          pidsGive({ dir, why: null }),
+          apps,
+          undefined,
+          proc
+        )
+      ).toEqual({
+        mode: 'polled',
+        scan: 'in-process',
+        why: "worker's pm2.pid_file moves its pid file",
+      });
+    }));
+  it('a pids directory no daemon has made yet: polled; once it is there: events', () =>
+    withTmp(async (home) => {
+      const dir = path.join(home, 'pids');
+      const client = pidsGive({ dir, why: null });
+      expect(await monitMode(local, client, m.apps, undefined, proc)).toEqual({
+        mode: 'polled',
+        scan: 'in-process',
+        why: 'no daemon has made its pids directory yet',
+      });
+      fs.mkdirSync(dir);
+      expect(await monitMode(local, client, m.apps, undefined, proc)).toEqual({
+        mode: 'events',
+        scan: 'in-process',
+        why: null,
+      });
+    }));
+  it("no pids directory from pm2, or pids() fails: polled with pm2's reason", async () => {
+    const why = 'PM2_DEFAULT_PID_PATH moves its pid files';
+    expect(
+      await monitMode(
+        local,
+        pidsGive({ dir: null, why }),
+        m.apps,
+        undefined,
+        proc
+      )
+    ).toEqual({ mode: 'polled', scan: 'in-process', why });
+    expect(
+      await monitMode(
+        local,
+        pidsGive(new Error('the login shell hung')),
+        m.apps,
+        undefined,
+        proc
+      )
+    ).toEqual({
+      mode: 'polled',
+      scan: 'in-process',
+      why: 'the login shell hung',
+    });
+  });
+  it('no /proc on this machine: polled with the script', async () => {
+    expect(
+      await monitMode(
+        local,
+        pidsGive({ dir: null, why: 'unused' }),
+        m.apps,
+        undefined,
+        null
+      )
+    ).toEqual({ mode: 'polled', scan: 'script', why: 'no /proc here' });
   });
 });
