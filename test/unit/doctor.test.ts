@@ -545,6 +545,7 @@ describe('renderDoctor: the daemon and how reads run', () => {
     environment: null,
     urls: [],
     reads: null,
+    monit: null,
   };
   it('a daemon that does not run', () => {
     expect(
@@ -590,5 +591,55 @@ describe('renderDoctor: the daemon and how reads run', () => {
       reason: expect.stringContaining('printed no environment'),
     });
     expect(stand.reads).toBeNull();
+  });
+  it('how monit reads a host: events with the in-process scan, or polled and why', () => {
+    expect(
+      renderDoctor([
+        { ...rep, monit: { mode: 'events', scan: 'in-process', why: null } },
+      ])
+    ).toContain('\n  monit: events + in-process scan');
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          monit: {
+            mode: 'polled',
+            scan: 'in-process',
+            why: 'PM2_DEFAULT_PID_PATH moves its pid files',
+          },
+        },
+      ])
+    ).toContain(
+      '\n  monit: polled every 2 s with the in-process scan (PM2_DEFAULT_PID_PATH moves its pid files)'
+    );
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          monit: { mode: 'polled', scan: 'script', why: 'another host' },
+        },
+      ])
+    ).toContain('\n  monit: polled every 2 s (another host)');
+    expect(renderDoctor([rep])).not.toContain('monit:');
+  });
+  it('doctor says how monit reads each host it reached', async () => {
+    const [local, stand, prod] = await doctor(
+      loadManifest(basic),
+      undefined,
+      spawner,
+      neverHere
+    );
+    // the injected spawner is a fake world: no in-process scan, no socket lister, so nothing to watch
+    expect(local.monit).toEqual({
+      mode: 'polled',
+      scan: 'script',
+      why: "pm2's list does not come over its socket here",
+    });
+    expect(stand.monit).toBeNull();
+    expect(prod.monit).toEqual({
+      mode: 'polled',
+      scan: 'script',
+      why: 'another host',
+    });
   });
 });
