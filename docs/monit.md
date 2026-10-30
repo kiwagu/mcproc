@@ -41,19 +41,19 @@ stay yours ([urls](urls.md)). How lines reach the screen: [live logs](logs.md#li
 
 ## When the screen reads
 
-On this machine monit waits for pm2 to say that something happened instead of reading every 2 seconds. It watches
-the pid files pm2 writes for each process (`pids/` in the daemon's home): when one of the project's appears or goes
-(a process starts, exits, stops or restarts) it reads, then checks the declared ports of an app that is starting after
-0.5, 1, 2, 4 and 8 seconds. While an app runs it reads every `--interval` (2 s by default) for its CPU and memory;
-with nothing running it reads every 30 seconds, which also shows what pm2 does not announce (a stopped app deleted, a
-process outside pm2 taking a port). The screen is drawn again only when what it shows changed, and its clock says
-when the rows were last read.
+On this machine monit does not read every 2 seconds whatever happens: it waits for pm2 to say that something happened.
+It watches the pid files pm2 writes for each process (`pids/` in the daemon's home): when one of the project's appears
+or goes (a process starts, exits, stops or restarts), and when monit starts watching, it reads; then, while a running
+app's declared ports do not all listen, again 0.5, 1, 2, 4 and 8 seconds after it. While an app runs it also reads every
+`--interval` (2 s by default) for its CPU and memory; with nothing running it reads every 30 seconds, which also shows
+what pm2 does not announce (a stopped app deleted, a process outside pm2 taking a port). The screen is drawn again only
+when what it shows changed, and its clock says when the rows were last read.
 
 Hosts reached over ssh or docker are read every `--interval` as before, and so is this machine when there is nothing
 to watch (no `/proc`, `hosts.local.pm2` set, `PM2_DEFAULT_PID_PATH` set, an app whose `pm2:` options set its own
-`pid_file`, a login environment that cannot be read without `pm2_home`) or while the daemon's `pids/` directory is
-missing (no daemon has run there yet, or its home was removed: monit looks for it again every second); `mcproc doctor`
-says which way each host is read.
+`pid_file` (or `pid`), a login environment that cannot be read without `pm2_home`) or while the daemon's `pids/`
+directory is missing (no daemon has run there yet, or its home was removed: monit looks for it again every second);
+`mcproc doctor` says which way each host is read.
 
 ## Every stack of the host
 
