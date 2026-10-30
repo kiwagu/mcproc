@@ -9,8 +9,10 @@ import {
   prepare,
 } from '../../src/core/resolve.js';
 import { actOn, Fleet } from '../../src/core/fleet.js';
-import { rowsFor, snapshot } from '../../src/core/list.js';
+import { rowsFor, snapshot, type Snapshot } from '../../src/core/list.js';
+import { findProcess } from '../../src/core/pm2.js';
 import { closeDaemons } from '../../src/core/pm2socket.js';
+import { descendants } from '../../src/core/ports.js';
 import {
   closePidWatches,
   followPids,
@@ -54,6 +56,15 @@ const pm2 = (...args: string[]) => {
     stdio: 'ignore',
     timeout: PM2_CALL_MS,
   });
+};
+/** web's CPU ticks in a snapshot's first sample: its pm2 process and every descendant. */
+const webTicks = (s: Snapshot): number => {
+  const root = findProcess(s.procs, 'ev', 'web')?.pid ?? 0;
+  const ticks = s.stats.samples[0]?.ticks ?? new Map<number, number>();
+  return [root, ...descendants(s.tree, root)].reduce(
+    (sum, pid) => sum + (ticks.get(pid) ?? 0),
+    0
+  );
 };
 /** Stops the daemon of the throwaway home, only when one runs there. */
 function killDaemon(at: string) {
@@ -112,7 +123,7 @@ afterAll(() => {
       failure
     );
   if (base) fs.rmSync(base, { recursive: true, force: true });
-});
+}, 60_000); // pm2 kill may take up to PM2_CALL_MS
 
 describe('monit events, on real pm2', () => {
   it("a pid watch follows a real daemon: up once it made its pids directory, its project's starts and restarts, across a kill and a new daemon", async () => {
@@ -148,25 +159,24 @@ describe('monit events, on real pm2', () => {
 
   it('the in-process scan sees what the script sees', async () => {
     const fleet = new Fleet(prepare({ project }).manifest, undefined);
-    await actOn(fleet, 'web', 'start');
+    // one sample each, so the CPU ticks of the two scans compare
+    const once = { cpu: 'none', urls: 'none', leases: 'none' } as const;
     try {
+      await actOn(fleet, 'web', 'start');
       const ctx = await connect(prepare({ project }));
       expect(ctx.proc).toBeTruthy();
-      let mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
+      let mine = await snapshot(ctx, once);
       for (
         let i = 0;
         i < 40 && mine.ports.web.checks[0]?.status !== 'listening';
         i++
       ) {
         await sleep(250);
-        mine = await snapshot(ctx, { urls: 'none', leases: 'none' });
+        mine = await snapshot(ctx, once);
       }
       // web really listens: two scans that both saw no listener would agree on nothing
       expect(mine.ports.web.checks[0]?.status).toBe('listening');
-      const script = await snapshot(
-        { ...ctx, proc: null },
-        { urls: 'none', leases: 'none' }
-      );
+      const script = await snapshot({ ...ctx, proc: null }, once);
       expect(script.ports.web.actual).not.toEqual([]);
       expect(mine.ports.web.checks).toEqual(script.ports.web.checks);
       expect(mine.ports.web.actual.map((l) => l.pid)).toEqual(
@@ -177,6 +187,11 @@ describe('monit events, on real pm2', () => {
       expect(m.procs).toBe(s.procs);
       expect(Math.abs(m.memory - s.memory)).toBeLessThanOrEqual(s.memory * 0.1);
       expect(m.runtime).toBe(s.runtime);
+      // the same ticks read the same way: the script's, taken a moment later, within an order of magnitude
+      const ticks = webTicks(mine);
+      expect(ticks).toBeGreaterThan(0);
+      expect(webTicks(script) / ticks).toBeGreaterThanOrEqual(0.1);
+      expect(webTicks(script) / ticks).toBeLessThanOrEqual(10);
     } finally {
       // the next case starts web from stopped, and checks that it is
       await actOn(fleet, 'web', 'stop').catch(() => undefined);
@@ -227,8 +242,8 @@ describe('monit events, on real pm2', () => {
       // ten minutes: within this test only pm2's pid files (or a port check after one of their events) can explain a read
       loop.start(600_000);
       await loop.refresh();
-      // the port checks start only on a pid-file event, so the loop's own feed must be up before the start: one that came
-      // up only after the start's pid file was written would show the port listening at the 30 s safety read
+      // the loop's own feed must be up before the start: one that came up after it would show web online by the
+      // read it makes on coming up, not by the start's event
       await until("the loop's feed up", () => heard.includes('up'));
       // not running before the start: online can only come from the start's event
       expect(['stopped', 'not-started']).toContain(web()?.status);
