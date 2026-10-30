@@ -1,6 +1,6 @@
 /** A read a pm2 event asks for waits this long, so a burst of events (a restart removes and writes its pid file) is read once. */
 export const EVENT_DEBOUNCE_MS = 100;
-/** After an event, while a running app's declared ports do not all listen, the group is read at these times. */
+/** After an event (or the feed coming up), while a running app's declared ports do not all listen, the group is read at these times. */
 export const PORT_CHECKS_MS = [500, 1000, 2000, 4000, 8000] as const;
 /** An event-driven group is read at least this often: for what pm2 does not announce (a stopped app deleted, a process outside pm2 taking a port). */
 export const SAFETY_MS = 30_000;
@@ -15,8 +15,8 @@ export interface Settled {
  * When one host group of the monit view is read. Polled (another host, or nothing to watch): every `intervalMs`, as
  * before. Event-driven (this machine, its pid files watched): EVENT_DEBOUNCE_MS after a pm2 event; every `intervalMs`
  * while an app of the group runs (CPU is a difference of two samples; with nothing running there is none to take); at
- * PORT_CHECKS_MS after an event while a running app's declared ports do not all listen; and SAFETY_MS after the last
- * read in any case. The reads the screen's keys ask for are the loop's own, as before.
+ * PORT_CHECKS_MS after an event, or after the feed came up, while a running app's declared ports do not all listen; and
+ * SAFETY_MS after the last read in any case. The reads the screen's keys ask for are the loop's own, as before.
  */
 export class HostSchedule {
   private mode: 'polled' | 'events' = 'polled';
@@ -47,6 +47,8 @@ export class HostSchedule {
     }
     this.armSafety();
     if (this.last.running) this.armTick();
+    // an app may be launching as the feed comes up: its ports are checked as after an event
+    this.armCheck(0);
   }
 
   /** A pm2 event of the group's processes: one read soon, and the port checks start over. */

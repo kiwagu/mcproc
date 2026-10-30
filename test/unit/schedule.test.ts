@@ -91,6 +91,18 @@ describe('HostSchedule', () => {
     expect(at).toEqual([EVENT_DEBOUNCE_MS, ...PORT_CHECKS_MS]);
     s.stop();
   });
+  it('the feed coming up starts the port checks too: an app still launching then shows its port within seconds', async () => {
+    const { s, at, world } = harness(60_000, {
+      running: true,
+      portsPending: true,
+    });
+    s.start();
+    s.settled({ ...world }); // a polled read found it launching
+    s.setMode('events');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(at).toEqual([...PORT_CHECKS_MS]);
+    s.stop();
+  });
   it('a check that finds every declared port listening ends the checks', async () => {
     const { s, at, world } = harness(60_000, {
       running: true,
