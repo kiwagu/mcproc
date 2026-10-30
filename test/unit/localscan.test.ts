@@ -170,6 +170,33 @@ describe('probeLocal', () => {
       'demo-db'
     );
   });
+  it("declared containers' memory is read on every ask that wants it, never from the cache", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      let mib = 27;
+      const { link, fake } = local([
+        {
+          match: MARK.DOCKER,
+          result: () => ({
+            stdout: `${DOCKER_OUT}${MARK.DOCKERMEM}\ndemo-db\t${mib++}MiB / 31.09GiB\n`,
+          }),
+        },
+      ]);
+      const ask = { ...QUIET, holders: [5432], containers: ['demo-db'] };
+      const first = (await probeLocal(link, ask))!;
+      const second = (await probeLocal(link, ask))!; // the same moment: well inside the ports' 30 s
+      expect(fake.calls).toHaveLength(2);
+      expect(fake.calls.every((c) => c.cmd.includes(MARK.DOCKERMEM))).toBe(
+        true
+      );
+      expect([
+        first.data.containers.get('demo-db'),
+        second.data.containers.get('demo-db'),
+      ]).toEqual([27, 28]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('a declared port held without a pid asks docker for the published ports, at most every 30 s', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
@@ -181,8 +208,11 @@ describe('probeLocal', () => {
       expect(p.data.listeners.find((l) => l.port === 5432)?.container).toBe(
         'demo-db'
       );
-      await probeLocal(link, ask);
+      const cached = (await probeLocal(link, ask))!;
       expect(fake.calls).toHaveLength(1);
+      expect(
+        cached.data.listeners.find((l) => l.port === 5432)?.container
+      ).toBe('demo-db');
       vi.setSystemTime(Date.now() + DOCKER_EVERY_MS);
       await probeLocal(link, ask);
       expect(fake.calls).toHaveLength(2);
