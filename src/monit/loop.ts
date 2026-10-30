@@ -5,7 +5,8 @@ import {
   type Snapshot,
   type SnapshotOptions,
 } from '../core/list.js';
-import { findProcess } from '../core/pm2.js';
+import { findProcess, isRunning } from '../core/pm2.js';
+import type { EventFeed, FeedNote } from '../core/pm2watch.js';
 import { assertWritable, pickHost, type Context } from '../core/resolve.js';
 import {
   actOn,
@@ -42,6 +43,7 @@ import {
   type MonitState,
   type ReloadInfo,
 } from './state.js';
+import { HostSchedule } from './schedule.js';
 
 export type Cmd = 'start' | 'restart' | 'stop';
 export interface Follower {
@@ -92,6 +94,11 @@ export interface LoopDeps {
     cursor: CursorState,
     restart: Restarts
   ): Promise<{ answer: TakenAnswer; next: CursorState }>;
+  /**
+   * pm2's process events of a host's daemon, as its pid files show them (see followPids), when this machine can follow
+   * them; null, or no such dep: the host is read every interval
+   */
+  events?(ctx: Context, on: (n: FeedNote) => void): Promise<EventFeed | null>;
 }
 
 export { describeError };
@@ -157,11 +164,11 @@ interface Counter {
 const WAKE_GAP_MS = 50;
 
 /**
- * The monit screen's data loop: periodic refreshes of every host the view reaches, each host on its own, log following
- * for the selected app (or every app in the flat view) on the host it runs on, view switches and commands. Every refresh
- * belongs to a generation; a view switch starts a new one, and whatever an older refresh still returns is dropped. The
- * followers of the apps on screen wake the loop when their files change, so new lines show without waiting for a
- * refresh; the refresh stays as the clock behind them.
+ * The monit screen's data loop: the reads of every host the view reaches, each host on its own schedule (pm2's pid
+ * files on this machine, the interval elsewhere: see HostSchedule), log following for the selected app (or every app in the
+ * flat view) on the host it runs on, view switches and commands. Every read belongs to a generation; a view switch
+ * starts a new one, and whatever an older read still returns is dropped. The followers of the apps on screen wake the
+ * loop when their files change, so new lines show without waiting for a read.
  */
 export class MonitLoop {
   private gen = 0;
@@ -196,6 +203,14 @@ export class MonitLoop {
    * emptied since it last read them, which its next read starts at their beginning when pm2 still writes them
    */
   private inc: IncidentsView = freshView();
+  /** the interval of each group's schedule, set by start; null before it (tests and --once read by hand) */
+  private intervalMs: number | null = null;
+  /** per host group of the view: when it is read */
+  private schedules = new Map<string, HostSchedule>();
+  /** the event feeds of the view's groups, closed with it */
+  private feeds: EventFeed[] = [];
+  /** reads the store (clears, takes) and lets the incidents view read, without reading any host */
+  private storeTimer: NodeJS.Timeout | null = null;
 
   constructor(
     public fleet: Fleet,
@@ -235,6 +250,83 @@ export class MonitLoop {
         }),
       incidents,
     ]).then(() => undefined);
+  }
+
+  /**
+   * Starts reading on its own: each host group on its schedule, pm2's pid files watched where this machine can, and the
+   * store (clears and takes of other agents) with the incidents view on a timer of their own every interval.
+   */
+  start(intervalMs: number): void {
+    if (this.closed || this.intervalMs !== null) return;
+    this.intervalMs = intervalMs;
+    this.arm();
+    this.storeTimer = setInterval(() => {
+      if (this.closed) return;
+      this.readCleared();
+      if (this.getState().view === 'incidents') void this.pollIncidents();
+    }, intervalMs);
+  }
+
+  /** A schedule for each host group of the view, and its feed asked for where the deps can give one. */
+  private arm(): void {
+    if (this.intervalMs === null) return;
+    const gen = this.gen;
+    for (const g of this.groups) {
+      const s = new HostSchedule({
+        intervalMs: this.intervalMs,
+        refresh: () => void this.refresh([g.host]),
+      });
+      this.schedules.set(g.host, s);
+      s.start();
+      if (this.deps.events) void this.follow(gen, g.host, s);
+    }
+  }
+
+  /** The view's schedules stop and its feeds close. */
+  private disarm(): void {
+    for (const s of this.schedules.values()) s.stop();
+    this.schedules.clear();
+    for (const f of this.feeds.splice(0)) f.close();
+  }
+
+  /** Follows the events of `host`'s daemon for this generation; a host that gives no feed, or fails to, stays on its timer. */
+  private async follow(
+    gen: number,
+    host: string,
+    s: HostSchedule
+  ): Promise<void> {
+    const events = this.deps.events;
+    if (!events) return;
+    try {
+      const ctx = await this.fleet.ctx(host);
+      if (gen !== this.gen) return;
+      const feed = await events(ctx, (n) => {
+        if (gen !== this.gen) return;
+        if (n === 'event') return s.event();
+        s.setMode(n === 'up' ? 'events' : 'polled');
+        // what happened before the feed was up, or while it was down, is read at once: by a read begun after this, since
+        // one under way may predate it (the first start in a fresh pm2 home is heard as 'up' alone)
+        if (n === 'up') void this.refreshAfterCurrent([host]);
+      });
+      if (!feed) return;
+      if (gen !== this.gen) return feed.close();
+      this.feeds.push(feed);
+    } catch {
+      /* the group stays on its timer */
+    }
+  }
+
+  /** What the group's newest rows say, for its schedule: whether an app runs, and whether one that runs waits for a port. */
+  private settle(g: HostApps): void {
+    const rows = g.apps.flatMap((a) => this.latest.get(a) ?? []);
+    this.schedules.get(g.host)?.settled({
+      running: rows.some((r) => isRunning(r.status)),
+      portsPending: rows.some(
+        (r) =>
+          isRunning(r.status) &&
+          r.ports.checks.some((c) => c.status !== 'listening')
+      ),
+    });
   }
 
   /**
@@ -357,6 +449,7 @@ export class MonitLoop {
         this.latest.set(r.app, r);
       this.errors.delete(g.host);
       this.publish(true);
+      this.settle(g);
       // every app gets its own buffer and follower; the dashboard polls the selected app, the flat view every running one.
       // Lines are consumed from the file by offset, so a poll's result always lands in its app's buffer — even if the
       // selection moved on meanwhile (the reducer only shows the selected app; nothing is lost).
@@ -408,6 +501,7 @@ export class MonitLoop {
             )
           );
       this.publish(false);
+      this.settle(g);
     }
   }
 
@@ -591,6 +685,9 @@ export class MonitLoop {
       q.dirty.clear();
     }
     for (const app of [...this.watched]) this.unwatch(app);
+    this.disarm();
+    if (this.storeTimer) clearInterval(this.storeTimer);
+    this.storeTimer = null;
   }
 
   /** The user moved the selection: refresh its host so an app seen for the first time gets its follower (history) at once. */
@@ -640,6 +737,9 @@ export class MonitLoop {
       this.latest.clear();
       this.errors.clear();
       this.inc = freshView(); // the incidents of the new view are read afresh
+      // the old view's groups stop being read; the new view's get their schedules and feeds
+      this.disarm();
+      this.arm();
       this.dispatch({ type: 'host', host: viewLabel(requested) });
       await this.refresh(); // a new generation: starts at once, the old view's pending probes are dropped when they return
     } catch (e) {

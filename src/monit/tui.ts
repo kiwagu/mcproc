@@ -4,6 +4,7 @@ import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
 import { createFollower } from '../core/logfollow.js';
+import { followPids } from '../core/pm2watch.js';
 import {
   appInfos,
   CONFIRM_MS,
@@ -40,6 +41,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   },
   peekIncidents: (fleet, names, cursor, restart) =>
     peekView(fleet, names, cursor, restart),
+  events: followPids,
 });
 
 /** A blessed screen: monit's own, or the stacks overview's that monit draws on for a while. */
@@ -175,13 +177,11 @@ export async function runMonit(opts: {
   );
 
   return new Promise<'quit' | 'back'>((resolve) => {
-    const timer = setInterval(() => {
-      void loop.refresh();
-    }, opts.intervalMs);
+    // each host group on its own schedule: pm2's pid files on this machine, the interval elsewhere
+    loop.start(opts.intervalMs);
     // a screen of its own goes with monit; the overview's screen is left as monit found it, its own boxes taken off
     const leave = (why: 'quit' | 'back') => {
       left = true;
-      clearInterval(timer);
       loop.close();
       screen.removeListener('keypress', onKey);
       screen.removeListener('resize', paint);
