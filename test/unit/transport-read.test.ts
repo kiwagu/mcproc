@@ -343,6 +343,55 @@ describe('Transport.read', () => {
     ]);
     expect(t.readMode()).toMatchObject({ shell: 'host' });
   });
+  it('a remote host whose ssh outlasts the timeout: the read fails with that timeout, without connecting again', async () => {
+    const w = world();
+    w.onCapture(() => {
+      w.advance(30_000);
+      throw new McprocError(
+        'TIMEOUT',
+        'Command timed out after 30000 ms: ssh -o BatchMode=yes -o'
+      );
+    });
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    await expect(t.read('probe')).rejects.toMatchObject({ code: 'TIMEOUT' });
+    w.advance(1_000);
+    await expect(t.read('again')).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(w.captures()).toBe(1);
+    expect(w.calls).toEqual([]); // no exec through the host shell: it would wait out the same timeout
+    expect(t.readMode()).toMatchObject({
+      shell: 'host',
+      reason: expect.stringContaining('did not answer'),
+    });
+    // 30 s after it gave up, the host is asked again
+    w.onCapture(() => {});
+    w.advance(30_000);
+    await t.read('later');
+    expect(w.captures()).toBe(2);
+    expect(t.readMode()).toMatchObject({ shell: 'plain' });
+  });
+  it('a remote host where ssh cannot even start: the read fails with that, without a second attempt', async () => {
+    const w = world();
+    w.onCapture(() => {
+      throw new McprocError(
+        'TRANSPORT_FAILED',
+        'Cannot spawn ssh: spawn ssh ENOENT'
+      );
+    });
+    const t = createTransport(ssh, w.spawner, undefined, w.clock);
+    await expect(t.read('probe')).rejects.toMatchObject({
+      code: 'TRANSPORT_FAILED',
+    });
+    expect(w.calls).toEqual([]);
+  });
+  it('this machine: a capture that times out still falls back to the host shell', async () => {
+    const w = world();
+    w.onCapture(() => {
+      throw new McprocError('TIMEOUT', 'Command timed out after 30000 ms');
+    });
+    const t = createTransport(local, w.spawner, undefined, w.clock);
+    await t.read('a');
+    expect(w.calls.map((c) => c.argv[0])).toEqual(['/bin/bash']);
+  });
   it('a plain sh that cannot start with the login environment: the host shell, with no second capture', async () => {
     const w = world((argv) =>
       argv[0] === '/bin/bash' ? { stdout: 'via login' } : {}
