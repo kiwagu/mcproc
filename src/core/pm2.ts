@@ -160,6 +160,26 @@ export class Pm2Client {
     }
     return parseJlist((await this.run(['jlist'], { read: true })).stdout);
   }
+  /**
+   * the directory pm2 writes its processes' pid files to, for monit to watch: only where its list comes over the socket
+   * (this machine, mcproc's own pm2), its home is known, and PM2_DEFAULT_PID_PATH (pm2 reads it from its environment)
+   * does not move it; else why not
+   */
+  async pids(): Promise<
+    { dir: string; why: null } | { dir: null; why: string }
+  > {
+    if (!this.lister)
+      return {
+        dir: null,
+        why: "pm2's list does not come over its socket here",
+      };
+    const env = await this.daemonEnv();
+    if (!this.pm2Home && !env)
+      return { dir: null, why: 'the login environment could not be read' };
+    if ((env ?? process.env).PM2_DEFAULT_PID_PATH)
+      return { dir: null, why: 'PM2_DEFAULT_PID_PATH moves its pid files' };
+    return { dir: path.join(await this.home(), 'pids'), why: null };
+  }
   env(): Record<string, string> | undefined {
     return this.pm2Home ? { PM2_HOME: this.pm2Home } : undefined;
   }
