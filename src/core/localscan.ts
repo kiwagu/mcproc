@@ -24,12 +24,20 @@ export type LocalLink = HostLink & { proc: ProcReader };
 export const inProcess = (link: HostLink): link is LocalLink =>
   Boolean(link.proc) && link.host.local;
 
-/** The docker-published ports are read again at most this often while a declared port's listener has no pid. */
+/**
+ * The docker-published ports are read again at most this often while a declared port's listener has no pid, and at once
+ * for one that had a pid (or did not listen) at the last read.
+ */
 export const DOCKER_EVERY_MS = 30_000;
 /** The gap between the two sweeps of an inline CPU reading, as the script's `sleep 0.5`. */
 const INLINE_GAP_MS = 500;
 
-let dockerSeen: { at: number; ports: Map<number, string> } | null = null;
+/** the published ports docker gave last, when, and the ports listened on without a pid then: the ones it answered for */
+let dockerSeen: {
+  at: number;
+  ports: Map<number, string>;
+  pidless: Set<number>;
+} | null = null;
 /** Forgets the published ports read last (tests). */
 export function clearLocalScanCache(): void {
   dockerSeen = null;
@@ -63,7 +71,7 @@ async function hostUrls(
 /**
  * What the scan asks docker: the declared containers' memory when asked (with the published ports, in one read), else
  * the published ports when a listener of a holder port has no pid (a container's port), at most every DOCKER_EVERY_MS
- * and every time for 'all'; nothing otherwise.
+ * while each such port had no pid at the last read too, and every time for 'all'; nothing otherwise.
  */
 async function dockerPart(
   link: LocalLink,
@@ -71,19 +79,24 @@ async function dockerPart(
   listeners: Listener[]
 ): Promise<{ ports: Map<number, string>; containers: Map<string, number> }> {
   const holders = ask.holders ?? [];
-  const unnamed = listeners.some(
-    (l) => l.pid === null && (holders === 'all' || holders.includes(l.port))
+  const pidless = new Set(
+    listeners.flatMap((l) => (l.pid === null ? [l.port] : []))
   );
-  if (ask.containers.length === 0 && !unnamed)
+  const unnamed = [...pidless].filter(
+    (p) => holders === 'all' || holders.includes(p)
+  );
+  if (ask.containers.length === 0 && unnamed.length === 0)
     return { ports: new Map(), containers: new Map() };
   const now = Date.now();
+  const last = dockerSeen;
   if (
     ask.containers.length === 0 &&
     holders !== 'all' &&
-    dockerSeen &&
-    now - dockerSeen.at < DOCKER_EVERY_MS
+    last &&
+    now - last.at < DOCKER_EVERY_MS &&
+    unnamed.every((p) => last.pidless.has(p))
   )
-    return { ports: dockerSeen.ports, containers: new Map() };
+    return { ports: last.ports, containers: new Map() };
   const res = ensureOk(
     await link.transport.read(dockerScript(ask.containers), {
       env: link.pm2.env(),
@@ -93,7 +106,7 @@ async function dockerPart(
     'docker'
   );
   const d = parseProbe(res.stdout);
-  dockerSeen = { at: now, ports: d.stats.dockerPorts };
+  dockerSeen = { at: now, ports: d.stats.dockerPorts, pidless };
   return { ports: d.stats.dockerPorts, containers: d.containers };
 }
 

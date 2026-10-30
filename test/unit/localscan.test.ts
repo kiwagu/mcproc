@@ -190,6 +190,37 @@ describe('probeLocal', () => {
       vi.useRealTimers();
     }
   });
+  it('a declared port that has lost its pid since the last docker read asks docker again within the 30 s', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const a = local([
+        {
+          match: MARK.DOCKER,
+          result: {
+            stdout: `${DOCKER_OUT}demo-cache\t0.0.0.0:6379->6379/tcp\n`,
+          },
+        },
+      ]);
+      const ask = { ...QUIET, holders: [5432, 6379] };
+      await probeLocal(a.link, ask);
+      expect(a.fake.calls).toHaveLength(1);
+      // a container starts publishing 6379: its proxy's socket has no pid here
+      const b = local(
+        [],
+        { ...WORLD, tcp: [...WORLD.tcp!, { port: 6379, inode: 6002 }] },
+        a.fake
+      );
+      const p = (await probeLocal(b.link, ask))!;
+      expect(a.fake.calls).toHaveLength(2);
+      expect(p.data.listeners.find((l) => l.port === 6379)?.container).toBe(
+        'demo-cache'
+      );
+      await probeLocal(b.link, ask);
+      expect(a.fake.calls).toHaveLength(2); // nothing new since: the cached ports
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('every declared port held by the trees: docker is not asked', async () => {
     const { link, fake } = local();
     await probeLocal(link, { ...QUIET, holders: [3310] });

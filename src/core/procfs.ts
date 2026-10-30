@@ -38,7 +38,10 @@ export interface ProcTrees {
   args: Map<number, string>;
 }
 
-/** A holder of a declared port outside pm2's trees is named from a walk over every process's fds made at most this often. */
+/**
+ * A holder of a declared port outside pm2's trees is named from a walk over every process's fds made at most this often,
+ * and again at once for a socket the last walk did not see (a new holder).
+ */
 export const HOLDER_WALK_MS = 30_000;
 
 const NET: [ProcSocket['proto'], string][] = [
@@ -73,8 +76,15 @@ function getconf(name: string, fallback: number): number {
  */
 export class ProcReader {
   private consts: { clkTck: number; pageSize: number } | null;
-  /** the last walk over every process's fds: socket inode → the pids that hold it */
-  private walked: { at: number; owners: Map<number, number[]> } | null = null;
+  /**
+   * the last walk over every process's fds: socket inode → the pids that hold it, and every socket of /proc/net it looked
+   * for, held or not (another user's stays without an owner, and is no reason to walk again)
+   */
+  private walked: {
+    at: number;
+    owners: Map<number, number[]>;
+    seen: Set<number>;
+  } | null = null;
 
   constructor(
     private readonly fs: ProcFs = realProcFs,
@@ -132,8 +142,8 @@ export class ProcReader {
   /**
    * The trees of `roots` (pm2's processes, each with its descendants): their listeners with their pids and command, and
    * with `metrics` their RSS and command lines. A listening socket outside the trees has no pid, unless its port is one
-   * of `holders` (or holders is 'all'): then a walk over every process's fds names it, at most every HOLDER_WALK_MS,
-   * and every time for 'all'.
+   * of `holders` (or holders is 'all'): then a walk over every process's fds names it, at most every HOLDER_WALK_MS
+   * unless such a socket is new since the last walk, and every time for 'all'.
    */
   trees(
     sweep: ProcSweep,
@@ -169,10 +179,12 @@ export class ProcReader {
     }
     const wanted = (port: number) =>
       o.holders === 'all' || o.holders.includes(port);
-    const foreign = sweep.sockets.some(
-      (s) => !owners.has(s.inode) && wanted(s.port)
+    const outside = sweep.sockets.flatMap((s) =>
+      !owners.has(s.inode) && wanted(s.port) ? [s.inode] : []
     );
-    const walk = foreign ? this.walk(sweep, o.holders === 'all') : null;
+    const walk = outside.length
+      ? this.walk(sweep, o.holders === 'all', outside)
+      : null;
     const comms = new Map<number, string | null>();
     const comm = (pid: number): string | null => {
       if (!comms.has(pid)) {
@@ -254,14 +266,31 @@ export class ProcReader {
     }
   }
 
-  /** inode → pids over every process this user may look into: fresh for `fresh`, else at most every HOLDER_WALK_MS. */
-  private walk(sweep: ProcSweep, fresh: boolean): Map<number, number[]> {
+  /**
+   * inode → pids over every process this user may look into: fresh for `fresh`, else at most every HOLDER_WALK_MS while
+   * the last walk saw every socket of `inodes`.
+   */
+  private walk(
+    sweep: ProcSweep,
+    fresh: boolean,
+    inodes: number[]
+  ): Map<number, number[]> {
     const now = this.now();
-    if (!fresh && this.walked && now - this.walked.at < HOLDER_WALK_MS)
-      return this.walked.owners;
+    const last = this.walked;
+    if (
+      !fresh &&
+      last &&
+      now - last.at < HOLDER_WALK_MS &&
+      inodes.every((i) => last.seen.has(i))
+    )
+      return last.owners;
     const owners = new Map<number, number[]>();
     for (const pid of sweep.tree.keys()) this.fds(pid, owners);
-    this.walked = { at: now, owners };
+    this.walked = {
+      at: now,
+      owners,
+      seen: new Set(sweep.sockets.map((s) => s.inode)),
+    };
     return owners;
   }
 }

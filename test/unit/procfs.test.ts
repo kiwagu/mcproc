@@ -65,6 +65,32 @@ const reader = (w: FakeWorld = WORLD, clock = { t: 1_000_000 }) => {
   const fs = procWorld(w);
   return { fs, clock, r: new ProcReader(fs, () => clock.t, CONSTS) };
 };
+/** A /proc that changes under one reader: `to(w)` makes it `w`'s; `asked` keeps every path asked of either. */
+const changing = (w: FakeWorld) => {
+  let cur = procWorld(w);
+  const asked: string[] = [];
+  const fs: ProcFs = {
+    readdir(d) {
+      asked.push(d);
+      return cur.readdir(d);
+    },
+    read(f) {
+      asked.push(f);
+      return cur.read(f);
+    },
+    readlink(f) {
+      asked.push(f);
+      return cur.readlink(f);
+    },
+  };
+  return {
+    fs,
+    asked,
+    to: (next: FakeWorld) => {
+      cur = procWorld(next);
+    },
+  };
+};
 
 describe('ProcReader.sweep', () => {
   it('every process with its parent and CPU ticks, the listening sockets, the memory', () => {
@@ -173,6 +199,48 @@ describe('ProcReader.trees', () => {
     look('all');
     look('all');
     expect(walks()).toBe(4);
+  });
+  it('a new process outside the trees on a declared port within 30 s of a walk is named at the next read', () => {
+    const clock = { t: 1_000_000 };
+    const w = changing(WORLD);
+    const r = new ProcReader(w.fs, () => clock.t, CONSTS);
+    const walks = () => w.asked.filter((p) => p === '/proc/1/fd').length;
+    const look = () =>
+      r
+        .trees(r.sweep(), { roots: [200], metrics: false, holders: [8080] })
+        .listeners.find((l) => l.port === 8080)!;
+    expect(look().pid).toBe(400);
+    // the outside server restarts (a watcher reloads it): another process, a new socket on the same port
+    w.to({
+      ...WORLD,
+      procs: [
+        ...WORLD.procs.filter((p) => p.pid !== 400),
+        { pid: 401, ppid: 1, comm: 'vite', sockets: [7002] },
+      ],
+      tcp: [
+        ...WORLD.tcp!.filter((s) => s.port !== 8080),
+        { port: 8080, inode: 7002 },
+      ],
+    });
+    clock.t += 1000;
+    const l = look();
+    expect([l.pid, l.pids, l.command]).toEqual([401, [401], 'vite']);
+    expect(walks()).toBe(2);
+    clock.t += 1000;
+    expect(look().pid).toBe(401);
+    expect(walks()).toBe(2); // nothing new since: the walk is reused
+  });
+  it("another user's socket seen at the last walk is no reason to walk again within 30 s", () => {
+    const { r, fs, clock } = reader();
+    const walks = () => fs.asked.filter((p) => p === '/proc/1/fd').length;
+    const look = () =>
+      r
+        .trees(r.sweep(), { roots: [200], metrics: false, holders: [5432] })
+        .listeners.find((l) => l.port === 5432)!;
+    expect(look().pid).toBeNull();
+    clock.t += HOLDER_WALK_MS - 1;
+    expect(look().pid).toBeNull();
+    expect(walks()).toBe(1);
   });
   it('a root that is gone is a tree of its own that reads nothing', () => {
     const { r } = reader();
