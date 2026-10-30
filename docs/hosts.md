@@ -55,12 +55,13 @@ pm2. `doctor` tells you which pm2 a host would use and why, or why none is usabl
 `shell` is what mcproc launches your apps with. By default it is a login shell, so the apps get the PATH your
 profile sets up (nvm, nodenv, bun). Replaying a profile costs a few hundred milliseconds of CPU, so mcproc does it
 once per host: everything that only reads (the probes behind `ls` and monit, log reads, port checks) runs in a plain
-`sh` with the environment that shell set up; on this machine the probes and port checks run no shell at all, only their
-url checks and docker reads do. The environment is read again every 5 minutes, and at once when a command is not found;
-if the plain shell still cannot run it, or `sh` does not start with that environment, that host is read through `shell`
-itself for the next 5 minutes. A host whose environment cannot be read is read through `shell` and tried again after 30
-seconds (one that does not answer at all reads as unreachable until then, without a second connection), and one whose
-`shell` is already a plain `sh -c` is read through it directly. `mcproc doctor` says which way each host is read.
+`sh` with the environment that shell set up; on this machine, with `/proc` and pm2's list over its socket, the probes
+and port checks run no shell at all, only their url checks and docker reads do. The environment is read again every 5
+minutes, and at once when a command is not found; if the plain shell still cannot run it, or `sh` does not start with
+that environment, that host is read through `shell` itself for the next 5 minutes. A host whose environment cannot be
+read is read through `shell` and tried again after 30 seconds (one that does not answer at all reads as unreachable
+until then, without a second connection), and one whose `shell` is already a plain `sh -c` is read through it directly.
+`mcproc doctor` says which way each host is read.
 
 On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
 `pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own, `PM2_DAEMON_RPC_PORT` moves the daemon's
