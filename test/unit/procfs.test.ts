@@ -180,6 +180,31 @@ describe('ProcReader.trees', () => {
     expect(t.rssKb.size).toBe(0);
     expect(t.listeners.every((l) => l.pid === null)).toBe(true);
   });
+  it('an IPv6 listener has its address as ss prints it', () => {
+    const { r } = reader({
+      ...WORLD,
+      tcp6: [{ port: 5173, inode: 5002, addr: '::1' }],
+    });
+    const t = r.trees(r.sweep(), { roots: [200], metrics: false, holders: [] });
+    const l = t.listeners.find((x) => x.port === 5173)!;
+    expect([l.proto, l.addr, l.pid]).toEqual(['tcp', '::1', 201]);
+  });
+  it("an unconnected UDP socket a tree's process holds is a udp listener", () => {
+    const { r } = reader({
+      ...WORLD,
+      procs: [
+        ...WORLD.procs,
+        { pid: 203, ppid: 201, comm: 'dns', sockets: [5003] },
+      ],
+      udp: [{ port: 5353, inode: 5003 }],
+    });
+    const t = r.trees(r.sweep(), { roots: [200], metrics: false, holders: [] });
+    expect(
+      t.listeners
+        .filter((l) => l.port === 5353)
+        .map((l) => [l.proto, l.addr, l.pid, l.pids, l.command])
+    ).toEqual([['udp', '0.0.0.0', 203, [203], 'dns']]);
+  });
 });
 
 describe('procAvailable', () => {

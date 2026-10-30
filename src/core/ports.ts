@@ -97,22 +97,35 @@ export function parseSs(text: string, proto: 'tcp' | 'udp'): Listener[] {
   return out;
 }
 
+/**
+ * An address of /proc/net (each 32-bit word little-endian) as ss prints it (inet_ntop): IPv4 dotted; IPv6 lowercase
+ * without leading zeros, the longest run of two or more zero groups as '::' (the first on a tie), an IPv4-mapped
+ * address as ::ffff:a.b.c.d.
+ */
 export function hexToIp(hex: string): string {
   if (hex.length === 8) {
     return [6, 4, 2, 0].map((i) => parseInt(hex.slice(i, i + 2), 16)).join('.');
   }
   if (hex.length === 32) {
-    const groups: string[] = [];
-    for (let w = 0; w < 4; w++) {
-      const word = hex.slice(w * 8, w * 8 + 8);
-      const bytes = [6, 4, 2, 0].map((i) => word.slice(i, i + 2));
-      groups.push(
-        (bytes[0] + bytes[1]).toLowerCase(),
-        (bytes[2] + bytes[3]).toLowerCase()
-      );
+    const bytes: number[] = [];
+    for (let w = 0; w < 4; w++)
+      for (const i of [6, 4, 2, 0])
+        bytes.push(parseInt(hex.slice(w * 8 + i, w * 8 + i + 2), 16));
+    const groups = [0, 1, 2, 3, 4, 5, 6, 7].map(
+      (g) => bytes[2 * g] * 256 + bytes[2 * g + 1]
+    );
+    if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff)
+      return `::ffff:${bytes.slice(12).join('.')}`;
+    let run = { at: -1, len: 0 };
+    for (let g = 0; g < 8; g++) {
+      let end = g;
+      while (end < 8 && groups[end] === 0) end++;
+      if (end - g > run.len) run = { at: g, len: end - g };
+      g = end;
     }
-    if (groups.every((g) => g === '0000')) return '::';
-    return groups.map((g) => g.replace(/^0+(?=\w)/, '')).join(':');
+    const text = groups.map((g) => g.toString(16));
+    if (run.len < 2) return text.join(':');
+    return `${text.slice(0, run.at).join(':')}::${text.slice(run.at + run.len).join(':')}`;
   }
   return hex;
 }

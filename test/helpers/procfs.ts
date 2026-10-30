@@ -19,8 +19,8 @@ export interface FakeProc {
 export interface FakeSocket {
   port: number;
   inode: number;
-  /** IPv4 only: the listening address, default 0.0.0.0 */
-  addr?: '0.0.0.0' | '127.0.0.1';
+  /** the listening address: IPv4 0.0.0.0 (default) or 127.0.0.1; IPv6 :: (default) or ::1 */
+  addr?: '0.0.0.0' | '127.0.0.1' | '::1';
 }
 export interface FakeWorld {
   procs: FakeProc[];
@@ -39,13 +39,22 @@ const fail = (code: string, p: string) =>
 const hexPort = (p: number) => p.toString(16).toUpperCase().padStart(4, '0');
 const V4 = { '0.0.0.0': '00000000', '127.0.0.1': '0100007F' } as const;
 const ANY6 = '0'.repeat(32);
+/** ::1 as /proc writes it: each 32-bit word little-endian */
+const LOOP6 = `${'0'.repeat(24)}01000000`;
+/** A socket's local address column. */
+const local = (r: FakeSocket, v6: boolean) =>
+  v6
+    ? r.addr === '::1'
+      ? LOOP6
+      : ANY6
+    : V4[r.addr === '127.0.0.1' ? '127.0.0.1' : '0.0.0.0'];
 /** A /proc/net table: its header, then one listening (tcp 0A) or unconnected (udp 07) line per socket. */
 const table = (rows: FakeSocket[], state: string, v6: boolean) =>
   `${[
     '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode',
     ...rows.map(
       (r, i) =>
-        `   ${i}: ${v6 ? ANY6 : V4[r.addr ?? '0.0.0.0']}:${hexPort(r.port)} ${v6 ? ANY6 : '00000000'}:0000 ${state} 00000000:00000000 00:00000000 00000000  1000        0 ${r.inode} 1 0000000000000000 100 0 0 10 0`
+        `   ${i}: ${local(r, v6)}:${hexPort(r.port)} ${v6 ? ANY6 : '00000000'}:0000 ${state} 00000000:00000000 00:00000000 00000000  1000        0 ${r.inode} 1 0000000000000000 100 0 0 10 0`
     ),
   ].join('\n')}\n`;
 

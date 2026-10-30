@@ -159,6 +159,27 @@ describe('parsers', () => {
     ]);
     expect(parseFdMap(fx('proc-fd.txt')).get(2171731)).toBe(69265);
   });
+  it('hexToIp prints an IPv6 address of /proc/net/tcp6 (32-bit words little-endian) as ss does', () => {
+    expect(hexToIp('00000000000000000000000001000000')).toBe('::1');
+    expect(hexToIp('000080FE00000000FF3E2D1C6B5A4FFE')).toBe(
+      'fe80::1c2d:3eff:fe4f:5a6b'
+    );
+    expect(hexToIp('B80D0120000000002E8A000034737003')).toBe(
+      '2001:db8::8a2e:370:7334'
+    );
+    expect(hexToIp('0000000000000000FFFF00000100007F')).toBe(
+      '::ffff:127.0.0.1'
+    );
+    expect(hexToIp('00000000000000000000000000000000')).toBe('::');
+    expect(hexToIp('B80D01200100A3852E8A020034737003')).toBe(
+      '2001:db8:85a3:1:2:8a2e:370:7334'
+    );
+    // two runs of the same length: the first is '::'; a lone zero group stays 0
+    expect(hexToIp('00000120010000000000000003000200')).toBe('2001::1:0:0:2:3');
+    expect(hexToIp('B80D0120010000000100010001000100')).toBe(
+      '2001:db8:0:1:1:1:1:1'
+    );
+  });
   it('parseProbe reads the host memory and the containers memory sections', () => {
     const d = parseProbe(
       probeOut({

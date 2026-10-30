@@ -186,6 +186,8 @@ export class ProcReader {
       }
       return comms.get(pid) ?? null;
     };
+    // /proc/net cannot tell a dual-stack socket from a v6-only one, nor name the device a socket is bound to: where ss
+    // prints `*` and `127.0.0.53%lo`, these read `::` and `127.0.0.53`
     const listeners: Listener[] = sweep.sockets.map((s) => {
       const held =
         owners.get(s.inode) ??
