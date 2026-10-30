@@ -518,6 +518,28 @@ export function logsTitle(
   return `logs · ${who} · ${s.stream}${when}${up}`;
 }
 
+/**
+ * Everything the screen shows for frame `f` of state `s` at `size`, as one string: two equal strings paint the same
+ * screen (the pane rules are drawn from the width and the log title).
+ */
+export function paintedText(
+  s: MonitState,
+  f: Frame,
+  size: { width: number; height: number }
+): string {
+  return JSON.stringify([
+    size.width,
+    size.height,
+    s.view,
+    f.header,
+    f.footer,
+    logsTitle(s, f.scroll),
+    f.table,
+    f.logs,
+    f.details,
+  ]);
+}
+
 /** A pane's one-line title rule: `── label ─────…` cut to the width. Panes have no frames, so a terminal selection copies text only. */
 export function paneTitle(label: string, width: number): string {
   const head = `── ${label} `;

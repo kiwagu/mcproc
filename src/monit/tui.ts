@@ -16,6 +16,7 @@ import {
 } from './state.js';
 import {
   logsTitle,
+  paintedText,
   paneTitle,
   renderFrame,
   scrollTo,
@@ -24,6 +25,7 @@ import {
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, peekView, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
+import { onChange } from './coalesce.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 import { takenPoints } from '../core/incidents/taken.js';
 
@@ -158,6 +160,11 @@ export async function runMonit(opts: {
     logBox.setScrollPerc(100);
     screen.render();
   };
+  // a frame equal to the one on screen is not painted again: a read that changed nothing costs no redraw
+  const showChanged = onChange(
+    (f: Frame) => paintedText(state, f, size()),
+    show
+  );
   // reduce at once, paint once per burst (a wheel notch is three key presses), clamp a scroll by the pane as it is now
   const { dispatch, paint } = screenDispatch({
     get: () => state,
@@ -165,7 +172,7 @@ export async function runMonit(opts: {
       state = s;
     },
     render: (s) => renderFrame(s, size()),
-    show,
+    show: showChanged,
     scrollTo: (s, delta) => scrollTo(s, size(), delta),
   });
   const loop = new MonitLoop(

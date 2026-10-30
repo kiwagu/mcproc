@@ -7,6 +7,7 @@ import {
   wrapText,
   logsTitle,
   scrollTo,
+  paintedText,
 } from '../../src/monit/frame.js';
 import { displayWidth } from '../../src/monit/screentext.js';
 import type { LsRow } from '../../src/core/list.js';
@@ -781,5 +782,26 @@ describe('the incidents view', () => {
     const size = { width: 120, height: 6 }; // a pane of 3 rows: one incident at a time
     expect(scrollTo(s, size, Infinity)).toEqual({ entries: 2, rows: 0 });
     expect(scrollTo(s, size, 1)).toEqual({ entries: 0, rows: 1 }); // by rows, as the log pane does
+  });
+});
+
+describe('paintedText', () => {
+  const s0 = initialState({
+    project: 'demo',
+    host: 'local',
+    hosts: ['local'],
+    apps: {},
+  });
+  const size = { width: 100, height: 30 };
+  it('the same state and size paint the same text; another read time, size or view does not', () => {
+    const a = { ...s0, updatedAt: new Date('2026-10-30T12:00:00') };
+    const same = paintedText(a, renderFrame(a, size), size);
+    expect(paintedText(a, renderFrame(a, size), size)).toBe(same);
+    const later = { ...a, updatedAt: new Date('2026-10-30T12:00:02') };
+    expect(paintedText(later, renderFrame(later, size), size)).not.toBe(same);
+    const wide = { width: 120, height: 30 };
+    expect(paintedText(a, renderFrame(a, wide), wide)).not.toBe(same);
+    const flat = { ...a, view: 'flat' as const };
+    expect(paintedText(flat, renderFrame(flat, size), size)).not.toBe(same);
   });
 });
