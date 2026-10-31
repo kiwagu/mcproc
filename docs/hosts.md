@@ -55,12 +55,13 @@ pm2. `doctor` tells you which pm2 a host would use and why, or why none is usabl
 `shell` is what mcproc launches your apps with. By default it is a login shell, so the apps get the PATH your
 profile sets up (nvm, nodenv, bun). Replaying a profile costs a few hundred milliseconds of CPU, so mcproc does it
 once per host: everything that only reads (the probes behind `ls` and monit, log reads, port checks) runs in a plain
-`sh` with the environment that shell set up. The environment is read again every 5 minutes, and at once when a
-command is not found; if the plain shell still cannot run it, or `sh` does not start with that environment, that
-host is read through `shell` itself for the next 5 minutes. A host whose environment cannot be read is read through
-`shell` and tried again after 30 seconds (one that does not answer at all reads as unreachable until then, without a
-second connection), and one whose `shell` is already a plain `sh -c` is read through it directly. `mcproc doctor`
-says which way each host is read.
+`sh` with the environment that shell set up; on this machine, with `/proc` and pm2's list over its socket, the probes
+and port checks run no shell at all, only their url checks and docker reads do. The environment is read again every 5
+minutes, and at once when a command is not found; if the plain shell still cannot run it, or `sh` does not start with
+that environment, that host is read through `shell` itself for the next 5 minutes. A host whose environment cannot be
+read is read through `shell` and tried again after 30 seconds (one that does not answer at all reads as unreachable
+until then, without a second connection), and one whose `shell` is already a plain `sh -c` is read through it directly.
+`mcproc doctor` says which way each host is read.
 
 On this machine mcproc asks the pm2 daemon for its process list over the daemon's own socket instead of starting
 `pm2 jlist` each time (unless `hosts.local.pm2` names a pm2 of your own, `PM2_DAEMON_RPC_PORT` moves the daemon's
@@ -71,12 +72,21 @@ PATH, though, mcproc checks its version with `pm2 -v` first, and pm2 starts a da
 
 ## How ports are found
 
-`ls` runs one command on the host: `ps -eo pid,ppid`, `ss -ltnp` / `ss -lunp` (falling back to `/proc/net/tcp` and
-`/proc/*/fd` when `ss` is missing or fails) and `pm2 jlist`, unless pm2's list comes from the daemon's socket
-([above](#how-mcproc-reads-a-host)). pm2's pid plus its descendants are matched to listening sockets, then compared
-with the declared ports: `listening`, `declared-not-listening` (naming the process that holds the port, if any),
-`undeclared`. Ports of processes owned by other users show without a pid, as the kernel reports them. Ports published
-by Docker containers show the container name instead of a pid.
+On this machine mcproc reads `/proc` itself, without running a command: every process's parent and CPU time from
+`/proc/<pid>/stat`, and for the process trees under pm2's processes their memory, command lines and sockets; the
+listening ports from `/proc/net/tcp`, `tcp6`, `udp` and `udp6`. pm2's pid plus its descendants are matched to
+listening sockets, then compared with the declared ports: `listening`, `declared-not-listening` (naming the process
+that holds the port, if any), `undeclared`. A declared port held by a process outside those trees is named from a look
+at every process's sockets, made only when such a port exists, at most every 30 seconds and again when a new process
+takes such a port; `ports` looks every time. Ports of processes owned by other users show without a pid, as the kernel
+reports them. Ports published by Docker containers show the container name instead of a pid (`docker ps`, asked only
+when a declared port's holder has no pid, at most every 30 seconds and again when such a port is new; `ports` asks every
+time, and so do `ls` and `describe` where an app declares `containers:`). A machine without `/proc` (macOS) runs the
+command below instead, without `pm2 jlist` when pm2's list comes from the daemon's socket
+([above](#how-mcproc-reads-a-host)).
+
+On every other host `ls` runs one command there: `ps -eo pid,ppid`, `ss -ltnp` / `ss -lunp` (falling back to
+`/proc/net/tcp` and `/proc/*/fd` when `ss` is missing or fails) and `pm2 jlist`, and matches the ports the same way.
 
 ## Hosts without pm2: `unpack`
 

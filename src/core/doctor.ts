@@ -1,6 +1,12 @@
+import fs from 'node:fs';
 import { McprocError } from './errors.js';
 import { watcherIn } from './leases/view.js';
-import { type Host, type Manifest, scopeManifest } from './manifest.js';
+import {
+  type App,
+  type Host,
+  type Manifest,
+  scopeManifest,
+} from './manifest.js';
 import { type HostMemory, parseMeminfo } from './memory.js';
 import {
   Pm2Client,
@@ -9,7 +15,9 @@ import {
   runtimeDir,
 } from './pm2.js';
 import { parseUrlProbe } from './ports.js';
-import { daemonFor, pickHost } from './resolve.js';
+import { ownPidFile } from './pm2watch.js';
+import type { ProcReader } from './procfs.js';
+import { daemonFor, pickHost, procFor } from './resolve.js';
 import { stateDir } from './state.js';
 import {
   checkHere,
@@ -83,9 +91,55 @@ export interface DoctorReport {
     age_s: number | null;
     reason: string | null;
   } | null;
+  /** how monit reads the host: woken by pm2's pid files with the in-process scan, or every interval and why; null when unreachable or without pm2 */
+  monit: {
+    mode: 'events' | 'polled';
+    scan: 'in-process' | 'script';
+    why: string | null;
+  } | null;
 }
 
 const MARKER = '__MCPROC_DOCTOR__';
+
+/**
+ * How monit reads a host whose pm2 was resolved, with `apps` the manifest's apps there (see DoctorReport.monit);
+ * `proc` is how its processes are read, procFor's choice unless a caller (a test) passes another.
+ */
+export async function monitMode(
+  host: Host,
+  client: Pm2Client,
+  apps: Record<string, App>,
+  spawner?: Spawner,
+  proc: ProcReader | null = procFor(host, spawner)
+): Promise<NonNullable<DoctorReport['monit']>> {
+  const scan = proc ? 'in-process' : 'script';
+  if (!host.local) return { mode: 'polled', scan, why: 'another host' };
+  // on this machine without an injected spawner, only a missing /proc leaves the script
+  if (scan === 'script' && !spawner)
+    return { mode: 'polled', scan, why: 'no /proc here' };
+  const own = ownPidFile(apps);
+  if (own)
+    return {
+      mode: 'polled',
+      scan,
+      why: `${own}'s pm2.pid_file moves its pid file`,
+    };
+  let p: Awaited<ReturnType<Pm2Client['pids']>>;
+  try {
+    p = await client.pids();
+  } catch (e) {
+    p = { dir: null, why: (e as Error).message };
+  }
+  if (p.dir && !fs.existsSync(p.dir))
+    return {
+      mode: 'polled',
+      scan,
+      why: 'no daemon has made its pids directory yet',
+    };
+  return p.dir && scan === 'in-process'
+    ? { mode: 'events', scan, why: null }
+    : { mode: 'polled', scan, why: p.why ?? 'no in-process scan' };
+}
 
 /** Diagnoses one host: its shell, Node, pm2 and tools, the daemon, the urls of its apps, and on this machine the lease state. */
 export async function doctorHost(
@@ -120,6 +174,7 @@ export async function doctorHost(
     environment: null,
     urls: [],
     reads: null,
+    monit: null,
   };
   const probe = [
     `echo ${MARKER}`,
@@ -197,14 +252,15 @@ export async function doctorHost(
     );
   }
   if (resolution) {
+    const client = new Pm2Client(
+      transport,
+      host,
+      resolution.bin,
+      host.pm2_home,
+      daemonFor(host, resolution, spawner)
+    );
     try {
-      const procs = await new Pm2Client(
-        transport,
-        host,
-        resolution.bin,
-        host.pm2_home,
-        daemonFor(host, resolution, spawner)
-      ).daemonList();
+      const procs = await client.daemonList();
       r.daemon = procs === null ? 'not-running' : 'answers';
       r.processes = procs?.length ?? 0;
       r.in_namespace = (procs ?? []).filter(
@@ -219,6 +275,12 @@ export async function doctorHost(
       r.daemon = 'error';
       r.recommendations.push(`pm2 jlist failed: ${(e as Error).message}`);
     }
+    r.monit = await monitMode(
+      host,
+      client,
+      scopeManifest(m, host.name, 'local').apps,
+      spawner
+    );
   }
   // the resolution read, and so may the list: how reads run on this host now
   const mode = transport.readMode();
@@ -366,6 +428,7 @@ export async function doctor(
         environment: null,
         urls: [],
         reads: null,
+        monit: null,
       });
     }
   }

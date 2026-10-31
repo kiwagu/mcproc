@@ -630,3 +630,66 @@ describe('resolvePm2Bin: a pm2 only the host shell finds', () => {
     expect(w.probes).toEqual({ plain: 1, host: 0 });
   });
 });
+
+describe('Pm2Client.pids', () => {
+  const lister = async () => [];
+  it("the daemon home's pids directory, where its list comes over the socket", async () => {
+    const c = new Pm2Client(
+      new FakeTransport([]),
+      here_,
+      'pm2',
+      '/h/.pm2',
+      lister
+    );
+    expect(await c.pids()).toEqual({ dir: '/h/.pm2/pids', why: null });
+  });
+  it("the login environment's PM2_HOME decides the home; the socket overrides do not move the pid files", async () => {
+    const t = new EnvTransport([], {
+      PM2_HOME: '/x/.pm2',
+      HOME: '/x',
+      PM2_DAEMON_RPC_PORT: '/y/rpc.sock',
+      PM2_DAEMON_PUB_PORT: '/y/pub.sock',
+    });
+    expect(
+      (await new Pm2Client(t, here_, 'pm2', undefined, lister).pids()).dir
+    ).toBe('/x/.pm2/pids');
+  });
+  it.each([
+    {
+      what: 'no socket lister (another host, hosts.local.pm2, a test spawner)',
+      c: () => new Pm2Client(new FakeTransport([]), here_, 'pm2', '/h/.pm2'),
+      why: /does not come over its socket here/,
+    },
+    {
+      what: 'a login environment that cannot be read, and no pm2_home',
+      c: () =>
+        new Pm2Client(
+          new EnvTransport([], null),
+          here_,
+          'pm2',
+          undefined,
+          lister
+        ),
+      why: /could not be read/,
+    },
+    {
+      what: 'PM2_DEFAULT_PID_PATH',
+      c: () =>
+        new Pm2Client(
+          new EnvTransport([], {
+            PM2_HOME: '/x/.pm2',
+            PM2_DEFAULT_PID_PATH: '/run/pm2',
+          }),
+          here_,
+          'pm2',
+          undefined,
+          lister
+        ),
+      why: /PM2_DEFAULT_PID_PATH/,
+    },
+  ])('$what: no directory, and why', async ({ c, why }) => {
+    const p = await c().pids();
+    expect(p.dir).toBeNull();
+    expect(p.why).toMatch(why);
+  });
+});

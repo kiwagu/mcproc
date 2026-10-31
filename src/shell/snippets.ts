@@ -186,6 +186,20 @@ export function listenScript(pm2Bin: string, jlist: boolean): string {
   ].join('\n');
 }
 
+/** The docker-published ports: one line per running container, its name and ports, as parseDockerPorts reads them. */
+export const DOCKER_PORTS_LINES = [
+  `echo ${MARK.DOCKER}`,
+  `if command -v docker >/dev/null 2>&1; then ${bounded(3, "docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null")}; fi`,
+];
+
+/** What a scan of this machine still asks docker: the published ports, and the memory of the named containers that run. */
+export function dockerScript(containers: string[]): string {
+  return [
+    ...DOCKER_PORTS_LINES,
+    ...(containers.length ? [dockerMemSnippet(containers)] : []),
+  ].join('\n');
+}
+
 /** One round trip: pm2 state, the host's UTC offset, process tree, listeners, CPU ticks, RSS, command lines, docker-published ports, the host's
  * memory (/proc/meminfo), the memory of the declared `containers` that run (docker stats, only when names are given), and one HTTP
  * request per declared url, with the host's environment (container, hostname, own addresses) when there is one. `metrics: false` is the light form
@@ -227,8 +241,7 @@ export function probeScript(
           `cat /proc/[0-9]*/status 2>/dev/null | ${RSS_AWK}`,
           `echo ${MARK.ARGS}`,
           `ps -eo pid=,args= 2>/dev/null || ps -o pid,args 2>/dev/null`,
-          `echo ${MARK.DOCKER}`,
-          `if command -v docker >/dev/null 2>&1; then ${bounded(3, "docker ps --format '{{.Names}}\\t{{.Ports}}' 2>/dev/null")}; fi`,
+          ...DOCKER_PORTS_LINES,
           MEM_SNIPPET,
           ...(opts.containers?.length
             ? [dockerMemSnippet(opts.containers)]

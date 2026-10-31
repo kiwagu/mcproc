@@ -18,3 +18,20 @@ export function coalesce(
     });
   };
 }
+
+/**
+ * `run` only when `key` of what it is given differs from the last run's: a frame equal to the one on screen is not
+ * painted again.
+ */
+export function onChange<T>(
+  key: (t: T) => string,
+  run: (t: T) => void
+): (t: T) => void {
+  let last: string | null = null;
+  return (t) => {
+    const k = key(t);
+    if (k === last) return;
+    last = k;
+    run(t);
+  };
+}

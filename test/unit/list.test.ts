@@ -1,12 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
+import { procWorld, type FakeWorld } from '../helpers/procfs.js';
+import type { Rule } from '../helpers/fake-transport.js';
 import { MARK, listenScript, probeScript } from '../../src/shell/snippets.js';
 import { Pm2Client } from '../../src/core/pm2.js';
+import { ProcReader } from '../../src/core/procfs.js';
+import { clearLocalScanCache } from '../../src/core/localscan.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
@@ -1124,5 +1128,145 @@ describe('probeRetry', () => {
     },
   ])('$what: retry $retry', ({ stdout, retry }) => {
     expect(probeRetry(res(stdout))).toBe(retry);
+  });
+});
+
+describe('the in-process scan behind probeHost, listenCheck and snapshot', () => {
+  const API = {
+    pid: 200,
+    name: 'demo-api',
+    pm_id: 0,
+    pm2_env: { status: 'online', namespace: 'demo', pm_uptime: 1000 },
+  };
+  /** demo-api: sh 200 → node 201; another checkout's server (400) and a python one (500) are this user's, outside pm2 */
+  const WORLD: FakeWorld = {
+    procs: [
+      { pid: 1, ppid: 0, comm: 'systemd' },
+      {
+        pid: 200,
+        ppid: 1,
+        comm: 'sh',
+        rss: 500,
+        cmdline: 'sh -c node main.js',
+      },
+      {
+        pid: 201,
+        ppid: 200,
+        comm: 'node-MainThread',
+        rss: 25_000,
+        cmdline: 'node main.js',
+        sockets: [5001],
+      },
+      {
+        pid: 400,
+        ppid: 1,
+        comm: 'node-MainThread',
+        cmdline: 'node other.js',
+        sockets: [],
+      },
+      {
+        pid: 500,
+        ppid: 1,
+        comm: 'python3',
+        cmdline: 'python3 -m http.server 8080',
+        sockets: [7001],
+      },
+    ],
+    tcp: [
+      { port: 3310, inode: 5001 },
+      { port: 8080, inode: 7001 },
+    ],
+  };
+  /** the api's port taken by the other checkout's server instead */
+  const TAKEN: FakeWorld = {
+    ...WORLD,
+    procs: WORLD.procs.map((p) =>
+      p.pid === 201
+        ? { ...p, sockets: [] }
+        : p.pid === 400
+          ? { ...p, sockets: [5001] }
+          : p
+    ),
+  };
+  const link = (w: FakeWorld = WORLD, rules: Rule[] = []) => {
+    const ctx = fakeCtx(basic, 'local', rules);
+    return {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        API,
+      ]),
+      proc: new ProcReader(procWorld(w), Date.now, {
+        clkTck: 100,
+        pageSize: 4096,
+      }),
+    };
+  };
+  beforeEach(() => clearLocalScanCache());
+
+  it('probeHost on this machine with a reader runs no script', async () => {
+    const c = link();
+    const p = await probeHost(c, { ...quiet, metrics: true });
+    expect(c.fake.calls).toEqual([]);
+    expect(p.data.listeners.find((l) => l.port === 3310)?.pid).toBe(201);
+    expect(p.data.stats.rssKb.get(201)).toBe(100_000);
+  });
+  it('a reader that cannot read /proc: the script, as before', async () => {
+    const c = link({ ...WORLD, noNet: true }, [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    await probeHost(c, quiet);
+    expect(c.fake.calls).toHaveLength(1);
+    expect(c.fake.calls[0].cmd).toBe(
+      probeScript('pm2', { ...quiet, jlist: false })
+    );
+  });
+  it('another host is probed with its script byte for byte, whatever reader its link carries', async () => {
+    const ctx = fakeCtx(basic, 'stand', [
+      { match: MARK.JLIST, result: { stdout: probeOut({}) } },
+    ]);
+    const boom = () => {
+      throw new Error('this machine was read');
+    };
+    const ask = {
+      cpuSample: false,
+      metrics: true,
+      urls: [],
+      containers: [],
+      holders: [3310],
+    };
+    await probeHost(
+      {
+        ...ctx,
+        proc: new ProcReader({ readdir: boom, read: boom, readlink: boom }),
+      },
+      ask
+    );
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].cmd).toBe(probeScript('pm2', ask));
+    expect(ctx.fake.calls[0].opts).toMatchObject({ retryIf: probeRetry });
+  });
+  it('listenCheck on this machine with a reader runs no script', async () => {
+    const c = link();
+    const r = await listenCheck(c);
+    expect(c.fake.calls).toEqual([]);
+    expect([...r.ports].sort((a, b) => a - b)).toEqual([3310, 8080]);
+  });
+  it('snapshot names the holder of a declared port outside the trees; undeclared ports stay unnamed', async () => {
+    const snap = await snapshot(link(TAKEN), { urls: 'none', leases: 'none' });
+    expect(snap.ports.api.checks).toEqual([
+      {
+        port: 3310,
+        status: 'declared-not-listening',
+        held_by: { pid: 400, command: 'node-MainThread' },
+      },
+    ]);
+    expect(snap.listeners.find((l) => l.port === 8080)?.pid).toBeNull();
+  });
+  it('ports names every holder', async () => {
+    const rep = await portsReport(link(TAKEN) as unknown as Context);
+    expect(rep.listeners.map((l) => [l.port, l.pid, l.command])).toEqual([
+      [3310, 400, 'node-MainThread'],
+      [8080, 500, 'python3'],
+    ]);
   });
 });

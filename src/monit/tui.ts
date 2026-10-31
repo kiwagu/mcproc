@@ -4,6 +4,7 @@ import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
 import { createFollower } from '../core/logfollow.js';
+import { followPids } from '../core/pm2watch.js';
 import {
   appInfos,
   CONFIRM_MS,
@@ -15,6 +16,7 @@ import {
 } from './state.js';
 import {
   logsTitle,
+  paintedText,
   paneTitle,
   renderFrame,
   scrollTo,
@@ -23,6 +25,7 @@ import {
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, peekView, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
+import { onChange } from './coalesce.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
 import { takenPoints } from '../core/incidents/taken.js';
 
@@ -40,6 +43,7 @@ const deps = (manifest: Manifest): LoopDeps => ({
   },
   peekIncidents: (fleet, names, cursor, restart) =>
     peekView(fleet, names, cursor, restart),
+  events: followPids,
 });
 
 /** A blessed screen: monit's own, or the stacks overview's that monit draws on for a while. */
@@ -125,6 +129,7 @@ export async function runMonit(opts: {
   });
   /** monit has left the screen: a paint that a late dispatch or the first refresh still asks for touches nothing */
   let left = false;
+  // everything this paints must be in paintedText's key (frame.ts), or a change in it alone would not be drawn
   const show = (f: Frame) => {
     if (left) return;
     const { width: w, height: h } = size();
@@ -156,6 +161,11 @@ export async function runMonit(opts: {
     logBox.setScrollPerc(100);
     screen.render();
   };
+  // a frame equal to the one on screen is not painted again: a read that changed nothing costs no redraw
+  const showChanged = onChange(
+    (f: Frame) => paintedText(state, f, size()),
+    show
+  );
   // reduce at once, paint once per burst (a wheel notch is three key presses), clamp a scroll by the pane as it is now
   const { dispatch, paint } = screenDispatch({
     get: () => state,
@@ -163,7 +173,7 @@ export async function runMonit(opts: {
       state = s;
     },
     render: (s) => renderFrame(s, size()),
-    show,
+    show: showChanged,
     scrollTo: (s, delta) => scrollTo(s, size(), delta),
   });
   const loop = new MonitLoop(
@@ -175,13 +185,11 @@ export async function runMonit(opts: {
   );
 
   return new Promise<'quit' | 'back'>((resolve) => {
-    const timer = setInterval(() => {
-      void loop.refresh();
-    }, opts.intervalMs);
+    // each host group on its own schedule: pm2's pid files on this machine, the interval elsewhere
+    loop.start(opts.intervalMs);
     // a screen of its own goes with monit; the overview's screen is left as monit found it, its own boxes taken off
     const leave = (why: 'quit' | 'back') => {
       left = true;
-      clearInterval(timer);
       loop.close();
       screen.removeListener('keypress', onKey);
       screen.removeListener('resize', paint);

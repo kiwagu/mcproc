@@ -396,6 +396,12 @@ export function renderDoctor(reps: DoctorReport[]): string {
               ? `  reads: plain sh with the login environment (read ${r.reads.age_s} s ago)`
               : `  reads: the host shell (${r.reads.reason})`
           );
+        if (r.monit)
+          L.push(
+            r.monit.mode === 'events'
+              ? '  monit: events + in-process scan'
+              : `  monit: polled every 2 s${r.monit.scan === 'in-process' ? ' with the in-process scan' : ''} (${r.monit.why})`
+          );
         if (r.runtime_present)
           L.push(
             `  watch from a shell there: ${r.pm2_home ? `PM2_HOME=${shq(r.pm2_home)} ` : ''}${shq(`${r.runtime_dir}/bin/pm2`)} monit`
