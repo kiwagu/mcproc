@@ -1006,6 +1006,48 @@ describe('worktree', () => {
       ).toHaveLength(1);
     });
 
+    // an unreadable file denies nobody when the suite runs as root: the copy would not fail
+    it.skipIf(asRoot)(
+      'a copy that fails halfway leaves nothing in its place, and the next sync copies it whole',
+      async () => {
+        const locked = path.join(main, 'cache', 'locked.bin');
+        fs.writeFileSync(locked, 'locked');
+        fs.chmodSync(locked, 0o000);
+        let e: { code?: string; message?: string };
+        try {
+          e = await refusal(wt);
+        } finally {
+          fs.chmodSync(locked, 0o644);
+        }
+        expect(e.code).toBe('BAD_ARGUMENT');
+        expect(e.message).toContain(
+          `worktree sync into ${wtReal}: copying ${path.join(real, 'cache')} failed`
+        );
+        // neither the half-copied folder nor the temporary it was copied into
+        expect(fs.readdirSync(wt).filter((n) => n.includes('cache'))).toEqual(
+          []
+        );
+        const r = await sync(wt);
+        expect(r).toMatchObject({
+          copied: ['cache', 'tool-local.yml'],
+          kept: [],
+          linked: ['notes'],
+          excluded: ['/notes'],
+        });
+        expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+          'cache'
+        );
+        expect(
+          fs.readFileSync(path.join(wt, 'cache', 'locked.bin'), 'utf8')
+        ).toBe('locked');
+        expect(fs.readdirSync(wt).filter((n) => n.includes('mcproc-'))).toEqual(
+          []
+        );
+        expect(exclude()).not.toContain('mcproc-');
+        expect(git(['status', '--porcelain'], wt).trim()).toBe('');
+      }
+    );
+
     it('no manifest in either checkout: nothing to copy, said once', async () => {
       fs.rmSync(path.join(main, '.mcproc', 'mcproc.yaml'));
       const r = await sync(wt);
@@ -1555,6 +1597,32 @@ describe('worktree', () => {
       readRegistry(registryPath(state, 'demo', real))!.slots['1']
     ).toMatchObject({ path: wt, project: 'demo-w1' });
   });
+
+  // an unreadable file denies nobody when the suite runs as root: the copy would not fail
+  it.skipIf(asRoot)(
+    'a copy that fails halfway in add leaves nothing in its place either',
+    async () => {
+      const locked = path.join(main, 'certs', 'locked.pem');
+      fs.writeFileSync(locked, 'locked');
+      fs.chmodSync(locked, 0o000);
+      const m = loadManifest(main);
+      const wt = path.join(`${real}.worktrees`, 'half');
+      try {
+        await expect(
+          worktreeAdd(m, { branch: 'half', install: false }, deps())
+        ).rejects.toMatchObject({
+          code: 'BAD_ARGUMENT',
+          message: expect.stringContaining(
+            `but copying ${path.join(real, 'certs')} failed`
+          ),
+        });
+      } finally {
+        fs.chmodSync(locked, 0o644);
+      }
+      // neither the half-copied folder nor the temporary it was copied into
+      expect(fs.readdirSync(wt).filter((n) => n.includes('certs'))).toEqual([]);
+    }
+  );
 
   it('remove takes back the slot of an add that ended between its claim and git: an empty folder', async () => {
     const m = loadManifest(main);

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describeError, describeErrorWithHint, McprocError } from './errors.js';
@@ -89,6 +90,48 @@ const present = (p: string): boolean => {
     return false;
   }
 };
+
+/**
+ * Copies `from` to `to` whole or not at all: into a temporary sibling first (a dot name no run shares), renamed into
+ * place once complete, so a copy that fails halfway (an unreadable file in a folder) leaves nothing a later run would
+ * take for done; the temporary goes again, and the error is thrown on. Whatever is at `to` already is never touched:
+ * answers false then, true when it copied.
+ */
+function copyWhole(from: string, to: string): boolean {
+  if (present(to)) return false;
+  const dir = path.dirname(to);
+  fs.mkdirSync(dir, { recursive: true });
+  let tmp: string;
+  do
+    tmp = path.join(
+      dir,
+      `.${path.basename(to)}.mcproc-${process.pid}-${randomBytes(6).toString('hex')}`
+    );
+  while (present(tmp));
+  try {
+    fs.cpSync(from, tmp, {
+      recursive: true,
+      force: false,
+      errorOnExist: false,
+    });
+    // something put there while the copy ran is left as it is
+    if (present(to)) {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      return false;
+    }
+    fs.renameSync(tmp, to);
+    return true;
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch (r) {
+      throw new Error(
+        `${(e as Error).message}; its partial copy ${tmp} could not be removed: ${(r as Error).message}`
+      );
+    }
+    throw e;
+  }
+}
 
 /** The main checkout of the repository `root` belongs to: the parent of git's common dir, real path. */
 export async function mainCheckout(
@@ -760,12 +803,13 @@ export async function worktreeAdd(
   try {
     for (const c of plan.copies) {
       step = `copying ${c.from}`;
-      fs.mkdirSync(path.dirname(c.to), { recursive: true });
-      fs.cpSync(c.from, c.to, {
-        recursive: true,
-        force: false,
-        errorOnExist: false,
-      });
+      // a place the branch's tree takes already gets, as ever, what it lacks; an absent one is published only whole
+      if (!copyWhole(c.from, c.to))
+        fs.cpSync(c.from, c.to, {
+          recursive: true,
+          force: false,
+          errorOnExist: false,
+        });
     }
     for (const l of plan.links) {
       step = `linking ${l.from}`;
@@ -860,7 +904,8 @@ export const isFreshCheckout = (prevRef: string): boolean =>
  * Brings the worktree `dir` is in (its git top level, never the root a manifest search finds: a worktree nested in the
  * main checkout would find the main's) the files a new worktree gets, copied from the main checkout: the copy, required
  * and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the main checkout's
- * override. A file or link already in its place is kept as it is, so a second sync changes nothing. A required entry
+ * override. A file or link already in its place is kept as it is, so a second sync changes nothing, and a copy is
+ * published only whole, so a failed one leaves nothing a second sync would keep. A required entry
  * missing in the main checkout refuses the sync before anything is copied, unless `allowMissing`; `fromHook` says in
  * the refusal that the worktree exists without them (git keeps a worktree whatever its post-checkout hook answers).
  * No slot, override or install: those make a stand, and only worktree add makes one.
@@ -940,19 +985,11 @@ export async function worktreeSync(
   let step = '';
   try {
     for (const c of plan.copies) {
-      const rel = path.relative(main, c.from);
-      if (present(c.to)) {
-        kept.push(rel);
-        continue;
-      }
       step = `copying ${c.from}`;
-      fs.mkdirSync(path.dirname(c.to), { recursive: true });
-      fs.cpSync(c.from, c.to, {
-        recursive: true,
-        force: false,
-        errorOnExist: false,
-      });
-      copied.push(rel);
+      // only a whole copy is published: a failed one leaves nothing a second sync would keep as done
+      (copyWhole(c.from, c.to) ? copied : kept).push(
+        path.relative(main, c.from)
+      );
     }
     for (const l of plan.links) {
       const rel = path.relative(main, l.from);
