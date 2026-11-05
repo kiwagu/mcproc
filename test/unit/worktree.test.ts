@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +18,6 @@ import { projectFile, recordProject } from '../../src/core/registry.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
   excludePattern,
-  gitRunner,
   installCommand,
   isGlob,
   mainCheckout,
@@ -28,6 +27,7 @@ import {
   worktreeDir,
   worktreeLs,
   worktreeRemove,
+  type GitRunner,
   type WorktreeDeps,
 } from '../../src/core/worktree.js';
 
@@ -39,6 +39,22 @@ const gitEnv = {
 };
 const git = (args: string[], cwd: string) =>
   execFileSync('git', args, { cwd, stdio: 'pipe', env: gitEnv }).toString();
+// the code under test gets the same isolation: a hook or identity in this machine's git config never reaches the git
+// it runs (`git worktree add` fires a post-checkout hook); the answer has the production runner's shape, never a throw
+const isolatedGit: GitRunner = (args, cwd) =>
+  new Promise((resolve) => {
+    execFile(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+      { cwd, env: gitEnv, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) =>
+        resolve({
+          code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+          stdout: String(stdout),
+          stderr: String(stderr) || (err ? err.message : ''),
+        })
+    );
+  });
 
 describe('worktree', () => {
   let base: string;
@@ -50,7 +66,7 @@ describe('worktree', () => {
   let stopped: string[];
   let online: { name: string; namespace: string }[];
   const deps = (): WorktreeDeps => ({
-    git: gitRunner,
+    git: isolatedGit,
     stateDir: state,
     run: async (cmd, cwd) => {
       ran.push({ cmd, cwd });
@@ -143,7 +159,7 @@ describe('worktree', () => {
     expect(excludePattern('.')).toBeNull();
   });
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
-    expect(await mainCheckout(main, gitRunner)).toBe(real);
+    expect(await mainCheckout(main, isolatedGit)).toBe(real);
     const m = loadManifest(main);
     expect(worktreeDir(m, main)).toBe(`${main}.worktrees`);
     expect(installCommand(m, main)).toBe('bun install');
@@ -705,7 +721,7 @@ describe('worktree', () => {
       ...deps(),
       git: (args, cwd) => {
         calls.push(args);
-        return gitRunner(args, cwd);
+        return isolatedGit(args, cwd);
       },
     };
     await expect(
