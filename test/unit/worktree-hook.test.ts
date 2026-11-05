@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   HOOK_MARK,
   hookInstall,
@@ -78,6 +79,38 @@ describe('worktree hook', () => {
       ? fs.readFileSync(marker, 'utf8').split('\n').filter(Boolean)
       : [];
   const hookFile = () => path.join(real, '.git', 'hooks', 'post-checkout');
+  const sources = (f: string) =>
+    fileURLToPath(new URL(`../../src/core/${f}`, import.meta.url));
+  /**
+   * hookInstall of the main checkout in a child process killed after 10 s, so a hook path it would loop on fails the
+   * test instead of hanging the suite (the loop is synchronous: no timer in this process would ever fire); answers
+   * what it returned or the error it threw.
+   */
+  const installInChild = (): Record<string, string | undefined> => {
+    const script = path.join(base, 'install.mts');
+    fs.writeFileSync(
+      script,
+      [
+        `import { hookInstall } from ${JSON.stringify(sources('worktree-hook.ts'))};`,
+        `import { gitRunner } from ${JSON.stringify(sources('worktree.ts'))};`,
+        'try {',
+        `  const r = await hookInstall(${JSON.stringify(main)}, ${JSON.stringify({ node, cli })}, gitRunner);`,
+        '  console.log(JSON.stringify({ changed: r.changed }));',
+        '} catch (e) {',
+        '  console.log(JSON.stringify({ code: e.code, message: e.message, hint: e.hint }));',
+        '}',
+      ].join('\n')
+    );
+    const r = spawnSync(process.execPath, ['--import', 'tsx', script], {
+      cwd: process.cwd(),
+      env: gitEnv(),
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(r.signal, 'hookInstall did not return within 10 s').toBeNull();
+    expect(r.status, r.stderr).toBe(0);
+    return JSON.parse(r.stdout.trim().split('\n').at(-1) ?? '{}');
+  };
   beforeEach(() => {
     base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-hook-'));
     main = path.join(base, 'repo');
@@ -318,5 +351,133 @@ describe('worktree hook', () => {
     expect((await hookStatus(main, isolatedGit)).state).toBe('lefthook');
     fs.writeFileSync(hookFile(), '#!/bin/sh\nexit 0\n');
     expect((await hookStatus(main, isolatedGit)).state).toBe('other');
+  });
+
+  it("a link at post-checkout that leads to no file is another tool's: install refuses it at once, remove and status leave it", async () => {
+    const gone = path.join(base, 'gone', 'post-checkout');
+    fs.symlinkSync(gone, hookFile());
+    expect(installInChild()).toEqual({
+      code: 'HOOK_TAKEN',
+      message: `${hookFile()} is another hook's post-checkout (a link to ${gone}, which leads to no hook file): mcproc does not overwrite it`,
+      hint: 'Delete it and run mcproc worktree hook install again, or point it at the hook it should run and add this line there: mcproc worktree sync --hook "$1"',
+    });
+    expect(fs.readlinkSync(hookFile())).toBe(gone);
+    await expect(hookRemove(main, isolatedGit)).rejects.toMatchObject({
+      code: 'HOOK_TAKEN',
+      message: expect.stringContaining('leads to no hook file'),
+    });
+    expect(fs.readlinkSync(hookFile())).toBe(gone);
+    expect(await hookStatus(main, isolatedGit)).toMatchObject({
+      state: 'other',
+      node: null,
+      cli: null,
+    });
+    expect(fs.existsSync(path.dirname(gone))).toBe(false);
+    // a link to itself, and a folder: entries too, refused the same way
+    fs.rmSync(hookFile());
+    fs.symlinkSync('post-checkout', hookFile());
+    expect(installInChild()).toMatchObject({
+      code: 'HOOK_TAKEN',
+      message: expect.stringContaining('(a link to post-checkout, which'),
+    });
+    expect(fs.readlinkSync(hookFile())).toBe('post-checkout');
+    fs.rmSync(hookFile());
+    fs.mkdirSync(hookFile());
+    expect(installInChild()).toMatchObject({
+      code: 'HOOK_TAKEN',
+      message: expect.stringContaining('(a folder)'),
+    });
+    await expect(hookRemove(main, isolatedGit)).rejects.toMatchObject({
+      code: 'HOOK_TAKEN',
+    });
+    expect(fs.statSync(hookFile()).isDirectory()).toBe(true);
+  }, 60_000);
+
+  it("a link to mcproc's own hook counts as mcproc's: an update puts the hook in its place, remove deletes the link only", async () => {
+    const kept = path.join(base, 'kept', 'post-checkout');
+    fs.mkdirSync(path.dirname(kept));
+    fs.writeFileSync(kept, hookScript(node, cli), { mode: 0o755 });
+    fs.symlinkSync(kept, hookFile());
+    expect(await hookStatus(main, isolatedGit)).toMatchObject({
+      state: 'installed',
+      node,
+      cli,
+    });
+    expect((await hookInstall(main, { node, cli }, isolatedGit)).changed).toBe(
+      'unchanged'
+    );
+    expect((await hookRemove(main, isolatedGit)).changed).toBe('removed');
+    expect(fs.existsSync(hookFile())).toBe(false);
+    expect(fs.readFileSync(kept, 'utf8')).toBe(hookScript(node, cli));
+    fs.symlinkSync(kept, hookFile());
+    const other = path.join(base, 'other.js');
+    fs.writeFileSync(other, '');
+    expect(
+      (await hookInstall(main, { node, cli: other }, isolatedGit)).changed
+    ).toBe('updated');
+    expect(fs.lstatSync(hookFile()).isFile()).toBe(true);
+    expect(fs.readFileSync(hookFile(), 'utf8')).toBe(hookScript(node, other));
+    expect(fs.readFileSync(kept, 'utf8')).toBe(hookScript(node, cli));
+  });
+
+  it('a hook path that keeps changing under install ends in a refusal after a few looks, never a loop', async () => {
+    let calls = 0;
+    const link = vi.spyOn(fs, 'linkSync').mockImplementation(() => {
+      // past 10 a loop without end: stop it here so it fails the test instead of hanging it
+      if (++calls > 10) throw new Error('install is still looping');
+      throw Object.assign(new Error('EEXIST: file already exists'), {
+        code: 'EEXIST',
+      });
+    });
+    try {
+      await expect(
+        hookInstall(main, { node, cli }, isolatedGit)
+      ).rejects.toMatchObject({
+        code: 'HOOK_TAKEN',
+        message: `${hookFile()} kept changing while mcproc installed its hook (3 looks): another tool is writing it`,
+      });
+      expect(calls).toBe(3);
+    } finally {
+      link.mockRestore();
+    }
+    expect(fs.existsSync(hookFile())).toBe(false);
+    expect(
+      fs
+        .readdirSync(path.dirname(hookFile()))
+        .filter((f) => f.includes('.mcproc-'))
+    ).toEqual([]);
+  });
+
+  it('an update reads the hook again right before it replaces it: one another tool put there meanwhile is refused and kept', async () => {
+    await hookInstall(main, { node, cli }, isolatedGit);
+    const foreign = '#!/bin/sh\necho mine\n';
+    const theirs = path.join(base, 'theirs');
+    fs.writeFileSync(theirs, foreign, { mode: 0o755 });
+    const chmod = fs.chmodSync;
+    // the staged copy's chmod comes after install read the hook: another tool replaces it then
+    const spy = vi
+      .spyOn(fs, 'chmodSync')
+      .mockImplementationOnce((p: fs.PathLike, m: fs.Mode) => {
+        fs.renameSync(theirs, hookFile());
+        chmod(p, m);
+      });
+    const other = path.join(base, 'other.js');
+    fs.writeFileSync(other, '');
+    try {
+      await expect(
+        hookInstall(main, { node, cli: other }, isolatedGit)
+      ).rejects.toMatchObject({
+        code: 'HOOK_TAKEN',
+        message: `${hookFile()} is another hook's post-checkout: mcproc does not overwrite it`,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readFileSync(hookFile(), 'utf8')).toBe(foreign);
+    expect(
+      fs
+        .readdirSync(path.dirname(hookFile()))
+        .filter((f) => f.includes('.mcproc-'))
+    ).toEqual([]);
   });
 });

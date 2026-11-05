@@ -103,15 +103,42 @@ export async function hookPath(root: string, git: GitRunner): Promise<string> {
   return path.join(dir, path.basename(named));
 }
 
-/** The text of the file at `p`, null when there is none. */
-function readMaybe(p: string): string | null {
+/**
+ * What is at a hook path: null when there is no entry at all (lstat finds nothing); else the text it reads as, or a
+ * null text with what it is when it reads as no file (a link that leads nowhere or loops, a folder): an entry all the
+ * same, so another tool's, never an empty place to write.
+ */
+interface Entry {
+  text: string | null;
+  what: string;
+}
+function entryAt(p: string): Entry | null {
+  let st: fs.Stats;
   try {
-    return fs.readFileSync(p, 'utf8');
+    st = fs.lstatSync(p);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw e;
   }
+  try {
+    return { text: fs.readFileSync(p, 'utf8'), what: '' };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? '';
+    if (!['ENOENT', 'ENOTDIR', 'ELOOP', 'EISDIR', 'EACCES'].includes(code))
+      throw e;
+    return {
+      text: null,
+      what: st.isSymbolicLink()
+        ? `a link to ${fs.readlinkSync(p)}, which leads to no hook file`
+        : st.isDirectory()
+          ? 'a folder'
+          : 'a file mcproc cannot read',
+    };
+  }
 }
+
+/** The text of the file at `p`, null when there is none or it reads as no file. */
+const textAt = (p: string): string | null => entryAt(p)?.text ?? null;
 
 /** Whether a hook's text is mcproc's: its second line is the marker, as hookScript writes it. */
 const marked = (text: string | null): text is string =>
@@ -154,15 +181,16 @@ const isFile = (p: string): boolean => {
 
 /** The hook at `file` as it stands. */
 function infoAt(file: string): HookInfo {
-  const text = readMaybe(file);
-  const old = marked(text) ? null : readMaybe(`${file}.old`);
+  const entry = entryAt(file);
+  const text = entry?.text ?? null;
+  const old = marked(text) ? null : textAt(`${file}.old`);
   const state: HookState = marked(text)
     ? 'installed'
     : marked(old)
       ? 'moved-aside'
-      : text === null
+      : entry === null
         ? 'absent'
-        : isLefthook(text)
+        : text !== null && isLefthook(text)
           ? 'lefthook'
           : 'other';
   const ours =
@@ -183,26 +211,51 @@ function infoAt(file: string): HookInfo {
 }
 
 /** The refusal to touch a hook that is not mcproc's, naming its owner and what to do instead. */
-function taken(file: string, text: string, act: 'install' | 'remove') {
-  const lefthook = isLefthook(text);
+function taken(file: string, entry: Entry, act: 'install' | 'remove') {
+  const lefthook = entry.text !== null && isLefthook(entry.text);
   const hint =
     act === 'remove'
-      ? marked(readMaybe(`${file}.old`))
+      ? marked(textAt(`${file}.old`))
         ? `mcproc's own hook is ${file}.old, where ${lefthook ? 'lefthook' : 'another tool'} moved it aside: delete that file to remove it.`
-        : 'It is not the hook mcproc installs; if it runs mcproc worktree sync, take that line out of it by hand.'
+        : entry.text === null
+          ? 'It is not the hook mcproc installs, and it leads to no hook file: delete it by hand if nothing needs it.'
+          : 'It is not the hook mcproc installs; if it runs mcproc worktree sync, take that line out of it by hand.'
       : lefthook
         ? "Add to lefthook.yml: post-checkout: jobs: - run: mcproc worktree sync --hook {1} (lefthook looks for its binary in the worktree's node_modules, which a fresh worktree lacks; a plain hook is more reliable)"
-        : `Add this line to it: ${HOOK_LINE}`;
+        : entry.text === null
+          ? `Delete it and run mcproc worktree hook install again, or point it at the hook it should run and add this line there: ${HOOK_LINE}`
+          : `Add this line to it: ${HOOK_LINE}`;
   return new McprocError(
     'HOOK_TAKEN',
-    `${file} is ${lefthook ? "lefthook's" : "another hook's"} post-checkout: mcproc does not ${act === 'install' ? 'overwrite' : 'remove'} it`,
+    `${file} is ${lefthook ? "lefthook's" : "another hook's"} post-checkout${entry.text === null ? ` (${entry.what})` : ''}: mcproc does not ${act === 'install' ? 'overwrite' : 'remove'} it`,
     { hint }
   );
 }
 
 /**
- * Puts `text` at `file` (mode 755) whole: written to a temporary sibling first, then renamed over mcproc's own hook, or,
- * when there was none, linked into place, which fails when a file appeared there meanwhile: answers false then.
+ * mcproc's hook at `file` read again right before it is replaced or deleted: refused with HOOK_TAKEN when another
+ * tool's stands there now, null when nothing does.
+ */
+function ownedNow(file: string, act: 'install' | 'remove'): string | null {
+  const now = entryAt(file);
+  if (now !== null && !marked(now.text)) throw taken(file, now, act);
+  return now?.text ?? null;
+}
+
+/** The permission bits of the file at `p` (through a link), null when there is none. */
+const modeOf = (p: string): number | null => {
+  try {
+    return fs.statSync(p).mode & 0o777;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Puts `text` at `file` (mode 755) whole: written to a temporary sibling first, then renamed over mcproc's own hook
+ * once that is read again and still mcproc's, or, when there was none, linked into place, which fails when an entry
+ * appeared there meanwhile. Answers false when what is there is no longer what the caller saw (an entry appeared, or
+ * mcproc's own went): look again.
  */
 function place(file: string, text: string, create: boolean): boolean {
   const dir = path.dirname(file);
@@ -215,6 +268,7 @@ function place(file: string, text: string, create: boolean): boolean {
     fs.writeFileSync(tmp, text, { mode: 0o755, flag: 'wx' });
     fs.chmodSync(tmp, 0o755); // the umask may have taken bits off
     if (!create) {
+      if (ownedNow(file, 'install') === null) return false;
       fs.renameSync(tmp, file);
       return true;
     }
@@ -230,6 +284,9 @@ function place(file: string, text: string, create: boolean): boolean {
   }
 }
 
+/** How many times install looks again at a hook path that changed under it before it gives up. */
+const INSTALL_TRIES = 3;
+
 /** The repository's post-checkout hook as it stands (see hookPath for where it is). A read only. */
 export async function hookStatus(
   root: string,
@@ -239,9 +296,14 @@ export async function hookStatus(
 }
 
 /**
- * Writes mcproc's hook running `entry` into the repository's post-checkout: where there is none, or over mcproc's own
- * when its text or mode differs (a newer node or CLI), else changes nothing. Any other file there is refused with
- * HOOK_TAKEN and left as it is, with what to add to it instead.
+ * Writes mcproc's hook running `entry` into the repository's post-checkout: where there is no entry at all, or over
+ * mcproc's own when its text or mode differs (a newer node or CLI), else changes nothing. Any other entry there,
+ * a link that leads to no file included, is refused with HOOK_TAKEN and left as it is, with what to add to it instead.
+ * A link to mcproc's own hook counts as mcproc's; an update puts the hook in its place.
+ *
+ * Ownership is read again right before the rename. What stays open is the instant between that read and the rename
+ * itself: POSIX has no rename that depends on what the target holds, so a hook another tool writes in that instant is
+ * replaced. A hook path that keeps changing under it gives up after a few looks with HOOK_TAKEN, never loops.
  */
 export async function hookInstall(
   root: string,
@@ -250,26 +312,36 @@ export async function hookInstall(
 ): Promise<HookInfo & { changed: 'written' | 'updated' | 'unchanged' }> {
   const file = await hookPath(root, git);
   const text = hookScript(entry.node, entry.cli);
-  for (;;) {
-    const had = readMaybe(file);
-    if (had !== null && !marked(had)) throw taken(file, had, 'install');
-    if (had === text && (fs.statSync(file).mode & 0o777) === 0o755)
+  for (let i = 0; i < INSTALL_TRIES; i++) {
+    const had = entryAt(file);
+    if (had !== null && !marked(had.text)) throw taken(file, had, 'install');
+    if (had !== null && had.text === text && modeOf(file) === 0o755)
       return { ...infoAt(file), changed: 'unchanged' };
-    // a file that appeared since it was read is looked at again: it may be another tool's
     if (place(file, text, had === null))
       return { ...infoAt(file), changed: had === null ? 'written' : 'updated' };
   }
+  throw new McprocError(
+    'HOOK_TAKEN',
+    `${file} kept changing while mcproc installed its hook (${INSTALL_TRIES} looks): another tool is writing it`,
+    {
+      hint: 'Run mcproc worktree hook status once that tool is done, then install again.',
+    }
+  );
 }
 
-/** Deletes mcproc's post-checkout hook of the repository; none there is a no-op, another tool's is refused (HOOK_TAKEN). */
+/**
+ * Deletes mcproc's post-checkout hook of the repository; no entry there is a no-op, any other (a link that leads to no
+ * file included) is refused (HOOK_TAKEN). A link to mcproc's own hook is deleted, never the file it leads to. The
+ * ownership read is the last thing before the unlink; what stays open is the instant between the two: POSIX has no
+ * unlink that depends on what the file holds, so a hook another tool writes in that instant is deleted.
+ */
 export async function hookRemove(
   root: string,
   git: GitRunner
 ): Promise<HookInfo & { changed: 'removed' | 'absent' }> {
   const file = await hookPath(root, git);
-  const had = readMaybe(file);
-  if (had === null) return { ...infoAt(file), changed: 'absent' };
-  if (!marked(had)) throw taken(file, had, 'remove');
+  if (ownedNow(file, 'remove') === null)
+    return { ...infoAt(file), changed: 'absent' };
   fs.rmSync(file, { force: true });
   return { ...infoAt(file), changed: 'removed' };
 }
