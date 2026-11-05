@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import { afterAll } from 'vitest';
+import { GIT_REPO_VARS } from './helpers/git-env.js';
 import { suiteStateDir } from './helpers/state-dir.js';
 
 // No test reads this machine's git config or runs its hooks: a global or system config may set a hooks directory
@@ -8,6 +9,9 @@ import { suiteStateDir } from './helpers/state-dir.js';
 // this process or in a child CLI, inherits this; a fixture that commits passes its identity with -c.
 process.env.GIT_CONFIG_GLOBAL = '/dev/null';
 process.env.GIT_CONFIG_NOSYSTEM = '1';
+// Nor does any test git act on a repository named from outside: a suite run from a git hook or from a shell that
+// exported git's variables for a repository would hand them to every fixture's init, add and commit, whatever its cwd.
+for (const k of GIT_REPO_VARS) delete process.env[k];
 
 // Every test file gets a state directory of its own, so no test reads or writes this machine's real leases and slot
 // registry: an inherited MCPROC_STATE_DIR is kept only when it lies inside the temp directory, any other is replaced

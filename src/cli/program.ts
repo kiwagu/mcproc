@@ -868,13 +868,15 @@ export function buildProgram(io: Io = defaultIo): Command {
           // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said,
           // whatever else the command line carries
           if (!isFreshCheckout(hook) || process.env.MCPROC_WORKTREE_ADD) return;
-          // git's variables for the repository that ran the hook would steer every git call here; this process is
-          // short-lived, so they go from its environment and git finds the worktree from the folder it runs in
+          // git's variables for the repository that ran the hook (and a caller's GIT_COMMON_DIR, which git passes on to
+          // its hooks) would steer every git call here; this process is short-lived, so they go from its environment
+          // and git finds the worktree from the folder it runs in
           for (const k of [
             'GIT_DIR',
             'GIT_WORK_TREE',
             'GIT_INDEX_FILE',
             'GIT_PREFIX',
+            'GIT_COMMON_DIR',
           ])
             delete process.env[k];
           // the main checkout's first checkout of an unborn HEAD comes from nothing too: there is nothing to copy it

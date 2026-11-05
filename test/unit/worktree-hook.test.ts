@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,7 @@ import {
 } from '../../src/core/worktree-hook.js';
 import type { GitRunner } from '../../src/core/worktree.js';
 import { shq } from '../../src/transport/quote.js';
+import { GIT_REPO_VARS } from '../helpers/git-env.js';
 
 /**
  * The git every fixture runs: none of this machine's git config (test/setup.ts), and nothing a git hook or mcproc's own
@@ -25,14 +27,7 @@ const gitEnv = (): NodeJS.ProcessEnv => {
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1',
   };
-  for (const k of [
-    'MCPROC_WORKTREE_ADD',
-    'GIT_DIR',
-    'GIT_WORK_TREE',
-    'GIT_INDEX_FILE',
-    'GIT_PREFIX',
-  ])
-    delete env[k];
+  for (const k of ['MCPROC_WORKTREE_ADD', ...GIT_REPO_VARS]) delete env[k];
   return env;
 };
 const id = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
@@ -128,6 +123,54 @@ describe('worktree hook', () => {
   });
   afterEach(() => {
     fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("the fixtures' git acts on the repository of its cwd, never on one git's inherited variables name", () => {
+    // a repository outside the fixture, named the way a git hook that runs the suite or an exporting shell names it
+    const other = path.join(base, 'other');
+    fs.mkdirSync(other);
+    git(['init', '-q', '-b', 'main'], other);
+    fs.writeFileSync(path.join(other, 'o.txt'), 'o');
+    git(['add', '-A'], other);
+    git(['commit', '-qm', 'other'], other);
+    // an untracked file: an add that reached this repository would stage it
+    fs.writeFileSync(path.join(other, 'untracked.txt'), 'u');
+    const otherGit = path.join(other, '.git');
+    /** every file of its git directory with a hash of its bytes: an object, ref, index or hook written there shows */
+    const state = (): string[] =>
+      fs
+        .readdirSync(otherGit, { recursive: true, encoding: 'utf8' })
+        .filter((f) => fs.statSync(path.join(otherGit, f)).isFile())
+        .sort()
+        .map(
+          (f) =>
+            `${f} ${createHash('sha256')
+              .update(fs.readFileSync(path.join(otherGit, f)))
+              .digest('hex')}`
+        );
+    const before = state();
+    const named: Record<(typeof GIT_REPO_VARS)[number], string> = {
+      GIT_DIR: otherGit,
+      GIT_WORK_TREE: other,
+      GIT_INDEX_FILE: path.join(otherGit, 'index'),
+      GIT_PREFIX: 'sub/',
+      GIT_COMMON_DIR: otherGit,
+    };
+    const repo = path.join(base, 'fixture');
+    fs.mkdirSync(repo);
+    try {
+      for (const [k, v] of Object.entries(named)) vi.stubEnv(k, v);
+      git(['init', '-q', '-b', 'main'], repo);
+      fs.writeFileSync(path.join(repo, 'r.txt'), 'r');
+      git(['add', '-A'], repo);
+      git(['commit', '-qm', 'fixture'], repo);
+      expect(git(['log', '--format=%s'], repo).trim()).toBe('fixture');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(state()).toEqual(before);
+    // the fixture's commit is in its own repository, objects included
+    expect(git(['cat-file', '-t', 'HEAD'], repo).trim()).toBe('commit');
   });
 
   it('hookScript: the shebang, the marker line, the paths as JSON, then the script with the paths quoted', () => {

@@ -589,12 +589,21 @@ describe('cli', () => {
       expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
     });
 
-    it('sync --hook ignores the env defaults and GIT_DIR', async () => {
-      // what a hook may inherit: git's own variables for the repository, an agent's project pointing at the main checkout
+    it("sync --hook ignores the env defaults and git's variables for a repository", async () => {
+      // what a hook may inherit: git's own variables for the repository (a caller's GIT_COMMON_DIR too, which git
+      // passes on), an agent's project pointing at the main checkout
+      const other = path.join(base, 'other');
+      fs.mkdirSync(other);
+      execFileSync('git', ['init', '-q', '-b', 'main'], {
+        cwd: other,
+        stdio: 'pipe',
+      });
       vi.stubEnv('MCPROC_PROJECT', main);
       vi.stubEnv('CLAUDE_PROJECT_DIR', main);
       vi.stubEnv('GIT_DIR', path.join(main, '.git'));
       vi.stubEnv('GIT_WORK_TREE', main);
+      vi.stubEnv('GIT_INDEX_FILE', path.join(other, '.git', 'index'));
+      vi.stubEnv('GIT_COMMON_DIR', path.join(other, '.git'));
       const c = await sync('--hook', fresh, '--project', wt, '--json');
       expect(c.err).toEqual([]);
       expect(process.exitCode ?? 0).toBe(0);
