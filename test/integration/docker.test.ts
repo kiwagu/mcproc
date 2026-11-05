@@ -67,6 +67,10 @@ describe.skipIf(!RUN)(
           `    docker: { container: ${name} }`,
           '    cwd: /srv/p',
           '    shell: /bin/sh -c',
+          '  login:', // the same container through BusyBox's login shell: reads capture what its /etc/profile sets
+          `    docker: { container: ${name} }`,
+          '    cwd: /srv/p',
+          '    shell: /bin/sh -lc',
           '',
         ].join('\n')
       );
@@ -102,8 +106,16 @@ describe.skipIf(!RUN)(
       await startApps(ctx, 'web');
       await sleep(2500);
       const row = (await listApps(ctx, 'web'))[0];
+      expect(ctx.transport.readMode()?.shell).toBe('host'); // a plain sh as the host shell: nothing to capture
       expect(row.status).toBe('online');
       expect(row.ports.checks[0]).toEqual({ port: 38611, status: 'listening' });
+      // through the login shell, reads run in plain BusyBox sh after the variables it exports
+      const login = await connect(prepare({ project: proj, host: 'login' }));
+      expect((await listApps(login, 'web'))[0]).toMatchObject({
+        status: 'online',
+        ports: { checks: [{ port: 38611, status: 'listening' }] },
+      });
+      expect(login.transport.readMode()?.shell).toBe('plain');
     }, 600_000);
 
     it('host-bound apps: one command starts a local app and the container app, ls/logs/monit show both from their hosts', async () => {

@@ -13,6 +13,7 @@ import {
   LIVE_DESCRIPTION,
 } from '../../src/core/init.js';
 import { loadManifest, parseManifest } from '../../src/core/manifest.js';
+import { VERSION } from '../../src/version.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const turbo = path.join(here, '..', 'fixtures', 'projects', 'turbo');
@@ -568,6 +569,15 @@ describe('renderDraft / initProject', () => {
       ports: [4100],
       url: 'http://localhost:4100',
     });
+    expect(m.mcproc).toBe(VERSION);
+  });
+  it('the draft names the mcproc that wrote it, right after the format version', () => {
+    const lines = renderDraft(root, 'mono', discover(root)).split('\n');
+    const at = lines.indexOf('version: 1');
+    expect(at).toBeGreaterThan(-1);
+    expect(lines[at + 1]).toMatch(
+      new RegExp(`^mcproc: ${VERSION.replace(/\./g, '\\.')}\\s+#`)
+    );
   });
   it('force never overwrites a manifest whose local host is readonly, even one that does not validate', () => {
     for (const text of [
@@ -860,8 +870,12 @@ describe('renderDraft on a turbo repo', () => {
     expect(text).not.toContain('--- other scripts');
     expect(text).toContain('profiles:\n  # base: [api-build, api]\n');
     expect(text).not.toContain('persistent dev task');
-    // the first line carries the date and the temp path
-    expect(text.slice(text.indexOf('\n') + 1)).toMatchInlineSnapshot(`
+    // the first line carries the date and the temp path; the version line carries this build's version
+    expect(
+      text
+        .slice(text.indexOf('\n') + 1)
+        .replace(`mcproc: ${VERSION} `, 'mcproc: <version> ')
+    ).toMatchInlineSnapshot(`
       "#
       # Candidates below are commented out. Uncomment the ones your dev stack needs,
       # write a description for each app, then run start + ls to confirm the ports; fix; repeat.
@@ -873,6 +887,7 @@ describe('renderDraft on a turbo repo', () => {
       # host = the one host an app always runs on (e.g. a dev container); without it the app runs where --host points.
       # note: ecosystem.config.cjs found: JavaScript ecosystem files are not executed by init; port its apps by hand
       version: 1
+      mcproc: <version>   # the mcproc that wrote this draft
       project: mono
       apps:
         # dev:    # source: package.json:dev; kind? server; port? 7777

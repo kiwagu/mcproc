@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { McprocError } from './errors.js';
+import { VERSION } from '../version.js';
 import type { App, AppKind, Dep, Manifest } from './manifest.js';
 import {
   findProcess,
@@ -20,16 +21,24 @@ import {
   parseProbe,
   type AppPorts,
   type Listener,
+  type ProbeData,
 } from './ports.js';
 import type { ProcStats, StatSample } from './stats.js';
 import { buildEcosystem, type Pm2AppConfig } from './ecosystem.js';
-import type { Context } from './resolve.js';
+import { inProcess, listenLocal, probeLocal } from './localscan.js';
+import { scriptNotRun, type Context, type HostLink } from './resolve.js';
 import type { ReloadCount } from './reloads.js';
 import { settleUrls, type UrlApp, type UrlResult } from './urlcheck.js';
 import { leasesCovering, type LeaseView } from './leases/view.js';
 import { stateDir } from './state.js';
-import { MARK, probeScript, probeTimeoutMs } from '../shell/snippets.js';
+import {
+  MARK,
+  listenScript,
+  probeScript,
+  probeTimeoutMs,
+} from '../shell/snippets.js';
 import { describeHost, ensureOk } from '../transport/index.js';
+import type { ExecResult } from '../transport/types.js';
 
 export interface LsRow {
   app: string;
@@ -109,6 +118,8 @@ export interface SnapshotOptions {
   containers?: 'probe' | 'none';
   /** 'read' (the default): read this checkout's leases from the state directory, on the local host only; 'none': skip it */
   leases?: 'read' | 'none';
+  /** on this machine, whose holder a port held outside pm2's trees is named for: the declared ports (default), or every port */
+  holders?: 'declared' | 'all';
 }
 export interface HostInfo {
   name: string;
@@ -149,89 +160,174 @@ function urlFields(
       };
 }
 
-/** Probes the context's host once (see SnapshotOptions for what it asks), and on this machine reads the checkout's leases. */
-export async function snapshot(
-  ctx: Context,
-  opts: SnapshotOptions = {}
-): Promise<Snapshot> {
-  const withMetrics = opts.metrics !== 'none';
-  const cpuSample = (opts.cpu ?? 'inline') === 'inline' && withMetrics;
-  const which = opts.urls ?? 'check';
-  const asked: UrlApp[] =
-    which === 'none'
-      ? []
-      : Object.values(ctx.manifest.apps).flatMap((a) =>
-          a.url !== null && (which === 'check' || which.includes(a.name))
-            ? [{ name: a.name, url: a.url, url_check: a.url_check }]
-            : []
-        );
-  // the host requests each asked url once, except those checked only from here (url_check: here, on a host that is not this machine)
-  const urls = [
-    ...new Set(
-      asked
-        .filter((a) => ctx.host.local || a.url_check !== 'here')
-        .map((a) => a.url)
-    ),
-  ];
-  const containers =
-    withMetrics && opts.containers === 'probe'
-      ? [
-          ...new Set(
-            Object.values(ctx.manifest.apps).flatMap((a) => a.containers)
-          ),
-        ]
-      : [];
-  const res = ensureOk(
-    await ctx.transport.exec(
-      probeScript(ctx.pm2.bin, {
-        cpuSample,
-        urls,
-        metrics: withMetrics,
-        containers,
-      }),
-      {
-        env: ctx.pm2.env(),
-        // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
-        timeoutMs: probeTimeoutMs(urls.length),
-      }
-    ),
-    ctx.host,
-    'probe'
-  );
-  const sampledAt = Date.now();
-  if (!res.stdout.includes(MARK.JLIST)) {
-    const tail = (res.stderr || res.stdout)
-      .trim()
-      .split('\n')
-      .slice(-5)
-      .join('\n');
-    throw new McprocError(
-      'TRANSPORT_FAILED',
-      `the shell on ${ctx.transport.describe()} did not run the probe (exit ${res.code}): ${tail}`,
-      {
-        hint: `Check hosts.${ctx.host.name}.shell (default /bin/bash -lc) exists on that host.`,
-      }
-    );
-  }
-  const data = parseProbe(res.stdout);
+/** What the probe script is asked for beyond pm2's list, the process tree and the listeners. */
+export interface ProbeAsk {
+  cpuSample: boolean;
+  metrics: boolean;
+  urls: string[];
+  containers: string[];
+  /**
+   * on this machine, the ports whose holder outside pm2's trees is named (a walk over every process's fds, at most every
+   * 30 s), or 'all' (every port, every time); other hosts ignore it: their script names every holder
+   */
+  holders?: number[] | 'all';
+}
+/** One probe of a host before any manifest reads it: the parsed sections, pm2's processes of every namespace, when it was taken. */
+export interface HostProbe {
+  data: ProbeData;
+  procs: Pm2Process[];
+  sampledAt: number;
+}
+/** The parts of a context that read a probe for one manifest. */
+export type ManifestView = Pick<Context, 'manifest' | 'host' | 'hereCheck'>;
+
+/** The host's side of a probe without pm2's list: the script once, its sections parsed, when it was taken. */
+export interface HostScan {
+  data: ProbeData;
+  sampledAt: number;
+}
+
+/** A probe the plain shell could not run, or whose pm2 it could not find where the host shell might. */
+export const probeRetry = (r: ExecResult): boolean =>
+  !r.stdout.includes(MARK.JLIST) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
+/** A probe without pm2's list that the plain shell could not run: it never reached the clock. */
+const clockRetry = (r: ExecResult): boolean => !r.stdout.includes(MARK.CLOCK);
+/** A listen check with pm2's list that the plain shell could not run, or whose pm2 it could not find. */
+const listenRetry = (r: ExecResult): boolean =>
+  clockRetry(r) || r.stdout.includes(`${MARK.JLIST_RC} 127`);
+
+/** pm2's list as the probe's jlist section printed it, with its exit checks. */
+function jlistOf(
+  link: HostLink,
+  data: ProbeData,
+  res: ExecResult
+): Pm2Process[] {
   if (data.jlistRc === 127)
     throw new McprocError(
       'PM2_NOT_FOUND',
-      `pm2 not found on ${ctx.transport.describe()}`,
+      `pm2 not found on ${link.transport.describe()}`,
       { hint: PM2_NOT_FOUND_HINT }
     );
   if (data.jlistRc !== 0)
     throw new McprocError(
       'PM2_FAILED',
-      `pm2 jlist exited ${data.jlistRc} on ${ctx.transport.describe()}`,
+      `pm2 jlist exited ${data.jlistRc} on ${link.transport.describe()}`,
       { details: res.stderr.slice(-500) }
     );
-  const procs = parseJlist(data.jlistRaw);
+  return parseJlist(data.jlistRaw);
+}
+
+/** Runs the probe script without pm2's list: for a link whose pm2 lists over the daemon's socket. */
+export async function scanHost(
+  link: HostLink,
+  ask: ProbeAsk
+): Promise<HostScan> {
+  const res = ensureOk(
+    await link.transport.read(
+      probeScript(link.pm2.bin, { ...ask, jlist: false }),
+      {
+        env: link.pm2.env(),
+        timeoutMs: probeTimeoutMs(ask.urls.length),
+        retryIf: clockRetry,
+      }
+    ),
+    link.host,
+    'probe'
+  );
+  const sampledAt = Date.now();
+  if (!res.stdout.includes(MARK.CLOCK))
+    throw scriptNotRun(link, res, 'the probe');
+  return { data: parseProbe(res.stdout), sampledAt };
+}
+
+/** Runs the probe once on the host: the script, and pm2's list from the daemon's socket or from the script's own jlist. */
+export async function probeHost(
+  link: HostLink,
+  ask: ProbeAsk
+): Promise<HostProbe> {
+  // this machine is read in-process; a /proc that cannot be read leaves it to the script, as before
+  if (inProcess(link)) {
+    const local = await probeLocal(link, ask);
+    if (local) return local;
+  }
+  if (link.pm2.listsOverSocket()) {
+    const [scan, procs] = await Promise.all([
+      scanHost(link, ask),
+      link.pm2.jlist(),
+    ]);
+    return { ...scan, procs };
+  }
+  const res = ensureOk(
+    await link.transport.read(probeScript(link.pm2.bin, ask), {
+      env: link.pm2.env(),
+      // each url adds its bounded lookup and request: many on a host whose resolver drops packets outlast the default
+      timeoutMs: probeTimeoutMs(ask.urls.length),
+      retryIf: probeRetry,
+    }),
+    link.host,
+    'probe'
+  );
+  const sampledAt = Date.now();
+  if (!res.stdout.includes(MARK.JLIST))
+    throw scriptNotRun(link, res, 'the probe');
+  const data = parseProbe(res.stdout);
+  return { data, procs: jlistOf(link, data, res), sampledAt };
+}
+
+/** What a listening wait reads on a tick: pm2's list and every port something listens on, whoever holds it. */
+export interface ListenCheck {
+  procs: Pm2Process[];
+  ports: Set<number>;
+}
+/** The cheap look of a listening wait: no fd walk; who holds a port is the light probe's question, once all listen. */
+export async function listenCheck(link: HostLink): Promise<ListenCheck> {
+  if (inProcess(link)) {
+    const local = await listenLocal(link);
+    if (local) return local;
+  }
+  const socket = link.pm2.listsOverSocket();
+  const [res, listed] = await Promise.all([
+    link.transport.read(listenScript(link.pm2.bin, !socket), {
+      env: link.pm2.env(),
+      retryIf: socket ? clockRetry : listenRetry,
+    }),
+    socket ? link.pm2.jlist() : Promise.resolve(null),
+  ]);
+  ensureOk(res, link.host, 'listen check');
+  if (!res.stdout.includes(MARK.CLOCK))
+    throw scriptNotRun(link, res, 'the probe');
+  const data = parseProbe(res.stdout);
+  return {
+    procs: listed ?? jlistOf(link, data, res),
+    ports: new Set(data.listeners.map((l) => l.port)),
+  };
+}
+
+/** The apps whose url this read asks for (see SnapshotOptions.urls). */
+function askedUrls(view: ManifestView, opts: SnapshotOptions): UrlApp[] {
+  const which = opts.urls ?? 'check';
+  return which === 'none'
+    ? []
+    : Object.values(view.manifest.apps).flatMap((a) =>
+        a.url !== null && (which === 'check' || which.includes(a.name))
+          ? [{ name: a.name, url: a.url, url_check: a.url_check }]
+          : []
+      );
+}
+
+/** One manifest's reading of a probe: its apps' pids, ports and tree metrics, the url checks, its leases. */
+export async function deriveSnapshot(
+  view: ManifestView,
+  probe: HostProbe,
+  opts: SnapshotOptions = {}
+): Promise<Snapshot> {
+  const { data, procs, sampledAt } = probe;
+  const asked = askedUrls(view, opts);
   const pids = appPids(
-    ctx.manifest.apps,
+    view.manifest.apps,
     procs,
     data.tree,
-    ctx.manifest.project
+    view.manifest.project
   );
   const metricOpts = opts.prev
     ? { prev: opts.prev.sample, intervalSec: (sampledAt - opts.prev.at) / 1000 }
@@ -239,7 +335,7 @@ export async function snapshot(
   const metrics: Record<string, TreeMetrics | null> = {};
   for (const [name, set] of pids)
     metrics[name] = treeMetrics(set, data.stats, data.listeners, metricOpts);
-  for (const app of Object.values(ctx.manifest.apps)) {
+  for (const app of Object.values(view.manifest.apps)) {
     const m = metrics[app.name];
     if (!m || app.containers.length === 0) continue;
     const mib = app.containers.reduce(
@@ -256,13 +352,13 @@ export async function snapshot(
   // the checks from here that url_check asks for, after the probe: a url the host answered costs nothing more
   const urlChecks = await settleUrls(
     asked,
-    { host: ctx.host.name, local: ctx.host.local },
+    { host: view.host.name, local: view.host.local },
     data,
-    ctx.hereCheck
+    view.hereCheck
   );
   return {
     procs,
-    ports: joinPorts(ctx.manifest.apps, procs, data, ctx.manifest.project),
+    ports: joinPorts(view.manifest.apps, procs, data, view.manifest.project),
     listeners: data.listeners,
     tree: data.tree,
     stats: data.stats,
@@ -272,10 +368,47 @@ export async function snapshot(
     zone: data.zone,
     memory: data.memory,
     leases:
-      ctx.host.local && opts.leases !== 'none'
-        ? leasesCovering(stateDir(), ctx.manifest)
+      view.host.local && opts.leases !== 'none'
+        ? leasesCovering(stateDir(), view.manifest)
         : [],
   };
+}
+
+/** Probes the context's host once (see SnapshotOptions for what it asks), and on this machine reads the checkout's leases. */
+export async function snapshot(
+  ctx: Context,
+  opts: SnapshotOptions = {}
+): Promise<Snapshot> {
+  const withMetrics = opts.metrics !== 'none';
+  const asked = askedUrls(ctx, opts);
+  // the host requests each asked url once, except those checked only from here (url_check: here, on a host that is not this machine)
+  const urls = [
+    ...new Set(
+      asked
+        .filter((a) => ctx.host.local || a.url_check !== 'here')
+        .map((a) => a.url)
+    ),
+  ];
+  const containers =
+    withMetrics && opts.containers === 'probe'
+      ? [
+          ...new Set(
+            Object.values(ctx.manifest.apps).flatMap((a) => a.containers)
+          ),
+        ]
+      : [];
+  const holders: number[] | 'all' =
+    opts.holders === 'all'
+      ? 'all'
+      : [...new Set(Object.values(ctx.manifest.apps).flatMap((a) => a.ports))];
+  const probe = await probeHost(ctx, {
+    cpuSample: (opts.cpu ?? 'inline') === 'inline' && withMetrics,
+    metrics: withMetrics,
+    urls,
+    containers,
+    holders,
+  });
+  return deriveSnapshot(ctx, probe, opts);
 }
 
 /** Exit codes bash reports for SIGINT and SIGTERM: the process was stopped, it did not fail. */
@@ -298,7 +431,7 @@ export function statusWord(p: Pm2Process | undefined, app: App): string {
 
 /** One row per named app, in that order: what pm2 and the probe show, or for an app not running that a lease covers, its place in the queue. */
 export function rowsFor(
-  ctx: Context,
+  ctx: Pick<Context, 'manifest' | 'host'>,
   snap: Snapshot,
   names: string[]
 ): LsRow[] {
@@ -429,8 +562,8 @@ export async function portsReport(
   port: number | null;
   listeners: Array<Listener & { app: string | null }>;
 }> {
-  // no url is shown, so none is asked; the full probe stays for the docker-published ports
-  const snap = await snapshot(ctx, { urls: 'none' });
+  // no url is shown, so none is asked; every holder is named, which is what this answer is for
+  const snap = await snapshot(ctx, { urls: 'none', holders: 'all' });
   const pidToApp = new Map<number, string>();
   for (const [name, ap] of Object.entries(snap.ports))
     for (const l of ap.actual)
@@ -499,6 +632,8 @@ export function describeProject(m: Manifest) {
     project: m.project,
     root: m.root,
     manifest_path: m.path,
+    /** the mcproc that wrote the manifest (null when it names none) and the one answering */
+    mcproc: { manifest: m.mcproc, running: VERSION },
     base_project: m.base_project,
     vars: m.vars,
     override: m.override,

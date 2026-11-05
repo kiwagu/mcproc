@@ -40,7 +40,7 @@ const fakeNpm = (): Runner & { calls: string[] } => {
     });
     fs.writeFileSync(
       path.join(cwd, 'node_modules', 'pm2', 'package.json'),
-      JSON.stringify({ name: 'pm2', version: '7.0.4', license: 'AGPL-3.0' })
+      JSON.stringify({ name: 'pm2', version: '7.0.4' })
     );
     fs.writeFileSync(
       path.join(cwd, 'node_modules', 'pm2', 'bin', 'pm2'),

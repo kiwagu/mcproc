@@ -64,7 +64,7 @@ export async function readLogs(
   if (stream !== 'out')
     parts.push(`echo ${ERR}; tail -n ${lines} ${shq(p.err_log)} 2>/dev/null`);
   const res = ensureOk(
-    await ctx.transport.exec(parts.join('; ')),
+    await ctx.transport.read(parts.join('; ')),
     ctx.host,
     'tail logs'
   );

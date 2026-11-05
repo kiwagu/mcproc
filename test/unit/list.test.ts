@@ -1,11 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
 import { probeOut } from '../helpers/probe.js';
-import { MARK } from '../../src/shell/snippets.js';
+import { procWorld, type FakeWorld } from '../helpers/procfs.js';
+import type { Rule } from '../helpers/fake-transport.js';
+import { MARK, listenScript, probeScript } from '../../src/shell/snippets.js';
+import { Pm2Client } from '../../src/core/pm2.js';
+import { ProcReader } from '../../src/core/procfs.js';
+import { clearLocalScanCache } from '../../src/core/localscan.js';
 import { fmtUrl } from '../../src/mcp/render.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
@@ -19,9 +24,13 @@ import {
   describeApp,
   describeProject,
   snapshot,
+  probeHost,
+  listenCheck,
+  deriveSnapshot,
   rowsFor,
   statusWord,
   unreachableRow,
+  probeRetry,
 } from '../../src/core/list.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -250,6 +259,43 @@ describe('listApps', () => {
       code: 'TRANSPORT_FAILED',
       message: expect.stringContaining('/bin/bash: not found'),
     });
+  });
+});
+
+describe('probeHost and deriveSnapshot', () => {
+  it('one probe read by the manifest gives what snapshot gives', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); // the clock stands still: both reads see the same pm2 uptimes
+    try {
+      const ctx = fakeCtx(basic, 'local', [probeRule]);
+      const probe = await probeHost(ctx, {
+        cpuSample: true,
+        metrics: true,
+        urls: ['http://localhost:3310/health'],
+        containers: [],
+      });
+      expect(probe.procs.map((p) => p.name)).toEqual([
+        'demo-api',
+        'demo-api-build',
+      ]);
+      const derived = await deriveSnapshot(ctx, probe);
+      const wholeCtx = fakeCtx(basic, 'local', [probeRule]);
+      const whole = await snapshot(wholeCtx);
+      expect({ ...derived, sampledAt: 0 }).toEqual({ ...whole, sampledAt: 0 });
+      expect(ctx.fake.calls).toEqual(wholeCtx.fake.calls); // the same probe, asked the same way
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('probeHost needs no manifest: it reads every namespace of the daemon', async () => {
+    const ctx = fakeCtx(basic, 'local', [probeRule]);
+    const probe = await probeHost(
+      { host: ctx.host, transport: ctx.transport, pm2: ctx.pm2 },
+      { cpuSample: false, metrics: true, urls: [], containers: [] }
+    );
+    expect(new Set(probe.procs.map((p) => p.namespace))).toEqual(
+      new Set(['demo'])
+    );
+    expect(ctx.fake.calls[0].cmd).not.toContain('localhost:3310'); // no url asked
   });
 });
 
@@ -933,5 +979,294 @@ describe('queued and starting rows', () => {
       else process.env.MCPROC_STATE_DIR = prev;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+// stopped: no uptime, so two normalizations of it are equal whenever they run
+const RAW = {
+  pid: 0,
+  name: 'p-web',
+  pm_id: 0,
+  pm2_env: { status: 'stopped', namespace: 'p', pm_uptime: 1000 },
+};
+const quiet = { cpuSample: false, metrics: false, urls: [], containers: [] };
+describe('the probe beside the socket', () => {
+  it('probeScript without jlist has no jlist section and keeps the clock; the default is unchanged', () => {
+    expect(probeScript('pm2', { jlist: false })).not.toContain(MARK.JLIST);
+    expect(probeScript('pm2', { jlist: false })).toContain(MARK.CLOCK);
+    expect(probeScript('pm2')).toContain(MARK.JLIST);
+  });
+  it('a link that lists over the socket: one read without jlist, the procs from the socket', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        RAW,
+      ]),
+    };
+    const p = await probeHost(link, quiet);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].read).toBe(true);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
+    expect(p.procs.map((x) => x.name)).toEqual(['p-web']);
+  });
+  it('that probe without the clock marker: the shell did not run it', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: { code: 2, stdout: '', stderr: 'sh: 1: syntax error' },
+      },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', undefined, async () => []),
+    };
+    await expect(probeHost(link, quiet)).rejects.toMatchObject({
+      code: 'TRANSPORT_FAILED',
+    });
+  });
+  it('no daemon: no process, and pm2 was never asked', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    const c = {
+      ...ctx,
+      pm2: new Pm2Client(
+        ctx.fake,
+        ctx.host,
+        'pm2',
+        '/h/.pm2',
+        async () => null
+      ),
+    };
+    const snap = await snapshot(c, { urls: 'none', leases: 'none' });
+    expect(snap.procs).toEqual([]);
+    expect(ctx.fake.calls.some((x) => /'jlist'/.test(x.cmd))).toBe(false);
+    // nor did the probe script carry its own jlist section
+    expect(ctx.fake.calls.some((x) => x.cmd.includes(MARK.JLIST))).toBe(false);
+  });
+});
+
+describe('the listening pre-check', () => {
+  it('listenScript asks ss for ports only: no -p, no fd scan; jlist only when asked', () => {
+    const s = listenScript('pm2', false);
+    expect(s).toContain('ss -ltn 2>');
+    expect(s).toContain('ss -lun 2>');
+    expect(s).not.toContain('-ltnp');
+    expect(s).not.toContain(MARK.FD);
+    expect(s).not.toContain(MARK.JLIST);
+    expect(listenScript('pm2', true)).toContain(MARK.JLIST);
+  });
+  it('listenCheck: the ports that listen, whoever holds them, and the list from the script', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: {
+          stdout: probeOut({
+            jlist: JSON.stringify([RAW]),
+            tcp: 'LISTEN 0 511 *:3010 *:*\n',
+          }),
+        },
+      },
+    ]);
+    const c = await listenCheck(ctx);
+    expect([...c.ports]).toEqual([3010]);
+    expect(c.procs.map((p) => p.name)).toEqual(['p-web']);
+  });
+  it('listenCheck: /proc/net where ss is missing gives the same ports', async () => {
+    // 0BC2 = 3010, state 0A = LISTEN
+    const proc = `${MARK.PROC}\n  sl  local_address rem_address   st\n   0: 00000000:0BC2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242\n`;
+    const ctx = fakeCtx(readiness, 'local', [
+      { match: MARK.CLOCK, result: { stdout: probeOut({ tcp: proc }) } },
+    ]);
+    expect([...(await listenCheck(ctx)).ports]).toEqual([3010]);
+  });
+  it('listenCheck over the socket: one plain read without jlist, the list from the socket', async () => {
+    const ctx = fakeCtx(readiness, 'local', [
+      {
+        match: MARK.CLOCK,
+        result: { stdout: probeOut({ tcp: 'LISTEN 0 511 *:3010 *:*\n' }) },
+      },
+    ]);
+    const link = {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        RAW,
+      ]),
+    };
+    const c = await listenCheck(link);
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].read).toBe(true);
+    expect(ctx.fake.calls[0].cmd).not.toContain(MARK.JLIST);
+    expect([...c.ports]).toEqual([3010]);
+    expect(c.procs.map((p) => p.name)).toEqual(['p-web']);
+  });
+});
+
+describe('probeRetry', () => {
+  const res = (stdout: string) => ({ code: 0, stdout, stderr: '' });
+  it.each([
+    { what: 'a good probe', stdout: probeOut({ jlist: '[]' }), retry: false },
+    {
+      what: 'a probe whose pm2 exited non-zero',
+      stdout: probeOut({ rc: 1 }),
+      retry: false,
+    },
+    {
+      what: 'no JLIST marker (the plain shell did not run it)',
+      stdout: 'sh: 1: oops\n',
+      retry: true,
+    },
+    { what: 'an empty answer', stdout: '', retry: true },
+    {
+      what: 'pm2 not found in plain sh (JLIST_RC 127)',
+      stdout: probeOut({ rc: 127 }),
+      retry: true,
+    },
+  ])('$what: retry $retry', ({ stdout, retry }) => {
+    expect(probeRetry(res(stdout))).toBe(retry);
+  });
+});
+
+describe('the in-process scan behind probeHost, listenCheck and snapshot', () => {
+  const API = {
+    pid: 200,
+    name: 'demo-api',
+    pm_id: 0,
+    pm2_env: { status: 'online', namespace: 'demo', pm_uptime: 1000 },
+  };
+  /** demo-api: sh 200 → node 201; another checkout's server (400) and a python one (500) are this user's, outside pm2 */
+  const WORLD: FakeWorld = {
+    procs: [
+      { pid: 1, ppid: 0, comm: 'systemd' },
+      {
+        pid: 200,
+        ppid: 1,
+        comm: 'sh',
+        rss: 500,
+        cmdline: 'sh -c node main.js',
+      },
+      {
+        pid: 201,
+        ppid: 200,
+        comm: 'node-MainThread',
+        rss: 25_000,
+        cmdline: 'node main.js',
+        sockets: [5001],
+      },
+      {
+        pid: 400,
+        ppid: 1,
+        comm: 'node-MainThread',
+        cmdline: 'node other.js',
+        sockets: [],
+      },
+      {
+        pid: 500,
+        ppid: 1,
+        comm: 'python3',
+        cmdline: 'python3 -m http.server 8080',
+        sockets: [7001],
+      },
+    ],
+    tcp: [
+      { port: 3310, inode: 5001 },
+      { port: 8080, inode: 7001 },
+    ],
+  };
+  /** the api's port taken by the other checkout's server instead */
+  const TAKEN: FakeWorld = {
+    ...WORLD,
+    procs: WORLD.procs.map((p) =>
+      p.pid === 201
+        ? { ...p, sockets: [] }
+        : p.pid === 400
+          ? { ...p, sockets: [5001] }
+          : p
+    ),
+  };
+  const link = (w: FakeWorld = WORLD, rules: Rule[] = []) => {
+    const ctx = fakeCtx(basic, 'local', rules);
+    return {
+      ...ctx,
+      pm2: new Pm2Client(ctx.fake, ctx.host, 'pm2', '/h/.pm2', async () => [
+        API,
+      ]),
+      proc: new ProcReader(procWorld(w), Date.now, {
+        clkTck: 100,
+        pageSize: 4096,
+      }),
+    };
+  };
+  beforeEach(() => clearLocalScanCache());
+
+  it('probeHost on this machine with a reader runs no script', async () => {
+    const c = link();
+    const p = await probeHost(c, { ...quiet, metrics: true });
+    expect(c.fake.calls).toEqual([]);
+    expect(p.data.listeners.find((l) => l.port === 3310)?.pid).toBe(201);
+    expect(p.data.stats.rssKb.get(201)).toBe(100_000);
+  });
+  it('a reader that cannot read /proc: the script, as before', async () => {
+    const c = link({ ...WORLD, noNet: true }, [
+      { match: MARK.CLOCK, result: { stdout: probeOut({}) } },
+    ]);
+    await probeHost(c, quiet);
+    expect(c.fake.calls).toHaveLength(1);
+    expect(c.fake.calls[0].cmd).toBe(
+      probeScript('pm2', { ...quiet, jlist: false })
+    );
+  });
+  it('another host is probed with its script byte for byte, whatever reader its link carries', async () => {
+    const ctx = fakeCtx(basic, 'stand', [
+      { match: MARK.JLIST, result: { stdout: probeOut({}) } },
+    ]);
+    const boom = () => {
+      throw new Error('this machine was read');
+    };
+    const ask = {
+      cpuSample: false,
+      metrics: true,
+      urls: [],
+      containers: [],
+      holders: [3310],
+    };
+    await probeHost(
+      {
+        ...ctx,
+        proc: new ProcReader({ readdir: boom, read: boom, readlink: boom }),
+      },
+      ask
+    );
+    expect(ctx.fake.calls).toHaveLength(1);
+    expect(ctx.fake.calls[0].cmd).toBe(probeScript('pm2', ask));
+    expect(ctx.fake.calls[0].opts).toMatchObject({ retryIf: probeRetry });
+  });
+  it('listenCheck on this machine with a reader runs no script', async () => {
+    const c = link();
+    const r = await listenCheck(c);
+    expect(c.fake.calls).toEqual([]);
+    expect([...r.ports].sort((a, b) => a - b)).toEqual([3310, 8080]);
+  });
+  it('snapshot names the holder of a declared port outside the trees; undeclared ports stay unnamed', async () => {
+    const snap = await snapshot(link(TAKEN), { urls: 'none', leases: 'none' });
+    expect(snap.ports.api.checks).toEqual([
+      {
+        port: 3310,
+        status: 'declared-not-listening',
+        held_by: { pid: 400, command: 'node-MainThread' },
+      },
+    ]);
+    expect(snap.listeners.find((l) => l.port === 8080)?.pid).toBeNull();
+  });
+  it('ports names every holder', async () => {
+    const rep = await portsReport(link(TAKEN) as unknown as Context);
+    expect(rep.listeners.map((l) => [l.port, l.pid, l.command])).toEqual([
+      [3310, 400, 'node-MainThread'],
+      [8080, 500, 'python3'],
+    ]);
   });
 });

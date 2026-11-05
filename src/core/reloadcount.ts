@@ -93,7 +93,7 @@ export async function countReloads(
       let stdout: string;
       try {
         stdout = ensureOk(
-          await ctx.transport.exec(
+          await ctx.transport.read(
             [
               ...unreadChecks(files),
               ...files.map((f) => readSnippet(f.id, f.log, null, null)),

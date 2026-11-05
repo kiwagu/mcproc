@@ -7,6 +7,7 @@ import {
   wrapText,
   logsTitle,
   scrollTo,
+  paintedText,
 } from '../../src/monit/frame.js';
 import { displayWidth } from '../../src/monit/screentext.js';
 import type { LsRow } from '../../src/core/list.js';
@@ -102,6 +103,17 @@ const base = () =>
   );
 
 describe('renderFrame', () => {
+  it('the legend offers esc stacks only when monit was opened from the stacks', () => {
+    const s = base();
+    for (const v of [s, reduce(s, { type: 'view', view: 'flat' })]) {
+      expect(renderFrame(v, { width: 200, height: 24 }).footer).not.toContain(
+        'esc stacks'
+      );
+      expect(
+        renderFrame({ ...v, toStacks: true }, { width: 200, height: 24 }).footer
+      ).toMatch(/^esc stacks {2}/); // first: a narrow terminal cuts the end of the legend, never this
+    }
+  });
   it('fits an 80-column terminal: no line wider than 80, marker on the selected row, ports visible', () => {
     const f = renderFrame(base(), { width: 80, height: 24 });
     for (const line of [
@@ -542,6 +554,15 @@ describe('renderFrame', () => {
       /^web {2}\| 2026-10-11T13:00:07: \x1b\[38;5;66mtimestamp=/
     );
   });
+  it('the apps table fits the width: no column falls off the edge, a long cell ends with …', () => {
+    for (const width of [80, 120]) {
+      const f = renderFrame(base(), { width, height: 24 });
+      expect(f.table[0]).toContain('RUNTIME');
+      for (const l of f.table)
+        expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      expect(f.table[1]).toMatch(/next-server.*…$/);
+    }
+  });
 });
 
 describe('logsTitle', () => {
@@ -698,10 +719,105 @@ describe('the incidents view', () => {
       }).footer
     ).toContain('o/e/b logs  i incidents  h host');
   });
+  it('shows what the agent has taken in muted colors, marked taken; its title counts them; t hides them', () => {
+    const taken = reduce(open([inc(2), inc(1)]), {
+      type: 'taken',
+      taken: {
+        'local/web': {
+          err: {
+            stamp: '2026-10-15T10:00:01.500',
+            path: '/l/x-err',
+            offset: 0,
+          },
+        },
+      },
+    });
+    const f = renderFrame(taken, { width: 120, height: 30 });
+    expect(f.logs).toEqual([
+      '\x1b[90mweb@local 2026-10-15T10:00:01 error (err) · taken\x1b[0m',
+      '\x1b[90m  │ before 1\x1b[0m',
+      '\x1b[38;5;131m  ▶ TypeError: boom 1\x1b[0m',
+      'web@local 2026-10-15T10:00:02 error (err)',
+      '  │ before 2',
+      '\x1b[31m  ▶ TypeError: boom 2\x1b[0m',
+    ]);
+    expect(logsTitle(taken, 0)).toBe(
+      'incidents · last 15 min · 2 shown · 1 taken'
+    );
+    expect(f.footer).toContain('i back  f flat  t hide taken  c clear');
+    const hidden = reduce(taken, { type: 'hideTaken' });
+    const h = renderFrame(hidden, { width: 120, height: 30 });
+    expect(h.logs).toEqual([
+      'web@local 2026-10-15T10:00:02 error (err)',
+      '  │ before 2',
+      '\x1b[31m  ▶ TypeError: boom 2\x1b[0m',
+    ]);
+    expect(logsTitle(hidden, 0)).toBe(
+      'incidents · last 15 min · 1 shown · 1 taken hidden'
+    );
+    expect(h.footer).toContain('t show taken');
+  });
+  it('with every incident taken and hidden, it says so rather than that nothing happened', () => {
+    const s = reduce(
+      reduce(open([inc(1)]), {
+        type: 'taken',
+        taken: {
+          'local/web': {
+            err: {
+              stamp: '2026-10-15T10:00:05.000',
+              path: '/l/x-err',
+              offset: 0,
+            },
+          },
+        },
+      }),
+      { type: 'hideTaken' }
+    );
+    expect(renderFrame(s, { width: 120, height: 30 }).logs).toEqual([
+      'every incident here is taken (t shows them)',
+    ]);
+  });
   it('scrolls by the rows the incidents take', () => {
     const s = open([inc(3), inc(2), inc(1)]);
     const size = { width: 120, height: 6 }; // a pane of 3 rows: one incident at a time
     expect(scrollTo(s, size, Infinity)).toEqual({ entries: 2, rows: 0 });
     expect(scrollTo(s, size, 1)).toEqual({ entries: 0, rows: 1 }); // by rows, as the log pane does
+  });
+});
+
+describe('paintedText', () => {
+  const s0 = initialState({
+    project: 'demo',
+    host: 'local',
+    hosts: ['local'],
+    apps: {},
+  });
+  const size = { width: 100, height: 30 };
+  it('the same state and size paint the same text; another read time, size or view does not', () => {
+    const a = { ...s0, updatedAt: new Date('2026-10-30T12:00:00') };
+    const same = paintedText(a, renderFrame(a, size), size);
+    expect(paintedText(a, renderFrame(a, size), size)).toBe(same);
+    const later = { ...a, updatedAt: new Date('2026-10-30T12:00:02') };
+    expect(paintedText(later, renderFrame(later, size), size)).not.toBe(same);
+    const wide = { width: 120, height: 30 };
+    expect(paintedText(a, renderFrame(a, wide), wide)).not.toBe(same);
+    const flat = { ...a, view: 'flat' as const };
+    expect(paintedText(flat, renderFrame(flat, size), size)).not.toBe(same);
+  });
+  // what `show` paints, field by field: a change in any one of them alone is a different text
+  const a = { ...s0, updatedAt: new Date('2026-10-30T12:00:00') };
+  const f = renderFrame(a, size);
+  it.each([
+    ['the table', { ...f, table: [...f.table, 'web  online'] }],
+    ['the logs', { ...f, logs: [...f.logs, 'listening 3100'] }],
+    ['the details', { ...f, details: [...f.details, 'pid 4242'] }],
+    ['the footer', { ...f, footer: `${f.footer} · started web` }],
+  ])('a change in %s alone is another text', (_field, changed) => {
+    expect(paintedText(a, changed, size)).not.toBe(paintedText(a, f, size));
+  });
+  it('a change in the log title alone is another text', () => {
+    const err = { ...a, stream: 'err' as const };
+    expect(logsTitle(err, f.scroll)).not.toBe(logsTitle(a, f.scroll));
+    expect(paintedText(err, f, size)).not.toBe(paintedText(a, f, size));
   });
 });

@@ -1,10 +1,23 @@
+import fs from 'node:fs';
 import { McprocError } from './errors.js';
 import { watcherIn } from './leases/view.js';
-import { type Host, type Manifest, scopeManifest } from './manifest.js';
+import {
+  type App,
+  type Host,
+  type Manifest,
+  scopeManifest,
+} from './manifest.js';
 import { type HostMemory, parseMeminfo } from './memory.js';
-import { Pm2Client, resolvePm2Bin, runtimeDir } from './pm2.js';
+import {
+  Pm2Client,
+  type Pm2Resolution,
+  resolvePm2Bin,
+  runtimeDir,
+} from './pm2.js';
 import { parseUrlProbe } from './ports.js';
-import { pickHost } from './resolve.js';
+import { ownPidFile } from './pm2watch.js';
+import type { ProcReader } from './procfs.js';
+import { daemonFor, pickHost, procFor } from './resolve.js';
 import { stateDir } from './state.js';
 import {
   checkHere,
@@ -58,7 +71,8 @@ export interface DoctorReport {
   runtime_present: boolean;
   runtime_pm2: string | null;
   runtime_node: string | null;
-  daemon: 'answers' | 'error' | 'unknown';
+  /** answers: pm2 listed its processes; not-running: no daemon at its home (only the socket can tell) */
+  daemon: 'answers' | 'not-running' | 'error' | 'unknown';
   processes: number;
   in_namespace: number;
   /** the state directory that holds this machine's leases; null on another host */
@@ -71,9 +85,61 @@ export interface DoctorReport {
   /** the host's own account of itself (container, hostname, own addresses); null when not read */
   environment: HostEnv | null;
   urls: DoctorUrl[];
+  /** how mcproc's reads run there: plain sh with the login environment (read age_s ago), or the host shell and why; null before any read */
+  reads: {
+    shell: 'plain' | 'host';
+    age_s: number | null;
+    reason: string | null;
+  } | null;
+  /** how monit reads the host: woken by pm2's pid files with the in-process scan, or every interval and why; null when unreachable or without pm2 */
+  monit: {
+    mode: 'events' | 'polled';
+    scan: 'in-process' | 'script';
+    why: string | null;
+  } | null;
 }
 
 const MARKER = '__MCPROC_DOCTOR__';
+
+/**
+ * How monit reads a host whose pm2 was resolved, with `apps` the manifest's apps there (see DoctorReport.monit);
+ * `proc` is how its processes are read, procFor's choice unless a caller (a test) passes another.
+ */
+export async function monitMode(
+  host: Host,
+  client: Pm2Client,
+  apps: Record<string, App>,
+  spawner?: Spawner,
+  proc: ProcReader | null = procFor(host, spawner)
+): Promise<NonNullable<DoctorReport['monit']>> {
+  const scan = proc ? 'in-process' : 'script';
+  if (!host.local) return { mode: 'polled', scan, why: 'another host' };
+  // on this machine without an injected spawner, only a missing /proc leaves the script
+  if (scan === 'script' && !spawner)
+    return { mode: 'polled', scan, why: 'no /proc here' };
+  const own = ownPidFile(apps);
+  if (own)
+    return {
+      mode: 'polled',
+      scan,
+      why: `${own}'s pm2.pid_file moves its pid file`,
+    };
+  let p: Awaited<ReturnType<Pm2Client['pids']>>;
+  try {
+    p = await client.pids();
+  } catch (e) {
+    p = { dir: null, why: (e as Error).message };
+  }
+  if (p.dir && !fs.existsSync(p.dir))
+    return {
+      mode: 'polled',
+      scan,
+      why: 'no daemon has made its pids directory yet',
+    };
+  return p.dir && scan === 'in-process'
+    ? { mode: 'events', scan, why: null }
+    : { mode: 'polled', scan, why: p.why ?? 'no in-process scan' };
+}
 
 /** Diagnoses one host: its shell, Node, pm2 and tools, the daemon, the urls of its apps, and on this machine the lease state. */
 export async function doctorHost(
@@ -107,6 +173,8 @@ export async function doctorHost(
     recommendations: [],
     environment: null,
     urls: [],
+    reads: null,
+    monit: null,
   };
   const probe = [
     `echo ${MARKER}`,
@@ -169,32 +237,37 @@ export async function doctorHost(
     );
     return r;
   }
+  let resolution: Pm2Resolution | null = null;
   try {
-    const res = await resolvePm2Bin(host, transport);
+    resolution = await resolvePm2Bin(host, transport);
     r.pm2 = {
-      source: res.source,
-      bin: res.bin,
-      version: res.pm2Version,
-      reason: res.reason,
+      source: resolution.source,
+      bin: resolution.bin,
+      version: resolution.pm2Version,
+      reason: resolution.reason,
     };
   } catch (e) {
     r.recommendations.push(
       `no usable pm2: ${(e as Error).message}. Run unpack for this host (brings pm2 along), or set hosts.${host.name}.pm2`
     );
   }
-  if (r.pm2) {
+  if (resolution) {
+    const client = new Pm2Client(
+      transport,
+      host,
+      resolution.bin,
+      host.pm2_home,
+      daemonFor(host, resolution, spawner)
+    );
     try {
-      const procs = await new Pm2Client(
-        transport,
-        host,
-        r.pm2.bin,
-        host.pm2_home
-      ).jlist();
-      r.daemon = 'answers';
-      r.processes = procs.length;
-      r.in_namespace = procs.filter((p) => p.namespace === m.project).length;
-      if (host.local) r.watcher = watcherIn(procs);
-      if (procs.length === 0)
+      const procs = await client.daemonList();
+      r.daemon = procs === null ? 'not-running' : 'answers';
+      r.processes = procs?.length ?? 0;
+      r.in_namespace = (procs ?? []).filter(
+        (p) => p.namespace === m.project
+      ).length;
+      if (host.local) r.watcher = watcherIn(procs ?? []);
+      if (!procs?.length)
         r.recommendations.push(
           `pm2 daemon is empty here: if ${m.project} should already run on this host under another user or PM2_HOME, set hosts.${host.name}.pm2_home`
         );
@@ -202,7 +275,20 @@ export async function doctorHost(
       r.daemon = 'error';
       r.recommendations.push(`pm2 jlist failed: ${(e as Error).message}`);
     }
+    r.monit = await monitMode(
+      host,
+      client,
+      scopeManifest(m, host.name, 'local').apps,
+      spawner
+    );
   }
+  // the resolution read, and so may the list: how reads run on this host now
+  const mode = transport.readMode();
+  r.reads = mode && {
+    shell: mode.shell,
+    age_s: mode.at === null ? null : Math.round((Date.now() - mode.at) / 1000),
+    reason: mode.reason,
+  };
   const major = Number(/^v(\d+)/.exec(r.node ?? '')?.[1] ?? 0);
   if (major < 18)
     r.recommendations.push(
@@ -341,6 +427,8 @@ export async function doctor(
         recommendations: [],
         environment: null,
         urls: [],
+        reads: null,
+        monit: null,
       });
     }
   }

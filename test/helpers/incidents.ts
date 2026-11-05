@@ -6,6 +6,7 @@ import { McprocError } from '../../src/core/errors.js';
 import { MARK } from '../../src/shell/snippets.js';
 import type { Attempt } from '../../src/core/urlcheck.js';
 import { fakeCtx } from './ctx.js';
+import type { FakeTransport } from './fake-transport.js';
 import { probeOut } from './probe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,7 @@ export function fakeHosts(
   const reads: string[] = [];
   const scripts: string[] = [];
   const probes: string[] = [];
+  const transports: FakeTransport[] = [];
   const clockOf = (host: string) => ({
     now: state.now,
     zone: state.zone,
@@ -67,7 +69,7 @@ export function fakeHosts(
         'TRANSPORT_FAILED',
         `ssh ${host}: Connection refused`
       );
-    return fakeCtx(
+    const ctx = fakeCtx(
       fleetDir,
       host,
       [
@@ -133,8 +135,10 @@ export function fakeHosts(
             state.here?.[u] ?? { answered: false, fail: 'refused' as const }
         : undefined
     );
+    transports.push(ctx.fake);
+    return ctx;
   });
-  return { fleet, reads, scripts, probes };
+  return { fleet, reads, scripts, probes, transports };
 }
 /**
  * Executes what a script runs before its reads: a readability check `[ ! -e 'f' ] || [ -r 'f' ] || echo M` prints M

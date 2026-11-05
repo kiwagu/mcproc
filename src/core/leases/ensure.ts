@@ -3,6 +3,7 @@ import path from 'node:path';
 import { LOG_STAMP } from '../ecosystem.js';
 import { McprocError } from '../errors.js';
 import type { Context } from '../resolve.js';
+import { realOf } from '../slots.js';
 import { stateDir } from '../state.js';
 import { LeaseStore } from './store.js';
 
@@ -32,14 +33,18 @@ function exitingAt(dir: string): number | null {
   }
 }
 
-/** The CLI file the watcher's node runs: MCPROC_CLI_ENTRY, else the running CLI's own entry when it is the built bundle. */
+/**
+ * The CLI file the watcher's node runs: MCPROC_CLI_ENTRY, else the running CLI's own entry when it is the built bundle.
+ * The entry is read through its symlinks: an npm global bin links to dist/cli.js, and node keeps the link's path in argv[1].
+ */
 export function watcherEntry(
   env: NodeJS.ProcessEnv = process.env,
   argv: string[] = process.argv
 ): string {
   if (env.MCPROC_CLI_ENTRY) return path.resolve(env.MCPROC_CLI_ENTRY);
   const own = argv[1] ?? '';
-  if (own.endsWith('cli.js')) return path.resolve(own);
+  const real = own ? realOf(own) : '';
+  if (real.endsWith('cli.js')) return real;
   throw new McprocError(
     'NOT_STARTED',
     `cannot launch the lease watcher: this mcproc runs from ${own || 'an unknown entry'}, not from a built cli.js`,

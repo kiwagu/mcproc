@@ -2,9 +2,11 @@ import { McprocError } from './errors.js';
 import { findProcess, isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
+  listenCheck,
   snapshot as probeSnapshot,
   statusWord,
   urlCheckOf,
+  type ListenCheck,
   type Snapshot,
   type SnapshotOptions,
 } from './list.js';
@@ -44,10 +46,12 @@ export interface WaitResult {
   /** reloaded: the reload that answered; `line` its first restart or rebuild line, else its first line, as written, and `time` that line's stamp */
   reloaded?: { time: string | null; lines: number; line: string };
 }
-/** What a wait reads and how it passes time: pm2's list, the light probe, the log follower, the leases, its sleep and clock. */
+/** What a wait reads and how it passes time: pm2's list, the light probe, the listening pre-check, the log follower, the leases, its sleep and clock. */
 export interface WaitDeps {
   jlist(ctx: Context): Promise<Pm2Process[]>;
   snapshot(ctx: Context, opts: SnapshotOptions): Promise<Snapshot>;
+  /** the cheap look of a listening wait: pm2's list and the ports that listen, whoever holds them */
+  listening(ctx: Context): Promise<ListenCheck>;
   follower(
     ctx: Context,
     paths: { out: string; err: string }
@@ -59,7 +63,7 @@ export interface WaitDeps {
 }
 export const WAIT_TIMEOUT_DEFAULT_MS = 60_000;
 export const WAIT_TIMEOUT_MAX_MS = 600_000;
-/** How often the host is asked: a light probe or jlist, a login shell each time, so not faster than this. */
+/** How often the host is asked: on this machine a socket call and a plain-sh look at the listeners, elsewhere one round trip. */
 const POLL_LOCAL_MS = 500;
 const POLL_REMOTE_MS = 1000;
 /** pm2 statuses of a process in the middle of a restart (a watch restart, a restart delay): it is not dead, so a wait goes on. */
@@ -69,7 +73,7 @@ const notDead = (status: string): boolean =>
   isRunning(status) || TRANSIENT.has(status);
 /** The log:, idle: and reloaded waits look at the follower at least this often (a file wake makes it sooner). */
 const LOG_TICK_MS = 1000;
-/** ...and ask pm2 about the process this often: each check is a login shell, so not every tick. */
+/** ...and ask pm2 about the process this often where each check is a round trip; on this machine a socket call is asked every tick. */
 const STATUS_EVERY_MS = 5000;
 
 const bad = (msg: string) =>
@@ -139,6 +143,7 @@ export function defaultWaitDeps(): WaitDeps {
   return {
     jlist: (ctx) => ctx.pm2.jlist(),
     snapshot: (ctx, opts) => probeSnapshot(ctx, opts),
+    listening: (ctx) => listenCheck(ctx),
     // no history: a wait looks only at what is written after it began
     follower: (ctx, paths) => createFollower(ctx, paths, 0),
     sleep: abortableSleep,
@@ -198,11 +203,12 @@ const inProgress = (r: Reload): string =>
  * log:/idle:/reloaded sit on the log follower, which takes its position at the end of both files: nothing written
  * before that is searched, and a quiet period counts from that moment (or from the last byte since). Lines read in a
  * poll are judged before the process is looked at, so a last line still counts. The process is asked about every few
- * seconds, and once more when the quiet period of idle: ends. reloaded feeds every line to a reload tracker and
- * answers with the first reload it closes: a later marker closes a burst at once, quiet closes it RELOAD_GAP_MS after
- * its last marker arrived, so the tick's sleep is cut to that moment. A re-listen line counts from its first burst:
- * the app's boot was before the call. A wait that times out or is aborted with a burst open says so in `observed`.
- * An app that is not running and that a lease covers is waited for first, as waitFor's other conditions do.
+ * seconds (every tick where pm2's list is a socket call), and once more when the quiet period of idle: ends.
+ * reloaded feeds every line to a reload tracker and answers with the first reload it closes: a later marker closes a
+ * burst at once, quiet closes it RELOAD_GAP_MS after its last marker arrived, so the tick's sleep is cut to that
+ * moment. A re-listen line counts from its first burst: the app's boot was before the call. A wait that times out or
+ * is aborted with a burst open says so in `observed`. An app that is not running and that a lease covers is waited
+ * for first, as waitFor's other conditions do.
  */
 async function waitOnLogs(
   ctx: Context,
@@ -212,6 +218,8 @@ async function waitOnLogs(
   run: LogRun
 ): Promise<WaitResult> {
   const { deps, signal } = run;
+  // a socket call costs next to nothing: the process is asked every tick, so a dying one ends the wait at once
+  const statusEvery = ctx.pm2.listsOverSocket() ? LOG_TICK_MS : STATUS_EVERY_MS;
   let p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
   // a process seen once makes its absence later a result (gone), never a request for an app that never started
   let seen = p !== undefined;
@@ -298,7 +306,7 @@ async function waitOnLogs(
         // mid-restart: not settled yet and not dead; look again after a tick
         lastCheck = now = deps.now();
       }
-      if (now - lastCheck >= STATUS_EVERY_MS) {
+      if (now - lastCheck >= statusEvery) {
         lastCheck = now;
         p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
         if (!p || !notDead(p.status)) return run.gone(p, observed);
@@ -309,7 +317,7 @@ async function waitOnLogs(
       const sleeps = [
         LOG_TICK_MS,
         run.deadline - now,
-        lastCheck + STATUS_EVERY_MS - now,
+        lastCheck + statusEvery - now,
       ];
       // (not once the quiet period is over: a process still restarting is looked at again after a tick, not in a spin)
       if (until.kind === 'idle' && now - lastChange < quietMs)
@@ -385,6 +393,40 @@ export async function waitFor(
     observed?: string
   ): WaitResult =>
     answer({ ok: false, reason, status: statusWord(p, a), observed });
+  /** the light probe of a listening or url-ok tick: no CPU, no metrics, no leases */
+  const light: SnapshotOptions = {
+    cpu: 'none',
+    metrics: 'none',
+    // the option names apps, not urls: the probe checks this app's url
+    urls: until.kind === 'url-ok' ? [app] : 'none',
+    // read below through deps.leases, and only while the app is not running
+    leases: 'none',
+  };
+  /**
+   * a listening wait that gives up on a tick the pre-check stopped: one light probe, so the answer still names what
+   * listens (a port the app took instead, undeclared, and the declared ones already up); a probe that fails keeps the
+   * pre-check's own text
+   */
+  const giveUpProbed = async (
+    reason: 'timeout' | 'aborted',
+    p: Pm2Process | undefined,
+    observed?: string
+  ): Promise<WaitResult> => {
+    let snap: Snapshot;
+    try {
+      snap = await deps.snapshot(ctx, light);
+    } catch {
+      return giveUp(reason, p, observed);
+    }
+    const ports = snap.ports[app];
+    if (!ports) return giveUp(reason, p, observed);
+    const q = findProcess(snap.procs, ctx.manifest.project, app);
+    return giveUp(
+      reason,
+      q,
+      `status ${q?.status ?? 'not-started'}, ${fmtPorts(ports)}`
+    );
+  };
   /** sleeps until the next poll or the deadline, whichever is first; false when the wait was aborted */
   const pause = async (): Promise<boolean> => {
     await deps.sleep(
@@ -431,6 +473,8 @@ export async function waitFor(
   for (;;) {
     let p: Pm2Process | undefined;
     let observed: string | undefined;
+    // a listening tick that stopped at the pre-check: the light probe did not look
+    let precheckOnly = false;
     if (until.kind === 'exited') {
       p = findProcess(await deps.jlist(ctx), ctx.manifest.project, app);
       if (p) first = false;
@@ -453,15 +497,19 @@ export async function waitFor(
         });
       observed = `status ${p.status}`;
     } else {
-      const snap = await deps.snapshot(ctx, {
-        cpu: 'none',
-        metrics: 'none',
-        // the option names apps, not urls: the probe checks this app's url
-        urls: until.kind === 'url-ok' ? [app] : 'none',
-        // read below through deps.leases, and only while the app is not running
-        leases: 'none',
-      });
-      p = findProcess(snap.procs, ctx.manifest.project, app);
+      let snap: Snapshot | null = null;
+      let missing: number[] = [];
+      if (until.kind === 'listening') {
+        // the cheap look first: until every declared port listens at all, there is nothing for the light probe to decide
+        const pre = await deps.listening(ctx);
+        missing = a.ports.filter((port) => !pre.ports.has(port));
+        if (missing.length > 0)
+          p = findProcess(pre.procs, ctx.manifest.project, app);
+      }
+      if (missing.length === 0) {
+        snap = await deps.snapshot(ctx, light);
+        p = findProcess(snap.procs, ctx.manifest.project, app);
+      }
       if (p) first = false;
       if (!p || !isRunning(p.status)) {
         const q = await queued();
@@ -470,7 +518,11 @@ export async function waitFor(
       }
       if (!p && first) throw notStarted(ctx, app);
       let met: boolean;
-      if (until.kind === 'listening') {
+      if (!snap) {
+        met = false;
+        precheckOnly = true;
+        observed = `status ${p?.status ?? 'not-started'}, ${missing.map((port) => `:${port} ✗ nothing listens`).join(', ')}`;
+      } else if (until.kind === 'listening') {
         const ports = snap.ports[app];
         met =
           ports.checks.length > 0 &&
@@ -493,8 +545,12 @@ export async function waitFor(
         observed = `status ${p.status}, ${observed}`;
       }
     }
-    if (deps.now() >= deadline) return giveUp('timeout', p, observed);
-    if (!(await pause())) return giveUp('aborted', p, observed);
+    const end =
+      deps.now() >= deadline ? 'timeout' : (await pause()) ? null : 'aborted';
+    if (end === null) continue;
+    return precheckOnly
+      ? giveUpProbed(end, p, observed)
+      : giveUp(end, p, observed);
   }
 }
 
