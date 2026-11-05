@@ -19,6 +19,7 @@ import { registryOf } from '../../src/core/leases/siblings.js';
 import {
   excludePattern,
   installCommand,
+  isFreshCheckout,
   isGlob,
   mainCheckout,
   planCopies,
@@ -28,6 +29,7 @@ import {
   worktreeDir,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
   type GitRunner,
   type WorktreeDeps,
 } from '../../src/core/worktree.js';
@@ -863,6 +865,260 @@ describe('worktree', () => {
       );
       expect(fs.existsSync(marker)).toBe(true);
     });
+  });
+
+  describe('sync', () => {
+    const c = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
+    let wt: string;
+    let wtReal: string;
+    let logged: string[];
+    const sync = (
+      dir: string,
+      o: { allowMissing?: boolean; fromHook?: boolean } = {}
+    ) =>
+      worktreeSync(
+        { dir, allowMissing: false, fromHook: false, ...o },
+        { git: isolatedGit, log: (l) => logged.push(l) }
+      );
+    const refusal = (dir: string, o: { fromHook?: boolean } = {}) =>
+      sync(dir, o).then(
+        () => {
+          throw new Error('worktreeSync synced');
+        },
+        (e) => e
+      );
+    const exclude = () =>
+      fs.readFileSync(path.join(real, '.git', 'info', 'exclude'), 'utf8');
+    const ownManifest = (dir: string, text: string) => {
+      fs.mkdirSync(path.join(dir, '.mcproc'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.mcproc', 'mcproc.yaml'), text);
+    };
+    beforeEach(() => {
+      logged = [];
+      // .mcproc/ leaves git and stays in main: a worktree git makes has no manifest, the main checkout's decides
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: demo',
+          'worktree:',
+          '  copy: [cache]',
+          '  required: [tool-local.yml]',
+          '  link: [notes]',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.appendFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      git(['rm', '-rq', '--cached', '.mcproc'], main);
+      git([...c, 'commit', '-qam', '.mcproc/ untracked'], main);
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+      wt = path.join(base, 'side');
+      git(['worktree', 'add', '-q', '-b', 'side', wt], main);
+      wtReal = fs.realpathSync(wt);
+    });
+
+    it("a sibling worktree git made gets the main checkout's copies and links, and the links are ignored in git", async () => {
+      expect(fs.existsSync(path.join(wt, '.mcproc'))).toBe(false);
+      const r = await sync(wt);
+      expect(r).toEqual({
+        path: wtReal,
+        repo: real,
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+        kept: [],
+        linked: ['notes'],
+        from_override: [],
+        excluded: ['/notes'],
+        missing: [],
+        missing_required: [],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'k: v\n'
+      );
+      expect(fs.readlinkSync(path.join(wt, 'notes'))).toBe(
+        path.join(real, 'notes')
+      );
+      expect(exclude().split('\n')).toContain('/notes');
+      expect(git(['status', '--porcelain'], wt).trim()).toBe('');
+      expect(logged).toEqual([]);
+    });
+
+    it('a worktree nested in the main checkout is synced, not the main checkout its manifest search finds', async () => {
+      const nested = path.join(main, '.claude', 'worktrees', 'x');
+      git(['worktree', 'add', '-q', '-b', 'x', nested], main);
+      // from a folder inside it: the git top level is the target
+      fs.mkdirSync(path.join(nested, 'deep'));
+      const r = await sync(path.join(nested, 'deep'));
+      const at = fs.realpathSync(nested);
+      expect(r).toMatchObject({
+        path: at,
+        repo: real,
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(at, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(fs.lstatSync(path.join(at, 'notes')).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(path.join(at, 'deep', 'cache'))).toBe(false);
+    });
+
+    it('the main checkout is refused: sync copies from it', async () => {
+      const e = await refusal(main);
+      expect(e.code).toBe('BAD_ARGUMENT');
+      expect(e.message).toContain(`${real} is the main checkout`);
+    });
+
+    it('a file already in the worktree is kept as it is; a second sync keeps everything', async () => {
+      fs.writeFileSync(path.join(wt, 'tool-local.yml'), 'mine\n');
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        copied: ['cache'],
+        kept: ['tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'mine\n'
+      );
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'newer');
+      const again = await sync(wt);
+      expect(again).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml', 'notes'],
+        linked: [],
+        excluded: ['/notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(
+        exclude()
+          .split('\n')
+          .filter((l) => l === '/notes')
+      ).toHaveLength(1);
+    });
+
+    it('no manifest in either checkout: nothing to copy, said once', async () => {
+      fs.rmSync(path.join(main, '.mcproc', 'mcproc.yaml'));
+      const r = await sync(wt);
+      expect(r).toEqual({
+        path: wtReal,
+        repo: real,
+        manifest: null,
+        copied: [],
+        kept: [],
+        linked: [],
+        from_override: [],
+        excluded: [],
+        missing: [],
+        missing_required: [],
+      });
+      expect(logged).toEqual([
+        `no manifest in ${wtReal} or ${real}: nothing to copy`,
+      ]);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it("the worktree's own manifest decides when it loads", async () => {
+      ownManifest(
+        wt,
+        'version: 1\nproject: demo\nworktree: { copy: [cache] }\napps:\n  db: { description: db, run: node db.js }\n'
+      );
+      // the main's required entry is not the worktree's: its miss refuses nothing
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        manifest: 'worktree',
+        copied: ['cache'],
+        linked: [],
+        missing: [],
+        missing_required: [],
+      });
+    });
+
+    it("sync falls back to the main manifest when the worktree's does not load", async () => {
+      ownManifest(wt, 'version: 2\n');
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+      });
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain(`the manifest of ${wtReal} does not load (`);
+      expect(logged[0]).toContain('MANIFEST_INVALID');
+    });
+
+    it("the main checkout's override adds its entries, named as the override's", async () => {
+      fs.writeFileSync(path.join(main, 'extra.env'), 'X=1');
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { copy: [extra.env] }\n'
+      );
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml', 'extra.env'],
+        from_override: ['extra.env'],
+      });
+    });
+
+    it('a required miss is refused before anything is copied, linked or excluded', async () => {
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'tool-local.yml', source: "the main checkout's manifest" },
+          ],
+        },
+      });
+      expect(e.message).toBe(
+        `required entry missing in ${real}: tool-local.yml (the main checkout's manifest); nothing was copied into ${wtReal}`
+      );
+      expect(e.hint).toBe(
+        `Put them into ${real} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to sync without them.`
+      );
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+      expect(fs.existsSync(path.join(wt, 'notes'))).toBe(false);
+      expect(exclude()).toBe(excluded);
+      // from the hook: git keeps the worktree whatever the hook answers, so the refusal says what finishes it
+      const h = await refusal(wt, { fromHook: true });
+      expect(h.code).toBe('REQUIRED_MISSING');
+      expect(h.message).toContain(
+        `; the worktree ${wtReal} exists without them (git keeps a worktree whose post-checkout hook fails); put them into ${real}, then run mcproc worktree sync in ${wtReal}`
+      );
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('allowMissing syncs the rest and says which required ones it lacks', async () => {
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const r = await sync(wt, { allowMissing: true });
+      expect(r).toMatchObject({
+        copied: ['cache'],
+        linked: ['notes'],
+        missing: ['tool-local.yml'],
+        missing_required: ['tool-local.yml'],
+      });
+      expect(logged).toEqual([
+        `copy: tool-local.yml is not in ${real}, skipped (required, allowed)`,
+      ]);
+    });
+  });
+
+  it('isFreshCheckout: only a previous ref of all zeros', () => {
+    expect(isFreshCheckout('0'.repeat(40))).toBe(true);
+    expect(isFreshCheckout('0'.repeat(64))).toBe(true);
+    expect(isFreshCheckout('')).toBe(false);
+    expect(isFreshCheckout('a'.repeat(40))).toBe(false);
   });
 
   it("add: copy and link extras from the main checkout's override, and every link is ignored through git's exclude file", async () => {

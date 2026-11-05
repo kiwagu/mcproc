@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -261,10 +261,15 @@ describe('cli', () => {
     ])
       expect(help).toContain(cmd);
   });
-  it('registers worktree with add, ls and remove and their options; the slug is no global --project', () => {
+  it('registers worktree with add, ls, remove and sync and their options; the slug is no global --project', () => {
     const p = buildProgram(capture().io);
     const wt = p.commands.find((x) => x.name() === 'worktree')!;
-    expect(wt.commands.map((x) => x.name())).toEqual(['add', 'ls', 'remove']);
+    expect(wt.commands.map((x) => x.name())).toEqual([
+      'add',
+      'ls',
+      'remove',
+      'sync',
+    ]);
     const opts = (n: string) =>
       wt.commands.find((x) => x.name() === n)!.options.map((o) => o.long);
     expect(opts('add')).toEqual([
@@ -275,6 +280,7 @@ describe('cli', () => {
       '--allow-missing',
     ]);
     expect(opts('remove')).toEqual(['--force']);
+    expect(opts('sync')).toEqual(['--allow-missing', '--hook']);
     expect(
       wt.commands
         .find((x) => x.name() === 'add')!
@@ -486,6 +492,134 @@ describe('cli', () => {
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
+  });
+  describe('worktree sync', () => {
+    let base: string;
+    let main: string;
+    let wt: string;
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    const sync = async (...argv: string[]) => {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(['worktree', 'sync', ...argv], {
+        from: 'user',
+      });
+      return c;
+    };
+    const fresh = '0'.repeat(40);
+    beforeEach(() => {
+      base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-sync-'));
+      main = path.join(base, 'wts');
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // the manifest stays out of git: a worktree git makes has none, the main checkout's decides
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wts',
+          'worktree: { copy: [cache] }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      wt = path.join(base, 'side');
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      // the suite may run under a git hook mcproc's own add fired: nothing here inherits its step aside
+      vi.stubEnv('MCPROC_WORKTREE_ADD', undefined);
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      fs.rmSync(base, { recursive: true, force: true });
+    });
+
+    it('sync --hook does nothing on an ordinary checkout, nor inside mcproc worktree add', async () => {
+      const plain = await sync('--hook', 'a'.repeat(40), '--project', wt);
+      expect([plain.out, plain.err]).toEqual([[], []]);
+      expect(process.exitCode ?? 0).toBe(0);
+      vi.stubEnv('MCPROC_WORKTREE_ADD', '1');
+      const inAdd = await sync('--hook', fresh, '--project', wt);
+      expect([inAdd.out, inAdd.err]).toEqual([[], []]);
+      expect(process.exitCode ?? 0).toBe(0);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('sync --hook ignores the env defaults and GIT_DIR', async () => {
+      // what a hook may inherit: git's own variables for the repository, an agent's project pointing at the main checkout
+      vi.stubEnv('MCPROC_PROJECT', main);
+      vi.stubEnv('CLAUDE_PROJECT_DIR', main);
+      vi.stubEnv('GIT_DIR', path.join(main, '.git'));
+      vi.stubEnv('GIT_WORK_TREE', main);
+      const c = await sync('--hook', fresh, '--project', wt, '--json');
+      expect(c.err).toEqual([]);
+      expect(process.exitCode ?? 0).toBe(0);
+      expect(JSON.parse(c.out.join(''))).toMatchObject({
+        path: fs.realpathSync(wt),
+        repo: fs.realpathSync(main),
+        manifest: 'main',
+        copied: ['cache'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+    });
+
+    it('sync without --project syncs the checkout of the cwd, whatever MCPROC_PROJECT and GIT_DIR say', async () => {
+      const deep = path.join(wt, 'deep');
+      fs.mkdirSync(deep);
+      vi.stubEnv('MCPROC_PROJECT', main);
+      vi.stubEnv('CLAUDE_PROJECT_DIR', main);
+      vi.stubEnv('GIT_DIR', path.join(main, '.git'));
+      const cwd = process.cwd();
+      process.chdir(deep);
+      let c: ReturnType<typeof capture>;
+      try {
+        c = await sync('--hook', fresh);
+      } finally {
+        process.chdir(cwd);
+      }
+      expect(c.err).toEqual([]);
+      expect(c.out.join('\n')).toContain(`synced ${fs.realpathSync(wt)}`);
+      expect(fs.existsSync(path.join(wt, 'cache', 'c.bin'))).toBe(true);
+      expect(fs.existsSync(path.join(deep, 'cache'))).toBe(false);
+    });
+
+    it('sync --hook refuses a required miss on stderr with exit 1: the worktree stays, and how to finish it', async () => {
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [tool-local.yml] }\n'
+      );
+      const c = await sync('--hook', fresh, '--project', wt);
+      expect(c.out).toEqual([]);
+      expect(c.err.join('\n')).toMatch(
+        /^REQUIRED_MISSING: required entry missing in .*: tool-local\.yml \(the main checkout's override\); the worktree .* exists without them .*then run mcproc worktree sync in .*\nHint: Put them into /
+      );
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('sync refuses the main checkout and another host', async () => {
+      for (const [argv, re] of [
+        [['--project', main], /^BAD_ARGUMENT: .* is the main checkout/],
+        [['--project', wt, '--host', 'stand'], /^BAD_ARGUMENT: .*--host/],
+      ] as const) {
+        const c = await sync(...argv);
+        expect(c.err[0], argv.join(' ')).toMatch(re);
+        expect(process.exitCode).toBe(1);
+        process.exitCode = 0;
+      }
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
   });
   it('exec refuses a bad --memory or --timeout and another host before touching any host', async () => {
     for (const argv of [

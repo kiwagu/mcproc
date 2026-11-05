@@ -24,9 +24,12 @@ import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
 import {
   defaultWorktreeDeps,
+  gitRunner,
+  isFreshCheckout,
   worktreeAdd,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
 } from '../core/worktree.js';
 import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
@@ -69,6 +72,7 @@ import {
   renderLeases,
   renderWorktreeAdded,
   renderWorktreeRemoved,
+  renderWorktreeSynced,
   renderWorktrees,
   renderStacks,
   hostsOf,
@@ -829,6 +833,54 @@ export function buildProgram(io: Io = defaultIo): Command {
           deps
         );
         emit(g, renderWorktreeRemoved(r), r);
+      })
+    );
+  worktree
+    .command('sync')
+    .description(
+      "bring this worktree (the one --project or the cwd is in) the files a new one gets: its manifest's (else the main checkout's) copy, required and link entries plus the main checkout's override, copied from the main checkout; files already there are kept"
+    )
+    .option(
+      '--allow-missing',
+      'sync even when a worktree.required entry is missing in the main checkout'
+    )
+    .option(
+      '--hook <prev-ref>',
+      "the form git's post-checkout hook runs: only a fresh checkout (an all-zero previous ref) that mcproc worktree add did not make is synced"
+    )
+    .action(
+      wrap(async (g, o) => {
+        // no prepare(): the target is the git top level, which a manifest search from a nested worktree would miss
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'worktree sync copies files on this machine; --host does not apply',
+            { hint: 'Drop --host; the checkout is on this machine.' }
+          );
+        const hook = o.hook === undefined ? null : String(o.hook);
+        if (hook !== null) {
+          // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said
+          if (!isFreshCheckout(hook) || process.env.MCPROC_WORKTREE_ADD) return;
+          // git's variables for the repository that ran the hook would steer every git call here; this process is
+          // short-lived, so they go from its environment and git finds the worktree from the folder it runs in
+          for (const k of [
+            'GIT_DIR',
+            'GIT_WORK_TREE',
+            'GIT_INDEX_FILE',
+            'GIT_PREFIX',
+          ])
+            delete process.env[k];
+        }
+        const r = await worktreeSync(
+          {
+            // the explicit flag or the folder it runs in: MCPROC_PROJECT and CLAUDE_PROJECT_DIR may name the main checkout
+            dir: g.project ?? process.cwd(),
+            allowMissing: Boolean(o.allowMissing),
+            fromHook: hook !== null,
+          },
+          { git: gitRunner, log: (line) => io.err(line) }
+        );
+        emit(g, renderWorktreeSynced(r), r);
       })
     );
   program

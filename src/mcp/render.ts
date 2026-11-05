@@ -17,6 +17,7 @@ import type {
   WorktreeAdded,
   WorktreeRemoved,
   WorktreeRow,
+  WorktreeSynced,
 } from '../core/worktree.js';
 import type { Orphan, Stack, StacksAnswer } from '../core/stacks/types.js';
 import { fmtMib } from '../core/sizes.js';
@@ -844,6 +845,35 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
     for (const v of vars) L.push(`  ${v.name} = ${JSON.stringify(v.value)}`);
   }
   L.push(`next: ${r.next}`);
+  return L.join('\n');
+}
+
+/** A synced worktree: where from, whose manifest decided, what was copied, kept and linked, what is missing. */
+export function renderWorktreeSynced(r: WorktreeSynced): string {
+  const L = [`synced ${r.path} from ${r.repo}`];
+  if (r.manifest === null) {
+    L.push('decided by: no manifest in either checkout, nothing to copy');
+    return L.join('\n');
+  }
+  L.push(
+    `decided by: the ${r.manifest === 'worktree' ? "worktree's own" : "main checkout's"} manifest`
+  );
+  const mark = (e: string) =>
+    r.from_override.includes(e) ? `${e} (override)` : e;
+  if (r.copied.length) L.push(`copied: ${r.copied.map(mark).join(', ')}`);
+  if (r.kept.length)
+    L.push(`kept (already there): ${r.kept.map(mark).join(', ')}`);
+  if (r.linked.length) L.push(`linked: ${r.linked.map(mark).join(', ')}`);
+  if (r.excluded.length)
+    L.push(
+      `ignored in git: ${r.excluded.join(', ')} (the repository's info/exclude)`
+    );
+  if (r.missing.length)
+    L.push(
+      `missing: ${r.missing.map((e) => (r.missing_required.includes(e) ? `${e} (required, allowed)` : e)).join(', ')}`
+    );
+  if (!r.copied.length && !r.kept.length && !r.linked.length)
+    L.push('nothing to copy');
   return L.join('\n');
 }
 

@@ -48,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 22 tools with annotations and short instructions', async () => {
+  it('registers the 23 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -75,6 +75,7 @@ describe('mcp server', () => {
       'worktree_add',
       'worktree_ls',
       'worktree_remove',
+      'worktree_sync',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
@@ -147,6 +148,19 @@ describe('mcp server', () => {
     expect(
       Object.keys(byName.worktree_ls.inputSchema.properties as object)
     ).toEqual(['project']);
+    // sync only adds what is absent and keeps what is there: running it again changes nothing more
+    expect(byName.worktree_sync.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_sync.inputSchema.properties as object).sort()
+    ).toEqual(['allow_missing', 'project']);
+    expect(byName.worktree_sync.description).toBe(
+      "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. No slot, override or install: worktree_add makes stands."
+    );
     expect(byName.lease_cancel.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
@@ -500,6 +514,83 @@ describe('mcp server', () => {
         missing_required: ['secret.env'],
       });
       expect(text(made)).toContain('missing: secret.env (required, allowed)');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_sync brings a worktree git made its files; a required miss is an error unless allow_missing; the main checkout is refused', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpsync-'));
+    const main = path.join(base, 'wty');
+    const wt = path.join(base, 'side');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wty',
+          'worktree: { copy: [cache] }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      const real = fs.realpathSync(main);
+      const cl = await client(neverSpawn, undefined, main);
+      // the main checkout's override requires a machine-local file it does not have
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [secret.env] }\n'
+      );
+      const refused: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.structuredContent.error.code).toBe('REQUIRED_MISSING');
+      expect(text(refused)).toContain('allow_missing');
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+      const r: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt, allow_missing: true },
+      });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        path: fs.realpathSync(wt),
+        repo: real,
+        manifest: 'main',
+        copied: ['cache'],
+        missing_required: ['secret.env'],
+        notes: [
+          `copy: secret.env is not in ${real}, skipped (required, allowed)`,
+        ],
+      });
+      expect(text(r).split('\n')[0]).toBe(
+        `synced ${fs.realpathSync(wt)} from ${real}`
+      );
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      // no project: the server's own, the main checkout
+      const self: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: {},
+      });
+      expect(self.isError).toBe(true);
+      expect(text(self)).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

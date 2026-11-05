@@ -260,18 +260,20 @@ export function worktreePlan(
 
 /**
  * The refusal of a worktree without its required entries: each entry as written (a mask, never a file it was meant to
- * match) with who required it, where it was looked for, then `tail` (what became of the worktree).
+ * match) with who required it, where it was looked for, then `tail` (what became of the worktree). `hint` says how to
+ * go on; by default the one of worktree add.
  */
 export function requiredMissing(
   missing: { entry: string; source: RequiredSource }[],
   where: string,
-  tail: string
+  tail: string,
+  hint = `Put them into ${where} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to make the worktree without them.`
 ): McprocError {
   return new McprocError(
     'REQUIRED_MISSING',
     `required ${missing.length === 1 ? 'entry' : 'entries'} missing in ${where}: ${missing.map((m) => `${m.entry} (${m.source})`).join(', ')}; ${tail}`,
     {
-      hint: `Put them into ${where} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to make the worktree without them.`,
+      hint,
       details: { missing },
     }
   );
@@ -826,6 +828,174 @@ export async function worktreeAdd(
     installed: install,
     vars,
     next,
+  };
+}
+
+/** What `worktree sync` did in an existing worktree: whose manifest decided, what it copied and linked, what it found there already. */
+export interface WorktreeSynced {
+  path: string;
+  repo: string;
+  /** whose manifest decided the copies: the worktree's own, the main checkout's when the worktree has none that loads, none when neither has one */
+  manifest: 'worktree' | 'main' | null;
+  /** what this sync copied, relative to the main checkout */
+  copied: string[];
+  /** the copies and links whose place in the worktree was taken already: left as they are */
+  kept: string[];
+  /** the links this sync made */
+  linked: string[];
+  /** the copy and link entries that came from the main checkout's override, not from a manifest */
+  from_override: string[];
+  /** the links as root-anchored patterns in git's exclude file of the repository */
+  excluded: string[];
+  missing: string[];
+  /** the missing entries a manifest or the override requires: synced without them only because allowMissing was given */
+  missing_required: string[];
+}
+
+/** Whether a post-checkout hook's previous ref is all zeros: git checked the tree out from nothing, as in a new worktree. */
+export const isFreshCheckout = (prevRef: string): boolean =>
+  /^0+$/.test(prevRef);
+
+/**
+ * Brings the worktree `dir` is in (its git top level, never the root a manifest search finds: a worktree nested in the
+ * main checkout would find the main's) the files a new worktree gets, copied from the main checkout: the copy, required
+ * and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the main checkout's
+ * override. A file or link already in its place is kept as it is, so a second sync changes nothing. A required entry
+ * missing in the main checkout refuses the sync before anything is copied, unless `allowMissing`; `fromHook` says in
+ * the refusal that the worktree exists without them (git keeps a worktree whatever its post-checkout hook answers).
+ * No slot, override or install: those make a stand, and only worktree add makes one.
+ */
+export async function worktreeSync(
+  opts: { dir: string; allowMissing: boolean; fromHook: boolean },
+  deps: Pick<WorktreeDeps, 'git' | 'log' | 'exists' | 'glob'>
+): Promise<WorktreeSynced> {
+  const dir = path.resolve(opts.dir);
+  // git cannot even start in a folder that is not there: its error would read as if git were missing
+  if (!fs.existsSync(dir))
+    throw new McprocError('BAD_ARGUMENT', `${dir} does not exist`);
+  const top = realOf(
+    (await gitOk(deps.git, ['rev-parse', '--show-toplevel'], dir)).trim()
+  );
+  const main = await mainCheckout(top, deps.git);
+  if (top === main)
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `${top} is the main checkout: worktree sync copies from it into a worktree of the repository`,
+      {
+        hint: 'Run it in a worktree (git worktree list names them), or pass its path as --project (MCP: project).',
+      }
+    );
+  let dm: Manifest | null = null;
+  let broken: string | null = null;
+  if (ownsManifest(top))
+    try {
+      dm = loadManifest(top);
+    } catch (e) {
+      broken = describeErrorWithHint(e);
+    }
+  const manifest: WorktreeSynced['manifest'] = dm
+    ? 'worktree'
+    : ownsManifest(main)
+      ? 'main'
+      : null;
+  if (broken !== null)
+    deps.log(
+      `the manifest of ${top} does not load (${broken}): ${manifest === 'main' ? "the main checkout's decides the copies" : `${main} has none either: nothing to copy`}`
+    );
+  if (manifest === null) {
+    if (broken === null)
+      deps.log(`no manifest in ${top} or ${main}: nothing to copy`);
+    return {
+      path: top,
+      repo: main,
+      manifest,
+      copied: [],
+      kept: [],
+      linked: [],
+      from_override: [],
+      excluded: [],
+      missing: [],
+      missing_required: [],
+    };
+  }
+  dm ??= loadManifest(main);
+  const extras = loadOverride(main)?.worktree ?? {
+    copy: [],
+    link: [],
+    required: [],
+  };
+  const plan = worktreePlan(main, top, dm, extras, deps);
+  if (plan.missingRequired.length && !opts.allowMissing)
+    throw requiredMissing(
+      plan.missingRequired,
+      main,
+      opts.fromHook
+        ? `the worktree ${top} exists without them (git keeps a worktree whose post-checkout hook fails); put them into ${main}, then run mcproc worktree sync in ${top}`
+        : `nothing was copied into ${top}`,
+      `Put them into ${main} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to sync without them.`
+    );
+  const copied: string[] = [];
+  const kept: string[] = [];
+  const linked: string[] = [];
+  let step = '';
+  try {
+    for (const c of plan.copies) {
+      const rel = path.relative(main, c.from);
+      if (present(c.to)) {
+        kept.push(rel);
+        continue;
+      }
+      step = `copying ${c.from}`;
+      fs.mkdirSync(path.dirname(c.to), { recursive: true });
+      fs.cpSync(c.from, c.to, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+      });
+      copied.push(rel);
+    }
+    for (const l of plan.links) {
+      const rel = path.relative(main, l.from);
+      if (present(l.to)) {
+        kept.push(rel);
+        continue;
+      }
+      step = `linking ${l.from}`;
+      fs.mkdirSync(path.dirname(l.to), { recursive: true });
+      fs.symlinkSync(l.from, l.to);
+      linked.push(rel);
+    }
+  } catch (e) {
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `worktree sync into ${top}: ${step} failed: ${(e as Error).message}`,
+      {
+        hint: "Clear what is in the way or fix the manifest's worktree: section, then run it again: what is in place already is kept.",
+      }
+    );
+  }
+  const required = plan.missingRequired.map((r) => r.entry);
+  for (const miss of plan.missing)
+    deps.log(
+      `copy: ${miss} is not in ${main}, skipped${required.includes(miss) ? ' (required, allowed)' : ''}`
+    );
+  const excluded = await excludeLinks(
+    top,
+    plan.links.map((l) => path.relative(top, l.to)),
+    deps.git,
+    deps.log
+  );
+  return {
+    path: top,
+    repo: main,
+    manifest,
+    copied,
+    kept,
+    linked,
+    from_override: plan.fromOverride,
+    excluded,
+    missing: plan.missing,
+    missing_required: required,
   };
 }
 

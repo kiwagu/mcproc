@@ -1,21 +1,24 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
-import { connect, prepare } from '../../core/resolve.js';
+import { connect, prepare, resolveProjectDir } from '../../core/resolve.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../../core/exec.js';
 import { parseSizeMib } from '../../core/sizes.js';
 import { McprocError } from '../../core/errors.js';
 import {
   defaultWorktreeDeps,
+  gitRunner,
   worktreeAdd,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
   type WorktreeDeps,
 } from '../../core/worktree.js';
 import {
   renderExec,
   renderWorktreeAdded,
   renderWorktreeRemoved,
+  renderWorktreeSynced,
   renderWorktrees,
 } from '../render.js';
 
@@ -237,6 +240,46 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
         );
         return {
           text: withNotes(renderWorktreeRemoved(r), notes),
+          data: { ...r, notes },
+        };
+      })
+  );
+
+  server.registerTool(
+    'worktree_sync',
+    {
+      title: 'Worktree sync',
+      description:
+        "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. No slot, override or install: worktree_add makes stands.",
+      inputSchema: {
+        project: commonInput.project,
+        allow_missing: z
+          .boolean()
+          .optional()
+          .describe(
+            'Sync even when a worktree.required entry is missing in the main checkout (default false)'
+          ),
+      },
+      // it only adds what is absent and keeps what is there: a second call changes nothing more
+      annotations: MUT(false, true),
+    },
+    (args) =>
+      runTool(async () => {
+        const notes: string[] = [];
+        // the git top level of the project folder, not the root a manifest search finds: no prepare() here
+        const r = await worktreeSync(
+          {
+            dir: resolveProjectDir(
+              args.project ?? deps.project,
+              await deps.roots()
+            ),
+            allowMissing: args.allow_missing ?? false,
+            fromHook: false,
+          },
+          { git: gitRunner, log: (line) => notes.push(line) }
+        );
+        return {
+          text: withNotes(renderWorktreeSynced(r), notes),
           data: { ...r, notes },
         };
       })
