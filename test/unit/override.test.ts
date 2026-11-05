@@ -43,17 +43,31 @@ describe('override', () => {
       path: '/p/o',
       project: undefined,
       vars: {},
-      worktree: { copy: ['.env.local'], link: ['notes'] },
+      worktree: { copy: ['.env.local'], link: ['notes'], required: [] },
     });
     expect(
       parseOverride('worktree:\n  link: [notes]\n', '/p/o').worktree
     ).toEqual({
       copy: [],
       link: ['notes'],
+      required: [],
     });
     expect(parseOverride('worktree:\n', '/p/o').worktree).toBeUndefined();
     expect(() => parseOverride('worktree:\n  dir: ../x\n', '/p/o')).toThrow(
       /worktree\.dir|worktree/
+    );
+  });
+  it('accepts worktree required extras, empty when only copy is given; the unknown-key hint names them', () => {
+    expect(
+      parseOverride('worktree: { required: [secret.env] }\n', '/p/o').worktree
+    ).toEqual({ copy: [], link: [], required: ['secret.env'] });
+    expect(
+      parseOverride('worktree: { copy: [cache] }\n', '/p/o').worktree
+    ).toEqual({ copy: ['cache'], link: [], required: [] });
+    expect(() => parseOverride('apps: {}', '/p/o')).toThrowError(
+      expect.objectContaining({
+        hint: 'The override may set only project, repo, vars and worktree (copy, link, required).',
+      })
     );
   });
   it('loads from .mcproc/mcproc.local.yaml and writes it back', () => {

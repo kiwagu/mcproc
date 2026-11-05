@@ -157,6 +157,7 @@ const worktreeSchema = z
   .object({
     dir: z.string().min(1).nullable().optional(),
     copy: z.array(z.string().min(1)).default([]),
+    required: z.array(z.string().min(1)).default([]),
     link: z.array(z.string().min(1)).default([]),
     install: z
       .union([z.string().min(1), z.literal(false)])
@@ -225,6 +226,8 @@ export interface WorktreeSettings {
   /** where worktrees go; null = `<main checkout>.worktrees` next to the repository */
   dir: string | null;
   copy: string[];
+  /** copied like `copy`, and each entry must be present in the main checkout */
+  required: string[];
   link: string[];
   /** the install command; null = detected from the lockfile; false = none */
   install: string | false | null;
@@ -794,6 +797,7 @@ function checkManifest(
   const worktree: WorktreeSettings = {
     dir: m.worktree.dir ?? null,
     copy: m.worktree.copy,
+    required: m.worktree.required,
     link: m.worktree.link,
     install: m.worktree.install ?? null,
     slots: m.worktree.slots,

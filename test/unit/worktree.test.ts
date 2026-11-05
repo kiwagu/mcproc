@@ -20,6 +20,7 @@ import {
   excludePattern,
   gitRunner,
   installCommand,
+  isGlob,
   mainCheckout,
   planCopies,
   stopCheckout,
@@ -146,12 +147,11 @@ describe('worktree', () => {
     const m = loadManifest(main);
     expect(worktreeDir(m, main)).toBe(`${main}.worktrees`);
     expect(installCommand(m, main)).toBe('bun install');
-    const plan = planCopies(
-      main,
-      '/t',
-      ['certs', 'snaps/**/*-snapshots', 'missing.txt'],
-      ['notes']
-    );
+    const plan = planCopies(main, '/t', {
+      copy: ['certs', 'snaps/**/*-snapshots', 'missing.txt'],
+      required: [],
+      link: ['notes'],
+    });
     expect(plan.copies).toEqual([
       { from: path.join(main, 'certs'), to: '/t/certs' },
       {
@@ -309,6 +309,27 @@ describe('worktree', () => {
         'utf8'
       )
     ).not.toContain('slot:');
+  });
+
+  it("add: the override's required entries are copied like copy entries; a miss is reported once, nothing refused yet", async () => {
+    fs.writeFileSync(path.join(main, 'local.env'), 'X=1');
+    // `certs` is the manifest's copy entry too: gone here, it is one miss, not two
+    fs.rmSync(path.join(main, 'certs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.local.yaml'),
+      'worktree:\n  required: [local.env, tool-local.yml, certs]\n'
+    );
+    const r = await worktreeAdd(
+      loadManifest(main),
+      { branch: 'feat/x', install: false },
+      deps()
+    );
+    expect(r).toMatchObject({
+      copied: ['snaps/a.spec.ts-snapshots', 'local.env'],
+      from_override: ['local.env'],
+      missing: ['certs', 'tool-local.yml'],
+    });
+    expect(fs.readFileSync(path.join(r.path, 'local.env'), 'utf8')).toBe('X=1');
   });
 
   it("add: copy and link extras from the main checkout's override, and every link is ignored through git's exclude file", async () => {
@@ -949,5 +970,83 @@ describe('worktree', () => {
       });
       expect(newer[0]).toContain('written by mcproc 9.0.0');
     });
+  });
+});
+
+describe('planCopies: copy and required entries', () => {
+  let main: string;
+  const touch = (rel: string) => {
+    fs.mkdirSync(path.dirname(path.join(main, rel)), { recursive: true });
+    fs.writeFileSync(path.join(main, rel), rel);
+  };
+  const plan = (lists: { copy?: string[]; required?: string[] }) =>
+    planCopies(main, '/t', {
+      copy: lists.copy ?? [],
+      required: lists.required ?? [],
+      link: [],
+    });
+  const copied = (p: ReturnType<typeof plan>) =>
+    p.copies.map((c) => path.relative(main, c.from));
+  beforeEach(() => {
+    main = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-plan-'));
+  });
+  afterEach(() => fs.rmSync(main, { recursive: true, force: true }));
+
+  it('a required directory is copied and counts as present', () => {
+    touch('certs/a.pem');
+    const p = plan({ required: ['certs'] });
+    expect(p.copies).toEqual([
+      { from: path.join(main, 'certs'), to: '/t/certs' },
+    ]);
+    expect(p.missing).toEqual([]);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('an absent required file is missing and missing as required', () => {
+    const p = plan({ required: ['tool-local.yml'] });
+    expect(p.copies).toEqual([]);
+    expect(p.missing).toEqual(['tool-local.yml']);
+    expect(p.missingRequired).toEqual(['tool-local.yml']);
+  });
+  it('a required mask that matches nothing is missing as required', () => {
+    touch('other.yml');
+    expect(plan({ required: ['*-local.{yml,yaml}'] }).missingRequired).toEqual([
+      '*-local.{yml,yaml}',
+    ]);
+  });
+  it('a required mask copies every file it matches', () => {
+    touch('a-local.yml');
+    touch('b-local.yaml');
+    const p = plan({ required: ['*-local.{yml,yaml}'] });
+    expect(copied(p)).toEqual(['a-local.yml', 'b-local.yaml']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('the accepted limit: a mask is present when it matches one file, however many were meant', () => {
+    touch('a-local.yml');
+    const p = plan({ required: ['*-local.{yml,yaml}'] });
+    expect(copied(p)).toEqual(['a-local.yml']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('a brace-only entry is a mask', () => {
+    expect(isGlob('{x,y}.env')).toBe(true);
+    expect(isGlob('certs')).toBe(false);
+    for (const g of ['*.pem', 'a?.yml', 'odd[1]']) expect(isGlob(g)).toBe(true);
+    touch('x.env');
+    const p = plan({ required: ['{x,y}.env'] });
+    expect(copied(p)).toEqual(['x.env']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('an entry both copied and required is walked once: one miss, missing as required', () => {
+    const p = plan({ copy: ['tool-local.yml'], required: ['tool-local.yml'] });
+    expect(p.missing).toEqual(['tool-local.yml']);
+    expect(p.missingRequired).toEqual(['tool-local.yml']);
+    touch('tool-local.yml');
+    expect(
+      plan({ copy: ['tool-local.yml'], required: ['tool-local.yml'] }).copies
+    ).toHaveLength(1);
+  });
+  it('an absent copy entry is missing, not missing as required', () => {
+    const p = plan({ copy: ['cache'] });
+    expect(p.missing).toEqual(['cache']);
+    expect(p.missingRequired).toEqual([]);
   });
 });

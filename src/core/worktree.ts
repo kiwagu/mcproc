@@ -109,12 +109,25 @@ export function installCommand(m: Manifest, root: string): string | null {
   return null;
 }
 
-/** What `copy` and `link` mean for one target: each entry a path or a glob relative to the main checkout. */
+/** A worktree's entry lists: `required` entries are copied like `copy` ones, and each must be present. */
+export interface CopyLists {
+  copy: string[];
+  required: string[];
+  link: string[];
+}
+
+/** Whether a copy or required entry is a glob (a wildcard, a character class or a brace list), not a plain path. */
+export const isGlob = (entry: string): boolean => /[*?[{]/.test(entry);
+
+/**
+ * What the lists mean for one target: each entry a path or a glob relative to the main checkout. An entry named by
+ * both `copy` and `required` is planned once; a required entry is present when its path exists or its glob matches
+ * at least one path.
+ */
 export function planCopies(
   main: string,
   target: string,
-  copy: string[],
-  link: string[],
+  lists: CopyLists,
   fsDeps: {
     exists?: (p: string) => boolean;
     glob?: (pattern: string, cwd: string) => string[];
@@ -123,29 +136,32 @@ export function planCopies(
   copies: { from: string; to: string }[];
   links: { from: string; to: string }[];
   missing: string[];
+  missingRequired: string[];
 } {
   const exists = fsDeps.exists ?? ((p) => fs.existsSync(p));
   const glob = fsDeps.glob ?? ((pattern, cwd) => fs.globSync(pattern, { cwd }));
   const copies: { from: string; to: string }[] = [];
   const missing: string[] = [];
-  for (const entry of copy) {
-    const hits = /[*?[]/.test(entry)
+  const missingRequired: string[] = [];
+  for (const entry of new Set([...lists.copy, ...lists.required])) {
+    const hits = isGlob(entry)
       ? glob(entry, main).sort()
       : exists(path.join(main, entry))
         ? [entry]
         : [];
     if (hits.length === 0) {
       missing.push(entry);
+      if (lists.required.includes(entry)) missingRequired.push(entry);
       continue;
     }
     for (const h of hits)
       copies.push({ from: path.join(main, h), to: path.join(target, h) });
   }
-  const links = link.map((l) => ({
+  const links = lists.link.map((l) => ({
     from: path.join(main, l),
     to: path.join(target, l),
   }));
-  return { copies, links, missing };
+  return { copies, links, missing, missingRequired };
 }
 
 /** What the worktree commands reach outside their arguments: git, the state directory, the install, pm2; tests pass fakes. */
@@ -380,9 +396,13 @@ export async function worktreeAdd(
       `"${opts.branch}" is not a valid branch name`
     );
   const main = await mainCheckout(m.root, deps.git);
-  // the main checkout's own override may add copy and link entries for every new worktree; a bad one refuses here,
-  // before anything is made
-  const extras = loadOverride(main)?.worktree ?? { copy: [], link: [] };
+  // the main checkout's own override may add copy, link and required entries for every new worktree; a bad one
+  // refuses here, before anything is made
+  const extras = loadOverride(main)?.worktree ?? {
+    copy: [],
+    link: [],
+    required: [],
+  };
   const prefix = (
     await gitOk(deps.git, ['rev-parse', '--show-prefix'], m.root)
   ).trim();
@@ -507,15 +527,21 @@ export async function worktreeAdd(
   const ownPlan = planCopies(
     main,
     target,
-    dm.worktree.copy,
-    dm.worktree.link,
+    {
+      copy: dm.worktree.copy,
+      required: dm.worktree.required,
+      link: dm.worktree.link,
+    },
     deps
   );
   const extraPlan = planCopies(
     main,
     target,
-    only(extras.copy, dm.worktree.copy),
-    only(extras.link, dm.worktree.link),
+    {
+      copy: only(extras.copy, dm.worktree.copy),
+      required: only(extras.required, dm.worktree.required),
+      link: only(extras.link, dm.worktree.link),
+    },
     deps
   );
   // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
@@ -528,7 +554,9 @@ export async function worktreeAdd(
   const plan = {
     copies: [...ownPlan.copies, ...addedCopies],
     links: [...ownPlan.links, ...addedLinks],
-    missing: [...ownPlan.missing, ...extraPlan.missing],
+    // an entry one side copies and the other requires is planned by both: it is still one miss
+    missing: [...new Set([...ownPlan.missing, ...extraPlan.missing])],
+    missingRequired: [...ownPlan.missingRequired, ...extraPlan.missingRequired],
   };
   // provenance after the globs are expanded: the entries the override added, as the copied and linked lists name them
   const fromOverride = [

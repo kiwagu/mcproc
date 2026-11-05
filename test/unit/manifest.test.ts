@@ -506,6 +506,7 @@ describe('vars, override and the new sections', () => {
     expect(m.worktree).toEqual({
       dir: null,
       copy: ['certs', 'snaps/**/*-snapshots'],
+      required: [],
       link: ['notes'],
       install: false,
       slots: 9,
@@ -576,6 +577,7 @@ describe('vars, override and the new sections', () => {
     expect(m.worktree).toEqual({
       dir: null,
       copy: [],
+      required: [],
       link: [],
       install: null,
       slots: 9,
@@ -664,6 +666,22 @@ describe('vars, override and the new sections', () => {
     ).worktree;
     expect(w.install).toBeNull();
     expect(w.dir).toBeNull();
+  });
+  it('reads worktree.required as a list of paths and masks; absent is empty; a non-string entry is refused', () => {
+    expect(
+      parse(
+        "version: 1\nworktree: { required: ['*-local.{yml,yaml}', certs] }\napps:\n  a: { description: x, run: y }\n"
+      ).worktree.required
+    ).toEqual(['*-local.{yml,yaml}', 'certs']);
+    expect(
+      parse(
+        'version: 1\nworktree: { copy: [cache] }\napps:\n  a: { description: x, run: y }\n'
+      ).worktree.required
+    ).toEqual([]);
+    expectInvalid(
+      'version: 1\nworktree: { required: [1] }\napps:\n  a: { description: x, run: y }\n',
+      'worktree.required'
+    );
   });
   it('refuses an override var the manifest does not declare', () => {
     const text =
