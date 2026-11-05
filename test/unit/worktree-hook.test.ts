@@ -480,4 +480,79 @@ describe('worktree hook', () => {
         .filter((f) => f.includes('.mcproc-'))
     ).toEqual([]);
   });
+
+  it('install restores mode 755 to its own hook that lost it (git skips a hook it cannot execute)', async () => {
+    await hookInstall(main, { node, cli }, isolatedGit);
+    fs.chmodSync(hookFile(), 0o644);
+    const r = await hookInstall(main, { node, cli }, isolatedGit);
+    expect(r).toMatchObject({ changed: 'updated', state: 'installed' });
+    expect(fs.statSync(hookFile()).mode & 0o777).toBe(0o755);
+    expect(fs.readFileSync(hookFile(), 'utf8')).toBe(hookScript(node, cli));
+  });
+
+  it('a repository reached through a symlinked path gets the hook of its real git directory', async () => {
+    const link = path.join(base, 'link');
+    fs.symlinkSync(main, link);
+    expect(await hookPath(link, isolatedGit)).toBe(hookFile());
+    expect(await hookInstall(link, { node, cli }, isolatedGit)).toMatchObject({
+      path: hookFile(),
+      changed: 'written',
+    });
+    expect((await hookStatus(link, isolatedGit)).state).toBe('installed');
+    git(['worktree', 'add', '-q', '../wt', '-b', 'b'], link);
+    expect(marks()).toEqual([
+      `${fs.realpathSync(path.join(base, 'wt'))} ${cli} worktree sync --hook ${fresh}`,
+    ]);
+  });
+
+  it('install makes the hooks directory when the repository has none yet', async () => {
+    const hooks = path.dirname(hookFile());
+    fs.rmSync(hooks, { recursive: true, force: true });
+    const r = await hookInstall(main, { node, cli }, isolatedGit);
+    expect(r).toMatchObject({ path: hookFile(), changed: 'written' });
+    expect(fs.statSync(hookFile()).mode & 0o777).toBe(0o755);
+    expect(fs.readdirSync(hooks)).toEqual(['post-checkout']);
+  });
+
+  it('install refuses a hooks directory that is a link out of the git directory, and writes nothing there', async () => {
+    const hooks = path.dirname(hookFile());
+    const out = path.join(base, 'shared-hooks');
+    fs.mkdirSync(out);
+    fs.rmSync(hooks, { recursive: true, force: true });
+    fs.symlinkSync(out, hooks);
+    await expect(
+      hookInstall(main, { node, cli }, isolatedGit)
+    ).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      message: expect.stringContaining(
+        `is ${fs.realpathSync(out)}, outside its git directory`
+      ),
+    });
+    expect(fs.readdirSync(out)).toEqual([]);
+  });
+
+  it('without its node the hook runs a mcproc in PATH: git worktree add runs it in the new worktree', async () => {
+    await hookInstall(main, { node, cli }, isolatedGit);
+    fs.rmSync(node);
+    const bin = path.join(base, 'path-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(bin, 'mcproc'),
+      `#!/bin/sh\necho "$PWD $*" >> ${shq(marker)}\n`,
+      { mode: 0o755 }
+    );
+    const r = spawnSync(
+      'git',
+      [...id, 'worktree', 'add', '-q', '../wt', '-b', 'b'],
+      {
+        cwd: main,
+        env: { ...gitEnv(), PATH: `${bin}:/usr/bin:/bin` },
+        encoding: 'utf8',
+      }
+    );
+    expect(r.status, r.stderr).toBe(0);
+    expect(marks()).toEqual([
+      `${fs.realpathSync(path.join(base, 'wt'))} worktree sync --hook ${fresh}`,
+    ]);
+  });
 });
