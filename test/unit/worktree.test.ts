@@ -58,6 +58,9 @@ const isolatedGit: GitRunner = (args, cwd, env) =>
     );
   });
 
+/** whether the suite runs as root, whom chmod denies nothing */
+const asRoot = process.getuid?.() === 0;
+
 describe('worktree', () => {
   let base: string;
   let main: string;
@@ -164,7 +167,7 @@ describe('worktree', () => {
     expect(excludePattern('../x')).toBeNull();
     expect(excludePattern('.')).toBeNull();
   });
-  it('pruneEmptyParents: empty folders go up to the top, a gone one is passed over, a full one ends it, a failure is answered', () => {
+  it('pruneEmptyParents: empty folders go up to the top, a gone one is passed over, a full one ends it', () => {
     const top = path.join(base, 'wts');
     fs.mkdirSync(path.join(top, 'a', 'b'), { recursive: true });
     // `c` is gone already: `b` and `a` are empty and go, `top` stays
@@ -176,19 +179,26 @@ describe('worktree', () => {
     expect(pruneEmptyParents(path.join(top, 'a', 'b'), top)).toEqual([]);
     expect(fs.existsSync(path.join(top, 'a', 'b'))).toBe(false);
     expect(fs.existsSync(path.join(top, 'a', 'keep'))).toBe(true);
-    fs.rmSync(path.join(top, 'a', 'keep'));
-    fs.chmodSync(top, 0o555);
-    let failed: { dir: string; error: string }[];
-    try {
-      failed = pruneEmptyParents(path.join(top, 'a'), top);
-    } finally {
-      fs.chmodSync(top, 0o755);
-    }
-    expect(failed).toEqual([
-      { dir: path.join(top, 'a'), error: expect.stringContaining('EACCES') },
-    ]);
-    expect(fs.existsSync(path.join(top, 'a'))).toBe(true);
   });
+  // a read-only folder denies nobody when the suite runs as root: no EACCES to answer
+  it.skipIf(asRoot)(
+    'pruneEmptyParents: a folder it cannot remove is answered with its error',
+    () => {
+      const top = path.join(base, 'wts');
+      fs.mkdirSync(path.join(top, 'a'), { recursive: true });
+      fs.chmodSync(top, 0o555);
+      let failed: { dir: string; error: string }[];
+      try {
+        failed = pruneEmptyParents(path.join(top, 'a'), top);
+      } finally {
+        fs.chmodSync(top, 0o755);
+      }
+      expect(failed).toEqual([
+        { dir: path.join(top, 'a'), error: expect.stringContaining('EACCES') },
+      ]);
+      expect(fs.existsSync(path.join(top, 'a'))).toBe(true);
+    }
+  );
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
     expect(await mainCheckout(main, isolatedGit)).toBe(real);
     const m = loadManifest(main);
@@ -673,76 +683,84 @@ describe('worktree', () => {
       ).toEqual(['0']);
     });
 
-    it('a slot the rollback cannot release is named: the worktree and its branch still go, and the next add takes the slot back', async () => {
-      manifestOnlyInMain();
-      requireInMain('[tool-local.yml]');
-      const wt = path.join(`${real}.worktrees`, 'feat', 'x');
-      const leases = path.join(state, 'leases');
-      // the host's lease lock cannot be taken once the branch is deleted: the release under it fails
-      const locked: WorktreeDeps = {
-        ...deps(),
-        git: (args, cwd, env) => {
-          if (args[0] === 'branch' && args[1] === '-D')
-            fs.chmodSync(leases, 0o555);
-          return isolatedGit(args, cwd, env);
-        },
-      };
-      let e: { code: string; message: string };
-      try {
-        e = await refusal('feat/x', {}, locked);
-      } finally {
-        fs.chmodSync(leases, 0o755);
+    // a read-only lease folder denies nobody when the suite runs as root: the release cannot fail
+    it.skipIf(asRoot)(
+      'a slot the rollback cannot release is named: the worktree and its branch still go, and the next add takes the slot back',
+      async () => {
+        manifestOnlyInMain();
+        requireInMain('[tool-local.yml]');
+        const wt = path.join(`${real}.worktrees`, 'feat', 'x');
+        const leases = path.join(state, 'leases');
+        // the host's lease lock cannot be taken once the branch is deleted: the release under it fails
+        const locked: WorktreeDeps = {
+          ...deps(),
+          git: (args, cwd, env) => {
+            if (args[0] === 'branch' && args[1] === '-D')
+              fs.chmodSync(leases, 0o555);
+            return isolatedGit(args, cwd, env);
+          },
+        };
+        let e: { code: string; message: string };
+        try {
+          e = await refusal('feat/x', {}, locked);
+        } finally {
+          fs.chmodSync(leases, 0o755);
+        }
+        expect(e.code).toBe('REQUIRED_MISSING');
+        expect(e.message).toContain(
+          '; the worktree is removed, but the rollback kept slot 1 in the registry (EACCES'
+        );
+        expect(e.message).toMatch(
+          /the next worktree add takes it back, its folder being gone\)$/
+        );
+        expect(worktrees()).toEqual([`worktree ${real}`]);
+        expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
+        expect(fs.existsSync(wt)).toBe(false);
+        expect(
+          readRegistry(registryPath(state, 'demo', real))!.slots['1']
+        ).toMatchObject({ path: wt });
+        fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+        const r = await worktreeAdd(
+          loadManifest(main),
+          { branch: 'feat/z', install: false },
+          deps()
+        );
+        expect(r.slot).toBe(1);
       }
-      expect(e.code).toBe('REQUIRED_MISSING');
-      expect(e.message).toContain(
-        '; the worktree is removed, but the rollback kept slot 1 in the registry (EACCES'
-      );
-      expect(e.message).toMatch(
-        /the next worktree add takes it back, its folder being gone\)$/
-      );
-      expect(worktrees()).toEqual([`worktree ${real}`]);
-      expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
-      expect(fs.existsSync(wt)).toBe(false);
-      expect(
-        readRegistry(registryPath(state, 'demo', real))!.slots['1']
-      ).toMatchObject({ path: wt });
-      fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
-      const r = await worktreeAdd(
-        loadManifest(main),
-        { branch: 'feat/z', install: false },
-        deps()
-      );
-      expect(r.slot).toBe(1);
-    });
+    );
 
-    it('a folder the rollback cannot prune is named with its command, and the slot is released all the same', async () => {
-      manifestOnlyInMain();
-      requireInMain('[tool-local.yml]');
-      const top = `${real}.worktrees`;
-      const feat = path.join(top, 'feat');
-      // `feat/` of feat/x cannot be removed from a folder that is read-only
-      const { d } = atRemove(() => fs.chmodSync(top, 0o555));
-      let e: { code: string; message: string };
-      try {
-        e = await refusal('feat/x', {}, d);
-      } finally {
-        fs.chmodSync(top, 0o755);
+    // a read-only folder denies nobody when the suite runs as root: the prune cannot fail
+    it.skipIf(asRoot)(
+      'a folder the rollback cannot prune is named with its command, and the slot is released all the same',
+      async () => {
+        manifestOnlyInMain();
+        requireInMain('[tool-local.yml]');
+        const top = `${real}.worktrees`;
+        const feat = path.join(top, 'feat');
+        // `feat/` of feat/x cannot be removed from a folder that is read-only
+        const { d } = atRemove(() => fs.chmodSync(top, 0o555));
+        let e: { code: string; message: string };
+        try {
+          e = await refusal('feat/x', {}, d);
+        } finally {
+          fs.chmodSync(top, 0o755);
+        }
+        expect(e.code).toBe('REQUIRED_MISSING');
+        expect(e.message).not.toContain('nothing was kept');
+        expect(e.message).toContain(
+          `; the worktree is removed, but the rollback kept the folder ${feat} (EACCES`
+        );
+        const tail = `: clear it with rmdir ${feat}`;
+        expect(e.message.slice(-tail.length)).toBe(tail);
+        expect(fs.existsSync(feat)).toBe(true);
+        expect(fs.existsSync(path.join(feat, 'x'))).toBe(false);
+        expect(worktrees()).toEqual([`worktree ${real}`]);
+        expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
+        expect(
+          Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
+        ).toEqual(['0']);
       }
-      expect(e.code).toBe('REQUIRED_MISSING');
-      expect(e.message).not.toContain('nothing was kept');
-      expect(e.message).toContain(
-        `; the worktree is removed, but the rollback kept the folder ${feat} (EACCES`
-      );
-      const tail = `: clear it with rmdir ${feat}`;
-      expect(e.message.slice(-tail.length)).toBe(tail);
-      expect(fs.existsSync(feat)).toBe(true);
-      expect(fs.existsSync(path.join(feat, 'x'))).toBe(false);
-      expect(worktrees()).toEqual([`worktree ${real}`]);
-      expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
-      expect(
-        Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
-      ).toEqual(['0']);
-    });
+    );
 
     it("a templated required entry is the new worktree's: its slug and slot decide, and a refusal wrote nothing into it", async () => {
       // the branch has no .mcproc/.gitignore of its own: an accepted add writes one, a refused one must not have
