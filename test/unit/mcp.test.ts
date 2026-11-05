@@ -48,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 22 tools with annotations and short instructions', async () => {
+  it('registers the 24 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -73,8 +73,10 @@ describe('mcp server', () => {
       'unpack',
       'wait',
       'worktree_add',
+      'worktree_hook',
       'worktree_ls',
       'worktree_remove',
+      'worktree_sync',
     ]);
     expect(byName.incidents.annotations).toMatchObject({
       readOnlyHint: false,
@@ -114,7 +116,25 @@ describe('mcp server', () => {
     });
     expect(
       Object.keys(byName.worktree_add.inputSchema.properties as object).sort()
-    ).toEqual(['branch', 'from', 'install', 'project', 'slot', 'slug']);
+    ).toEqual([
+      'allow_missing',
+      'branch',
+      'from',
+      'install',
+      'project',
+      'slot',
+      'slug',
+    ]);
+    expect(
+      (
+        byName.worktree_add.inputSchema.properties as Record<
+          string,
+          { description?: string }
+        >
+      ).allow_missing.description
+    ).toBe(
+      'Make the worktree even when a worktree.required entry is missing in the main checkout (default false)'
+    );
     expect(byName.worktree_add.description).toMatch(
       /<repo>\.worktrees\/<branch>/
     );
@@ -129,6 +149,40 @@ describe('mcp server', () => {
     expect(
       Object.keys(byName.worktree_ls.inputSchema.properties as object)
     ).toEqual(['project']);
+    // sync only adds what is absent and keeps what is there: running it again changes nothing more
+    expect(byName.worktree_sync.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_sync.inputSchema.properties as object).sort()
+    ).toEqual(['allow_missing', 'project']);
+    expect(byName.worktree_sync.description).toBe(
+      "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. Refused when the local host is readonly. No slot, override or install: worktree_add makes stands."
+    );
+    // the hook only ever writes or deletes mcproc's own marked file: never another tool's
+    expect(byName.worktree_hook.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_hook.inputSchema.properties as object)
+    ).toEqual(['action', 'project']);
+    expect(
+      (
+        byName.worktree_hook.inputSchema.properties as Record<
+          string,
+          { enum?: string[] }
+        >
+      ).action.enum
+    ).toEqual(['install', 'remove', 'status']);
+    expect(byName.worktree_hook.description).toBe(
+      "Install, remove or show mcproc's git post-checkout hook for this repository: once installed, every worktree made by any tool through git (Claude Code, Codex, a plain git worktree add) gets the worktree: files, and a missing required entry makes that git worktree add fail loudly. It lives in the repository's own git directory, never in a tracked file; another tool's post-checkout is never overwritten."
+    );
     expect(byName.lease_cancel.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
@@ -229,6 +283,7 @@ describe('mcp server', () => {
     // a watcher reloads in place: after an edit the agent waits for that reload, not for a port
     expect(INSTRUCTIONS).toContain('reloaded');
     expect(INSTRUCTIONS).toContain('after an edit, wait until reloaded');
+    expect(INSTRUCTIONS).toContain('worktree_hook install');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
@@ -422,6 +477,287 @@ describe('mcp server', () => {
         expect(rm.structuredContent.error.code).toBe(code);
       }
     } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_add refuses a missing required entry as an error with its code; allow_missing makes the worktree', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpreq-'));
+    const main = path.join(base, 'wtq');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtq',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'worktree: { install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      // the main checkout's override requires a machine-local file it does not have
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [secret.env] }\n'
+      );
+      const cl = await client(neverSpawn, undefined, main);
+      const refused: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'q' },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.structuredContent.error).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'secret.env', source: "the main checkout's override" },
+          ],
+        },
+      });
+      expect(text(refused)).toContain('allow_missing');
+      const made: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'q', allow_missing: true },
+      });
+      expect(made.isError).toBeFalsy();
+      expect(made.structuredContent).toMatchObject({
+        slot: 1,
+        missing_required: ['secret.env'],
+      });
+      expect(text(made)).toContain('missing: secret.env (required, allowed)');
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_sync brings a worktree git made its files; a required miss is an error unless allow_missing; the main checkout is refused', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpsync-'));
+    const main = path.join(base, 'wty');
+    const wt = path.join(base, 'side');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wty',
+          'worktree: { copy: [cache] }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      const real = fs.realpathSync(main);
+      const cl = await client(neverSpawn, undefined, main);
+      // the main checkout's override requires a machine-local file it does not have
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [secret.env] }\n'
+      );
+      const refused: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.structuredContent.error.code).toBe('REQUIRED_MISSING');
+      expect(text(refused)).toContain('allow_missing');
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+      const r: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt, allow_missing: true },
+      });
+      expect(r.isError).toBeFalsy();
+      expect(r.structuredContent).toMatchObject({
+        path: fs.realpathSync(wt),
+        repo: real,
+        manifest: 'main',
+        copied: ['cache'],
+        missing_required: ['secret.env'],
+        notes: [
+          `copy: secret.env is not in ${real}, skipped (required, allowed)`,
+        ],
+      });
+      expect(text(r).split('\n')[0]).toBe(
+        `synced ${fs.realpathSync(wt)} from ${real}`
+      );
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      // no project: the server's own, the main checkout
+      const self: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: {},
+      });
+      expect(self.isError).toBe(true);
+      expect(text(self)).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_sync is refused on a readonly local host: nothing copied, linked or excluded', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpro-'));
+    const main = path.join(base, 'wtq');
+    const wt = path.join(base, 'side');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // a link as well: a sync that went ahead would write git's exclude file too
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtq',
+          'worktree: { copy: [cache], link: [notes] }',
+          'hosts:',
+          '  local: { readonly: true }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(main, '.gitignore'),
+        '.mcproc/\ncache/\nnotes/\n'
+      );
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      fs.mkdirSync(path.join(main, 'notes'));
+      fs.writeFileSync(path.join(main, 'notes', 'n.md'), 'note');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      const exclude = path.join(main, '.git', 'info', 'exclude');
+      /** every path in the worktree below its top level, and git's exclude file of the repository */
+      const state = () => ({
+        files: fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort(),
+        exclude: fs.existsSync(exclude)
+          ? fs.readFileSync(exclude, 'utf8')
+          : null,
+      });
+      const before = state();
+      const cl = await client(neverSpawn, undefined, main);
+      const r: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent.error.code).toBe('READONLY_HOST');
+      expect(text(r)).toContain(
+        `declares the local host readonly: worktree sync is refused; nothing was copied into ${fs.realpathSync(wt)}`
+      );
+      expect(state()).toEqual(before);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_hook shows, installs and removes the hook; install and remove are refused on a readonly local host', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcphook-'));
+    const main = path.join(base, 'wtk');
+    const manifest = (local: string) =>
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtk',
+          'hosts:',
+          `  local: ${local}`,
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      manifest('{ pm2: /bin/false }');
+      execFileSync('git', ['init', '-q', '-b', 'main'], {
+        cwd: main,
+        stdio: 'pipe',
+      });
+      const hook = path.join(
+        fs.realpathSync(main),
+        '.git',
+        'hooks',
+        'post-checkout'
+      );
+      const cli = path.join(base, 'pkg', 'dist', 'cli.js');
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, '');
+      vi.stubEnv('MCPROC_CLI_ENTRY', cli);
+      const cl = await client(neverSpawn, undefined, main);
+      const st: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: {},
+      });
+      expect(st.isError).toBeFalsy();
+      expect(st.structuredContent).toMatchObject({
+        path: hook,
+        state: 'absent',
+      });
+      const inst: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: { action: 'install' },
+      });
+      expect(inst.isError).toBeFalsy();
+      expect(inst.structuredContent).toMatchObject({
+        state: 'installed',
+        changed: 'written',
+        node: process.execPath,
+        cli,
+      });
+      expect(text(inst).split('\n')[0]).toBe(`installed ${hook}`);
+      expect(fs.statSync(hook).mode & 0o777).toBe(0o755);
+      manifest('{ pm2: /bin/false, readonly: true }');
+      for (const action of ['install', 'remove']) {
+        const r: any = await cl.callTool({
+          name: 'worktree_hook',
+          arguments: { action },
+        });
+        expect(r.isError, action).toBe(true);
+        expect(r.structuredContent.error.code).toBe('READONLY_HOST');
+      }
+      expect(fs.existsSync(hook)).toBe(true);
+      manifest('{ pm2: /bin/false }');
+      const rm: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: { action: 'remove' },
+      });
+      expect(rm.structuredContent).toMatchObject({
+        state: 'absent',
+        changed: 'removed',
+      });
+      expect(fs.existsSync(hook)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
       fs.rmSync(base, { recursive: true, force: true });
     }
   });

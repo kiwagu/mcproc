@@ -17,7 +17,9 @@ import type {
   WorktreeAdded,
   WorktreeRemoved,
   WorktreeRow,
+  WorktreeSynced,
 } from '../core/worktree.js';
+import type { HookResult } from '../core/worktree-hook.js';
 import type { Orphan, Stack, StacksAnswer } from '../core/stacks/types.js';
 import { fmtMib } from '../core/sizes.js';
 import {
@@ -833,7 +835,10 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
     L.push(
       `ignored in git: ${r.excluded.join(', ')} (the repository's info/exclude)`
     );
-  if (r.missing.length) L.push(`missing: ${r.missing.join(', ')}`);
+  if (r.missing.length)
+    L.push(
+      `missing: ${r.missing.map((e) => (r.missing_required.includes(e) ? `${e} (required, allowed)` : e)).join(', ')}`
+    );
   L.push(`installed: ${r.installed ?? 'nothing'}`);
   const vars = r.vars.filter((v) => v.source !== 'built-in');
   if (vars.length) {
@@ -841,6 +846,80 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
     for (const v of vars) L.push(`  ${v.name} = ${JSON.stringify(v.value)}`);
   }
   L.push(`next: ${r.next}`);
+  return L.join('\n');
+}
+
+/** A synced worktree: where from, whose manifest decided, what was copied, kept and linked, what is missing. */
+export function renderWorktreeSynced(r: WorktreeSynced): string {
+  const L = [`synced ${r.path} from ${r.repo}`];
+  if (r.manifest === null) {
+    L.push('decided by: no manifest in either checkout, nothing to copy');
+    return L.join('\n');
+  }
+  L.push(
+    `decided by: the ${r.manifest === 'worktree' ? "worktree's own" : "main checkout's"} manifest`
+  );
+  const mark = (e: string) =>
+    r.from_override.includes(e) ? `${e} (override)` : e;
+  if (r.copied.length) L.push(`copied: ${r.copied.map(mark).join(', ')}`);
+  if (r.kept.length)
+    L.push(`kept (already there): ${r.kept.map(mark).join(', ')}`);
+  if (r.linked.length) L.push(`linked: ${r.linked.map(mark).join(', ')}`);
+  if (r.excluded.length)
+    L.push(
+      `ignored in git: ${r.excluded.join(', ')} (the repository's info/exclude)`
+    );
+  if (r.missing.length)
+    L.push(
+      `missing: ${r.missing.map((e) => (r.missing_required.includes(e) ? `${e} (required, allowed)` : e)).join(', ')}`
+    );
+  if (!r.copied.length && !r.kept.length && !r.linked.length)
+    L.push('nothing to copy');
+  return L.join('\n');
+}
+
+/** The repository's post-checkout hook: what install or remove changed, else its state; the paths it runs; what to add by hand to another tool's. */
+export function renderHook(r: HookResult): string {
+  const L = [
+    r.changed
+      ? {
+          written: `installed ${r.path}`,
+          updated: `updated ${r.path}: its node and CLI paths refreshed`,
+          unchanged: `already installed: ${r.path}`,
+          removed: `removed ${r.path}`,
+          absent: `no hook at ${r.path}: nothing to remove`,
+        }[r.changed]
+      : {
+          installed: `installed: ${r.path}`,
+          absent: `not installed: ${r.path} (mcproc worktree hook install puts it there)`,
+          lefthook: `taken by lefthook: ${r.path}`,
+          other: `taken by another hook: ${r.path}`,
+          'moved-aside': `moved aside: mcproc's hook is ${r.path}.old (lefthook renames a hook it replaces), ${r.path} another tool's`,
+        }[r.state],
+  ];
+  const at = (p: string | null, ok: boolean) =>
+    p === null ? '(none)' : ok ? p : `${p} (missing)`;
+  if (r.state === 'installed' || r.state === 'moved-aside') {
+    L.push(`node: ${at(r.node, r.node_exists)}`);
+    L.push(`cli: ${at(r.cli, r.cli_exists)}`);
+    if (r.state === 'installed' && !(r.node_exists && r.cli_exists))
+      L.push(
+        'the hook falls back to a mcproc in PATH; mcproc worktree hook install refreshes the paths'
+      );
+  }
+  if (
+    r.state === 'lefthook' ||
+    r.state === 'other' ||
+    r.state === 'moved-aside'
+  )
+    L.push(
+      r.snippet.includes('\n')
+        ? `add to lefthook.yml instead (lefthook looks for its binary in the worktree's node_modules, which a fresh worktree lacks; a plain hook is more reliable):\n${r.snippet
+            .split('\n')
+            .map((l) => `  ${l}`)
+            .join('\n')}`
+        : `add this line to that hook instead: ${r.snippet}`
+    );
   return L.join('\n');
 }
 

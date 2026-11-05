@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { Command, Option } from 'commander';
+import { Argument, Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
@@ -23,11 +23,20 @@ import {
 import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
 import {
+  checkoutOf,
   defaultWorktreeDeps,
+  gitRunner,
+  isFreshCheckout,
   worktreeAdd,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
 } from '../core/worktree.js';
+import {
+  HOOK_ACTIONS,
+  worktreeHook,
+  type HookAction,
+} from '../core/worktree-hook.js';
 import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
@@ -69,7 +78,9 @@ import {
   renderLeases,
   renderWorktreeAdded,
   renderWorktreeRemoved,
+  renderWorktreeSynced,
   renderWorktrees,
+  renderHook,
   renderStacks,
   hostsOf,
   sinceNotes,
@@ -745,7 +756,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       })
     );
   // git runs here: the worktree commands act on the local checkout; their notes go to stderr, the answer to stdout
-  const worktreeCtx = async (g: Globals) => {
+  const worktreePrep = (g: Globals) => {
     const prep = prepare({ project: g.project, host: g.host });
     if (!prep.host.local)
       throw new McprocError(
@@ -753,7 +764,10 @@ export function buildProgram(io: Io = defaultIo): Command {
         `worktree runs on the local host only, not on ${prep.host.name}`,
         { hint: 'Drop --host; the checkout is on this machine.' }
       );
-    const ctx = await connect(prep);
+    return prep;
+  };
+  const worktreeCtx = async (g: Globals) => {
+    const ctx = await connect(worktreePrep(g));
     return {
       manifest: ctx.manifest,
       deps: await defaultWorktreeDeps(ctx, { out: io.err }),
@@ -779,6 +793,10 @@ export function buildProgram(io: Io = defaultIo): Command {
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     )
     .option('--no-install', 'skip the install command')
+    .option(
+      '--allow-missing',
+      'make the worktree even when a worktree.required entry is missing in the main checkout'
+    )
     .action(
       wrap(async (g, o, [branch]) => {
         const { manifest, deps } = await worktreeCtx(g);
@@ -790,6 +808,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             slot: o.slot === undefined ? undefined : Number(o.slot),
             project: o.slug === undefined ? undefined : String(o.slug),
             install: o.install !== false,
+            allowMissing: Boolean(o.allowMissing),
           },
           deps
         );
@@ -824,6 +843,84 @@ export function buildProgram(io: Io = defaultIo): Command {
           deps
         );
         emit(g, renderWorktreeRemoved(r), r);
+      })
+    );
+  worktree
+    .command('sync')
+    .description(
+      "bring this worktree (the one --project or the cwd is in) the files a new one gets: its manifest's (else the main checkout's) copy, required and link entries plus the main checkout's override, copied from the main checkout; files already there are kept; refused when the local host is readonly"
+    )
+    .option(
+      '--allow-missing',
+      'sync even when a worktree.required entry is missing in the main checkout'
+    )
+    .option(
+      '--hook <prev-ref>',
+      "the form git's post-checkout hook runs: only a fresh checkout (an all-zero previous ref) that mcproc worktree add did not make is synced"
+    )
+    .action(
+      wrap(async (g, o) => {
+        // no prepare(): the target is the git top level, which a manifest search from a nested worktree would miss
+        const hook = o.hook === undefined ? null : String(o.hook);
+        // the explicit flag or the folder it runs in: MCPROC_PROJECT and CLAUDE_PROJECT_DIR may name the main checkout
+        const dir = g.project ?? process.cwd();
+        if (hook !== null) {
+          // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said,
+          // whatever else the command line carries
+          if (!isFreshCheckout(hook) || process.env.MCPROC_WORKTREE_ADD) return;
+          // git's variables for the repository that ran the hook (and a caller's GIT_COMMON_DIR, which git passes on to
+          // its hooks) would steer every git call here; this process is short-lived, so they go from its environment
+          // and git finds the worktree from the folder it runs in
+          for (const k of [
+            'GIT_DIR',
+            'GIT_WORK_TREE',
+            'GIT_INDEX_FILE',
+            'GIT_PREFIX',
+            'GIT_COMMON_DIR',
+          ])
+            delete process.env[k];
+          // the main checkout's first checkout of an unborn HEAD comes from nothing too: there is nothing to copy it
+          const { top, main } = await checkoutOf(dir, gitRunner);
+          if (top === main) return;
+        }
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'worktree sync copies files on this machine; --host does not apply',
+            { hint: 'Drop --host; the checkout is on this machine.' }
+          );
+        const r = await worktreeSync(
+          {
+            dir,
+            allowMissing: Boolean(o.allowMissing),
+            fromHook: hook !== null,
+          },
+          { git: gitRunner, log: (line) => io.err(line) }
+        );
+        emit(g, renderWorktreeSynced(r), r);
+      })
+    );
+  worktree
+    .command('hook')
+    .description(
+      "mcproc's git post-checkout hook of this repository (in its own git directory, shared by every worktree): once installed, a worktree any tool makes through git gets the worktree: files, and a missing required entry fails that git worktree add; another tool's hook is never overwritten"
+    )
+    .addArgument(
+      new Argument('[action]', 'install, remove or status')
+        .choices(HOOK_ACTIONS)
+        .default('status')
+    )
+    .action(
+      wrap(async (g, _o, [action]) => {
+        // no pm2 here: the hook is a file in the repository's git directory
+        const prep = worktreePrep(g);
+        const r = await worktreeHook(
+          action as HookAction,
+          prep.manifest.root,
+          prep.host,
+          gitRunner
+        );
+        emit(g, renderHook(r), r);
       })
     );
   program

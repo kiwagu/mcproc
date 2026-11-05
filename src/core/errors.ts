@@ -29,6 +29,8 @@ export const ERROR_CODES = [
   'WORKTREE_EXISTS',
   'WORKTREE_DIRTY',
   'NOT_A_WORKTREE',
+  'REQUIRED_MISSING',
+  'HOOK_TAKEN',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 

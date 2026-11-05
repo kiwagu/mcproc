@@ -1525,6 +1525,7 @@ describe('worktree renderers', () => {
         from_override: ['.env.local', 'notes'],
         excluded: ['/notes'],
         missing: ['gone.txt'],
+        missing_required: [],
         installed: 'bun install',
         vars: [
           { name: 'project', value: 'demo-w1', source: 'built-in' },
@@ -1550,6 +1551,27 @@ describe('worktree renderers', () => {
         'next: cd /w/demo.worktrees/feat/x && mcproc start db',
       ].join('\n')
     );
+  });
+  it('add: a required entry made without is marked (required, allowed) among the missing', () => {
+    const text = renderWorktreeAdded({
+      path: '/w/demo.worktrees/x',
+      branch: 'x',
+      created_branch: false,
+      slot: 2,
+      project: 'demo-w2',
+      repo: '/w/demo',
+      manifest: 'main',
+      copied: [],
+      linked: [],
+      from_override: [],
+      excluded: [],
+      missing: ['a', 'b'],
+      missing_required: ['a'],
+      installed: null,
+      vars: [],
+      next: 'cd /w/demo.worktrees/x',
+    });
+    expect(text.split('\n')).toContain('missing: a (required, allowed), b');
   });
   it('ls: a table with the main checkout marked; remove: one line', () => {
     expect(

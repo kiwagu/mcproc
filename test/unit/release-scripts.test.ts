@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripGitVars } from '../helpers/git-env.js';
 
 const scripts = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -125,7 +126,7 @@ const runWith = (script: string, env: Record<string, string>, tag: string) =>
   spawnSync('sh', [path.join(scripts, script), tag], {
     cwd: repo,
     encoding: 'utf8',
-    env: { ...process.env, ...env },
+    env: { ...stripGitVars({ ...process.env }), ...env },
   });
 
 describe('release-publish', () => {

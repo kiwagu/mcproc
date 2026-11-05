@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -261,14 +261,37 @@ describe('cli', () => {
     ])
       expect(help).toContain(cmd);
   });
-  it('registers worktree with add, ls and remove and their options; the slug is no global --project', () => {
+  it('registers worktree with add, ls, remove, sync and hook and their options; the slug is no global --project', () => {
     const p = buildProgram(capture().io);
     const wt = p.commands.find((x) => x.name() === 'worktree')!;
-    expect(wt.commands.map((x) => x.name())).toEqual(['add', 'ls', 'remove']);
+    expect(wt.commands.map((x) => x.name())).toEqual([
+      'add',
+      'ls',
+      'remove',
+      'sync',
+      'hook',
+    ]);
     const opts = (n: string) =>
       wt.commands.find((x) => x.name() === n)!.options.map((o) => o.long);
-    expect(opts('add')).toEqual(['--from', '--slot', '--slug', '--no-install']);
+    expect(opts('add')).toEqual([
+      '--from',
+      '--slot',
+      '--slug',
+      '--no-install',
+      '--allow-missing',
+    ]);
     expect(opts('remove')).toEqual(['--force']);
+    expect(opts('sync')).toEqual(['--allow-missing', '--hook']);
+    expect(opts('hook')).toEqual([]);
+    const hookArgs = wt.commands.find(
+      (x) => x.name() === 'hook'
+    )!.registeredArguments;
+    expect(hookArgs).toHaveLength(1);
+    expect(hookArgs[0]).toMatchObject({
+      required: false,
+      argChoices: ['install', 'remove', 'status'],
+      defaultValue: 'status',
+    });
     expect(
       wt.commands
         .find((x) => x.name() === 'add')!
@@ -276,6 +299,9 @@ describe('cli', () => {
     ).toBe(
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     );
+    expect(
+      wt.commands.find((x) => x.name() === 'sync')!.description()
+    ).toContain('refused when the local host is readonly');
   });
   it('worktree add --json keeps stdout to its JSON: the install prints to stderr', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-json-'));
@@ -426,6 +452,411 @@ describe('cli', () => {
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
+  });
+  it('worktree add refuses a missing required entry with REQUIRED_MISSING and its hint; --allow-missing makes it', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-req-'));
+    const main = path.join(base, 'wtr');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtr',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'worktree: { required: [tool-local.yml], install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const real = fs.realpathSync(main);
+      const add = async (...extra: string[]) => {
+        const c = capture();
+        await buildProgram(c.io).parseAsync(
+          ['worktree', 'add', 'r', '--project', main, ...extra],
+          { from: 'user' }
+        );
+        return c;
+      };
+      const refused = await add();
+      expect(refused.err.join('\n')).toMatch(
+        /^REQUIRED_MISSING: required entry missing in .*: tool-local\.yml \(the worktree's own manifest\); nothing was kept: the worktree, its new branch r and slot 1\nHint: Put them into /
+      );
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      expect(git(['branch', '--list', 'r']).trim()).toBe('');
+      const made = await add('--allow-missing', '--json');
+      expect(JSON.parse(made.out[0])).toMatchObject({
+        path: path.join(`${real}.worktrees`, 'r'),
+        missing: ['tool-local.yml'],
+        missing_required: ['tool-local.yml'],
+      });
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  describe('worktree sync', () => {
+    let base: string;
+    let main: string;
+    let wt: string;
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    const sync = async (...argv: string[]) => {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(['worktree', 'sync', ...argv], {
+        from: 'user',
+      });
+      return c;
+    };
+    const fresh = '0'.repeat(40);
+    beforeEach(() => {
+      base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-sync-'));
+      main = path.join(base, 'wts');
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // the manifest stays out of git: a worktree git makes has none, the main checkout's decides
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wts',
+          'worktree: { copy: [cache] }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      wt = path.join(base, 'side');
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      // the suite may run under a git hook mcproc's own add fired: nothing here inherits its step aside
+      vi.stubEnv('MCPROC_WORKTREE_ADD', undefined);
+    });
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      fs.rmSync(base, { recursive: true, force: true });
+    });
+
+    it('sync --hook does nothing on an ordinary checkout, nor inside mcproc worktree add', async () => {
+      // nothing to do is nothing said, whatever else the command line carries: --host included
+      for (const host of [[], ['--host', 'stand']]) {
+        const plain = await sync(
+          '--hook',
+          'a'.repeat(40),
+          '--project',
+          wt,
+          ...host
+        );
+        expect([plain.out, plain.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
+      vi.stubEnv('MCPROC_WORKTREE_ADD', '1');
+      for (const host of [[], ['--host', 'stand']]) {
+        const inAdd = await sync('--hook', fresh, '--project', wt, ...host);
+        expect([inAdd.out, inAdd.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('sync --hook in the main checkout (the first checkout of an unborn HEAD) does nothing; without --hook it is refused', async () => {
+      for (const host of [[], ['--host', 'stand']]) {
+        const c = await sync('--hook', fresh, '--project', main, ...host);
+        expect([c.out, c.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
+      const manual = await sync('--project', main);
+      expect(manual.out).toEqual([]);
+      expect(manual.err[0]).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it("sync --hook ignores the env defaults and git's variables for a repository", async () => {
+      // what a hook may inherit: git's own variables for the repository (a caller's GIT_COMMON_DIR too, which git
+      // passes on), an agent's project pointing at the main checkout
+      const other = path.join(base, 'other');
+      fs.mkdirSync(other);
+      execFileSync('git', ['init', '-q', '-b', 'main'], {
+        cwd: other,
+        stdio: 'pipe',
+      });
+      vi.stubEnv('MCPROC_PROJECT', main);
+      vi.stubEnv('CLAUDE_PROJECT_DIR', main);
+      vi.stubEnv('GIT_DIR', path.join(main, '.git'));
+      vi.stubEnv('GIT_WORK_TREE', main);
+      vi.stubEnv('GIT_INDEX_FILE', path.join(other, '.git', 'index'));
+      vi.stubEnv('GIT_COMMON_DIR', path.join(other, '.git'));
+      let c: ReturnType<typeof capture>;
+      try {
+        c = await sync('--hook', fresh, '--project', wt, '--json');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      expect(c.err).toEqual([]);
+      expect(process.exitCode ?? 0).toBe(0);
+      expect(JSON.parse(c.out.join(''))).toMatchObject({
+        path: fs.realpathSync(wt),
+        repo: fs.realpathSync(main),
+        manifest: 'main',
+        copied: ['cache'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+    });
+
+    it('sync without --project syncs the checkout of the cwd, whatever MCPROC_PROJECT and GIT_DIR say', async () => {
+      const deep = path.join(wt, 'deep');
+      fs.mkdirSync(deep);
+      vi.stubEnv('MCPROC_PROJECT', main);
+      vi.stubEnv('CLAUDE_PROJECT_DIR', main);
+      vi.stubEnv('GIT_DIR', path.join(main, '.git'));
+      const cwd = process.cwd();
+      process.chdir(deep);
+      let c: ReturnType<typeof capture>;
+      try {
+        c = await sync('--hook', fresh);
+      } finally {
+        process.chdir(cwd);
+        vi.unstubAllEnvs();
+      }
+      expect(c.err).toEqual([]);
+      expect(c.out.join('\n')).toContain(`synced ${fs.realpathSync(wt)}`);
+      expect(fs.existsSync(path.join(wt, 'cache', 'c.bin'))).toBe(true);
+      expect(fs.existsSync(path.join(deep, 'cache'))).toBe(false);
+    });
+
+    it('sync --hook refuses a required miss on stderr with exit 1: the worktree stays, and how to finish it', async () => {
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [tool-local.yml] }\n'
+      );
+      const c = await sync('--hook', fresh, '--project', wt);
+      expect(c.out).toEqual([]);
+      expect(c.err.join('\n')).toMatch(
+        /^REQUIRED_MISSING: required entry missing in .*: tool-local\.yml \(the main checkout's override\); the worktree .* exists without them .*then run mcproc worktree sync in .*\nHint: Put them into /
+      );
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    describe('on a readonly local host', () => {
+      let manifest: string;
+      let exclude: string;
+      /** every path in the worktree below its top level, and git's exclude file of the repository */
+      const state = () => ({
+        files: fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort(),
+        exclude: fs.existsSync(exclude)
+          ? fs.readFileSync(exclude, 'utf8')
+          : null,
+      });
+      beforeEach(() => {
+        manifest = path.join(fs.realpathSync(main), '.mcproc', 'mcproc.yaml');
+        exclude = path.join(main, '.git', 'info', 'exclude');
+        fs.mkdirSync(path.join(main, 'notes'));
+        fs.writeFileSync(path.join(main, 'notes', 'n.md'), 'note');
+        // a link as well: a sync that went ahead would write git's exclude file too
+        fs.writeFileSync(
+          manifest,
+          [
+            'version: 1',
+            'project: wts',
+            'worktree: { copy: [cache], link: [notes] }',
+            'hosts:',
+            '  local: { readonly: true }',
+            'apps:',
+            '  db: { description: db, run: node db.js }',
+            '',
+          ].join('\n')
+        );
+      });
+
+      it('sync is refused with READONLY_HOST: nothing copied, linked or excluded', async () => {
+        const before = state();
+        const c = await sync('--project', wt);
+        expect(c.out).toEqual([]);
+        expect(c.err.join('\n')).toBe(
+          `READONLY_HOST: ${manifest} declares the local host readonly: worktree sync is refused; nothing was copied into ${fs.realpathSync(wt)}\nHint: Remove hosts.local.readonly from ${manifest}, then run it again; or copy the files by hand.`
+        );
+        expect(process.exitCode).toBe(1);
+        expect(state()).toEqual(before);
+      });
+
+      it('sync --hook is refused loudly, on stderr with exit 1: the worktree stays without its files', async () => {
+        const before = state();
+        const c = await sync('--hook', fresh, '--project', wt);
+        expect(c.out).toEqual([]);
+        expect(c.err.join('\n')).toMatch(
+          /^READONLY_HOST: .*mcproc\.yaml declares the local host readonly: worktree sync is refused; the worktree .* exists without its files \(git keeps a worktree whose post-checkout hook fails\)\nHint: Remove hosts\.local\.readonly from .*, then run mcproc worktree sync in /
+        );
+        expect(process.exitCode).toBe(1);
+        expect(state()).toEqual(before);
+      });
+    });
+
+    it('sync refuses the main checkout and another host', async () => {
+      for (const [argv, re] of [
+        [['--project', main], /^BAD_ARGUMENT: .* is the main checkout/],
+        [['--project', wt, '--host', 'stand'], /^BAD_ARGUMENT: .*--host/],
+        // a hook that has a worktree to sync refuses another host too
+        [
+          ['--hook', fresh, '--project', wt, '--host', 'stand'],
+          /^BAD_ARGUMENT: .*--host/,
+        ],
+      ] as const) {
+        const c = await sync(...argv);
+        expect(c.err[0], argv.join(' ')).toMatch(re);
+        expect(process.exitCode).toBe(1);
+        process.exitCode = 0;
+      }
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+  });
+  describe('worktree hook', () => {
+    let base: string;
+    let main: string;
+    let hook: string;
+    let argv1: string;
+    const run = async (...argv: string[]) => {
+      const c = capture();
+      await buildProgram(c.io).parseAsync(['worktree', 'hook', ...argv], {
+        from: 'user',
+      });
+      return c;
+    };
+    const manifest = (local: string) =>
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wth',
+          'hosts:',
+          `  local: ${local}`,
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+    beforeEach(() => {
+      base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-hook-'));
+      main = path.join(base, 'wth');
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      manifest('{ pm2: /bin/false }');
+      execFileSync('git', ['init', '-q', '-b', 'main'], {
+        cwd: main,
+        stdio: 'pipe',
+      });
+      hook = path.join(fs.realpathSync(main), '.git', 'hooks', 'post-checkout');
+      // this process runs from the sources: what the hook would run comes from MCPROC_CLI_ENTRY or nowhere
+      argv1 = process.argv[1];
+      process.argv[1] = '/w/mcproc/src/cli.ts';
+      vi.stubEnv('MCPROC_CLI_ENTRY', undefined);
+    });
+    afterEach(() => {
+      process.argv[1] = argv1;
+      vi.unstubAllEnvs();
+      fs.rmSync(base, { recursive: true, force: true });
+    });
+
+    it('status by default, install with the built cli it is given, remove', async () => {
+      const st = await run('--project', main, '--json');
+      expect(st.err).toEqual([]);
+      expect(JSON.parse(st.out.join(''))).toMatchObject({
+        path: hook,
+        state: 'absent',
+      });
+      const cli = path.join(base, 'pkg', 'dist', 'cli.js');
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, '');
+      vi.stubEnv('MCPROC_CLI_ENTRY', cli);
+      const inst = await run('install', '--project', main, '--json');
+      expect(inst.err).toEqual([]);
+      expect(JSON.parse(inst.out.join(''))).toMatchObject({
+        path: hook,
+        state: 'installed',
+        changed: 'written',
+        node: process.execPath,
+        cli,
+        node_exists: true,
+        cli_exists: true,
+      });
+      expect(fs.readFileSync(hook, 'utf8')).toContain(`cli='${cli}'`);
+      const text = await run('status', '--project', main);
+      expect(text.out.join('\n')).toContain(`installed: ${hook}`);
+      const rm = await run('remove', '--project', main);
+      expect(rm.err).toEqual([]);
+      expect(rm.out.join('\n')).toContain(`removed ${hook}`);
+      expect(fs.existsSync(hook)).toBe(false);
+      expect(process.exitCode ?? 0).toBe(0);
+    });
+
+    it('install refuses a mcproc run from its sources, and an action it does not know', async () => {
+      const c = await run('install', '--project', main);
+      expect(c.err.join('\n')).toBe(
+        'BAD_ARGUMENT: worktree hook install needs a built mcproc: this one runs from /w/mcproc/src/cli.ts\nHint: Set MCPROC_CLI_ENTRY to the dist/cli.js the hook should run.'
+      );
+      expect(process.exitCode).toBe(1);
+      expect(fs.existsSync(hook)).toBe(false);
+      process.exitCode = 0;
+      const p = buildProgram(capture().io).exitOverride();
+      p.commands
+        .find((x) => x.name() === 'worktree')!
+        .exitOverride()
+        .commands.find((x) => x.name() === 'hook')!
+        .exitOverride()
+        .configureOutput({ writeErr: () => {} });
+      await expect(
+        p.parseAsync(['worktree', 'hook', 'wipe', '--project', main], {
+          from: 'user',
+        })
+      ).rejects.toMatchObject({ code: 'commander.invalidArgument' });
+    });
+
+    it('install and remove refuse a readonly local host; status still reads; another host is refused', async () => {
+      manifest('{ pm2: /bin/false, readonly: true }');
+      vi.stubEnv('MCPROC_CLI_ENTRY', path.join(base, 'cli.js'));
+      for (const action of ['install', 'remove']) {
+        const c = await run(action, '--project', main);
+        expect(c.err[0], action).toMatch(
+          new RegExp(
+            `^READONLY_HOST: the local host is marked readonly: worktree hook ${action} is refused`
+          )
+        );
+        expect(process.exitCode).toBe(1);
+        process.exitCode = 0;
+      }
+      expect(fs.existsSync(hook)).toBe(false);
+      const st = await run('--project', main);
+      expect(st.err).toEqual([]);
+      expect(st.out.join('\n')).toContain(`not installed: ${hook}`);
+      const other = await run('status', '--project', basic, '--host', 'stand');
+      expect(other.err[0]).toMatch(
+        /^BAD_ARGUMENT: worktree runs on the local host only/
+      );
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+    });
   });
   it('exec refuses a bad --memory or --timeout and another host before touching any host', async () => {
     for (const argv of [

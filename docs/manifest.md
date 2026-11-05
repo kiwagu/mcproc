@@ -50,6 +50,11 @@ Other host fields: `ssh_args`, `shell` (default `/bin/bash -lc`: apps are launch
 read once for everything that only reads, see [hosts](hosts.md#how-mcproc-reads-a-host)), `pm2` (binary or command),
 `pm2_home`, `runtime`, `env` (merged into every app on that host). Names match `^[a-z0-9][a-z0-9._-]*$`.
 
+`worktree:` sets up the checkouts per branch ([worktrees](worktrees.md)): `dir`, `copy`, `required`, `link`,
+`install`, `slots`. A `required` entry is copied like a `copy` entry and must exist in the main checkout: without it
+`worktree add` refuses the worktree and `worktree sync` refuses to sync, unless `--allow-missing`
+([required files](worktrees.md#required-files)).
+
 The folder is created with a `.gitignore` containing `*`: it never enters your repository, so each
 checkout keeps its own. `.mcproc/README.md` holds free-form notes that `describe` returns.
 

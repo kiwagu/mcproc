@@ -1,21 +1,26 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
-import { connect, prepare } from '../../core/resolve.js';
+import { connect, prepare, resolveProjectDir } from '../../core/resolve.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../../core/exec.js';
 import { parseSizeMib } from '../../core/sizes.js';
 import { McprocError } from '../../core/errors.js';
 import {
   defaultWorktreeDeps,
+  gitRunner,
   worktreeAdd,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
   type WorktreeDeps,
 } from '../../core/worktree.js';
+import { HOOK_ACTIONS, worktreeHook } from '../../core/worktree-hook.js';
 import {
   renderExec,
+  renderHook,
   renderWorktreeAdded,
   renderWorktreeRemoved,
+  renderWorktreeSynced,
   renderWorktrees,
 } from '../render.js';
 
@@ -117,7 +122,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Worktree add',
       description:
-        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files its own manifest's worktree: section (plus the main checkout's override) copies or links, its own slot (ports shifted by that manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. Then drive its stand with project: <its path> on every call.",
+        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files its own manifest's worktree: section (plus the main checkout's override) copies or links, its own slot (ports shifted by that manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. A worktree.required entry missing in the main checkout refuses it (REQUIRED_MISSING) and nothing of it is kept, unless allow_missing. Then drive its stand with project: <its path> on every call.",
       inputSchema: {
         project: commonInput.project,
         branch: z
@@ -151,6 +156,12 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           .describe(
             "Run the install command in the new checkout (default true): the manifest's worktree.install, else by the lockfile"
           ),
+        allow_missing: z
+          .boolean()
+          .optional()
+          .describe(
+            'Make the worktree even when a worktree.required entry is missing in the main checkout (default false)'
+          ),
       },
       annotations: MUT(false, false),
     },
@@ -166,6 +177,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
             slot: args.slot,
             project: args.slug,
             install: args.install ?? true,
+            allowMissing: args.allow_missing ?? false,
           },
           wdeps
         );
@@ -232,6 +244,81 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           text: withNotes(renderWorktreeRemoved(r), notes),
           data: { ...r, notes },
         };
+      })
+  );
+
+  server.registerTool(
+    'worktree_sync',
+    {
+      title: 'Worktree sync',
+      description:
+        "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. Refused when the local host is readonly. No slot, override or install: worktree_add makes stands.",
+      inputSchema: {
+        project: commonInput.project,
+        allow_missing: z
+          .boolean()
+          .optional()
+          .describe(
+            'Sync even when a worktree.required entry is missing in the main checkout (default false)'
+          ),
+      },
+      // it only adds what is absent and keeps what is there: a second call changes nothing more
+      annotations: MUT(false, true),
+    },
+    (args) =>
+      runTool(async () => {
+        const notes: string[] = [];
+        // the git top level of the project folder, not the root a manifest search finds: no prepare() here
+        const r = await worktreeSync(
+          {
+            dir: resolveProjectDir(
+              args.project ?? deps.project,
+              await deps.roots()
+            ),
+            allowMissing: args.allow_missing ?? false,
+            fromHook: false,
+          },
+          { git: gitRunner, log: (line) => notes.push(line) }
+        );
+        return {
+          text: withNotes(renderWorktreeSynced(r), notes),
+          data: { ...r, notes },
+        };
+      })
+  );
+
+  server.registerTool(
+    'worktree_hook',
+    {
+      title: 'Worktree hook',
+      description:
+        "Install, remove or show mcproc's git post-checkout hook for this repository: once installed, every worktree made by any tool through git (Claude Code, Codex, a plain git worktree add) gets the worktree: files, and a missing required entry makes that git worktree add fail loudly. It lives in the repository's own git directory, never in a tracked file; another tool's post-checkout is never overwritten.",
+      inputSchema: {
+        action: z
+          .enum(HOOK_ACTIONS)
+          .optional()
+          .describe(
+            'install, remove or status (default status); install and remove are refused when the local host is readonly'
+          ),
+        project: commonInput.project,
+      },
+      // it only ever writes or deletes mcproc's own marked file, never another tool's: a second call changes nothing more
+      annotations: MUT(false, true),
+    },
+    (args) =>
+      runTool(async () => {
+        // no pm2 here: the hook is a file in the repository's git directory
+        const prep = prepare({
+          project: args.project ?? deps.project,
+          roots: await deps.roots(),
+        });
+        const r = await worktreeHook(
+          args.action ?? 'status',
+          prep.manifest.root,
+          prep.host,
+          gitRunner
+        );
+        return { text: renderHook(r), data: { ...r } };
       })
   );
 }

@@ -12,7 +12,7 @@ import { Pm2Client } from '../../src/core/pm2.js';
 import { ProcReader } from '../../src/core/procfs.js';
 import { clearLocalScanCache } from '../../src/core/localscan.js';
 import { fmtUrl } from '../../src/mcp/render.js';
-import { loadManifest } from '../../src/core/manifest.js';
+import { loadManifest, parseManifest } from '../../src/core/manifest.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { leasesCovering } from '../../src/core/leases/view.js';
 import type { Context } from '../../src/core/resolve.js';
@@ -381,6 +381,17 @@ describe('hostsInfo / describe', () => {
     expect(web.depends_on).toEqual([
       { app: 'api', condition: 'ready', timeout_s: 90 },
       { app: 'logger', condition: 'started', timeout_s: 60 },
+    ]);
+  });
+  it("describeProject carries the manifest's worktree.required list", () => {
+    const m = parseManifest(
+      'version: 1\nworktree: { required: [tool-local.yml, certs] }\napps:\n  a: { description: x, run: y }\n',
+      '/proj',
+      '/proj/.mcproc/mcproc.yaml'
+    );
+    expect(describeProject(m).worktree.required).toEqual([
+      'tool-local.yml',
+      'certs',
     ]);
   });
 });

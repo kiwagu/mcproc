@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,32 +12,58 @@ import {
 import type { Connector } from '../../src/core/fleet.js';
 import { MARK } from '../../src/shell/snippets.js';
 import { fakeCtx } from '../helpers/ctx.js';
+import { stripGitVars } from '../helpers/git-env.js';
 import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { projectFile, recordProject } from '../../src/core/registry.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
 import {
   excludePattern,
-  gitRunner,
   installCommand,
+  isFreshCheckout,
+  isGlob,
   mainCheckout,
   planCopies,
+  pruneEmptyParents,
   stopCheckout,
   worktreeAdd,
   worktreeDir,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
+  type GitRunner,
   type WorktreeDeps,
 } from '../../src/core/worktree.js';
 
-// the fixtures' own git calls run without the user's global or system config (commit signing, a hooks directory)
-const gitEnv = {
+// the fixtures' own git calls run without the user's global or system config (commit signing, a hooks directory) and
+// without any git variable from outside (another repository, object store or config file)
+const gitEnv = stripGitVars({
   ...process.env,
   GIT_CONFIG_GLOBAL: '/dev/null',
   GIT_CONFIG_NOSYSTEM: '1',
-};
+});
 const git = (args: string[], cwd: string) =>
   execFileSync('git', args, { cwd, stdio: 'pipe', env: gitEnv }).toString();
+// the code under test gets the same isolation: a hook or identity in this machine's git config never reaches the git
+// it runs (`git worktree add` fires a post-checkout hook); the answer has the production runner's shape, never a throw,
+// and the env the code passes reaches git (and its hooks) over that isolation, as the production runner merges it
+const isolatedGit: GitRunner = (args, cwd, env) =>
+  new Promise((resolve) => {
+    execFile(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+      { cwd, env: { ...gitEnv, ...env }, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) =>
+        resolve({
+          code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+          stdout: String(stdout),
+          stderr: String(stderr) || (err ? err.message : ''),
+        })
+    );
+  });
+
+/** whether the suite runs as root, whom chmod denies nothing */
+const asRoot = process.getuid?.() === 0;
 
 describe('worktree', () => {
   let base: string;
@@ -49,7 +75,7 @@ describe('worktree', () => {
   let stopped: string[];
   let online: { name: string; namespace: string }[];
   const deps = (): WorktreeDeps => ({
-    git: gitRunner,
+    git: isolatedGit,
     stateDir: state,
     run: async (cmd, cwd) => {
       ran.push({ cmd, cwd });
@@ -122,7 +148,11 @@ describe('worktree', () => {
     fs.mkdirSync(path.join(main, 'notes'));
     fs.writeFileSync(path.join(main, 'notes', 'n.md'), 'note');
     fs.writeFileSync(path.join(main, 'bun.lock'), '');
-    fs.writeFileSync(path.join(main, '.gitignore'), 'certs/\nsnaps/\nnotes/\n');
+    // tool-local.yml stands for a machine-local file a worktree requires: never in git
+    fs.writeFileSync(
+      path.join(main, '.gitignore'),
+      'certs/\nsnaps/\nnotes/\ntool-local.yml\n'
+    );
     git(['init', '-q', '-b', 'main'], main);
     git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'], main);
     git(
@@ -141,17 +171,48 @@ describe('worktree', () => {
     expect(excludePattern('../x')).toBeNull();
     expect(excludePattern('.')).toBeNull();
   });
+  it('pruneEmptyParents: empty folders go up to the top, a gone one is passed over, a full one ends it', () => {
+    const top = path.join(base, 'wts');
+    fs.mkdirSync(path.join(top, 'a', 'b'), { recursive: true });
+    // `c` is gone already: `b` and `a` are empty and go, `top` stays
+    expect(pruneEmptyParents(path.join(top, 'a', 'b', 'c'), top)).toEqual([]);
+    expect(fs.existsSync(path.join(top, 'a'))).toBe(false);
+    expect(fs.existsSync(top)).toBe(true);
+    fs.mkdirSync(path.join(top, 'a', 'b'), { recursive: true });
+    fs.writeFileSync(path.join(top, 'a', 'keep'), '');
+    expect(pruneEmptyParents(path.join(top, 'a', 'b'), top)).toEqual([]);
+    expect(fs.existsSync(path.join(top, 'a', 'b'))).toBe(false);
+    expect(fs.existsSync(path.join(top, 'a', 'keep'))).toBe(true);
+  });
+  // a read-only folder denies nobody when the suite runs as root: no EACCES to answer
+  it.skipIf(asRoot)(
+    'pruneEmptyParents: a folder it cannot remove is answered with its error',
+    () => {
+      const top = path.join(base, 'wts');
+      fs.mkdirSync(path.join(top, 'a'), { recursive: true });
+      fs.chmodSync(top, 0o555);
+      let failed: { dir: string; error: string }[];
+      try {
+        failed = pruneEmptyParents(path.join(top, 'a'), top);
+      } finally {
+        fs.chmodSync(top, 0o755);
+      }
+      expect(failed).toEqual([
+        { dir: path.join(top, 'a'), error: expect.stringContaining('EACCES') },
+      ]);
+      expect(fs.existsSync(path.join(top, 'a'))).toBe(true);
+    }
+  );
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
-    expect(await mainCheckout(main, gitRunner)).toBe(real);
+    expect(await mainCheckout(main, isolatedGit)).toBe(real);
     const m = loadManifest(main);
     expect(worktreeDir(m, main)).toBe(`${main}.worktrees`);
     expect(installCommand(m, main)).toBe('bun install');
-    const plan = planCopies(
-      main,
-      '/t',
-      ['certs', 'snaps/**/*-snapshots', 'missing.txt'],
-      ['notes']
-    );
+    const plan = planCopies(main, '/t', {
+      copy: ['certs', 'snaps/**/*-snapshots', 'missing.txt'],
+      required: [],
+      link: ['notes'],
+    });
     expect(plan.copies).toEqual([
       { from: path.join(main, 'certs'), to: '/t/certs' },
       {
@@ -309,6 +370,968 @@ describe('worktree', () => {
         'utf8'
       )
     ).not.toContain('slot:');
+  });
+
+  it("add: the override's required entries are copied like copy entries; a miss is reported once, and allowed it makes the worktree", async () => {
+    fs.writeFileSync(path.join(main, 'local.env'), 'X=1');
+    // `certs` is the manifest's copy entry too: gone here, it is one miss, not two
+    fs.rmSync(path.join(main, 'certs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(main, '.mcproc', 'mcproc.local.yaml'),
+      'worktree:\n  required: [local.env, tool-local.yml, certs]\n'
+    );
+    const logged: string[] = [];
+    const r = await worktreeAdd(
+      loadManifest(main),
+      { branch: 'feat/x', install: false, allowMissing: true },
+      { ...deps(), log: (l) => logged.push(l) }
+    );
+    expect(r).toMatchObject({
+      copied: ['snaps/a.spec.ts-snapshots', 'local.env'],
+      from_override: ['local.env'],
+      missing: ['certs', 'tool-local.yml'],
+      missing_required: ['tool-local.yml', 'certs'],
+    });
+    expect(fs.readFileSync(path.join(r.path, 'local.env'), 'utf8')).toBe('X=1');
+    expect(logged).toContain(
+      `copy: tool-local.yml is not in ${real}, skipped (required, allowed)`
+    );
+  });
+
+  describe('required entries', () => {
+    const c = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
+    const manifestFile = () => path.join(main, '.mcproc', 'mcproc.yaml');
+    /** main's working manifest with `required: <list>` in its worktree section (committed only when the test commits it) */
+    const requireInMain = (list: string) =>
+      fs.writeFileSync(
+        manifestFile(),
+        fs
+          .readFileSync(manifestFile(), 'utf8')
+          .replace('worktree:\n', `worktree:\n  required: ${list}\n`)
+      );
+    /** the manifest leaves git and stays in main as an ignored file: a new worktree has none, so the main checkout's decides */
+    const manifestOnlyInMain = () => {
+      fs.writeFileSync(path.join(main, '.mcproc', '.gitignore'), '*\n');
+      git(['rm', '-q', '--cached', '.mcproc/mcproc.yaml'], main);
+      git([...c, 'commit', '-qam', 'manifest only in main'], main);
+    };
+    const refusal = (
+      branch: string,
+      extra: Partial<Parameters<typeof worktreeAdd>[1]> = {},
+      d: WorktreeDeps = deps()
+    ) =>
+      worktreeAdd(
+        loadManifest(main),
+        { branch, install: true, ...extra },
+        d
+      ).then(
+        () => {
+          throw new Error('worktreeAdd made the worktree');
+        },
+        (e) => e
+      );
+    const worktrees = () =>
+      git(['worktree', 'list', '--porcelain'], main)
+        .split('\n')
+        .filter((l) => l.startsWith('worktree '));
+    /**
+     * The tests' git with a step of its own before `git worktree remove` (the rollback's first): `before` gets the
+     * target. `seen` holds what the target held then, its top level and its `.mcproc`: what the add wrote before the
+     * refusal.
+     */
+    const atRemove = (before: (target: string) => void = () => undefined) => {
+      const seen: { top: string[]; mcproc: string[] }[] = [];
+      const d: WorktreeDeps = {
+        ...deps(),
+        git: (args, cwd, env) => {
+          if (args[0] === 'worktree' && args[1] === 'remove') {
+            const t = args.at(-1)!;
+            const mc = path.join(t, '.mcproc');
+            seen.push({
+              top: fs.readdirSync(t).sort(),
+              mcproc: fs.existsSync(mc) ? fs.readdirSync(mc).sort() : [],
+            });
+            before(t);
+          }
+          return isolatedGit(args, cwd, env);
+        },
+      };
+      return { d, seen };
+    };
+    /** git's exclude file of the repository, shared by its worktrees (null while there is none) */
+    const exclude = () => {
+      const f = path.join(real, '.git', 'info', 'exclude');
+      return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null;
+    };
+
+    it('missing on a new branch: refused, and nothing of the worktree is kept: no worktree, branch, slot, folder, copy or install', async () => {
+      manifestOnlyInMain();
+      requireInMain('[tool-local.yml]');
+      const excluded = exclude();
+      const { d, seen } = atRemove();
+      const e = await refusal('feat/x', {}, d);
+      // when the rollback began the worktree held only what git checked out: nothing copied, linked or written yet
+      expect(seen).toEqual([
+        {
+          top: ['.git', '.gitignore', '.mcproc', 'bun.lock'],
+          mcproc: ['.gitignore'],
+        },
+      ]);
+      // and the link was never written to git's exclude file (git init made it)
+      expect(excluded).not.toBeNull();
+      expect(exclude()).toBe(excluded);
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'tool-local.yml', source: "the main checkout's manifest" },
+          ],
+        },
+      });
+      expect(e.message).toContain(
+        "tool-local.yml (the main checkout's manifest)"
+      );
+      expect(e.message).toContain(real);
+      expect(e.message).toMatch(
+        /nothing was kept: the worktree, its new branch feat\/x and slot 1$/
+      );
+      expect(e.hint).toBe(
+        `Put them into ${real} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to make the worktree without them.`
+      );
+      expect(worktrees()).toEqual([`worktree ${real}`]);
+      expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
+      expect(
+        Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
+      ).toEqual(['0']);
+      expect(fs.existsSync(path.join(`${real}.worktrees`, 'feat'))).toBe(false);
+      expect(ran).toEqual([]);
+      // the slot is free again: the next add with the file in place takes it
+      fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+      const r = await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: false },
+        deps()
+      );
+      expect(r).toMatchObject({ slot: 1, created_branch: true });
+    });
+
+    it('missing on an existing branch: refused, and the branch stays', async () => {
+      manifestOnlyInMain();
+      requireInMain('[tool-local.yml]');
+      git(['branch', 'feat/y'], main);
+      const e = await refusal('feat/y');
+      expect(e.code).toBe('REQUIRED_MISSING');
+      expect(e.message).toMatch(/nothing was kept: the worktree and slot 1$/);
+      expect(git(['branch', '--list', 'feat/y'], main)).toContain('feat/y');
+      expect(worktrees()).toEqual([`worktree ${real}`]);
+      expect(fs.existsSync(path.join(`${real}.worktrees`, 'feat'))).toBe(false);
+    });
+
+    it('a mask that matches nothing is named as written, never a file', async () => {
+      manifestOnlyInMain();
+      requireInMain('["*-local.{yml,yaml}"]');
+      fs.writeFileSync(path.join(main, 'other.yml'), 'x');
+      const e = await refusal('feat/x');
+      expect(e.code).toBe('REQUIRED_MISSING');
+      expect(e.message).toContain(
+        "*-local.{yml,yaml} (the main checkout's manifest)"
+      );
+      expect(e.message).not.toContain('other.yml');
+    });
+
+    it("the worktree's own manifest decides: its required entry refuses, the main's working manifest's does not", async () => {
+      git(['switch', '-qc', 'feat/req'], main);
+      requireInMain('[tool-local.yml]');
+      git([...c, 'commit', '-qam', 'require'], main);
+      git(['switch', '-q', 'main'], main);
+      const e = await refusal('feat/req');
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'tool-local.yml', source: "the worktree's own manifest" },
+          ],
+        },
+      });
+      expect(e.message).toContain(
+        "tool-local.yml (the worktree's own manifest)"
+      );
+      expect(git(['branch', '--list', 'feat/req'], main)).toContain('feat/req');
+      // the reverse: main's working manifest requires it, the committed one a new branch gets does not
+      requireInMain('[tool-local.yml]');
+      const r = await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: false },
+        deps()
+      );
+      expect(r).toMatchObject({
+        manifest: 'worktree',
+        missing: [],
+        missing_required: [],
+      });
+    });
+
+    it("the main checkout's override requires one: refused, named as the override's", async () => {
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [secret.env] }\n'
+      );
+      const e = await refusal('feat/x');
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'secret.env', source: "the main checkout's override" },
+          ],
+        },
+      });
+      expect(e.message).toContain("secret.env (the main checkout's override)");
+      expect(worktrees()).toEqual([`worktree ${real}`]);
+    });
+
+    it('allowMissing makes the worktree without it, and says which required ones it lacks', async () => {
+      requireInMain('[tool-local.yml]');
+      git([...c, 'commit', '-qam', 'require'], main);
+      const r = await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: true, allowMissing: true },
+        deps()
+      );
+      expect(r).toMatchObject({
+        missing: ['tool-local.yml'],
+        missing_required: ['tool-local.yml'],
+        copied: ['certs', 'snaps/a.spec.ts-snapshots'],
+      });
+      expect(fs.existsSync(r.path)).toBe(true);
+      expect(ran).toEqual([{ cmd: 'bun install', cwd: r.path }]);
+    });
+
+    it('present: copied, nothing missing, and the copy stays out of git', async () => {
+      requireInMain('[tool-local.yml]');
+      git([...c, 'commit', '-qam', 'require'], main);
+      fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+      const r = await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: false },
+        deps()
+      );
+      expect(r).toMatchObject({ missing: [], missing_required: [] });
+      expect(r.copied).toContain('tool-local.yml');
+      expect(fs.readFileSync(path.join(r.path, 'tool-local.yml'), 'utf8')).toBe(
+        'k: v\n'
+      );
+      expect(git(['status', '--porcelain'], r.path).trim()).toBe('');
+    });
+
+    it('a rollback step that fails is named, with the command that clears what is left', async () => {
+      manifestOnlyInMain();
+      requireInMain('[tool-local.yml]');
+      const stuck: WorktreeDeps = {
+        ...deps(),
+        git: (args, cwd, env) =>
+          args[0] === 'worktree' && args[1] === 'remove'
+            ? Promise.resolve({
+                code: 128,
+                stdout: '',
+                stderr: 'fatal: stuck\n',
+              })
+            : isolatedGit(args, cwd, env),
+      };
+      const wt = path.join(`${real}.worktrees`, 'feat', 'x');
+      const e = await refusal('feat/x', {}, stuck);
+      expect(e.code).toBe('REQUIRED_MISSING');
+      expect(e.message).not.toContain('nothing was kept');
+      expect(e.message).toContain('fatal: stuck');
+      expect(e.message).toContain(
+        `the worktree ${wt}, its new branch feat/x and slot 1`
+      );
+      expect(e.message).toContain(
+        `git worktree remove --force ${wt} && git branch -D feat/x`
+      );
+      // the worktree stays as git made it (the check came before anything was written into it), and with it the branch
+      // it has checked out and its slot, which the next add takes back once the folder is gone
+      expect(fs.existsSync(wt)).toBe(true);
+      expect(fs.existsSync(path.join(wt, '.mcproc', 'mcproc.local.yaml'))).toBe(
+        false
+      );
+      expect(git(['branch', '--list', 'feat/x'], main)).toContain('feat/x');
+      expect(
+        readRegistry(registryPath(state, 'demo', real))!.slots['1']
+      ).toMatchObject({ path: wt });
+    });
+
+    it('a branch the rollback cannot delete is named with its command; the worktree, its folder and the slot still go', async () => {
+      manifestOnlyInMain();
+      requireInMain('[tool-local.yml]');
+      const held: WorktreeDeps = {
+        ...deps(),
+        git: (args, cwd, env) =>
+          args[0] === 'branch' && args[1] === '-D'
+            ? Promise.resolve({
+                code: 1,
+                stdout: '',
+                stderr: 'error: branch held\n',
+              })
+            : isolatedGit(args, cwd, env),
+      };
+      const e = await refusal('feat/x', {}, held);
+      expect(e.code).toBe('REQUIRED_MISSING');
+      expect(e.message).toMatch(
+        /; the worktree is removed, but the rollback kept its new branch feat\/x \(git branch: error: branch held\): clear it with git branch -D feat\/x$/
+      );
+      expect(worktrees()).toEqual([`worktree ${real}`]);
+      expect(git(['branch', '--list', 'feat/x'], main)).toContain('feat/x');
+      expect(fs.existsSync(path.join(`${real}.worktrees`, 'feat'))).toBe(false);
+      expect(
+        Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
+      ).toEqual(['0']);
+    });
+
+    // a read-only lease folder denies nobody when the suite runs as root: the release cannot fail
+    it.skipIf(asRoot)(
+      'a slot the rollback cannot release is named: the worktree and its branch still go, and the next add takes the slot back',
+      async () => {
+        manifestOnlyInMain();
+        requireInMain('[tool-local.yml]');
+        const wt = path.join(`${real}.worktrees`, 'feat', 'x');
+        const leases = path.join(state, 'leases');
+        // the host's lease lock cannot be taken once the branch is deleted: the release under it fails
+        const locked: WorktreeDeps = {
+          ...deps(),
+          git: (args, cwd, env) => {
+            if (args[0] === 'branch' && args[1] === '-D')
+              fs.chmodSync(leases, 0o555);
+            return isolatedGit(args, cwd, env);
+          },
+        };
+        let e: { code: string; message: string };
+        try {
+          e = await refusal('feat/x', {}, locked);
+        } finally {
+          fs.chmodSync(leases, 0o755);
+        }
+        expect(e.code).toBe('REQUIRED_MISSING');
+        expect(e.message).toContain(
+          '; the worktree is removed, but the rollback kept slot 1 in the registry (EACCES'
+        );
+        expect(e.message).toMatch(
+          /the next worktree add takes it back, its folder being gone\)$/
+        );
+        expect(worktrees()).toEqual([`worktree ${real}`]);
+        expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
+        expect(fs.existsSync(wt)).toBe(false);
+        expect(
+          readRegistry(registryPath(state, 'demo', real))!.slots['1']
+        ).toMatchObject({ path: wt });
+        fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+        const r = await worktreeAdd(
+          loadManifest(main),
+          { branch: 'feat/z', install: false },
+          deps()
+        );
+        expect(r.slot).toBe(1);
+      }
+    );
+
+    // a read-only folder denies nobody when the suite runs as root: the prune cannot fail
+    it.skipIf(asRoot)(
+      'a folder the rollback cannot prune is named with its command, and the slot is released all the same',
+      async () => {
+        manifestOnlyInMain();
+        requireInMain('[tool-local.yml]');
+        const top = `${real}.worktrees`;
+        const feat = path.join(top, 'feat');
+        // `feat/` of feat/x cannot be removed from a folder that is read-only
+        const { d } = atRemove(() => fs.chmodSync(top, 0o555));
+        let e: { code: string; message: string };
+        try {
+          e = await refusal('feat/x', {}, d);
+        } finally {
+          fs.chmodSync(top, 0o755);
+        }
+        expect(e.code).toBe('REQUIRED_MISSING');
+        expect(e.message).not.toContain('nothing was kept');
+        expect(e.message).toContain(
+          `; the worktree is removed, but the rollback kept the folder ${feat} (EACCES`
+        );
+        const tail = `: clear it with rmdir ${feat}`;
+        expect(e.message.slice(-tail.length)).toBe(tail);
+        expect(fs.existsSync(feat)).toBe(true);
+        expect(fs.existsSync(path.join(feat, 'x'))).toBe(false);
+        expect(worktrees()).toEqual([`worktree ${real}`]);
+        expect(git(['branch', '--list', 'feat/x'], main).trim()).toBe('');
+        expect(
+          Object.keys(readRegistry(registryPath(state, 'demo', real))!.slots)
+        ).toEqual(['0']);
+      }
+    );
+
+    it("a templated required entry is the new worktree's: its slug and slot decide, and a refusal wrote nothing into it", async () => {
+      // the branch has no .mcproc/.gitignore of its own: an accepted add writes one, a refused one must not have
+      git(['rm', '-q', '.mcproc/.gitignore'], main);
+      requireInMain('["{{ project }}.env", "slot-{{ slot }}.env"]');
+      git([...c, 'commit', '-qam', 'templated require'], main);
+      // what the main checkout's own slug and slot render to is there: it is not what the new worktree needs
+      fs.writeFileSync(path.join(main, 'demo.env'), 'main');
+      fs.writeFileSync(path.join(main, 'slot-0.env'), 'main');
+      const excluded = exclude();
+      const { d, seen } = atRemove();
+      const e = await refusal('feat/x', {}, d);
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'demo-w1.env', source: "the worktree's own manifest" },
+            { entry: 'slot-1.env', source: "the worktree's own manifest" },
+          ],
+        },
+      });
+      expect(e.message).toContain(
+        'entries missing in ' +
+          `${real}: demo-w1.env (the worktree's own manifest), slot-1.env (the worktree's own manifest); nothing was kept`
+      );
+      // no override, no .mcproc/.gitignore, no copy, no link: only what git checked out
+      expect(seen).toEqual([
+        {
+          top: ['.git', '.gitignore', '.mcproc', 'bun.lock'],
+          mcproc: ['mcproc.yaml'],
+        },
+      ]);
+      expect(exclude()).toBe(excluded);
+      // present under the new worktree's names: copied, and only then the override and the .gitignore are written
+      fs.writeFileSync(path.join(main, 'demo-w1.env'), 'w1');
+      fs.writeFileSync(path.join(main, 'slot-1.env'), 'one');
+      const r = await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: false },
+        deps()
+      );
+      expect(r).toMatchObject({
+        slot: 1,
+        project: 'demo-w1',
+        manifest: 'worktree',
+        missing: [],
+        missing_required: [],
+      });
+      expect(r.copied).toEqual(
+        expect.arrayContaining(['demo-w1.env', 'slot-1.env'])
+      );
+      expect(r.copied).not.toContain('demo.env');
+      expect(fs.readFileSync(path.join(r.path, 'demo-w1.env'), 'utf8')).toBe(
+        'w1'
+      );
+      expect(fs.readFileSync(path.join(r.path, 'slot-1.env'), 'utf8')).toBe(
+        'one'
+      );
+      expect(
+        fs.readFileSync(
+          path.join(r.path, '.mcproc', 'mcproc.local.yaml'),
+          'utf8'
+        )
+      ).toContain('slot: 1');
+      expect(
+        fs.readFileSync(path.join(r.path, '.mcproc', '.gitignore'), 'utf8')
+      ).toBe('*\n');
+    });
+
+    it('a post-checkout hook steps aside for mcproc: its git worktree add carries MCPROC_WORKTREE_ADD=1', async () => {
+      const marker = path.join(base, 'hook-ran');
+      const hook = path.join(real, '.git', 'hooks', 'post-checkout');
+      fs.mkdirSync(path.dirname(hook), { recursive: true });
+      fs.writeFileSync(
+        hook,
+        `#!/bin/sh\n[ -n "$MCPROC_WORKTREE_ADD" ] || echo "$PWD" >> '${marker}'\n`,
+        { mode: 0o755 }
+      );
+      const envs: [string, Record<string, string> | undefined][] = [];
+      const recording: WorktreeDeps = {
+        ...deps(),
+        git: (args, cwd, env) => {
+          envs.push([args.slice(0, 2).join(' '), env]);
+          return isolatedGit(args, cwd, env);
+        },
+      };
+      await worktreeAdd(
+        loadManifest(main),
+        { branch: 'feat/x', install: false },
+        recording
+      );
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(envs.filter(([, env]) => env)).toEqual([
+        ['worktree add', { MCPROC_WORKTREE_ADD: '1' }],
+      ]);
+      // the hook does run for a worktree git makes without mcproc: the step aside is what kept the marker away
+      git(
+        ['worktree', 'add', '-q', '-b', 'plain', path.join(base, 'plain')],
+        main
+      );
+      expect(fs.existsSync(marker)).toBe(true);
+    });
+  });
+
+  describe('sync', () => {
+    const c = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
+    let wt: string;
+    let wtReal: string;
+    let logged: string[];
+    const sync = (
+      dir: string,
+      o: { allowMissing?: boolean; fromHook?: boolean } = {},
+      beforePublish?: (to: string) => void
+    ) =>
+      worktreeSync(
+        { dir, allowMissing: false, fromHook: false, ...o },
+        { git: isolatedGit, log: (l) => logged.push(l), beforePublish }
+      );
+    /** the entries of the worktree's top level a copy staged under a temporary name */
+    const staged = () =>
+      fs.readdirSync(wt).filter((n) => n.includes('mcproc-'));
+    const refusal = (dir: string, o: { fromHook?: boolean } = {}) =>
+      sync(dir, o).then(
+        () => {
+          throw new Error('worktreeSync synced');
+        },
+        (e) => e
+      );
+    const exclude = () =>
+      fs.readFileSync(path.join(real, '.git', 'info', 'exclude'), 'utf8');
+    const ownManifest = (dir: string, text: string) => {
+      fs.mkdirSync(path.join(dir, '.mcproc'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.mcproc', 'mcproc.yaml'), text);
+    };
+    beforeEach(() => {
+      logged = [];
+      // .mcproc/ leaves git and stays in main: a worktree git makes has no manifest, the main checkout's decides
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: demo',
+          'worktree:',
+          '  copy: [cache]',
+          '  required: [tool-local.yml]',
+          '  link: [notes]',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.appendFileSync(path.join(main, '.gitignore'), '.mcproc/\ncache/\n');
+      git(['rm', '-rq', '--cached', '.mcproc'], main);
+      git([...c, 'commit', '-qam', '.mcproc/ untracked'], main);
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      fs.writeFileSync(path.join(main, 'tool-local.yml'), 'k: v\n');
+      wt = path.join(base, 'side');
+      git(['worktree', 'add', '-q', '-b', 'side', wt], main);
+      wtReal = fs.realpathSync(wt);
+    });
+
+    it("a sibling worktree git made gets the main checkout's copies and links, and the links are ignored in git", async () => {
+      expect(fs.existsSync(path.join(wt, '.mcproc'))).toBe(false);
+      const r = await sync(wt);
+      expect(r).toEqual({
+        path: wtReal,
+        repo: real,
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+        kept: [],
+        linked: ['notes'],
+        from_override: [],
+        excluded: ['/notes'],
+        missing: [],
+        missing_required: [],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'k: v\n'
+      );
+      expect(fs.readlinkSync(path.join(wt, 'notes'))).toBe(
+        path.join(real, 'notes')
+      );
+      expect(exclude().split('\n')).toContain('/notes');
+      expect(git(['status', '--porcelain'], wt).trim()).toBe('');
+      expect(logged).toEqual([]);
+    });
+
+    it('a worktree nested in the main checkout is synced, not the main checkout its manifest search finds', async () => {
+      const nested = path.join(main, '.claude', 'worktrees', 'x');
+      git(['worktree', 'add', '-q', '-b', 'x', nested], main);
+      // from a folder inside it: the git top level is the target
+      fs.mkdirSync(path.join(nested, 'deep'));
+      const r = await sync(path.join(nested, 'deep'));
+      const at = fs.realpathSync(nested);
+      expect(r).toMatchObject({
+        path: at,
+        repo: real,
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(at, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(fs.lstatSync(path.join(at, 'notes')).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(path.join(at, 'deep', 'cache'))).toBe(false);
+    });
+
+    it('the main checkout is refused: sync copies from it', async () => {
+      const e = await refusal(main);
+      expect(e.code).toBe('BAD_ARGUMENT');
+      expect(e.message).toContain(`${real} is the main checkout`);
+    });
+
+    it('a file already in the worktree is kept as it is; a second sync keeps everything', async () => {
+      fs.writeFileSync(path.join(wt, 'tool-local.yml'), 'mine\n');
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        copied: ['cache'],
+        kept: ['tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'mine\n'
+      );
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'newer');
+      const again = await sync(wt);
+      expect(again).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml', 'notes'],
+        linked: [],
+        excluded: ['/notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      expect(
+        exclude()
+          .split('\n')
+          .filter((l) => l === '/notes')
+      ).toHaveLength(1);
+    });
+
+    // an unreadable file denies nobody when the suite runs as root: the copy would not fail
+    it.skipIf(asRoot)(
+      'a copy that fails halfway leaves nothing in its place, and the next sync copies it whole',
+      async () => {
+        const locked = path.join(main, 'cache', 'locked.bin');
+        fs.writeFileSync(locked, 'locked');
+        fs.chmodSync(locked, 0o000);
+        let e: { code?: string; message?: string };
+        try {
+          e = await refusal(wt);
+        } finally {
+          fs.chmodSync(locked, 0o644);
+        }
+        expect(e.code).toBe('BAD_ARGUMENT');
+        expect(e.message).toContain(
+          `worktree sync into ${wtReal}: copying ${path.join(real, 'cache')} failed`
+        );
+        // neither the half-copied folder nor the temporary it was copied into
+        expect(fs.readdirSync(wt).filter((n) => n.includes('cache'))).toEqual(
+          []
+        );
+        const r = await sync(wt);
+        expect(r).toMatchObject({
+          copied: ['cache', 'tool-local.yml'],
+          kept: [],
+          linked: ['notes'],
+          excluded: ['/notes'],
+        });
+        expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+          'cache'
+        );
+        expect(
+          fs.readFileSync(path.join(wt, 'cache', 'locked.bin'), 'utf8')
+        ).toBe('locked');
+        expect(fs.readdirSync(wt).filter((n) => n.includes('mcproc-'))).toEqual(
+          []
+        );
+        expect(exclude()).not.toContain('mcproc-');
+        expect(git(['status', '--porcelain'], wt).trim()).toBe('');
+      }
+    );
+
+    it('with nothing in the way a staged copy is published whole, and its temporary goes', async () => {
+      const seen: { to: string; there: boolean; staged: string[] }[] = [];
+      const r = await sync(wt, {}, (to) =>
+        seen.push({ to, there: fs.existsSync(to), staged: staged() })
+      );
+      expect(seen).toEqual([
+        {
+          to: path.join(wtReal, 'cache'),
+          there: false,
+          staged: [expect.stringMatching(/^\.cache\.mcproc-/)],
+        },
+        {
+          to: path.join(wtReal, 'tool-local.yml'),
+          there: false,
+          staged: [expect.stringMatching(/^\.tool-local\.yml\.mcproc-/)],
+        },
+      ]);
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml'],
+        kept: [],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      const file = fs.lstatSync(path.join(wt, 'tool-local.yml'));
+      // a plain file of its own: the temporary it was linked from is gone
+      expect([file.isFile(), file.nlink]).toEqual([true, 1]);
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'k: v\n'
+      );
+      expect(staged()).toEqual([]);
+    });
+
+    it('a target another writer puts in place while its copy is staged is kept as it is', async () => {
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'cache') {
+          fs.mkdirSync(to);
+          fs.writeFileSync(path.join(to, 'theirs.bin'), 'theirs');
+        } else fs.writeFileSync(to, 'theirs\n');
+      });
+      expect(r).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readdirSync(path.join(wt, 'cache'))).toEqual(['theirs.bin']);
+      expect(
+        fs.readFileSync(path.join(wt, 'cache', 'theirs.bin'), 'utf8')
+      ).toBe('theirs');
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'theirs\n'
+      );
+      expect(staged()).toEqual([]);
+    });
+
+    it('a target of the other kind put in place then is kept too: a file for a folder, a folder for a file', async () => {
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'cache') fs.writeFileSync(to, 'theirs');
+        else {
+          fs.mkdirSync(to);
+          fs.writeFileSync(path.join(to, 'x'), 'x');
+        }
+      });
+      expect(r).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache'), 'utf8')).toBe('theirs');
+      expect(fs.readdirSync(path.join(wt, 'tool-local.yml'))).toEqual(['x']);
+      expect(staged()).toEqual([]);
+    });
+
+    it('a symlink entry is published as a symlink, and never over a target put in place then', async () => {
+      fs.symlinkSync('tool-local.yml', path.join(main, 'shared.yml'));
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { copy: [shared.yml] }\n'
+      );
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'shared.yml')
+          fs.writeFileSync(to, 'theirs\n');
+      });
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml'],
+        kept: ['shared.yml'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'shared.yml'), 'utf8')).toBe(
+        'theirs\n'
+      );
+      expect(staged()).toEqual([]);
+      fs.rmSync(path.join(wt, 'shared.yml'));
+      const again = await sync(wt);
+      expect(again).toMatchObject({ copied: ['shared.yml'] });
+      // the link itself, not a second name of the file it points at
+      expect(fs.lstatSync(path.join(wt, 'shared.yml')).isSymbolicLink()).toBe(
+        true
+      );
+      expect(fs.readlinkSync(path.join(wt, 'shared.yml'))).toBe(
+        path.join(real, 'tool-local.yml')
+      );
+      expect(staged()).toEqual([]);
+    });
+
+    it('no manifest in either checkout: nothing to copy, said once', async () => {
+      fs.rmSync(path.join(main, '.mcproc', 'mcproc.yaml'));
+      const r = await sync(wt);
+      expect(r).toEqual({
+        path: wtReal,
+        repo: real,
+        manifest: null,
+        copied: [],
+        kept: [],
+        linked: [],
+        from_override: [],
+        excluded: [],
+        missing: [],
+        missing_required: [],
+      });
+      expect(logged).toEqual([
+        `no manifest in ${wtReal} or ${real}: nothing to copy`,
+      ]);
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it("the worktree's own manifest decides when it loads", async () => {
+      ownManifest(
+        wt,
+        'version: 1\nproject: demo\nworktree: { copy: [cache] }\napps:\n  db: { description: db, run: node db.js }\n'
+      );
+      // the main's required entry is not the worktree's: its miss refuses nothing
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        manifest: 'worktree',
+        copied: ['cache'],
+        linked: [],
+        missing: [],
+        missing_required: [],
+      });
+    });
+
+    it("sync falls back to the main manifest when the worktree's does not load", async () => {
+      ownManifest(wt, 'version: 2\n');
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        manifest: 'main',
+        copied: ['cache', 'tool-local.yml'],
+      });
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain(`the manifest of ${wtReal} does not load (`);
+      expect(logged[0]).toContain('MANIFEST_INVALID');
+    });
+
+    it("the main checkout's override adds its entries, named as the override's", async () => {
+      fs.writeFileSync(path.join(main, 'extra.env'), 'X=1');
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { copy: [extra.env] }\n'
+      );
+      const r = await sync(wt);
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml', 'extra.env'],
+        from_override: ['extra.env'],
+      });
+    });
+
+    it('a required miss is refused before anything is copied, linked or excluded', async () => {
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'tool-local.yml', source: "the main checkout's manifest" },
+          ],
+        },
+      });
+      expect(e.message).toBe(
+        `required entry missing in ${real}: tool-local.yml (the main checkout's manifest); nothing was copied into ${wtReal}`
+      );
+      expect(e.hint).toBe(
+        `Put them into ${real} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to sync without them.`
+      );
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+      expect(fs.existsSync(path.join(wt, 'notes'))).toBe(false);
+      expect(exclude()).toBe(excluded);
+      // from the hook: git keeps the worktree whatever the hook answers, so the refusal says what finishes it
+      const h = await refusal(wt, { fromHook: true });
+      expect(h.code).toBe('REQUIRED_MISSING');
+      expect(h.message).toContain(
+        `; the worktree ${wtReal} exists without them (git keeps a worktree whose post-checkout hook fails); put them into ${real}, then run mcproc worktree sync in ${wtReal}`
+      );
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('allowMissing syncs the rest and says which required ones it lacks', async () => {
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      const r = await sync(wt, { allowMissing: true });
+      expect(r).toMatchObject({
+        copied: ['cache'],
+        linked: ['notes'],
+        missing: ['tool-local.yml'],
+        missing_required: ['tool-local.yml'],
+      });
+      expect(logged).toEqual([
+        `copy: tool-local.yml is not in ${real}, skipped (required, allowed)`,
+      ]);
+    });
+
+    /** every path in the worktree below its top level */
+    const files = () =>
+      fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort();
+    const readonlyLocal = 'hosts:\n  local: { readonly: true }\n';
+
+    it('a readonly local host refuses the sync before anything is copied, linked or excluded', async () => {
+      const manifest = path.join(real, '.mcproc', 'mcproc.yaml');
+      fs.appendFileSync(manifest, readonlyLocal);
+      const inWt = files();
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e).toMatchObject({
+        code: 'READONLY_HOST',
+        message: `${manifest} declares the local host readonly: worktree sync is refused; nothing was copied into ${wtReal}`,
+        hint: `Remove hosts.local.readonly from ${manifest}, then run it again; or copy the files by hand.`,
+      });
+      // from the hook: git keeps the worktree whatever the hook answers, so the refusal says so and what finishes it
+      const h = await refusal(wt, { fromHook: true });
+      expect(h.code).toBe('READONLY_HOST');
+      expect(h.message).toBe(
+        `${manifest} declares the local host readonly: worktree sync is refused; the worktree ${wtReal} exists without its files (git keeps a worktree whose post-checkout hook fails)`
+      );
+      expect(h.hint).toContain(
+        `Remove hosts.local.readonly from ${manifest}, then run mcproc worktree sync in ${wtReal}`
+      );
+      // a required miss as well: the host refuses first, so putting the file in place would not be enough
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      expect((await refusal(wt)).code).toBe('READONLY_HOST');
+      expect(files()).toEqual(inWt);
+      expect(exclude()).toBe(excluded);
+      expect(logged).toEqual([]);
+    });
+
+    it("the deciding manifest's local host is the one asked: the worktree's own when it loads", async () => {
+      const mainManifest = path.join(real, '.mcproc', 'mcproc.yaml');
+      const own =
+        'version: 1\nproject: demo\nworktree: { copy: [cache], link: [notes] }\napps:\n  db: { description: db, run: node db.js }\n';
+      // the worktree's own manifest marks it readonly, the main checkout's does not
+      ownManifest(wt, own + readonlyLocal);
+      const inWt = files();
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e.code).toBe('READONLY_HOST');
+      expect(e.message).toContain(
+        `${path.join(wtReal, '.mcproc', 'mcproc.yaml')} declares the local host readonly`
+      );
+      expect(files()).toEqual(inWt);
+      expect(exclude()).toBe(excluded);
+      // the main checkout's marks it readonly, the worktree's own decides and does not
+      ownManifest(wt, own);
+      fs.appendFileSync(mainManifest, readonlyLocal);
+      expect(await sync(wt)).toMatchObject({
+        manifest: 'worktree',
+        copied: ['cache'],
+        linked: ['notes'],
+      });
+      // without a manifest of its own the main checkout's decides: readonly again
+      fs.rmSync(path.join(wt, '.mcproc'), { recursive: true });
+      expect((await refusal(wt)).code).toBe('READONLY_HOST');
+    });
+  });
+
+  it('isFreshCheckout: only a previous ref of all zeros', () => {
+    expect(isFreshCheckout('0'.repeat(40))).toBe(true);
+    expect(isFreshCheckout('0'.repeat(64))).toBe(true);
+    expect(isFreshCheckout('')).toBe(false);
+    expect(isFreshCheckout('a'.repeat(40))).toBe(false);
   });
 
   it("add: copy and link extras from the main checkout's override, and every link is ignored through git's exclude file", async () => {
@@ -682,9 +1705,9 @@ describe('worktree', () => {
     const calls: string[][] = [];
     const recording: WorktreeDeps = {
       ...deps(),
-      git: (args, cwd) => {
+      git: (args, cwd, env) => {
         calls.push(args);
-        return gitRunner(args, cwd);
+        return isolatedGit(args, cwd, env);
       },
     };
     await expect(
@@ -745,6 +1768,32 @@ describe('worktree', () => {
       readRegistry(registryPath(state, 'demo', real))!.slots['1']
     ).toMatchObject({ path: wt, project: 'demo-w1' });
   });
+
+  // an unreadable file denies nobody when the suite runs as root: the copy would not fail
+  it.skipIf(asRoot)(
+    'a copy that fails halfway in add leaves nothing in its place either',
+    async () => {
+      const locked = path.join(main, 'certs', 'locked.pem');
+      fs.writeFileSync(locked, 'locked');
+      fs.chmodSync(locked, 0o000);
+      const m = loadManifest(main);
+      const wt = path.join(`${real}.worktrees`, 'half');
+      try {
+        await expect(
+          worktreeAdd(m, { branch: 'half', install: false }, deps())
+        ).rejects.toMatchObject({
+          code: 'BAD_ARGUMENT',
+          message: expect.stringContaining(
+            `but copying ${path.join(real, 'certs')} failed`
+          ),
+        });
+      } finally {
+        fs.chmodSync(locked, 0o644);
+      }
+      // neither the half-copied folder nor the temporary it was copied into
+      expect(fs.readdirSync(wt).filter((n) => n.includes('certs'))).toEqual([]);
+    }
+  );
 
   it('remove takes back the slot of an add that ended between its claim and git: an empty folder', async () => {
     const m = loadManifest(main);
@@ -949,5 +1998,83 @@ describe('worktree', () => {
       });
       expect(newer[0]).toContain('written by mcproc 9.0.0');
     });
+  });
+});
+
+describe('planCopies: copy and required entries', () => {
+  let main: string;
+  const touch = (rel: string) => {
+    fs.mkdirSync(path.dirname(path.join(main, rel)), { recursive: true });
+    fs.writeFileSync(path.join(main, rel), rel);
+  };
+  const plan = (lists: { copy?: string[]; required?: string[] }) =>
+    planCopies(main, '/t', {
+      copy: lists.copy ?? [],
+      required: lists.required ?? [],
+      link: [],
+    });
+  const copied = (p: ReturnType<typeof plan>) =>
+    p.copies.map((c) => path.relative(main, c.from));
+  beforeEach(() => {
+    main = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-plan-'));
+  });
+  afterEach(() => fs.rmSync(main, { recursive: true, force: true }));
+
+  it('a required directory is copied and counts as present', () => {
+    touch('certs/a.pem');
+    const p = plan({ required: ['certs'] });
+    expect(p.copies).toEqual([
+      { from: path.join(main, 'certs'), to: '/t/certs' },
+    ]);
+    expect(p.missing).toEqual([]);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('an absent required file is missing and missing as required', () => {
+    const p = plan({ required: ['tool-local.yml'] });
+    expect(p.copies).toEqual([]);
+    expect(p.missing).toEqual(['tool-local.yml']);
+    expect(p.missingRequired).toEqual(['tool-local.yml']);
+  });
+  it('a required mask that matches nothing is missing as required', () => {
+    touch('other.yml');
+    expect(plan({ required: ['*-local.{yml,yaml}'] }).missingRequired).toEqual([
+      '*-local.{yml,yaml}',
+    ]);
+  });
+  it('a required mask copies every file it matches', () => {
+    touch('a-local.yml');
+    touch('b-local.yaml');
+    const p = plan({ required: ['*-local.{yml,yaml}'] });
+    expect(copied(p)).toEqual(['a-local.yml', 'b-local.yaml']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('the accepted limit: a mask is present when it matches one file, however many were meant', () => {
+    touch('a-local.yml');
+    const p = plan({ required: ['*-local.{yml,yaml}'] });
+    expect(copied(p)).toEqual(['a-local.yml']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('a brace-only entry is a mask', () => {
+    expect(isGlob('{x,y}.env')).toBe(true);
+    expect(isGlob('certs')).toBe(false);
+    for (const g of ['*.pem', 'a?.yml', 'odd[1]']) expect(isGlob(g)).toBe(true);
+    touch('x.env');
+    const p = plan({ required: ['{x,y}.env'] });
+    expect(copied(p)).toEqual(['x.env']);
+    expect(p.missingRequired).toEqual([]);
+  });
+  it('an entry both copied and required is walked once: one miss, missing as required', () => {
+    const p = plan({ copy: ['tool-local.yml'], required: ['tool-local.yml'] });
+    expect(p.missing).toEqual(['tool-local.yml']);
+    expect(p.missingRequired).toEqual(['tool-local.yml']);
+    touch('tool-local.yml');
+    expect(
+      plan({ copy: ['tool-local.yml'], required: ['tool-local.yml'] }).copies
+    ).toHaveLength(1);
+  });
+  it('an absent copy entry is missing, not missing as required', () => {
+    const p = plan({ copy: ['cache'] });
+    expect(p.missing).toEqual(['cache']);
+    expect(p.missingRequired).toEqual([]);
   });
 });
