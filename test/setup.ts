@@ -3,6 +3,12 @@ import os from 'node:os';
 import { afterAll } from 'vitest';
 import { suiteStateDir } from './helpers/state-dir.js';
 
+// No test reads this machine's git config or runs its hooks: a global or system config may set a hooks directory
+// (git worktree add fires post-checkout in the temp repos), sign commits or rewrite URLs. Every git the tests run, in
+// this process or in a child CLI, inherits this; a fixture that commits passes its identity with -c.
+process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+process.env.GIT_CONFIG_NOSYSTEM = '1';
+
 // Every test file gets a state directory of its own, so no test reads or writes this machine's real leases and slot
 // registry: an inherited MCPROC_STATE_DIR is kept only when it lies inside the temp directory, any other is replaced
 // by a fresh name (see suiteStateDir). A test that needs a known directory still sets MCPROC_STATE_DIR itself and puts
