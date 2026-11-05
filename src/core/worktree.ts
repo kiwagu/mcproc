@@ -9,12 +9,18 @@ import { LeaseStore } from './leases/store.js';
 import {
   loadManifest,
   MANIFEST_REL,
+  parseManifest,
   type Manifest,
   type VarInfo,
 } from './manifest.js';
 import { NAME_RE } from './names.js';
 import { forgetProject } from './registry.js';
-import { loadOverride, writeOverride } from './override.js';
+import {
+  loadOverride,
+  OVERRIDE_REL,
+  writeOverride,
+  type Override,
+} from './override.js';
 import { isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
@@ -271,16 +277,27 @@ export function requiredMissing(
   );
 }
 
-/** Removes `dir` and the folders above it while they are empty, up to but never `top`: the folders a branch with slashes made (`feat/` of feat/x). */
-export function pruneEmptyParents(dir: string, top: string): void {
+/**
+ * Removes `dir` and the folders above it while they are empty, up to but never `top`: the folders a branch with
+ * slashes made (`feat/` of feat/x). A folder that is not empty ends it, one already gone is passed over (its parent may
+ * be empty now); any other failure ends it too and is answered with the folder it left, which a caller may ignore.
+ */
+export function pruneEmptyParents(
+  dir: string,
+  top: string
+): { dir: string; error: string }[] {
   const t = realOf(top);
   for (let d = dir; d.startsWith(`${t}${path.sep}`); d = path.dirname(d)) {
     try {
       fs.rmdirSync(d);
-    } catch {
-      break; // not empty
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') continue;
+      if (code === 'ENOTEMPTY' || code === 'EEXIST') break;
+      return [{ dir: d, error: (e as Error).message }];
     }
   }
+  return [];
 }
 
 /** What the worktree commands reach outside their arguments: git, the state directory, the install, pm2; tests pass fakes. */
@@ -320,15 +337,18 @@ export interface WorktreeAdded {
   next: string;
 }
 
-/** The new worktree's own manifest, or null when it has none of its own or it does not load (logged, with what the main checkout's decides instead). */
+/** The new worktree's own manifest, or null when it has none of its own or it does not load (logged, with what the main checkout's decides instead). Read with `override` when one is given, in place of any override file there. */
 function ownManifest(
   target: string,
   log: (line: string) => void,
-  instead: string
+  instead: string,
+  override?: Override
 ): Manifest | null {
   if (!ownsManifest(target)) return null;
   try {
-    return loadManifest(target);
+    if (!override) return loadManifest(target);
+    const file = path.join(target, MANIFEST_REL);
+    return parseManifest(fs.readFileSync(file, 'utf8'), target, file, override);
   } catch (e) {
     log(
       `the manifest of ${target} does not load (${describeErrorWithHint(e)}): the main checkout's decides ${instead}`
@@ -486,10 +506,11 @@ const listOf = (xs: string[]): string =>
     : xs.join('');
 
 /**
- * Takes back what `worktree add` made before it found a required entry missing: the worktree with its override, the
- * branch when this add made it, the folders a branch with slashes made, the slot. Answers the tail of the refusal:
- * that nothing was kept, or what was and how to clear it. A worktree git does not remove keeps the branch it has checked
- * out and the slot its override names, so nothing more is undone then.
+ * Takes back what `worktree add` made before it found a required entry missing: the worktree as git made it (nothing
+ * was written into it yet), the branch when this add made it, the folders a branch with slashes made, the slot.
+ * Answers the tail of the refusal: that nothing was kept, or what was and how to clear it. A worktree git does not
+ * remove keeps the branch it has checked out, and its slot stays with the folder (the next add frees it once the folder
+ * is gone), so nothing more is undone then; any later step that fails is named, and the slot is released all the same.
  */
 async function rollBackAdd(
   a: {
@@ -515,11 +536,16 @@ async function rollBackAdd(
   if (a.created) {
     const br = await git(['branch', '-D', '--', a.branch], a.main);
     if (br.code !== 0) {
-      kept.push(`its new branch ${a.branch} (git branch: ${br.stderr.trim()})`);
+      kept.push(
+        `its new branch ${a.branch} (git branch: ${br.stderr.trim() || `exit ${br.code}`})`
+      );
       clear.push(`git branch -D ${shPath(a.branch)}`);
     }
   }
-  pruneEmptyParents(path.dirname(a.target), a.top);
+  for (const f of pruneEmptyParents(path.dirname(a.target), a.top)) {
+    kept.push(`the folder ${f.dir} (${f.error})`);
+    clear.push(`rmdir ${shPath(f.dir)}`);
+  }
   try {
     await a.giveBack();
   } catch (e) {
@@ -529,7 +555,7 @@ async function rollBackAdd(
   }
   if (!kept.length)
     return `nothing was kept: ${a.created ? `the worktree, its new branch ${a.branch} and slot ${a.slot}` : `the worktree and slot ${a.slot}`}`;
-  return `the worktree is removed, but the rollback kept ${listOf(kept)}${clear.length ? `: clear it with ${clear.join(' and ')}` : ''}`;
+  return `the worktree is removed, but the rollback kept ${listOf(kept)}${clear.length ? `: clear ${clear.length > 1 ? 'them' : 'it'} with ${clear.join(' and ')}` : ''}`;
 }
 
 /**
@@ -537,8 +563,8 @@ async function rollBackAdd(
  * new) in the sibling folder, with the declared copies and links, the override that gives it its slot and project
  * slug, the install, and its slot in the registry. The slot is claimed and the folder made under the host's lease
  * lock, so parallel runs never share a slot; when git then fails, the slot is given back. A required entry missing in
- * the main checkout refuses the worktree before anything is copied, linked or installed, and takes back all this add
- * made (the worktree, its new branch, its slot), unless `allowMissing`.
+ * the main checkout refuses the worktree before anything is written into it, copied, linked or installed, and takes
+ * back all this add made (the worktree, its new branch, its slot), unless `allowMissing`.
  */
 export async function worktreeAdd(
   m: Manifest,
@@ -682,30 +708,30 @@ export async function worktreeAdd(
     throw e;
   }
   // the new worktree's own manifest says what it gets (a branch that introduces the slot scheme gets it from its first
-  // worktree); the main checkout's only when the worktree has none that loads. It is read first without the override,
-  // only to learn whether it declares `slot`, and again once the override is in place, so that its templates (an
-  // install command, a copy entry) see this checkout's slug and slot, as every later command does
+  // worktree); the main checkout's only when the worktree has none that loads. It is read first as it is, only to learn
+  // whether it declares `slot`, and again with the override this checkout gets, held in memory until the required
+  // entries are checked, so that its templates (an install command, a copy or required entry) see this checkout's slug
+  // and slot, as every later command does
   const probe = ownManifest(
     target,
     deps.log,
     'the slot var, the copies and the install'
   );
-  // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
-  writeOverride(target, {
+  const override: { project: string; repo: string; vars: Override['vars'] } = {
     project,
     repo: main,
-    vars: (probe ?? m).slot !== null ? { slot } : undefined,
-  });
-  // a .mcproc/.gitignore of the branch (a whitelist) already hides the override; else one that hides everything here
-  const gi = path.join(target, '.mcproc', '.gitignore');
-  if (!present(gi)) fs.writeFileSync(gi, '*\n');
+    vars: (probe ?? m).slot !== null ? { slot } : {},
+  };
   const own = probe
-    ? ownManifest(target, deps.log, 'the copies and the install')
+    ? ownManifest(target, deps.log, 'the copies and the install', {
+        path: path.join(target, OVERRIDE_REL),
+        ...override,
+      })
     : null;
   const dm = own ?? m;
   const plan = worktreePlan(main, target, dm, extras, deps);
-  // checked once the override is in and the manifest read with it (a templated entry sees this checkout's slug and
-  // slot), before anything is copied, linked or installed: a refusal takes the worktree back with its override
+  // checked before anything is written into the worktree, copied, linked or installed: a refusal takes back only what
+  // git and the slot claim made
   if (plan.missingRequired.length && !opts.allowMissing)
     throw requiredMissing(
       plan.missingRequired,
@@ -723,6 +749,11 @@ export async function worktreeAdd(
         deps.git
       )
     );
+  // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
+  writeOverride(target, override);
+  // a .mcproc/.gitignore of the branch (a whitelist) already hides the override; else one that hides everything here
+  const gi = path.join(target, '.mcproc', '.gitignore');
+  if (!present(gi)) fs.writeFileSync(gi, '*\n');
   let step = '';
   try {
     for (const c of plan.copies) {
