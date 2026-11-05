@@ -1,13 +1,16 @@
+/** The two git variables the tests set themselves: no global and no system config. */
+const KEEP = new Set(['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM']);
+
 /**
- * git's variables for a repository: its git directory, work tree, index, common directory and the prefix git hands an
- * alias. A suite run from a git hook or from a shell that exported them would pass them on, and every git a test runs
- * would act on that repository instead of the temp one in its cwd. test/setup.ts drops them from the process, and every
- * helper that builds an environment for git or for a CLI that runs git drops them again.
+ * Deletes from `env` every variable whose name starts with GIT_ except GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM, and
+ * returns `env`. A suite run from a git hook or from a shell that exported them would otherwise steer every git a test
+ * runs: to another repository or index (GIT_DIR, GIT_INDEX_FILE…), another object store (GIT_OBJECT_DIRECTORY), another
+ * file for `git config` (GIT_CONFIG), or settings such as a hooks directory (GIT_CONFIG_COUNT with its pairs,
+ * GIT_CONFIG_PARAMETERS). test/setup.ts applies it to the process; every helper that builds an environment for git or
+ * for a CLI that runs git applies it again.
  */
-export const GIT_REPO_VARS = [
-  'GIT_DIR',
-  'GIT_WORK_TREE',
-  'GIT_INDEX_FILE',
-  'GIT_PREFIX',
-  'GIT_COMMON_DIR',
-] as const;
+export function stripGitVars(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const k of Object.keys(env))
+    if (k.startsWith('GIT_') && !KEEP.has(k)) delete env[k];
+  return env;
+}

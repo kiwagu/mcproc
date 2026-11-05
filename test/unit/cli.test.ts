@@ -607,7 +607,12 @@ describe('cli', () => {
       vi.stubEnv('GIT_WORK_TREE', main);
       vi.stubEnv('GIT_INDEX_FILE', path.join(other, '.git', 'index'));
       vi.stubEnv('GIT_COMMON_DIR', path.join(other, '.git'));
-      const c = await sync('--hook', fresh, '--project', wt, '--json');
+      let c: ReturnType<typeof capture>;
+      try {
+        c = await sync('--hook', fresh, '--project', wt, '--json');
+      } finally {
+        vi.unstubAllEnvs();
+      }
       expect(c.err).toEqual([]);
       expect(process.exitCode ?? 0).toBe(0);
       expect(JSON.parse(c.out.join(''))).toMatchObject({
@@ -634,6 +639,7 @@ describe('cli', () => {
         c = await sync('--hook', fresh);
       } finally {
         process.chdir(cwd);
+        vi.unstubAllEnvs();
       }
       expect(c.err).toEqual([]);
       expect(c.out.join('\n')).toContain(`synced ${fs.realpathSync(wt)}`);

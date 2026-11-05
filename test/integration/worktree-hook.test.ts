@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readRegistry, registryPath } from '../../src/core/slots.js';
-import { GIT_REPO_VARS } from '../helpers/git-env.js';
+import { stripGitVars } from '../helpers/git-env.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -14,19 +14,18 @@ const cli = process.env.MCPROC_CLI ?? path.join(root, 'dist', 'cli.js');
 const MASK = '*-local.{yml,yaml}';
 
 /**
- * The environment of every git and mcproc this file runs: no git config of this machine, no repository named from
- * outside (git's own variables would make the fixture's init, add and commit act on that repository), no project named
- * from outside (MCPROC_PROJECT or CLAUDE_PROJECT_DIR would steer mcproc away from the temp repository), the test's own
- * state dir.
+ * The environment of every git and mcproc this file runs: no git config of this machine and no other git variable from
+ * outside (they would make the fixture's git act on another repository, object store or config, or run other hooks),
+ * no project named from outside (MCPROC_PROJECT or CLAUDE_PROJECT_DIR would steer mcproc away from the temp
+ * repository), the test's own state dir.
  */
 function envOf(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
+  const env = stripGitVars({
     ...process.env,
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1',
-  };
+  });
   for (const k of [
-    ...GIT_REPO_VARS,
     'MCPROC_PROJECT',
     'CLAUDE_PROJECT_DIR',
     'MCPROC_CLI_ENTRY',

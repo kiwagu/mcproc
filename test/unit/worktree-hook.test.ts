@@ -15,19 +15,19 @@ import {
 } from '../../src/core/worktree-hook.js';
 import type { GitRunner } from '../../src/core/worktree.js';
 import { shq } from '../../src/transport/quote.js';
-import { GIT_REPO_VARS } from '../helpers/git-env.js';
+import { stripGitVars } from '../helpers/git-env.js';
 
 /**
- * The git every fixture runs: none of this machine's git config (test/setup.ts), and nothing a git hook or mcproc's own
- * worktree add that runs this suite would pass on (its step-aside variable, git's variables for its repository).
+ * The git every fixture runs: none of this machine's git config and no other git variable from outside
+ * (test/setup.ts), and not the step-aside variable of mcproc's own worktree add that may run this suite.
  */
 const gitEnv = (): NodeJS.ProcessEnv => {
-  const env: NodeJS.ProcessEnv = {
+  const env = stripGitVars({
     ...process.env,
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1',
-  };
-  for (const k of ['MCPROC_WORKTREE_ADD', ...GIT_REPO_VARS]) delete env[k];
+  });
+  delete env.MCPROC_WORKTREE_ADD;
   return env;
 };
 const id = ['-c', 'user.email=t@t', '-c', 'user.name=t'];
@@ -125,7 +125,7 @@ describe('worktree hook', () => {
     fs.rmSync(base, { recursive: true, force: true });
   });
 
-  it("the fixtures' git acts on the repository of its cwd, never on one git's inherited variables name", () => {
+  it("the fixtures' git acts on the repository of its cwd, never on the repository, objects, config or hooks git's inherited variables name", () => {
     // a repository outside the fixture, named the way a git hook that runs the suite or an exporting shell names it
     const other = path.join(base, 'other');
     fs.mkdirSync(other);
@@ -148,19 +148,39 @@ describe('worktree hook', () => {
               .update(fs.readFileSync(path.join(otherGit, f)))
               .digest('hex')}`
         );
+    // a config file and a hooks directory outside the fixture: a commit that ran these hooks leaves a line in `ran`
+    const otherConfig = path.join(base, 'other.gitconfig');
+    fs.writeFileSync(otherConfig, '[other]\n\tkeep = 1\n');
+    const otherHooks = path.join(base, 'other-hooks');
+    const ran = path.join(base, 'ran');
+    fs.mkdirSync(otherHooks);
+    for (const h of ['pre-commit', 'post-commit'])
+      fs.writeFileSync(
+        path.join(otherHooks, h),
+        `#!/bin/sh\necho ${h} >> ${shq(ran)}\n`,
+        { mode: 0o755 }
+      );
+    const hooksKey = ['core', 'hooksPath'].join('.');
     const before = state();
-    const named: Record<(typeof GIT_REPO_VARS)[number], string> = {
+    const named: Record<string, string> = {
       GIT_DIR: otherGit,
       GIT_WORK_TREE: other,
       GIT_INDEX_FILE: path.join(otherGit, 'index'),
       GIT_PREFIX: 'sub/',
       GIT_COMMON_DIR: otherGit,
+      GIT_OBJECT_DIRECTORY: path.join(otherGit, 'objects'),
+      GIT_CONFIG: otherConfig,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: hooksKey,
+      GIT_CONFIG_VALUE_0: otherHooks,
+      GIT_CONFIG_PARAMETERS: `${shq(hooksKey)}=${shq(otherHooks)}`,
     };
     const repo = path.join(base, 'fixture');
     fs.mkdirSync(repo);
     try {
       for (const [k, v] of Object.entries(named)) vi.stubEnv(k, v);
       git(['init', '-q', '-b', 'main'], repo);
+      git(['config', '--local', 'fixture.mark', 'set'], repo);
       fs.writeFileSync(path.join(repo, 'r.txt'), 'r');
       git(['add', '-A'], repo);
       git(['commit', '-qm', 'fixture'], repo);
@@ -169,8 +189,11 @@ describe('worktree hook', () => {
       vi.unstubAllEnvs();
     }
     expect(state()).toEqual(before);
-    // the fixture's commit is in its own repository, objects included
+    expect(fs.readFileSync(otherConfig, 'utf8')).toBe('[other]\n\tkeep = 1\n');
+    expect(fs.existsSync(ran)).toBe(false);
+    // the fixture's commit is in its own repository, objects included, and its config write in its own config
     expect(git(['cat-file', '-t', 'HEAD'], repo).trim()).toBe('commit');
+    expect(git(['config', '--local', 'fixture.mark'], repo).trim()).toBe('set');
   });
 
   it('hookScript: the shebang, the marker line, the paths as JSON, then the script with the paths quoted', () => {
@@ -334,7 +357,7 @@ describe('worktree hook', () => {
   it('install refuses a hooks directory outside the git directory: it may be tracked or shared', async () => {
     const out = path.join(main, 'hooks-out');
     fs.mkdirSync(out);
-    git(['config', ['core', 'hooksPath'].join('.'), out], main);
+    git(['config', '--local', ['core', 'hooksPath'].join('.'), out], main);
     await expect(
       hookInstall(main, { node, cli }, isolatedGit)
     ).rejects.toMatchObject({
