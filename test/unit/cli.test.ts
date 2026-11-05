@@ -299,6 +299,9 @@ describe('cli', () => {
     ).toBe(
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     );
+    expect(
+      wt.commands.find((x) => x.name() === 'sync')!.description()
+    ).toContain('refused when the local host is readonly');
   });
   it('worktree add --json keeps stdout to its JSON: the install prints to stderr', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-json-'));
@@ -650,6 +653,60 @@ describe('cli', () => {
       );
       expect(process.exitCode).toBe(1);
       expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    describe('on a readonly local host', () => {
+      let manifest: string;
+      let exclude: string;
+      /** every path in the worktree below its top level, and git's exclude file of the repository */
+      const state = () => ({
+        files: fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort(),
+        exclude: fs.existsSync(exclude)
+          ? fs.readFileSync(exclude, 'utf8')
+          : null,
+      });
+      beforeEach(() => {
+        manifest = path.join(fs.realpathSync(main), '.mcproc', 'mcproc.yaml');
+        exclude = path.join(main, '.git', 'info', 'exclude');
+        fs.mkdirSync(path.join(main, 'notes'));
+        fs.writeFileSync(path.join(main, 'notes', 'n.md'), 'note');
+        // a link as well: a sync that went ahead would write git's exclude file too
+        fs.writeFileSync(
+          manifest,
+          [
+            'version: 1',
+            'project: wts',
+            'worktree: { copy: [cache], link: [notes] }',
+            'hosts:',
+            '  local: { readonly: true }',
+            'apps:',
+            '  db: { description: db, run: node db.js }',
+            '',
+          ].join('\n')
+        );
+      });
+
+      it('sync is refused with READONLY_HOST: nothing copied, linked or excluded', async () => {
+        const before = state();
+        const c = await sync('--project', wt);
+        expect(c.out).toEqual([]);
+        expect(c.err.join('\n')).toBe(
+          `READONLY_HOST: ${manifest} declares the local host readonly: worktree sync is refused; nothing was copied into ${fs.realpathSync(wt)}\nHint: Remove hosts.local.readonly from ${manifest}, then run it again; or copy the files by hand.`
+        );
+        expect(process.exitCode).toBe(1);
+        expect(state()).toEqual(before);
+      });
+
+      it('sync --hook is refused loudly, on stderr with exit 1: the worktree stays without its files', async () => {
+        const before = state();
+        const c = await sync('--hook', fresh, '--project', wt);
+        expect(c.out).toEqual([]);
+        expect(c.err.join('\n')).toMatch(
+          /^READONLY_HOST: .*mcproc\.yaml declares the local host readonly: worktree sync is refused; the worktree .* exists without its files \(git keeps a worktree whose post-checkout hook fails\)\nHint: Remove hosts\.local\.readonly from .*, then run mcproc worktree sync in /
+        );
+        expect(process.exitCode).toBe(1);
+        expect(state()).toEqual(before);
+      });
     });
 
     it('sync refuses the main checkout and another host', async () => {

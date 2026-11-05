@@ -160,7 +160,7 @@ describe('mcp server', () => {
       Object.keys(byName.worktree_sync.inputSchema.properties as object).sort()
     ).toEqual(['allow_missing', 'project']);
     expect(byName.worktree_sync.description).toBe(
-      "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. No slot, override or install: worktree_add makes stands."
+      "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. Refused when the local host is readonly. No slot, override or install: worktree_add makes stands."
     );
     // the hook only ever writes or deletes mcproc's own marked file: never another tool's
     expect(byName.worktree_hook.annotations).toMatchObject({
@@ -614,6 +614,68 @@ describe('mcp server', () => {
       });
       expect(self.isError).toBe(true);
       expect(text(self)).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_sync is refused on a readonly local host: nothing copied, linked or excluded', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpro-'));
+    const main = path.join(base, 'wtq');
+    const wt = path.join(base, 'side');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // a link as well: a sync that went ahead would write git's exclude file too
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtq',
+          'worktree: { copy: [cache], link: [notes] }',
+          'hosts:',
+          '  local: { readonly: true }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(main, '.gitignore'),
+        '.mcproc/\ncache/\nnotes/\n'
+      );
+      fs.mkdirSync(path.join(main, 'cache'));
+      fs.writeFileSync(path.join(main, 'cache', 'c.bin'), 'cache');
+      fs.mkdirSync(path.join(main, 'notes'));
+      fs.writeFileSync(path.join(main, 'notes', 'n.md'), 'note');
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      git(['worktree', 'add', '-q', '-b', 'side', wt]);
+      const exclude = path.join(main, '.git', 'info', 'exclude');
+      /** every path in the worktree below its top level, and git's exclude file of the repository */
+      const state = () => ({
+        files: fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort(),
+        exclude: fs.existsSync(exclude)
+          ? fs.readFileSync(exclude, 'utf8')
+          : null,
+      });
+      const before = state();
+      const cl = await client(neverSpawn, undefined, main);
+      const r: any = await cl.callTool({
+        name: 'worktree_sync',
+        arguments: { project: wt },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.structuredContent.error.code).toBe('READONLY_HOST');
+      expect(text(r)).toContain(
+        `declares the local host readonly: worktree sync is refused; nothing was copied into ${fs.realpathSync(wt)}`
+      );
+      expect(state()).toEqual(before);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

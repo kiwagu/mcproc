@@ -848,7 +848,7 @@ export function buildProgram(io: Io = defaultIo): Command {
   worktree
     .command('sync')
     .description(
-      "bring this worktree (the one --project or the cwd is in) the files a new one gets: its manifest's (else the main checkout's) copy, required and link entries plus the main checkout's override, copied from the main checkout; files already there are kept"
+      "bring this worktree (the one --project or the cwd is in) the files a new one gets: its manifest's (else the main checkout's) copy, required and link entries plus the main checkout's override, copied from the main checkout; files already there are kept; refused when the local host is readonly"
     )
     .option(
       '--allow-missing',

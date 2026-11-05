@@ -223,6 +223,33 @@ describe.skipIf(process.env.MCPROC_IT !== '1')(
       expect(Object.keys(reg?.slots ?? {})).toEqual(['0', '1']);
       expect(reg?.slots['1']).toMatchObject({ path: wz, branch: 'feat/z' });
 
+      // a readonly local host takes no files either: the hook fails git's add loudly, git keeps the bare worktree, and
+      // neither the worktree nor git's exclude file gets anything
+      fs.writeFileSync(local, 'local: true\n');
+      const manifestFile = path.join(main, '.mcproc', 'mcproc.yaml');
+      const writable = fs.readFileSync(manifestFile, 'utf8');
+      fs.writeFileSync(
+        manifestFile,
+        writable.replace('  local:\n', '  local:\n    readonly: true\n')
+      );
+      const exclude = path.join(main, '.git', 'info', 'exclude');
+      const excluded = fs.readFileSync(exclude, 'utf8');
+      const wt3 = path.join(base, 'wt3');
+      const ro = git(['worktree', 'add', '-q', '../wt3', '-b', 'd'], main);
+      expect(ro.status).not.toBe(0);
+      expect(ro.stderr).toContain(
+        `READONLY_HOST: ${manifestFile} declares the local host readonly: worktree sync is refused; the worktree ${wt3} exists without its files`
+      );
+      expect(ro.stderr).toContain(`run mcproc worktree sync in ${wt3}`);
+      // only what git checked out
+      expect(fs.readdirSync(wt3).sort()).toEqual([
+        '.git',
+        '.gitignore',
+        'web.js',
+      ]);
+      expect(fs.readFileSync(exclude, 'utf8')).toBe(excluded);
+      fs.writeFileSync(manifestFile, writable);
+
       // remove takes only mcproc's own hook away
       expect(mcproc(['worktree', 'hook', 'remove']).out).toMatchObject({
         changed: 'removed',

@@ -954,9 +954,10 @@ export async function checkoutOf(
  * Brings the worktree `dir` is in (see checkoutOf) the files a new worktree gets, copied from the main checkout: the
  * copy, required and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the
  * main checkout's override. A file or link already in its place is kept as it is, so a second sync changes nothing,
- * and a copy is published only whole, so a failed one leaves nothing a second sync would keep. A required entry
- * missing in the main checkout refuses the sync before anything is copied, unless `allowMissing`; `fromHook` says in
- * the refusal that the worktree exists without them (git keeps a worktree whatever its post-checkout hook answers).
+ * and a copy is published only whole, so a failed one leaves nothing a second sync would keep. A readonly local host in
+ * the deciding manifest refuses the sync before anything is written, and so does a required entry missing in the main
+ * checkout, unless `allowMissing`; `fromHook` says in either refusal that the worktree exists without its files (git
+ * keeps a worktree whatever its post-checkout hook answers).
  * No slot, override or install: those make a stand, and only worktree add makes one.
  */
 export async function worktreeSync(
@@ -1006,6 +1007,22 @@ export async function worktreeSync(
     };
   }
   dm ??= loadManifest(main);
+  // a readonly local host takes no writes, these copies and links included: refused before anything is written, the
+  // same way exec is (and from the hook as loudly as a required miss: git keeps the worktree, without its files)
+  if (dm.hosts.local?.readonly)
+    throw new McprocError(
+      'READONLY_HOST',
+      `${dm.path} declares the local host readonly: worktree sync is refused; ${
+        opts.fromHook
+          ? `the worktree ${top} exists without its files (git keeps a worktree whose post-checkout hook fails)`
+          : `nothing was copied into ${top}`
+      }`,
+      {
+        hint: opts.fromHook
+          ? `Remove hosts.local.readonly from ${dm.path}, then run mcproc worktree sync in ${top}; or copy the files by hand. While the host stays readonly a git worktree add here fails like this; to make worktrees without the files, delete mcproc's hook (git rev-parse --git-path hooks/post-checkout names it).`
+          : `Remove hosts.local.readonly from ${dm.path}, then run it again; or copy the files by hand.`,
+      }
+    );
   const extras = loadOverride(main)?.worktree ?? {
     copy: [],
     link: [],

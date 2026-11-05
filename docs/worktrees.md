@@ -98,12 +98,14 @@ mcproc worktree hook [install | remove | status]  # default: status
 worktree's own manifest when it has one that loads, else of the main checkout's, plus the main checkout's override,
 copied from the main checkout. The worktree is the git top level of `--project` or the current folder, never the folder
 a manifest search walks up to, so a worktree nested in the main checkout (`.claude/worktrees/x`) is found too. A
-required miss refuses before anything is copied, unless `--allow-missing`. What is already in its place is `kept`,
-never overwritten, so a second sync changes nothing; a copy is published whole or not at all, so a failed one leaves
-nothing a later sync would take for done. Links are made where absent and go into git's exclude file. No slot,
-override or install: those make a stand, and only `worktree add` makes one. In the main checkout it refuses
-(`BAD_ARGUMENT`): it copies from there. Worktrees made before the hook below get their files from a `worktree sync` in
-each.
+required miss refuses before anything is copied, unless `--allow-missing`. A `readonly` local host in the manifest that
+decides refuses it as well (`READONLY_HOST`, as `exec` is), before anything is written; from the hook below that fails
+the `git worktree add` loudly like a required miss, and `worktree hook remove` is refused on that host too, so remove
+the hook before marking the host readonly. What is already in its place is `kept`, never overwritten, so a second sync
+changes nothing; a copy is published whole or not at all, so a failed one leaves nothing a later sync would take for
+done. Links are made where absent and go into git's exclude file. No slot, override or install: those make a stand, and
+only `worktree add` makes one. In the main checkout it refuses (`BAD_ARGUMENT`): it copies from there. Worktrees made
+before the hook below get their files from a `worktree sync` in each.
 
 `worktree hook install` writes mcproc's `post-checkout` hook (mode 755) where git looks for it in the repository's own
 git directory (`git rev-parse --git-path hooks/post-checkout`, usually `.git/hooks/post-checkout`): never a tracked

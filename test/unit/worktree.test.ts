@@ -1262,6 +1262,67 @@ describe('worktree', () => {
         `copy: tool-local.yml is not in ${real}, skipped (required, allowed)`,
       ]);
     });
+
+    /** every path in the worktree below its top level */
+    const files = () =>
+      fs.readdirSync(wt, { recursive: true, encoding: 'utf8' }).sort();
+    const readonlyLocal = 'hosts:\n  local: { readonly: true }\n';
+
+    it('a readonly local host refuses the sync before anything is copied, linked or excluded', async () => {
+      const manifest = path.join(real, '.mcproc', 'mcproc.yaml');
+      fs.appendFileSync(manifest, readonlyLocal);
+      const inWt = files();
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e).toMatchObject({
+        code: 'READONLY_HOST',
+        message: `${manifest} declares the local host readonly: worktree sync is refused; nothing was copied into ${wtReal}`,
+        hint: `Remove hosts.local.readonly from ${manifest}, then run it again; or copy the files by hand.`,
+      });
+      // from the hook: git keeps the worktree whatever the hook answers, so the refusal says so and what finishes it
+      const h = await refusal(wt, { fromHook: true });
+      expect(h.code).toBe('READONLY_HOST');
+      expect(h.message).toBe(
+        `${manifest} declares the local host readonly: worktree sync is refused; the worktree ${wtReal} exists without its files (git keeps a worktree whose post-checkout hook fails)`
+      );
+      expect(h.hint).toContain(
+        `Remove hosts.local.readonly from ${manifest}, then run mcproc worktree sync in ${wtReal}`
+      );
+      // a required miss as well: the host refuses first, so putting the file in place would not be enough
+      fs.rmSync(path.join(main, 'tool-local.yml'));
+      expect((await refusal(wt)).code).toBe('READONLY_HOST');
+      expect(files()).toEqual(inWt);
+      expect(exclude()).toBe(excluded);
+      expect(logged).toEqual([]);
+    });
+
+    it("the deciding manifest's local host is the one asked: the worktree's own when it loads", async () => {
+      const mainManifest = path.join(real, '.mcproc', 'mcproc.yaml');
+      const own =
+        'version: 1\nproject: demo\nworktree: { copy: [cache], link: [notes] }\napps:\n  db: { description: db, run: node db.js }\n';
+      // the worktree's own manifest marks it readonly, the main checkout's does not
+      ownManifest(wt, own + readonlyLocal);
+      const inWt = files();
+      const excluded = exclude();
+      const e = await refusal(wt);
+      expect(e.code).toBe('READONLY_HOST');
+      expect(e.message).toContain(
+        `${path.join(wtReal, '.mcproc', 'mcproc.yaml')} declares the local host readonly`
+      );
+      expect(files()).toEqual(inWt);
+      expect(exclude()).toBe(excluded);
+      // the main checkout's marks it readonly, the worktree's own decides and does not
+      ownManifest(wt, own);
+      fs.appendFileSync(mainManifest, readonlyLocal);
+      expect(await sync(wt)).toMatchObject({
+        manifest: 'worktree',
+        copied: ['cache'],
+        linked: ['notes'],
+      });
+      // without a manifest of its own the main checkout's decides: readonly again
+      fs.rmSync(path.join(wt, '.mcproc'), { recursive: true });
+      expect((await refusal(wt)).code).toBe('READONLY_HOST');
+    });
   });
 
   it('isFreshCheckout: only a previous ref of all zeros', () => {

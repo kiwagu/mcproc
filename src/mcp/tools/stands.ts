@@ -252,7 +252,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Worktree sync',
       description:
-        "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. No slot, override or install: worktree_add makes stands.",
+        "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. Refused when the local host is readonly. No slot, override or install: worktree_add makes stands.",
       inputSchema: {
         project: commonInput.project,
         allow_missing: z
