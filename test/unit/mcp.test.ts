@@ -114,7 +114,25 @@ describe('mcp server', () => {
     });
     expect(
       Object.keys(byName.worktree_add.inputSchema.properties as object).sort()
-    ).toEqual(['branch', 'from', 'install', 'project', 'slot', 'slug']);
+    ).toEqual([
+      'allow_missing',
+      'branch',
+      'from',
+      'install',
+      'project',
+      'slot',
+      'slug',
+    ]);
+    expect(
+      (
+        byName.worktree_add.inputSchema.properties as Record<
+          string,
+          { description?: string }
+        >
+      ).allow_missing.description
+    ).toBe(
+      'Make the worktree even when a worktree.required entry is missing in the main checkout (default false)'
+    );
     expect(byName.worktree_add.description).toMatch(
       /<repo>\.worktrees\/<branch>/
     );
@@ -421,6 +439,67 @@ describe('mcp server', () => {
         expect(rm.isError).toBe(true);
         expect(rm.structuredContent.error.code).toBe(code);
       }
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_add refuses a missing required entry as an error with its code; allow_missing makes the worktree', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpreq-'));
+    const main = path.join(base, 'wtq');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtq',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'worktree: { install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      // the main checkout's override requires a machine-local file it does not have
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { required: [secret.env] }\n'
+      );
+      const cl = await client(neverSpawn, undefined, main);
+      const refused: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'q' },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.structuredContent.error).toMatchObject({
+        code: 'REQUIRED_MISSING',
+        details: {
+          missing: [
+            { entry: 'secret.env', source: "the main checkout's override" },
+          ],
+        },
+      });
+      expect(text(refused)).toContain('allow_missing');
+      const made: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'q', allow_missing: true },
+      });
+      expect(made.isError).toBeFalsy();
+      expect(made.structuredContent).toMatchObject({
+        slot: 1,
+        missing_required: ['secret.env'],
+      });
+      expect(text(made)).toContain('missing: secret.env (required, allowed)');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

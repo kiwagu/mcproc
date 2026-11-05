@@ -267,7 +267,13 @@ describe('cli', () => {
     expect(wt.commands.map((x) => x.name())).toEqual(['add', 'ls', 'remove']);
     const opts = (n: string) =>
       wt.commands.find((x) => x.name() === n)!.options.map((o) => o.long);
-    expect(opts('add')).toEqual(['--from', '--slot', '--slug', '--no-install']);
+    expect(opts('add')).toEqual([
+      '--from',
+      '--slot',
+      '--slug',
+      '--no-install',
+      '--allow-missing',
+    ]);
     expect(opts('remove')).toEqual(['--force']);
     expect(
       wt.commands
@@ -423,6 +429,60 @@ describe('cli', () => {
         expect(process.exitCode).toBe(1);
         process.exitCode = 0;
       }
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree add refuses a missing required entry with REQUIRED_MISSING and its hint; --allow-missing makes it', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-req-'));
+    const main = path.join(base, 'wtr');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      // an explicit pm2 binary: connecting runs no probe on this machine
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtr',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'worktree: { required: [tool-local.yml], install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const real = fs.realpathSync(main);
+      const add = async (...extra: string[]) => {
+        const c = capture();
+        await buildProgram(c.io).parseAsync(
+          ['worktree', 'add', 'r', '--project', main, ...extra],
+          { from: 'user' }
+        );
+        return c;
+      };
+      const refused = await add();
+      expect(refused.err.join('\n')).toMatch(
+        /^REQUIRED_MISSING: required entry missing in .*: tool-local\.yml \(the worktree's own manifest\); nothing was kept: the worktree, its new branch r and slot 1\nHint: Put them into /
+      );
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      expect(git(['branch', '--list', 'r']).trim()).toBe('');
+      const made = await add('--allow-missing', '--json');
+      expect(JSON.parse(made.out[0])).toMatchObject({
+        path: path.join(`${real}.worktrees`, 'r'),
+        missing: ['tool-local.yml'],
+        missing_required: ['tool-local.yml'],
+      });
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

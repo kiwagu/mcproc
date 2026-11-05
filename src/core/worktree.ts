@@ -32,19 +32,23 @@ import {
 import { stateDir } from './state.js';
 import { shq } from '../transport/quote.js';
 
-/** Runs git with these arguments in `cwd` and answers its exit code and output; it never throws. */
+/**
+ * Runs git with these arguments in `cwd` and answers its exit code and output; it never throws. `env` is laid over the
+ * process's environment for that run (git passes it on to its hooks).
+ */
 export type GitRunner = (
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: Record<string, string>
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 /** git as a child process, never through a shell. */
-export const gitRunner: GitRunner = (args, cwd) =>
+export const gitRunner: GitRunner = (args, cwd, env) =>
   new Promise((resolve) => {
     execFile(
       'git',
       args,
-      { cwd, maxBuffer: 8 * 1024 * 1024 },
+      { cwd, env: { ...process.env, ...env }, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) =>
         resolve({
           // execFile puts the exit status in err.code; a git that cannot be spawned has a string code there
@@ -58,9 +62,10 @@ export const gitRunner: GitRunner = (args, cwd) =>
 const gitOk = async (
   git: GitRunner,
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: Record<string, string>
 ): Promise<string> => {
-  const r = await git(args, cwd);
+  const r = await git(args, cwd, env);
   if (r.code !== 0)
     throw new McprocError(
       'TRANSPORT_FAILED',
@@ -164,6 +169,120 @@ export function planCopies(
   return { copies, links, missing, missingRequired };
 }
 
+/** Who required an entry: the manifest that decides the worktree's files, or the main checkout's override. */
+export type RequiredSource =
+  | "the worktree's own manifest"
+  | "the main checkout's manifest"
+  | "the main checkout's override";
+
+/**
+ * What a worktree at `target` gets: the deciding manifest's copy, required and link entries, then the main checkout's
+ * override extras beyond them (what both name counts as the manifest's). Each required miss carries who required it:
+ * the worktree's own manifest when `dm` is the one at `target`, else the main checkout's, or the override.
+ * `fromOverride` names, after the globs are expanded, the copies and links only the override added.
+ */
+export function worktreePlan(
+  main: string,
+  target: string,
+  dm: Manifest,
+  extras: CopyLists,
+  fsDeps: {
+    exists?: (p: string) => boolean;
+    glob?: (pattern: string, cwd: string) => string[];
+  } = {}
+): {
+  copies: { from: string; to: string }[];
+  links: { from: string; to: string }[];
+  missing: string[];
+  missingRequired: { entry: string; source: RequiredSource }[];
+  fromOverride: string[];
+} {
+  const only = (xs: string[], not: string[]) =>
+    [...new Set(xs)].filter((e) => !not.includes(e));
+  const ownPlan = planCopies(
+    main,
+    target,
+    {
+      copy: dm.worktree.copy,
+      required: dm.worktree.required,
+      link: dm.worktree.link,
+    },
+    fsDeps
+  );
+  const extraPlan = planCopies(
+    main,
+    target,
+    {
+      copy: only(extras.copy, dm.worktree.copy),
+      required: only(extras.required, dm.worktree.required),
+      link: only(extras.link, dm.worktree.link),
+    },
+    fsDeps
+  );
+  // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
+  const addedCopies = extraPlan.copies.filter(
+    (c) => !ownPlan.copies.some((o) => o.to === c.to)
+  );
+  const addedLinks = extraPlan.links.filter(
+    (l) => !ownPlan.links.some((o) => o.to === l.to)
+  );
+  const byManifest: RequiredSource =
+    realOf(dm.root) === realOf(target)
+      ? "the worktree's own manifest"
+      : "the main checkout's manifest";
+  return {
+    copies: [...ownPlan.copies, ...addedCopies],
+    links: [...ownPlan.links, ...addedLinks],
+    // an entry one side copies and the other requires is planned by both: it is still one miss
+    missing: [...new Set([...ownPlan.missing, ...extraPlan.missing])],
+    missingRequired: [
+      ...ownPlan.missingRequired.map((entry) => ({
+        entry,
+        source: byManifest,
+      })),
+      ...extraPlan.missingRequired.map((entry) => ({
+        entry,
+        source: "the main checkout's override" as const,
+      })),
+    ],
+    fromOverride: [
+      ...addedCopies.map((c) => path.relative(main, c.from)),
+      ...addedLinks.map((l) => path.relative(main, l.from)),
+    ],
+  };
+}
+
+/**
+ * The refusal of a worktree without its required entries: each entry as written (a mask, never a file it was meant to
+ * match) with who required it, where it was looked for, then `tail` (what became of the worktree).
+ */
+export function requiredMissing(
+  missing: { entry: string; source: RequiredSource }[],
+  where: string,
+  tail: string
+): McprocError {
+  return new McprocError(
+    'REQUIRED_MISSING',
+    `required ${missing.length === 1 ? 'entry' : 'entries'} missing in ${where}: ${missing.map((m) => `${m.entry} (${m.source})`).join(', ')}; ${tail}`,
+    {
+      hint: `Put them into ${where} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to make the worktree without them.`,
+      details: { missing },
+    }
+  );
+}
+
+/** Removes `dir` and the folders above it while they are empty, up to but never `top`: the folders a branch with slashes made (`feat/` of feat/x). */
+export function pruneEmptyParents(dir: string, top: string): void {
+  const t = realOf(top);
+  for (let d = dir; d.startsWith(`${t}${path.sep}`); d = path.dirname(d)) {
+    try {
+      fs.rmdirSync(d);
+    } catch {
+      break; // not empty
+    }
+  }
+}
+
 /** What the worktree commands reach outside their arguments: git, the state directory, the install, pm2; tests pass fakes. */
 export interface WorktreeDeps {
   git: GitRunner;
@@ -194,6 +313,8 @@ export interface WorktreeAdded {
   /** the links as root-anchored patterns written to git's exclude file of the repository */
   excluded: string[];
   missing: string[];
+  /** the missing entries a manifest or the override requires: the worktree was made without them only because allowMissing was given */
+  missing_required: string[];
   installed: string | null;
   vars: VarInfo[];
   next: string;
@@ -358,11 +479,66 @@ function realAhead(p: string): string {
 /** A path as a shell word: bare when it needs no quoting. */
 const shPath = (p: string): string => (/^[\w./@%+:-]+$/.test(p) ? p : shq(p));
 
+/** `a`, `a and b`, `a, b and c`. */
+const listOf = (xs: string[]): string =>
+  xs.length > 1
+    ? `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`
+    : xs.join('');
+
+/**
+ * Takes back what `worktree add` made before it found a required entry missing: the worktree with its override, the
+ * branch when this add made it, the folders a branch with slashes made, the slot. Answers the tail of the refusal:
+ * that nothing was kept, or what was and how to clear it. A worktree git does not remove keeps the branch it has checked
+ * out and the slot its override names, so nothing more is undone then.
+ */
+async function rollBackAdd(
+  a: {
+    main: string;
+    target: string;
+    top: string;
+    branch: string;
+    created: boolean;
+    slot: number;
+    giveBack: () => Promise<void>;
+  },
+  git: GitRunner
+): Promise<string> {
+  const newBranch = a.created ? [`its new branch ${a.branch}`] : [];
+  const rm = await git(
+    ['worktree', 'remove', '--force', '--', a.target],
+    a.main
+  );
+  if (rm.code !== 0)
+    return `the rollback failed (git worktree remove: ${rm.stderr.trim() || `exit ${rm.code}`}) and kept ${listOf([`the worktree ${a.target}`, ...newBranch, `slot ${a.slot}`])}: clear them with git worktree remove --force ${shPath(a.target)}${a.created ? ` && git branch -D ${shPath(a.branch)}` : ''} (the next worktree add takes the slot back once the folder is gone)`;
+  const kept: string[] = [];
+  const clear: string[] = [];
+  if (a.created) {
+    const br = await git(['branch', '-D', '--', a.branch], a.main);
+    if (br.code !== 0) {
+      kept.push(`its new branch ${a.branch} (git branch: ${br.stderr.trim()})`);
+      clear.push(`git branch -D ${shPath(a.branch)}`);
+    }
+  }
+  pruneEmptyParents(path.dirname(a.target), a.top);
+  try {
+    await a.giveBack();
+  } catch (e) {
+    kept.push(
+      `slot ${a.slot} in the registry (${(e as Error).message}; the next worktree add takes it back, its folder being gone)`
+    );
+  }
+  if (!kept.length)
+    return `nothing was kept: ${a.created ? `the worktree, its new branch ${a.branch} and slot ${a.slot}` : `the worktree and slot ${a.slot}`}`;
+  return `the worktree is removed, but the rollback kept ${listOf(kept)}${clear.length ? `: clear it with ${clear.join(' and ')}` : ''}`;
+}
+
 /**
  * A worktree of this repository on `branch` (made from `from`, default the main checkout's HEAD, when the branch is
  * new) in the sibling folder, with the declared copies and links, the override that gives it its slot and project
  * slug, the install, and its slot in the registry. The slot is claimed and the folder made under the host's lease
- * lock, so parallel runs never share a slot; when git then fails, the slot is given back.
+ * lock, so parallel runs never share a slot; when git then fails, the slot is given back. A required entry missing in
+ * the main checkout refuses the worktree before anything is copied, linked or installed, and takes back all this add
+ * made (the worktree, its new branch, its slot), unless `allowMissing`.
  */
 export async function worktreeAdd(
   m: Manifest,
@@ -372,6 +548,7 @@ export async function worktreeAdd(
     slot?: number;
     project?: string;
     install: boolean;
+    allowMissing?: boolean;
   },
   deps: WorktreeDeps
 ): Promise<WorktreeAdded> {
@@ -471,6 +648,13 @@ export async function worktreeAdd(
         main
       )
     ).code === 0;
+  /** gives the slot back under the lock, read afresh: only while it still names this checkout */
+  const giveBack = () =>
+    store.withLock(() => {
+      const r = readRegistry(file);
+      if (r?.slots[String(slot)]?.path === target)
+        writeRegistry(file, releaseSlot(r, slot));
+    });
   try {
     await gitOk(
       deps.git,
@@ -486,17 +670,15 @@ export async function worktreeAdd(
             target,
             opts.from ?? 'HEAD',
           ],
-      main
+      main,
+      // a post-checkout hook mcproc installed steps aside: this add copies the files itself, and a miss rolls back
+      { MCPROC_WORKTREE_ADD: '1' }
     );
   } catch (e) {
     try {
       fs.rmdirSync(target); // only while empty: whatever git left stays for a look
     } catch {}
-    await store.withLock(() => {
-      const r = readRegistry(file);
-      if (r?.slots[String(slot)]?.path === target)
-        writeRegistry(file, releaseSlot(r, slot));
-    });
+    await giveBack();
     throw e;
   }
   // the new worktree's own manifest says what it gets (a branch that introduces the slot scheme gets it from its first
@@ -521,48 +703,26 @@ export async function worktreeAdd(
     ? ownManifest(target, deps.log, 'the copies and the install')
     : null;
   const dm = own ?? m;
-  // the override's extras come after the manifest's entries; what both name counts as the manifest's
-  const only = (xs: string[], not: string[]) =>
-    [...new Set(xs)].filter((e) => !not.includes(e));
-  const ownPlan = planCopies(
-    main,
-    target,
-    {
-      copy: dm.worktree.copy,
-      required: dm.worktree.required,
-      link: dm.worktree.link,
-    },
-    deps
-  );
-  const extraPlan = planCopies(
-    main,
-    target,
-    {
-      copy: only(extras.copy, dm.worktree.copy),
-      required: only(extras.required, dm.worktree.required),
-      link: only(extras.link, dm.worktree.link),
-    },
-    deps
-  );
-  // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
-  const addedCopies = extraPlan.copies.filter(
-    (c) => !ownPlan.copies.some((o) => o.to === c.to)
-  );
-  const addedLinks = extraPlan.links.filter(
-    (l) => !ownPlan.links.some((o) => o.to === l.to)
-  );
-  const plan = {
-    copies: [...ownPlan.copies, ...addedCopies],
-    links: [...ownPlan.links, ...addedLinks],
-    // an entry one side copies and the other requires is planned by both: it is still one miss
-    missing: [...new Set([...ownPlan.missing, ...extraPlan.missing])],
-    missingRequired: [...ownPlan.missingRequired, ...extraPlan.missingRequired],
-  };
-  // provenance after the globs are expanded: the entries the override added, as the copied and linked lists name them
-  const fromOverride = [
-    ...addedCopies.map((c) => path.relative(main, c.from)),
-    ...addedLinks.map((l) => path.relative(main, l.from)),
-  ];
+  const plan = worktreePlan(main, target, dm, extras, deps);
+  // checked once the override is in and the manifest read with it (a templated entry sees this checkout's slug and
+  // slot), before anything is copied, linked or installed: a refusal takes the worktree back with its override
+  if (plan.missingRequired.length && !opts.allowMissing)
+    throw requiredMissing(
+      plan.missingRequired,
+      main,
+      await rollBackAdd(
+        {
+          main,
+          target,
+          top: worktreeDir(m, main),
+          branch: opts.branch,
+          created: !exists,
+          slot,
+          giveBack,
+        },
+        deps.git
+      )
+    );
   let step = '';
   try {
     for (const c of plan.copies) {
@@ -588,8 +748,11 @@ export async function worktreeAdd(
       }
     );
   }
+  const required = plan.missingRequired.map((r) => r.entry);
   for (const miss of plan.missing)
-    deps.log(`copy: ${miss} is not in ${main}, skipped`);
+    deps.log(
+      `copy: ${miss} is not in ${main}, skipped${required.includes(miss) ? ' (required, allowed)' : ''}`
+    );
   const excluded = await excludeLinks(
     target,
     plan.links.map((l) => path.relative(target, l.to)),
@@ -625,9 +788,10 @@ export async function worktreeAdd(
     manifest: own ? 'worktree' : 'main',
     copied: plan.copies.map((c) => path.relative(main, c.from)),
     linked: plan.links.map((l) => path.relative(main, l.from)),
-    from_override: fromOverride,
+    from_override: plan.fromOverride,
     excluded,
     missing: plan.missing,
+    missing_required: required,
     installed: install,
     vars,
     next,
@@ -772,18 +936,7 @@ export async function worktreeRemove(
     main
   );
   // the folders a branch with slashes made (`feat/` of feat/x) go when they are left empty
-  const top = realOf(worktreeDir(m, main));
-  for (
-    let d = path.dirname(e.path);
-    d.startsWith(`${top}${path.sep}`);
-    d = path.dirname(d)
-  ) {
-    try {
-      fs.rmdirSync(d);
-    } catch {
-      break; // not empty
-    }
-  }
+  pruneEmptyParents(path.dirname(e.path), worktreeDir(m, main));
   await free();
   forgetProject(e.project, e.path, deps.stateDir);
   return { path: e.path, slot: Number(k), branch: e.branch, stopped };

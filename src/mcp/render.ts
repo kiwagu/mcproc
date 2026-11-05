@@ -833,7 +833,10 @@ export function renderWorktreeAdded(r: WorktreeAdded): string {
     L.push(
       `ignored in git: ${r.excluded.join(', ')} (the repository's info/exclude)`
     );
-  if (r.missing.length) L.push(`missing: ${r.missing.join(', ')}`);
+  if (r.missing.length)
+    L.push(
+      `missing: ${r.missing.map((e) => (r.missing_required.includes(e) ? `${e} (required, allowed)` : e)).join(', ')}`
+    );
   L.push(`installed: ${r.installed ?? 'nothing'}`);
   const vars = r.vars.filter((v) => v.source !== 'built-in');
   if (vars.length) {

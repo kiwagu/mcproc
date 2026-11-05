@@ -117,7 +117,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Worktree add',
       description:
-        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files its own manifest's worktree: section (plus the main checkout's override) copies or links, its own slot (ports shifted by that manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. Then drive its stand with project: <its path> on every call.",
+        "Make an isolated checkout of this repository on a branch, in the sibling folder <repo>.worktrees/<branch>, with the files its own manifest's worktree: section (plus the main checkout's override) copies or links, its own slot (ports shifted by that manifest's vars), its slug (the project slug this checkout runs under, default <project>-w<slot>) and the install. A worktree.required entry missing in the main checkout refuses it (REQUIRED_MISSING) and nothing of it is kept, unless allow_missing. Then drive its stand with project: <its path> on every call.",
       inputSchema: {
         project: commonInput.project,
         branch: z
@@ -151,6 +151,12 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           .describe(
             "Run the install command in the new checkout (default true): the manifest's worktree.install, else by the lockfile"
           ),
+        allow_missing: z
+          .boolean()
+          .optional()
+          .describe(
+            'Make the worktree even when a worktree.required entry is missing in the main checkout (default false)'
+          ),
       },
       annotations: MUT(false, false),
     },
@@ -166,6 +172,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
             slot: args.slot,
             project: args.slug,
             install: args.install ?? true,
+            allowMissing: args.allow_missing ?? false,
           },
           wdeps
         );

@@ -779,6 +779,10 @@ export function buildProgram(io: Io = defaultIo): Command {
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     )
     .option('--no-install', 'skip the install command')
+    .option(
+      '--allow-missing',
+      'make the worktree even when a worktree.required entry is missing in the main checkout'
+    )
     .action(
       wrap(async (g, o, [branch]) => {
         const { manifest, deps } = await worktreeCtx(g);
@@ -790,6 +794,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             slot: o.slot === undefined ? undefined : Number(o.slot),
             project: o.slug === undefined ? undefined : String(o.slug),
             install: o.install !== false,
+            allowMissing: Boolean(o.allowMissing),
           },
           deps
         );
