@@ -283,6 +283,7 @@ describe('mcp server', () => {
     // a watcher reloads in place: after an edit the agent waits for that reload, not for a port
     expect(INSTRUCTIONS).toContain('reloaded');
     expect(INSTRUCTIONS).toContain('after an edit, wait until reloaded');
+    expect(INSTRUCTIONS).toContain('worktree_hook install');
     expect(INSTRUCTIONS.length).toBeLessThan(2000);
     expect(cl.getInstructions()).toBe(INSTRUCTIONS);
   });
