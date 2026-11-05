@@ -112,9 +112,11 @@ git directory (`git rev-parse --git-path hooks/post-checkout`, usually `.git/hoo
 file, and shared by the main checkout and every worktree, so one install covers them all. From then on every worktree
 made through git runs `mcproc worktree sync --hook` in it and gets its copies and links. A required miss there fails
 that `git worktree add` loudly with the missing entries and `mcproc worktree sync` as the way to finish; git keeps the
-worktree whatever the hook answers. Any checkout that is not a fresh worktree (a `git switch`, a `git checkout`) costs
-one shell test and starts no node, and the hook stays silent for mcproc's own `worktree add`, which sets
-`MCPROC_WORKTREE_ADD=1`, copies by itself and rolls back on a miss.
+worktree whatever the hook answers. An ordinary `git switch` or `git checkout` (a previous ref that is not all zeros)
+runs only the hook's shell tests and starts no node. The main checkout's first checkout of an unborn HEAD passes a null
+(all-zero) previous ref as well, so it starts node, and mcproc exits there silently: nothing is copied into the main
+checkout. mcproc's own `worktree add` sets `MCPROC_WORKTREE_ADD=1`, so its checkout ends the hook in the shell; the add
+copies by itself and rolls back on a miss.
 
 The hook runs this node and this mcproc by their absolute paths, since hook runners may strip `PATH`; without them it
 runs a `mcproc` in `PATH`, and without that it fails saying so. `install` again refreshes the paths (after a Node
