@@ -48,7 +48,7 @@ const neverHere: HereCheck = async (u) => {
 const text = (r: any) => r.content.map((c: any) => c.text).join('\n');
 
 describe('mcp server', () => {
-  it('registers the 23 tools with annotations and short instructions', async () => {
+  it('registers the 24 tools with annotations and short instructions', async () => {
     const cl = await client();
     const tools = await cl.listTools();
     const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -73,6 +73,7 @@ describe('mcp server', () => {
       'unpack',
       'wait',
       'worktree_add',
+      'worktree_hook',
       'worktree_ls',
       'worktree_remove',
       'worktree_sync',
@@ -160,6 +161,27 @@ describe('mcp server', () => {
     ).toEqual(['allow_missing', 'project']);
     expect(byName.worktree_sync.description).toBe(
       "Bring an existing worktree of this repository the files a new one gets: the worktree: section's copy, required and link entries of its own manifest (else the main checkout's), plus the main checkout's override, copied from the main checkout. Files already there are kept. A missing required entry is refused unless allow_missing. No slot, override or install: worktree_add makes stands."
+    );
+    // the hook only ever writes or deletes mcproc's own marked file: never another tool's
+    expect(byName.worktree_hook.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(
+      Object.keys(byName.worktree_hook.inputSchema.properties as object)
+    ).toEqual(['action', 'project']);
+    expect(
+      (
+        byName.worktree_hook.inputSchema.properties as Record<
+          string,
+          { enum?: string[] }
+        >
+      ).action.enum
+    ).toEqual(['install', 'remove', 'status']);
+    expect(byName.worktree_hook.description).toBe(
+      "Install, remove or show mcproc's git post-checkout hook for this repository: once installed, every worktree made by any tool through git (Claude Code, Codex, a plain git worktree add) gets the worktree: files, and a missing required entry makes that git worktree add fail loudly. It lives in the repository's own git directory, never in a tracked file; another tool's post-checkout is never overwritten."
     );
     expect(byName.lease_cancel.annotations).toMatchObject({
       readOnlyHint: false,
@@ -592,6 +614,87 @@ describe('mcp server', () => {
       expect(self.isError).toBe(true);
       expect(text(self)).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
     } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+  it('worktree_hook shows, installs and removes the hook; install and remove are refused on a readonly local host', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcphook-'));
+    const main = path.join(base, 'wtk');
+    const manifest = (local: string) =>
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wtk',
+          'hosts:',
+          `  local: ${local}`,
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      manifest('{ pm2: /bin/false }');
+      execFileSync('git', ['init', '-q', '-b', 'main'], {
+        cwd: main,
+        stdio: 'pipe',
+      });
+      const hook = path.join(
+        fs.realpathSync(main),
+        '.git',
+        'hooks',
+        'post-checkout'
+      );
+      const cli = path.join(base, 'pkg', 'dist', 'cli.js');
+      fs.mkdirSync(path.dirname(cli), { recursive: true });
+      fs.writeFileSync(cli, '');
+      vi.stubEnv('MCPROC_CLI_ENTRY', cli);
+      const cl = await client(neverSpawn, undefined, main);
+      const st: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: {},
+      });
+      expect(st.isError).toBeFalsy();
+      expect(st.structuredContent).toMatchObject({
+        path: hook,
+        state: 'absent',
+      });
+      const inst: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: { action: 'install' },
+      });
+      expect(inst.isError).toBeFalsy();
+      expect(inst.structuredContent).toMatchObject({
+        state: 'installed',
+        changed: 'written',
+        node: process.execPath,
+        cli,
+      });
+      expect(text(inst).split('\n')[0]).toBe(`installed ${hook}`);
+      expect(fs.statSync(hook).mode & 0o777).toBe(0o755);
+      manifest('{ pm2: /bin/false, readonly: true }');
+      for (const action of ['install', 'remove']) {
+        const r: any = await cl.callTool({
+          name: 'worktree_hook',
+          arguments: { action },
+        });
+        expect(r.isError, action).toBe(true);
+        expect(r.structuredContent.error.code).toBe('READONLY_HOST');
+      }
+      expect(fs.existsSync(hook)).toBe(true);
+      manifest('{ pm2: /bin/false }');
+      const rm: any = await cl.callTool({
+        name: 'worktree_hook',
+        arguments: { action: 'remove' },
+      });
+      expect(rm.structuredContent).toMatchObject({
+        state: 'absent',
+        changed: 'removed',
+      });
+      expect(fs.existsSync(hook)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
       fs.rmSync(base, { recursive: true, force: true });
     }
   });

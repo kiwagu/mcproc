@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { Command, Option } from 'commander';
+import { Argument, Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
@@ -32,6 +32,11 @@ import {
   worktreeRemove,
   worktreeSync,
 } from '../core/worktree.js';
+import {
+  HOOK_ACTIONS,
+  worktreeHook,
+  type HookAction,
+} from '../core/worktree-hook.js';
 import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
@@ -75,6 +80,7 @@ import {
   renderWorktreeRemoved,
   renderWorktreeSynced,
   renderWorktrees,
+  renderHook,
   renderStacks,
   hostsOf,
   sinceNotes,
@@ -750,7 +756,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       })
     );
   // git runs here: the worktree commands act on the local checkout; their notes go to stderr, the answer to stdout
-  const worktreeCtx = async (g: Globals) => {
+  const worktreePrep = (g: Globals) => {
     const prep = prepare({ project: g.project, host: g.host });
     if (!prep.host.local)
       throw new McprocError(
@@ -758,7 +764,10 @@ export function buildProgram(io: Io = defaultIo): Command {
         `worktree runs on the local host only, not on ${prep.host.name}`,
         { hint: 'Drop --host; the checkout is on this machine.' }
       );
-    const ctx = await connect(prep);
+    return prep;
+  };
+  const worktreeCtx = async (g: Globals) => {
+    const ctx = await connect(worktreePrep(g));
     return {
       manifest: ctx.manifest,
       deps: await defaultWorktreeDeps(ctx, { out: io.err }),
@@ -887,6 +896,29 @@ export function buildProgram(io: Io = defaultIo): Command {
           { git: gitRunner, log: (line) => io.err(line) }
         );
         emit(g, renderWorktreeSynced(r), r);
+      })
+    );
+  worktree
+    .command('hook')
+    .description(
+      "mcproc's git post-checkout hook of this repository (in its own git directory, shared by every worktree): once installed, a worktree any tool makes through git gets the worktree: files, and a missing required entry fails that git worktree add; another tool's hook is never overwritten"
+    )
+    .addArgument(
+      new Argument('[action]', 'install, remove or status')
+        .choices(HOOK_ACTIONS)
+        .default('status')
+    )
+    .action(
+      wrap(async (g, _o, [action]) => {
+        // no pm2 here: the hook is a file in the repository's git directory
+        const prep = worktreePrep(g);
+        const r = await worktreeHook(
+          action as HookAction,
+          prep.manifest.root,
+          prep.host,
+          gitRunner
+        );
+        emit(g, renderHook(r), r);
       })
     );
   program

@@ -23,7 +23,7 @@ describe('mcproc mcp over stdio (built dist)', () => {
     const client = new Client({ name: 'smoke', version: '0' });
     await client.connect(transport);
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(23);
+    expect(tools.tools).toHaveLength(24);
     expect(tools.tools.map((t) => t.name)).toEqual(
       expect.arrayContaining([
         'incidents',
@@ -34,6 +34,7 @@ describe('mcproc mcp over stdio (built dist)', () => {
         'worktree_ls',
         'worktree_remove',
         'worktree_sync',
+        'worktree_hook',
         'stacks',
       ])
     );

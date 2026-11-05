@@ -563,7 +563,7 @@ async function worktreeList(
 }
 
 /** The real path of `p` as far as it exists, the rest joined as given: a folder about to be made gets its real path. */
-function realAhead(p: string): string {
+export function realAhead(p: string): string {
   const rest: string[] = [];
   let d = path.resolve(p);
   while (!present(d) && path.dirname(d) !== d) {

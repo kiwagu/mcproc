@@ -14,8 +14,10 @@ import {
   worktreeSync,
   type WorktreeDeps,
 } from '../../core/worktree.js';
+import { HOOK_ACTIONS, worktreeHook } from '../../core/worktree-hook.js';
 import {
   renderExec,
+  renderHook,
   renderWorktreeAdded,
   renderWorktreeRemoved,
   renderWorktreeSynced,
@@ -282,6 +284,41 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           text: withNotes(renderWorktreeSynced(r), notes),
           data: { ...r, notes },
         };
+      })
+  );
+
+  server.registerTool(
+    'worktree_hook',
+    {
+      title: 'Worktree hook',
+      description:
+        "Install, remove or show mcproc's git post-checkout hook for this repository: once installed, every worktree made by any tool through git (Claude Code, Codex, a plain git worktree add) gets the worktree: files, and a missing required entry makes that git worktree add fail loudly. It lives in the repository's own git directory, never in a tracked file; another tool's post-checkout is never overwritten.",
+      inputSchema: {
+        action: z
+          .enum(HOOK_ACTIONS)
+          .optional()
+          .describe(
+            'install, remove or status (default status); install and remove are refused when the local host is readonly'
+          ),
+        project: commonInput.project,
+      },
+      // it only ever writes or deletes mcproc's own marked file, never another tool's: a second call changes nothing more
+      annotations: MUT(false, true),
+    },
+    (args) =>
+      runTool(async () => {
+        // no pm2 here: the hook is a file in the repository's git directory
+        const prep = prepare({
+          project: args.project ?? deps.project,
+          roots: await deps.roots(),
+        });
+        const r = await worktreeHook(
+          args.action ?? 'status',
+          prep.manifest.root,
+          prep.host,
+          gitRunner
+        );
+        return { text: renderHook(r), data: { ...r } };
       })
   );
 }
