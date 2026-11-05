@@ -92,12 +92,45 @@ const present = (p: string): boolean => {
 };
 
 /**
- * Copies `from` to `to` whole or not at all: into a temporary sibling first (a dot name no run shares), renamed into
- * place once complete, so a copy that fails halfway (an unreadable file in a folder) leaves nothing a later run would
- * take for done; the temporary goes again, and the error is thrown on. Whatever is at `to` already is never touched:
- * answers false then, true when it copied.
+ * Puts the staged `tmp` at `to` without ever replacing what is there: a file is hard-linked into place (the link fails
+ * when `to` exists) and a symlink made there anew (link(2) may follow a symlink, so a hard link could name the file it
+ * points at), the temporary then removed; a folder is renamed into place, which fails over a file or over a folder
+ * with anything in it. Answers false, the temporary left to the caller, when something is at `to`. The one thing a
+ * rename may still replace is an EMPTY folder appearing in that moment: nothing in it is lost.
  */
-function copyWhole(from: string, to: string): boolean {
+function publish(tmp: string, to: string): boolean {
+  const staged = fs.lstatSync(tmp);
+  const folder = staged.isDirectory();
+  try {
+    if (folder) fs.renameSync(tmp, to);
+    else if (staged.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(tmp), to);
+    else fs.linkSync(tmp, to);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (
+      code === 'EEXIST' ||
+      (folder && (code === 'ENOTEMPTY' || code === 'ENOTDIR'))
+    )
+      return false;
+    throw e;
+  }
+  if (!folder) fs.rmSync(tmp, { force: true });
+  return true;
+}
+
+/**
+ * Copies `from` to `to` whole or not at all: into a temporary sibling first (a dot name no run shares), published once
+ * complete, so a copy that fails halfway (an unreadable file in a folder) leaves nothing a later run would take for
+ * done; the temporary goes again, and the error is thrown on. Whatever is at `to` is never touched, whether it was
+ * there before or another writer (or sync) put it there while the copy ran, since publication never replaces (see
+ * publish): answers false then, the temporary removed, true when it copied. `beforePublish` (tests only) runs once the
+ * copy is staged, just before it is published.
+ */
+function copyWhole(
+  from: string,
+  to: string,
+  beforePublish?: (to: string) => void
+): boolean {
   if (present(to)) return false;
   const dir = path.dirname(to);
   fs.mkdirSync(dir, { recursive: true });
@@ -114,13 +147,10 @@ function copyWhole(from: string, to: string): boolean {
       force: false,
       errorOnExist: false,
     });
-    // something put there while the copy ran is left as it is
-    if (present(to)) {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      return false;
-    }
-    fs.renameSync(tmp, to);
-    return true;
+    beforePublish?.(to);
+    if (publish(tmp, to)) return true;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return false;
   } catch (e) {
     try {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -357,6 +387,8 @@ export interface WorktreeDeps {
   stopAll(root: string, opts: { force: boolean }): Promise<string[]>;
   exists?(p: string): boolean;
   glob?(pattern: string, cwd: string): string[];
+  /** tests only: runs once a copy is staged complete, just before it is published at `to` */
+  beforePublish?(to: string): void;
 }
 /** What `worktree add` made: the checkout, its branch, slot and project slug, what it copied, linked and installed, its vars and how to go on. */
 export interface WorktreeAdded {
@@ -804,7 +836,7 @@ export async function worktreeAdd(
     for (const c of plan.copies) {
       step = `copying ${c.from}`;
       // a place the branch's tree takes already gets, as ever, what it lacks; an absent one is published only whole
-      if (!copyWhole(c.from, c.to))
+      if (!copyWhole(c.from, c.to, deps.beforePublish))
         fs.cpSync(c.from, c.to, {
           recursive: true,
           force: false,
@@ -929,7 +961,7 @@ export async function checkoutOf(
  */
 export async function worktreeSync(
   opts: { dir: string; allowMissing: boolean; fromHook: boolean },
-  deps: Pick<WorktreeDeps, 'git' | 'log' | 'exists' | 'glob'>
+  deps: Pick<WorktreeDeps, 'git' | 'log' | 'exists' | 'glob' | 'beforePublish'>
 ): Promise<WorktreeSynced> {
   const { top, main } = await checkoutOf(opts.dir, deps.git);
   if (top === main)
@@ -997,7 +1029,7 @@ export async function worktreeSync(
     for (const c of plan.copies) {
       step = `copying ${c.from}`;
       // only a whole copy is published: a failed one leaves nothing a second sync would keep as done
-      (copyWhole(c.from, c.to) ? copied : kept).push(
+      (copyWhole(c.from, c.to, deps.beforePublish) ? copied : kept).push(
         path.relative(main, c.from)
       );
     }

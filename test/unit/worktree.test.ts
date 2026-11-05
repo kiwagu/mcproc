@@ -874,12 +874,16 @@ describe('worktree', () => {
     let logged: string[];
     const sync = (
       dir: string,
-      o: { allowMissing?: boolean; fromHook?: boolean } = {}
+      o: { allowMissing?: boolean; fromHook?: boolean } = {},
+      beforePublish?: (to: string) => void
     ) =>
       worktreeSync(
         { dir, allowMissing: false, fromHook: false, ...o },
-        { git: isolatedGit, log: (l) => logged.push(l) }
+        { git: isolatedGit, log: (l) => logged.push(l), beforePublish }
       );
+    /** the entries of the worktree's top level a copy staged under a temporary name */
+    const staged = () =>
+      fs.readdirSync(wt).filter((n) => n.includes('mcproc-'));
     const refusal = (dir: string, o: { fromHook?: boolean } = {}) =>
       sync(dir, o).then(
         () => {
@@ -1047,6 +1051,110 @@ describe('worktree', () => {
         expect(git(['status', '--porcelain'], wt).trim()).toBe('');
       }
     );
+
+    it('with nothing in the way a staged copy is published whole, and its temporary goes', async () => {
+      const seen: { to: string; there: boolean; staged: string[] }[] = [];
+      const r = await sync(wt, {}, (to) =>
+        seen.push({ to, there: fs.existsSync(to), staged: staged() })
+      );
+      expect(seen).toEqual([
+        {
+          to: path.join(wtReal, 'cache'),
+          there: false,
+          staged: [expect.stringMatching(/^\.cache\.mcproc-/)],
+        },
+        {
+          to: path.join(wtReal, 'tool-local.yml'),
+          there: false,
+          staged: [expect.stringMatching(/^\.tool-local\.yml\.mcproc-/)],
+        },
+      ]);
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml'],
+        kept: [],
+        linked: ['notes'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache', 'c.bin'), 'utf8')).toBe(
+        'cache'
+      );
+      const file = fs.lstatSync(path.join(wt, 'tool-local.yml'));
+      // a plain file of its own: the temporary it was linked from is gone
+      expect([file.isFile(), file.nlink]).toEqual([true, 1]);
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'k: v\n'
+      );
+      expect(staged()).toEqual([]);
+    });
+
+    it('a target another writer puts in place while its copy is staged is kept as it is', async () => {
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'cache') {
+          fs.mkdirSync(to);
+          fs.writeFileSync(path.join(to, 'theirs.bin'), 'theirs');
+        } else fs.writeFileSync(to, 'theirs\n');
+      });
+      expect(r).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml'],
+        linked: ['notes'],
+      });
+      expect(fs.readdirSync(path.join(wt, 'cache'))).toEqual(['theirs.bin']);
+      expect(
+        fs.readFileSync(path.join(wt, 'cache', 'theirs.bin'), 'utf8')
+      ).toBe('theirs');
+      expect(fs.readFileSync(path.join(wt, 'tool-local.yml'), 'utf8')).toBe(
+        'theirs\n'
+      );
+      expect(staged()).toEqual([]);
+    });
+
+    it('a target of the other kind put in place then is kept too: a file for a folder, a folder for a file', async () => {
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'cache') fs.writeFileSync(to, 'theirs');
+        else {
+          fs.mkdirSync(to);
+          fs.writeFileSync(path.join(to, 'x'), 'x');
+        }
+      });
+      expect(r).toMatchObject({
+        copied: [],
+        kept: ['cache', 'tool-local.yml'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'cache'), 'utf8')).toBe('theirs');
+      expect(fs.readdirSync(path.join(wt, 'tool-local.yml'))).toEqual(['x']);
+      expect(staged()).toEqual([]);
+    });
+
+    it('a symlink entry is published as a symlink, and never over a target put in place then', async () => {
+      fs.symlinkSync('tool-local.yml', path.join(main, 'shared.yml'));
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.local.yaml'),
+        'worktree: { copy: [shared.yml] }\n'
+      );
+      const r = await sync(wt, {}, (to) => {
+        if (path.basename(to) === 'shared.yml')
+          fs.writeFileSync(to, 'theirs\n');
+      });
+      expect(r).toMatchObject({
+        copied: ['cache', 'tool-local.yml'],
+        kept: ['shared.yml'],
+      });
+      expect(fs.readFileSync(path.join(wt, 'shared.yml'), 'utf8')).toBe(
+        'theirs\n'
+      );
+      expect(staged()).toEqual([]);
+      fs.rmSync(path.join(wt, 'shared.yml'));
+      const again = await sync(wt);
+      expect(again).toMatchObject({ copied: ['shared.yml'] });
+      // the link itself, not a second name of the file it points at
+      expect(fs.lstatSync(path.join(wt, 'shared.yml')).isSymbolicLink()).toBe(
+        true
+      );
+      expect(fs.readlinkSync(path.join(wt, 'shared.yml'))).toBe(
+        path.join(real, 'tool-local.yml')
+      );
+      expect(staged()).toEqual([]);
+    });
 
     it('no manifest in either checkout: nothing to copy, said once', async () => {
       fs.rmSync(path.join(main, '.mcproc', 'mcproc.yaml'));
