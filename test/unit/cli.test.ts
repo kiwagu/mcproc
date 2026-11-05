@@ -544,13 +544,37 @@ describe('cli', () => {
     });
 
     it('sync --hook does nothing on an ordinary checkout, nor inside mcproc worktree add', async () => {
-      const plain = await sync('--hook', 'a'.repeat(40), '--project', wt);
-      expect([plain.out, plain.err]).toEqual([[], []]);
-      expect(process.exitCode ?? 0).toBe(0);
+      // nothing to do is nothing said, whatever else the command line carries: --host included
+      for (const host of [[], ['--host', 'stand']]) {
+        const plain = await sync(
+          '--hook',
+          'a'.repeat(40),
+          '--project',
+          wt,
+          ...host
+        );
+        expect([plain.out, plain.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
       vi.stubEnv('MCPROC_WORKTREE_ADD', '1');
-      const inAdd = await sync('--hook', fresh, '--project', wt);
-      expect([inAdd.out, inAdd.err]).toEqual([[], []]);
-      expect(process.exitCode ?? 0).toBe(0);
+      for (const host of [[], ['--host', 'stand']]) {
+        const inAdd = await sync('--hook', fresh, '--project', wt, ...host);
+        expect([inAdd.out, inAdd.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
+      expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
+    });
+
+    it('sync --hook in the main checkout (the first checkout of an unborn HEAD) does nothing; without --hook it is refused', async () => {
+      for (const host of [[], ['--host', 'stand']]) {
+        const c = await sync('--hook', fresh, '--project', main, ...host);
+        expect([c.out, c.err], host.join(' ')).toEqual([[], []]);
+        expect(process.exitCode ?? 0).toBe(0);
+      }
+      const manual = await sync('--project', main);
+      expect(manual.out).toEqual([]);
+      expect(manual.err[0]).toMatch(/^BAD_ARGUMENT: .* is the main checkout/);
+      expect(process.exitCode).toBe(1);
       expect(fs.existsSync(path.join(wt, 'cache'))).toBe(false);
     });
 
@@ -612,6 +636,11 @@ describe('cli', () => {
       for (const [argv, re] of [
         [['--project', main], /^BAD_ARGUMENT: .* is the main checkout/],
         [['--project', wt, '--host', 'stand'], /^BAD_ARGUMENT: .*--host/],
+        // a hook that has a worktree to sync refuses another host too
+        [
+          ['--hook', fresh, '--project', wt, '--host', 'stand'],
+          /^BAD_ARGUMENT: .*--host/,
+        ],
       ] as const) {
         const c = await sync(...argv);
         expect(c.err[0], argv.join(' ')).toMatch(re);

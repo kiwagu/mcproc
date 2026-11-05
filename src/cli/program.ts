@@ -23,6 +23,7 @@ import {
 import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
 import {
+  checkoutOf,
   defaultWorktreeDeps,
   gitRunner,
   isFreshCheckout,
@@ -851,15 +852,12 @@ export function buildProgram(io: Io = defaultIo): Command {
     .action(
       wrap(async (g, o) => {
         // no prepare(): the target is the git top level, which a manifest search from a nested worktree would miss
-        if (g.host)
-          throw new McprocError(
-            'BAD_ARGUMENT',
-            'worktree sync copies files on this machine; --host does not apply',
-            { hint: 'Drop --host; the checkout is on this machine.' }
-          );
         const hook = o.hook === undefined ? null : String(o.hook);
+        // the explicit flag or the folder it runs in: MCPROC_PROJECT and CLAUDE_PROJECT_DIR may name the main checkout
+        const dir = g.project ?? process.cwd();
         if (hook !== null) {
-          // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said
+          // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said,
+          // whatever else the command line carries
           if (!isFreshCheckout(hook) || process.env.MCPROC_WORKTREE_ADD) return;
           // git's variables for the repository that ran the hook would steer every git call here; this process is
           // short-lived, so they go from its environment and git finds the worktree from the folder it runs in
@@ -870,11 +868,19 @@ export function buildProgram(io: Io = defaultIo): Command {
             'GIT_PREFIX',
           ])
             delete process.env[k];
+          // the main checkout's first checkout of an unborn HEAD comes from nothing too: there is nothing to copy it
+          const { top, main } = await checkoutOf(dir, gitRunner);
+          if (top === main) return;
         }
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'worktree sync copies files on this machine; --host does not apply',
+            { hint: 'Drop --host; the checkout is on this machine.' }
+          );
         const r = await worktreeSync(
           {
-            // the explicit flag or the folder it runs in: MCPROC_PROJECT and CLAUDE_PROJECT_DIR may name the main checkout
-            dir: g.project ?? process.cwd(),
+            dir,
             allowMissing: Boolean(o.allowMissing),
             fromHook: hook !== null,
           },

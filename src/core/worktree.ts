@@ -901,11 +901,28 @@ export const isFreshCheckout = (prevRef: string): boolean =>
   /^0+$/.test(prevRef);
 
 /**
- * Brings the worktree `dir` is in (its git top level, never the root a manifest search finds: a worktree nested in the
- * main checkout would find the main's) the files a new worktree gets, copied from the main checkout: the copy, required
- * and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the main checkout's
- * override. A file or link already in its place is kept as it is, so a second sync changes nothing, and a copy is
- * published only whole, so a failed one leaves nothing a second sync would keep. A required entry
+ * The checkout `dir` is in, as git's top level (real path; never the root a manifest search finds: a worktree nested in
+ * the main checkout would find the main's), and the main checkout of its repository.
+ */
+export async function checkoutOf(
+  dir: string,
+  git: GitRunner
+): Promise<{ top: string; main: string }> {
+  const d = path.resolve(dir);
+  // git cannot even start in a folder that is not there: its error would read as if git were missing
+  if (!fs.existsSync(d))
+    throw new McprocError('BAD_ARGUMENT', `${d} does not exist`);
+  const top = realOf(
+    (await gitOk(git, ['rev-parse', '--show-toplevel'], d)).trim()
+  );
+  return { top, main: await mainCheckout(top, git) };
+}
+
+/**
+ * Brings the worktree `dir` is in (see checkoutOf) the files a new worktree gets, copied from the main checkout: the
+ * copy, required and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the
+ * main checkout's override. A file or link already in its place is kept as it is, so a second sync changes nothing,
+ * and a copy is published only whole, so a failed one leaves nothing a second sync would keep. A required entry
  * missing in the main checkout refuses the sync before anything is copied, unless `allowMissing`; `fromHook` says in
  * the refusal that the worktree exists without them (git keeps a worktree whatever its post-checkout hook answers).
  * No slot, override or install: those make a stand, and only worktree add makes one.
@@ -914,14 +931,7 @@ export async function worktreeSync(
   opts: { dir: string; allowMissing: boolean; fromHook: boolean },
   deps: Pick<WorktreeDeps, 'git' | 'log' | 'exists' | 'glob'>
 ): Promise<WorktreeSynced> {
-  const dir = path.resolve(opts.dir);
-  // git cannot even start in a folder that is not there: its error would read as if git were missing
-  if (!fs.existsSync(dir))
-    throw new McprocError('BAD_ARGUMENT', `${dir} does not exist`);
-  const top = realOf(
-    (await gitOk(deps.git, ['rev-parse', '--show-toplevel'], dir)).trim()
-  );
-  const main = await mainCheckout(top, deps.git);
+  const { top, main } = await checkoutOf(opts.dir, deps.git);
   if (top === main)
     throw new McprocError(
       'BAD_ARGUMENT',
