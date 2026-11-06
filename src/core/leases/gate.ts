@@ -14,6 +14,7 @@ import {
   type AppMeasure,
 } from './admission.js';
 import { ensureWatcher } from './ensure.js';
+import { aheadOf } from './queue.js';
 import { listCheckout, measureSiblings, registryOf } from './siblings.js';
 import {
   LeaseStore,
@@ -156,9 +157,8 @@ export async function gateStart(
           created: false,
         };
       const all = deps.store.list();
-      const ahead = all.filter(
-        (l) => l.state === 'pending' || l.state === 'starting'
-      ).length;
+      // a lease waiting for its group, or for its group alone, is not ahead of a start
+      const ahead = aheadOf(all);
       // a start admitted seconds ago is not in the reading yet: two starts on one reading must not both fit
       const ramping_mib = rampingMib(
         all,

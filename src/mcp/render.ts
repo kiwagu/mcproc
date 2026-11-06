@@ -21,7 +21,7 @@ import type {
 } from '../core/worktree.js';
 import type { HookResult } from '../core/worktree-hook.js';
 import type { Orphan, Stack, StacksAnswer } from '../core/stacks/types.js';
-import { fmtMib } from '../core/sizes.js';
+import { fmtMib, fmtUptime } from '../core/sizes.js';
 import {
   type HostEnv,
   reasonWord,
@@ -32,16 +32,7 @@ import { bodyOf, type Incident } from '../core/incidents/detect.js';
 import { shq } from '../transport/quote.js';
 import { cutStartWidth, cutWidth, displayWidth } from '../monit/screentext.js';
 
-export function fmtUptime(ms: number | null): string {
-  if (ms === null) return '-';
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 48) return `${h}h${m % 60}m`;
-  return `${Math.floor(h / 24)}d`;
-}
+export { fmtUptime };
 export function fmtBytes(b: number): string {
   if (b < 1024) return `${b}B`;
   if (b < 1024 ** 2) return `${(b / 1024).toFixed(0)}K`;

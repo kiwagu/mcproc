@@ -228,6 +228,39 @@ describe('gateStart', () => {
     });
   });
 
+  it('a lease waiting for its group is not ahead of a start', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const exec = (): NewLease => ({
+      kind: 'exec',
+      project: 'other',
+      root: '/o',
+      slot: null,
+      repo: '/o',
+      target: 'bun test',
+      host: null,
+      apps: [],
+      reload: false,
+      estimate_mib: 100,
+      need_mib: 100,
+      margin: 0,
+      reserve_mib: 0,
+      sources: {},
+      note: null,
+      requester_pid: 1,
+      exclusive: 'suite',
+    });
+    await store.create(exec(), 'running');
+    await store.create(exec(), 'pending');
+    const r = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      deps({ total_mib: 8000, available_mib: 7000 })
+    );
+    expect(r.kind).toBe('proceed');
+    expect(r.kind === 'proceed' && r.lease?.state).toBe('running');
+  });
+
   it('refuses what can never fit, and a budgeted app on a remote host', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     await expect(

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from '../errors.js';
 import { bootId, type ProcFs, processStart, realProcFs } from '../procfs.js';
+import { memoryPosition, memoryQueue } from './queue.js';
 
 /** Where a lease stands: queued (pending), handed to a watcher (starting), up (running), or ended (freed, cancelled, failed). */
 export type LeaseState =
@@ -585,18 +586,16 @@ export class LeaseStore {
   pending(): Lease[] {
     return this.list().filter((l) => l.state === 'pending');
   }
-  /** The pending lease at the front of the queue, or null when the queue is empty. */
+  /** The lease at the front of the memory queue (see memoryQueue: a lease waiting for its group is not in it), or null. */
   head(): Lease | null {
-    return this.pending()[0] ?? null;
+    return memoryQueue(this.list())[0] ?? null;
   }
-  /** 1-based place in the queue, the starting leases counted ahead of every pending one; 0 when the lease is not pending. */
+  /**
+   * 1-based place in the memory queue, the starting leases that claim memory counted ahead; 0 when the lease is not in
+   * it (not pending, waiting for its group, or waiting for its group alone).
+   */
   positionOf(id: string): number {
-    const all = this.list();
-    const i = all
-      .filter((l) => l.state === 'pending')
-      .findIndex((l) => l.id === id);
-    if (i < 0) return 0;
-    return all.filter((l) => l.state === 'starting').length + i + 1;
+    return memoryPosition(this.list(), id);
   }
   /** Removes ended leases older than `maxAgeMs` (a day); returns how many. */
   prune(maxAgeMs = PRUNE_AFTER_MS): number {
