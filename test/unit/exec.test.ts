@@ -284,11 +284,20 @@ describe('runExec', () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     // a memory lease waits ahead, and the host is below its reserve: neither concerns a lease of a free group
     await store.create(suiteLease({ exclusive: null }), 'pending');
+    let reads = 0;
+    const d = deps({ total_mib: 8000, available_mib: 100 });
+    const memory = d.memory;
+    d.memory = async (c) => {
+      reads++;
+      return memory(c);
+    };
     const r = await runExec(
       ctx,
       { command: ['bun', 'test'], exclusive: 'suite', capture: true },
-      deps({ total_mib: 8000, available_mib: 100 })
+      d
     );
+    // a lease of its group alone reads no memory
+    expect(reads).toBe(0);
     expect(runs).toHaveLength(1);
     expect(store.get(r.lease!.id)).toMatchObject({
       state: 'freed',
@@ -329,6 +338,128 @@ describe('runExec', () => {
     expect(r.lease).toMatchObject({ exclusive: 'suite', state: 'freed' });
     expect(notices).toEqual([
       `exec: waiting for group suite: held by ${h.id} (demo-w5 slot 5, pid ${process.pid}, 0s), #1 in group`,
+    ]);
+  });
+
+  it('an exclusive exec with memory waits for its busy group first, with memory to spare', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const h = await store.create(suiteLease(), 'running');
+    let first: string | null = null;
+    const d = deps({ total_mib: 8000, available_mib: 7000 });
+    d.sleep = async (ms) => {
+      now += ms;
+      const l = store.pending()[0];
+      if (l) {
+        first ??= l.waiting_for;
+        await store.transition(h.id, 'freed');
+        await store.transition(l.id, 'starting');
+      }
+    };
+    const r = await runExec(
+      ctx,
+      { command: ['x'], exclusive: 'suite', memoryMib: 100, capture: true },
+      d
+    );
+    expect(first).toBe('group suite');
+    expect(r.lease).toMatchObject({
+      exclusive: 'suite',
+      estimate_mib: 100,
+      state: 'freed',
+    });
+    expect(r.lease?.need_mib).toBeGreaterThan(0);
+    expect(runs).toHaveLength(1);
+  });
+
+  it('with no holder, the notice names the older member it waits behind', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const w = await store.create(suiteLease(), 'pending');
+    const notices: string[] = [];
+    const ac = new AbortController();
+    const d: ExecDeps = {
+      ...deps(null),
+      notice: (line) => notices.push(line),
+    };
+    d.sleep = async () => {
+      ac.abort();
+    };
+    await expect(
+      runExec(
+        ctx,
+        {
+          command: ['x'],
+          exclusive: 'suite',
+          capture: true,
+          signal: ac.signal,
+        },
+        d
+      )
+    ).rejects.toMatchObject({ code: 'NOT_STARTED' });
+    expect(notices).toEqual([
+      `exec: waiting for group suite: behind ${w.id} (needs memory), #2 in group`,
+    ]);
+  });
+
+  it('a timeout names the holder at the time it gives up, not the first one', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const h1 = await store.create(suiteLease(), 'running');
+    let h2: Lease | null = null;
+    const d = deps(null);
+    d.sleep = async (ms) => {
+      now += ms;
+      if (!h2) {
+        await store.transition(h1.id, 'freed');
+        h2 = await store.create(
+          suiteLease({ project: 'demo-w6', slot: 6 }),
+          'running'
+        );
+      }
+    };
+    const err = await runExec(
+      ctx,
+      { command: ['x'], exclusive: 'suite', capture: true, timeoutMs: 5000 },
+      d
+    ).catch((e) => e);
+    expect(err).toMatchObject({ code: 'TIMEOUT' });
+    expect(err.message).toContain(`held by ${h2!.id} (demo-w6 slot 6,`);
+    expect(err.message).not.toContain(h1.id);
+  });
+
+  it("says so when the command's pid cannot be kept on the lease, and runs on", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    class Failing extends LeaseStore {
+      override async patch(
+        id: string,
+        fields: Partial<Lease>,
+        opts?: { expect?: Lease['state'] }
+      ): Promise<Lease> {
+        if ('command_pid' in fields) throw new Error('no space left on device');
+        return super.patch(id, fields, opts);
+      }
+    }
+    const failing = new Failing(dir, { now: () => now });
+    const notices: string[] = [];
+    const d: ExecDeps = {
+      ...deps(null),
+      store: failing,
+      notice: (line) => notices.push(line),
+    };
+    d.run = async (_command, o) => {
+      o.onSpawn?.(4242);
+      return { code: 0, output: '' };
+    };
+    const r = await runExec(
+      ctx,
+      { command: ['x'], exclusive: 'suite', capture: true },
+      d
+    );
+    expect(r.code).toBe(0);
+    expect(failing.get(r.lease!.id)).toMatchObject({
+      state: 'freed',
+      exit_code: 0,
+      command_pid: null,
+    });
+    expect(notices).toEqual([
+      `exec: the command's pid is not on lease ${r.lease!.id} (no space left on device): if this mcproc is killed, the lease is freed while the command still runs`,
     ]);
   });
 

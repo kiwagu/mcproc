@@ -384,7 +384,12 @@ export async function runExec(
               { expect: 'running' }
             )
           )
-          .catch(() => undefined);
+          // the command runs on without it: said once, since a killed mcproc would then free the lease under it
+          .catch((e) =>
+            deps.notice?.(
+              `exec: the command's pid is not on lease ${id} (${describeError(e)}): if this mcproc is killed, the lease is freed while the command still runs`
+            )
+          );
       }
     : undefined;
   const free = async (fields: Partial<Lease>) => {
