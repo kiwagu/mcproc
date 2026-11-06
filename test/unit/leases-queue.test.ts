@@ -134,6 +134,49 @@ describe('the queue rules', () => {
     expect(memoryPosition([g, m, s], s.id)).toBe(2);
   });
 
+  it('a starting holder blocks its group; ended members do not', () => {
+    const s = mk({ state: 'starting' });
+    const w = mk();
+    expect(groupBlocked([s, w], w)).toBe(true);
+    for (const state of ['cancelled', 'failed', 'freed'] as const) {
+      const e = mk({ state });
+      const w2 = mk();
+      expect(groupBlocked([e, w2], w2), state).toBe(false);
+      expect(groupBusy([e], 'suite'), state).toBe(false);
+    }
+  });
+
+  it('a younger group-only waiter does not pass an older memory waiter of its group', () => {
+    const m = mk();
+    const g = mk({ estimate_mib: 0, need_mib: 0 });
+    expect(groupBlocked([m, g], g)).toBe(true);
+    expect(memoryQueue([m, g])).toEqual([m]);
+  });
+
+  it('a waiter gets its place back by its sequence once its holder ends', () => {
+    const h = running();
+    const w = mk();
+    const s = mk({ kind: 'start', exclusive: null });
+    expect(memoryPosition([h, w, s], s.id)).toBe(1);
+    const freed: Lease = { ...h, state: 'freed' };
+    expect(memoryPosition([freed, w, s], w.id)).toBe(1);
+    expect(memoryPosition([freed, w, s], s.id)).toBe(2);
+  });
+
+  it('the rules do not depend on the order of the listing', () => {
+    const h = running();
+    const w1 = mk();
+    const w2 = mk();
+    const s = mk({ kind: 'start', exclusive: null });
+    expect(groupWait([s, w2, h, w1], w2)).toEqual({
+      name: 'suite',
+      place: 2,
+      holder: h,
+      before: null,
+    });
+    expect(memoryQueue([s, w2, w1])).toEqual([w1, s]);
+  });
+
   it('group names are exact: Suite and suite are two groups', () => {
     const h = running({ exclusive: 'Suite' });
     const w = mk({ exclusive: 'suite' });
