@@ -1,9 +1,11 @@
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from './errors.js';
 import type { Host } from './manifest.js';
 import { shq } from '../transport/quote.js';
 import { ensureOk } from '../transport/index.js';
+import { isPlainShell } from '../transport/loginenv.js';
 import type { ExecResult, Transport } from '../transport/types.js';
 
 export interface Pm2Process {
@@ -110,26 +112,88 @@ export function findProcess(
   return procs.find((p) => p.namespace === project && p.name === name);
 }
 
+/** Lists the daemon at a home over its socket; null when none runs there (src/core/pm2socket.ts). */
+export type DaemonLister = (home: string) => Promise<unknown[] | null>;
+
 export class Pm2Client {
   constructor(
     readonly transport: Transport,
     readonly host: Host,
     readonly bin: string,
-    readonly pm2Home?: string
+    readonly pm2Home?: string,
+    private readonly lister: DaemonLister | null = null
   ) {}
+  /** whether pm2's list comes from the daemon's socket (this machine) rather than from `pm2 jlist` */
+  listsOverSocket(): boolean {
+    return this.lister !== null;
+  }
+  /**
+   * the environment pm2 runs with here: the login one; this process's own where the host shell is a plain sh, which
+   * inherits it; null when the login environment could not be read
+   */
+  private async daemonEnv(): Promise<NodeJS.ProcessEnv | null> {
+    return (
+      (await this.transport.loginEnv()) ??
+      (isPlainShell(this.host.shell) ? process.env : null)
+    );
+  }
+  /** the daemon's home: hosts.<h>.pm2_home, else PM2_HOME of the login environment, else ~/.pm2 of it */
+  async home(): Promise<string> {
+    if (this.pm2Home) return this.pm2Home;
+    const env = (await this.daemonEnv()) ?? process.env;
+    return env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
+  }
+  /** pm2's processes; null when no daemon runs (only the socket can tell: `pm2 jlist` starts one and answers) */
+  async daemonList(): Promise<Pm2Process[] | null> {
+    if (this.lister) {
+      const env = await this.daemonEnv();
+      // the socket only for a daemon whose home is known and that listens at <home>/rpc.sock: PM2_DAEMON_RPC_PORT
+      // moves that endpoint, and an environment that could not be read leaves the home unknown; the CLI finds both
+      if ((this.pm2Home || env) && !(env ?? process.env).PM2_DAEMON_RPC_PORT) {
+        try {
+          const list = await this.lister(await this.home());
+          return list === null ? null : (list as RawProc[]).map(normalize);
+        } catch {
+          /* a daemon that errs or hangs: the CLI answers this once */
+        }
+      }
+    }
+    return parseJlist((await this.run(['jlist'], { read: true })).stdout);
+  }
+  /**
+   * the directory pm2 writes its processes' pid files to, for monit to watch: only where its list comes over the socket
+   * (this machine, mcproc's own pm2), its home is known, and PM2_DEFAULT_PID_PATH (pm2 reads it from its environment)
+   * does not move it; else why not
+   */
+  async pids(): Promise<
+    { dir: string; why: null } | { dir: null; why: string }
+  > {
+    if (!this.lister)
+      return {
+        dir: null,
+        why: "pm2's list does not come over its socket here",
+      };
+    const env = await this.daemonEnv();
+    if (!this.pm2Home && !env)
+      return { dir: null, why: 'the login environment could not be read' };
+    if ((env ?? process.env).PM2_DEFAULT_PID_PATH)
+      return { dir: null, why: 'PM2_DEFAULT_PID_PATH moves its pid files' };
+    return { dir: path.join(await this.home(), 'pids'), why: null };
+  }
   env(): Record<string, string> | undefined {
     return this.pm2Home ? { PM2_HOME: this.pm2Home } : undefined;
   }
   async run(
     args: string[],
-    opts: { timeoutMs?: number } = {}
+    opts: { timeoutMs?: number; read?: boolean } = {}
   ): Promise<ExecResult> {
     const cmd = `${this.bin} ${args.map(shq).join(' ')}`;
+    const how = { env: this.env(), timeoutMs: opts.timeoutMs };
     const res = ensureOk(
-      await this.transport.exec(cmd, {
-        env: this.env(),
-        timeoutMs: opts.timeoutMs,
-      }),
+      // a list or a version is a read; start, stop and delete keep the host shell, whose environment pm2 hands to the app
+      await (opts.read
+        ? this.transport.read(cmd, how)
+        : this.transport.exec(cmd, how)),
       this.host,
       `pm2 ${args[0]}`
     );
@@ -158,7 +222,7 @@ export class Pm2Client {
     return res;
   }
   async jlist(): Promise<Pm2Process[]> {
-    return parseJlist((await this.run(['jlist'])).stdout);
+    return (await this.daemonList()) ?? [];
   }
   startOrRestart(file: string, app: string) {
     return this.run(['startOrRestart', file, '--only', app, '--update-env'], {
@@ -172,7 +236,12 @@ export class Pm2Client {
     return this.run(['delete', String(id)]);
   }
   async version(): Promise<string> {
-    return (await this.run(['-v'])).stdout.trim().split('\n').pop() ?? '';
+    return (
+      (await this.run(['-v'], { read: true })).stdout
+        .trim()
+        .split('\n')
+        .pop() ?? ''
+    );
   }
 }
 
@@ -199,6 +268,17 @@ export function nodeMajor(v: string | null): number {
   return m ? Number(m[1]) : 0;
 }
 
+const RESOLVED = /^(RUNTIME|PATH_OK|PATH_NONE)$/m;
+/** this machine: only a missing marker retries; PATH_NONE is a real answer, the bundled pm2 takes over */
+const resolutionRetryHere = (r: ExecResult): boolean =>
+  !RESOLVED.test(r.stdout);
+/**
+ * another host: "pm2 not found" retries too, so the environment is read again and then the host shell asked: a pm2
+ * that only the login shell defines (a profile function, a wrapper) is still found
+ */
+const resolutionRetryRemote = (r: ExecResult): boolean =>
+  resolutionRetryHere(r) || /^PATH_NONE$/m.test(r.stdout);
+
 export async function resolvePm2Bin(
   host: Host,
   transport: Transport
@@ -219,8 +299,9 @@ export async function resolvePm2Bin(
     `node -v 2>/dev/null || echo NODE_NONE`,
   ].join('; ');
   const res = ensureOk(
-    await transport.exec(probe, {
+    await transport.read(probe, {
       env: host.pm2_home ? { PM2_HOME: host.pm2_home } : undefined,
+      retryIf: host.local ? resolutionRetryHere : resolutionRetryRemote,
     }),
     host,
     'pm2 probe'

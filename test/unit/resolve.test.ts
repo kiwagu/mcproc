@@ -10,7 +10,14 @@ import {
   assertApp,
   connect,
   clearResolutionCache,
+  bareLocalHost,
+  daemonFor,
+  procFor,
 } from '../../src/core/resolve.js';
+import { listDaemon } from '../../src/core/pm2socket.js';
+import { localProc, ProcReader } from '../../src/core/procfs.js';
+import { procWorld } from '../helpers/procfs.js';
+import type { Pm2Resolution } from '../../src/core/pm2.js';
 import type { Spawner } from '../../src/transport/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -85,8 +92,9 @@ describe('connect', () => {
   beforeEach(() => clearResolutionCache());
   it('resolves pm2 once per project+host and caches it', async () => {
     let calls = 0;
-    const spawner: Spawner = async () => {
-      calls++;
+    // counts the resolution probe only: a read also reads the host's login environment first
+    const spawner: Spawner = async (argv) => {
+      if (argv.some((a) => a.includes('PATH_OK'))) calls++;
       return { code: 0, stdout: 'PATH_OK\n7.0.4\nv22.0.0\n', stderr: '' };
     };
     const ctx = await connect(prepare({ project: basic, host: 'stand' }), {
@@ -102,5 +110,80 @@ describe('connect', () => {
       fresh: true,
     });
     expect(calls).toBe(2);
+  });
+  it('a daemon override stands in for how the list is read; without one an injected spawner keeps the CLI', async () => {
+    const spawner: Spawner = async () => ({
+      code: 0,
+      stdout: 'PATH_OK\n7.0.4\nv22.0.0\n',
+      stderr: '',
+    });
+    const prep = prepare({ project: basic });
+    expect((await connect(prep, { spawner })).pm2.listsOverSocket()).toBe(
+      false
+    );
+    const over = await connect(prep, { spawner, daemon: async () => [] });
+    expect(over.pm2.listsOverSocket()).toBe(true);
+  });
+});
+
+describe('daemonFor', () => {
+  const res = (source: Pm2Resolution['source']): Pm2Resolution => ({
+    bin: 'pm2',
+    source,
+    node: null,
+    pm2Version: null,
+    reason: 'test',
+  });
+  const mine = bareLocalHost();
+  const other = { ...mine, name: 'stand', local: false, ssh: 'stand' };
+  it('this machine reads its daemon over the socket, unless a wrapper stands in for pm2 or a test fakes the world', () => {
+    for (const s of ['path', 'bundled', 'runtime'] as const)
+      expect(daemonFor(mine, res(s))).toBe(listDaemon);
+    expect(daemonFor(mine, res('explicit'))).toBeNull();
+    expect(daemonFor(other, res('path'))).toBeNull();
+    expect(
+      daemonFor(mine, res('path'), async () => ({
+        code: 0,
+        stdout: '',
+        stderr: '',
+      }))
+    ).toBeNull();
+  });
+});
+
+describe('procFor', () => {
+  it('this machine is read in-process where it has /proc, unless a test fakes the world; another host never', () => {
+    const mine = bareLocalHost();
+    const other = { ...mine, name: 'stand', local: false, ssh: 'stand' };
+    expect(procFor(mine)).toBe(localProc());
+    expect(
+      procFor(mine, async () => ({ code: 0, stdout: '', stderr: '' }))
+    ).toBeNull();
+    expect(procFor(other)).toBeNull();
+  });
+  it('connect: an injected spawner reads with the script; a proc override stands in', async () => {
+    clearResolutionCache();
+    const spawner: Spawner = async () => ({
+      code: 0,
+      stdout: 'PATH_OK\n7.0.4\nv22.0.0\n',
+      stderr: '',
+    });
+    const prep = prepare({ project: basic });
+    expect((await connect(prep, { spawner })).proc).toBeNull();
+    const r = new ProcReader(procWorld({ procs: [] }));
+    expect((await connect(prep, { spawner, proc: r })).proc).toBe(r);
+  });
+});
+
+describe('bareLocalHost', () => {
+  it('bareLocalHost is the local host a manifest without hosts.local declares', () => {
+    expect(bareLocalHost()).toMatchObject({
+      name: 'local',
+      local: true,
+      readonly: false,
+      shell: { bin: '/bin/bash', flags: ['-lc'] },
+      env: {},
+    });
+    expect(bareLocalHost().pm2_home).toBeUndefined();
   });
 });

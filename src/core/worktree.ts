@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { describeError, McprocError } from './errors.js';
+import { describeError, describeErrorWithHint, McprocError } from './errors.js';
 import { spawnRun } from './exec.js';
 import { actOn, Fleet, type Connector } from './fleet.js';
 import { ownsManifest } from './leases/siblings.js';
@@ -9,11 +10,18 @@ import { LeaseStore } from './leases/store.js';
 import {
   loadManifest,
   MANIFEST_REL,
+  parseManifest,
   type Manifest,
   type VarInfo,
 } from './manifest.js';
 import { NAME_RE } from './names.js';
-import { writeOverride } from './override.js';
+import { forgetProject } from './registry.js';
+import {
+  loadOverride,
+  OVERRIDE_REL,
+  writeOverride,
+  type Override,
+} from './override.js';
 import { isRunning, type Pm2Process } from './pm2.js';
 import type { Context } from './resolve.js';
 import {
@@ -31,19 +39,23 @@ import {
 import { stateDir } from './state.js';
 import { shq } from '../transport/quote.js';
 
-/** Runs git with these arguments in `cwd` and answers its exit code and output; it never throws. */
+/**
+ * Runs git with these arguments in `cwd` and answers its exit code and output; it never throws. `env` is laid over the
+ * process's environment for that run (git passes it on to its hooks).
+ */
 export type GitRunner = (
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: Record<string, string>
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 /** git as a child process, never through a shell. */
-export const gitRunner: GitRunner = (args, cwd) =>
+export const gitRunner: GitRunner = (args, cwd, env) =>
   new Promise((resolve) => {
     execFile(
       'git',
       args,
-      { cwd, maxBuffer: 8 * 1024 * 1024 },
+      { cwd, env: { ...process.env, ...env }, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) =>
         resolve({
           // execFile puts the exit status in err.code; a git that cannot be spawned has a string code there
@@ -57,9 +69,10 @@ export const gitRunner: GitRunner = (args, cwd) =>
 const gitOk = async (
   git: GitRunner,
   args: string[],
-  cwd: string
+  cwd: string,
+  env?: Record<string, string>
 ): Promise<string> => {
-  const r = await git(args, cwd);
+  const r = await git(args, cwd, env);
   if (r.code !== 0)
     throw new McprocError(
       'TRANSPORT_FAILED',
@@ -77,6 +90,78 @@ const present = (p: string): boolean => {
     return false;
   }
 };
+
+/**
+ * Puts the staged `tmp` at `to` without ever replacing what is there: a file is hard-linked into place (the link fails
+ * when `to` exists) and a symlink made there anew (link(2) may follow a symlink, so a hard link could name the file it
+ * points at), the temporary then removed; a folder is renamed into place, which fails over a file or over a folder
+ * with anything in it. Answers false, the temporary left to the caller, when something is at `to`. The one thing a
+ * rename may still replace is an EMPTY folder appearing in that moment: nothing in it is lost.
+ */
+function publish(tmp: string, to: string): boolean {
+  const staged = fs.lstatSync(tmp);
+  const folder = staged.isDirectory();
+  try {
+    if (folder) fs.renameSync(tmp, to);
+    else if (staged.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(tmp), to);
+    else fs.linkSync(tmp, to);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (
+      code === 'EEXIST' ||
+      (folder && (code === 'ENOTEMPTY' || code === 'ENOTDIR'))
+    )
+      return false;
+    throw e;
+  }
+  if (!folder) fs.rmSync(tmp, { force: true });
+  return true;
+}
+
+/**
+ * Copies `from` to `to` whole or not at all: into a temporary sibling first (a dot name no run shares), published once
+ * complete, so a copy that fails halfway (an unreadable file in a folder) leaves nothing a later run would take for
+ * done; the temporary goes again, and the error is thrown on. Whatever is at `to` is never touched, whether it was
+ * there before or another writer (or sync) put it there while the copy ran, since publication never replaces (see
+ * publish): answers false then, the temporary removed, true when it copied. `beforePublish` (tests only) runs once the
+ * copy is staged, just before it is published.
+ */
+function copyWhole(
+  from: string,
+  to: string,
+  beforePublish?: (to: string) => void
+): boolean {
+  if (present(to)) return false;
+  const dir = path.dirname(to);
+  fs.mkdirSync(dir, { recursive: true });
+  let tmp: string;
+  do
+    tmp = path.join(
+      dir,
+      `.${path.basename(to)}.mcproc-${process.pid}-${randomBytes(6).toString('hex')}`
+    );
+  while (present(tmp));
+  try {
+    fs.cpSync(from, tmp, {
+      recursive: true,
+      force: false,
+      errorOnExist: false,
+    });
+    beforePublish?.(to);
+    if (publish(tmp, to)) return true;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    return false;
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch (r) {
+      throw new Error(
+        `${(e as Error).message}; its partial copy ${tmp} could not be removed: ${(r as Error).message}`
+      );
+    }
+    throw e;
+  }
+}
 
 /** The main checkout of the repository `root` belongs to: the parent of git's common dir, real path. */
 export async function mainCheckout(
@@ -108,12 +193,25 @@ export function installCommand(m: Manifest, root: string): string | null {
   return null;
 }
 
-/** What `copy` and `link` mean for one target: each entry a path or a glob relative to the main checkout. */
+/** A worktree's entry lists: `required` entries are copied like `copy` ones, and each must be present. */
+export interface CopyLists {
+  copy: string[];
+  required: string[];
+  link: string[];
+}
+
+/** Whether a copy or required entry is a glob (a wildcard, a character class or a brace list), not a plain path. */
+export const isGlob = (entry: string): boolean => /[*?[{]/.test(entry);
+
+/**
+ * What the lists mean for one target: each entry a path or a glob relative to the main checkout. An entry named by
+ * both `copy` and `required` is planned once; a required entry is present when its path exists or its glob matches
+ * at least one path.
+ */
 export function planCopies(
   main: string,
   target: string,
-  copy: string[],
-  link: string[],
+  lists: CopyLists,
   fsDeps: {
     exists?: (p: string) => boolean;
     glob?: (pattern: string, cwd: string) => string[];
@@ -122,29 +220,159 @@ export function planCopies(
   copies: { from: string; to: string }[];
   links: { from: string; to: string }[];
   missing: string[];
+  missingRequired: string[];
 } {
   const exists = fsDeps.exists ?? ((p) => fs.existsSync(p));
   const glob = fsDeps.glob ?? ((pattern, cwd) => fs.globSync(pattern, { cwd }));
   const copies: { from: string; to: string }[] = [];
   const missing: string[] = [];
-  for (const entry of copy) {
-    const hits = /[*?[]/.test(entry)
+  const missingRequired: string[] = [];
+  for (const entry of new Set([...lists.copy, ...lists.required])) {
+    const hits = isGlob(entry)
       ? glob(entry, main).sort()
       : exists(path.join(main, entry))
         ? [entry]
         : [];
     if (hits.length === 0) {
       missing.push(entry);
+      if (lists.required.includes(entry)) missingRequired.push(entry);
       continue;
     }
     for (const h of hits)
       copies.push({ from: path.join(main, h), to: path.join(target, h) });
   }
-  const links = link.map((l) => ({
+  const links = lists.link.map((l) => ({
     from: path.join(main, l),
     to: path.join(target, l),
   }));
-  return { copies, links, missing };
+  return { copies, links, missing, missingRequired };
+}
+
+/** Who required an entry: the manifest that decides the worktree's files, or the main checkout's override. */
+export type RequiredSource =
+  | "the worktree's own manifest"
+  | "the main checkout's manifest"
+  | "the main checkout's override";
+
+/**
+ * What a worktree at `target` gets: the deciding manifest's copy, required and link entries, then the main checkout's
+ * override extras beyond them (what both name counts as the manifest's). Each required miss carries who required it:
+ * the worktree's own manifest when `dm` is the one at `target`, else the main checkout's, or the override.
+ * `fromOverride` names, after the globs are expanded, the copies and links only the override added.
+ */
+export function worktreePlan(
+  main: string,
+  target: string,
+  dm: Manifest,
+  extras: CopyLists,
+  fsDeps: {
+    exists?: (p: string) => boolean;
+    glob?: (pattern: string, cwd: string) => string[];
+  } = {}
+): {
+  copies: { from: string; to: string }[];
+  links: { from: string; to: string }[];
+  missing: string[];
+  missingRequired: { entry: string; source: RequiredSource }[];
+  fromOverride: string[];
+} {
+  const only = (xs: string[], not: string[]) =>
+    [...new Set(xs)].filter((e) => !not.includes(e));
+  const ownPlan = planCopies(
+    main,
+    target,
+    {
+      copy: dm.worktree.copy,
+      required: dm.worktree.required,
+      link: dm.worktree.link,
+    },
+    fsDeps
+  );
+  const extraPlan = planCopies(
+    main,
+    target,
+    {
+      copy: only(extras.copy, dm.worktree.copy),
+      required: only(extras.required, dm.worktree.required),
+      link: only(extras.link, dm.worktree.link),
+    },
+    fsDeps
+  );
+  // what the override adds beyond the manifest's plan, by target: the rest is the manifest's, whatever named it
+  const addedCopies = extraPlan.copies.filter(
+    (c) => !ownPlan.copies.some((o) => o.to === c.to)
+  );
+  const addedLinks = extraPlan.links.filter(
+    (l) => !ownPlan.links.some((o) => o.to === l.to)
+  );
+  const byManifest: RequiredSource =
+    realOf(dm.root) === realOf(target)
+      ? "the worktree's own manifest"
+      : "the main checkout's manifest";
+  return {
+    copies: [...ownPlan.copies, ...addedCopies],
+    links: [...ownPlan.links, ...addedLinks],
+    // an entry one side copies and the other requires is planned by both: it is still one miss
+    missing: [...new Set([...ownPlan.missing, ...extraPlan.missing])],
+    missingRequired: [
+      ...ownPlan.missingRequired.map((entry) => ({
+        entry,
+        source: byManifest,
+      })),
+      ...extraPlan.missingRequired.map((entry) => ({
+        entry,
+        source: "the main checkout's override" as const,
+      })),
+    ],
+    fromOverride: [
+      ...addedCopies.map((c) => path.relative(main, c.from)),
+      ...addedLinks.map((l) => path.relative(main, l.from)),
+    ],
+  };
+}
+
+/**
+ * The refusal of a worktree without its required entries: each entry as written (a mask, never a file it was meant to
+ * match) with who required it, where it was looked for, then `tail` (what became of the worktree). `hint` says how to
+ * go on; by default the one of worktree add.
+ */
+export function requiredMissing(
+  missing: { entry: string; source: RequiredSource }[],
+  where: string,
+  tail: string,
+  hint = `Put them into ${where} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to make the worktree without them.`
+): McprocError {
+  return new McprocError(
+    'REQUIRED_MISSING',
+    `required ${missing.length === 1 ? 'entry' : 'entries'} missing in ${where}: ${missing.map((m) => `${m.entry} (${m.source})`).join(', ')}; ${tail}`,
+    {
+      hint,
+      details: { missing },
+    }
+  );
+}
+
+/**
+ * Removes `dir` and the folders above it while they are empty, up to but never `top`: the folders a branch with
+ * slashes made (`feat/` of feat/x). A folder that is not empty ends it, one already gone is passed over (its parent may
+ * be empty now); any other failure ends it too and is answered with the folder it left, which a caller may ignore.
+ */
+export function pruneEmptyParents(
+  dir: string,
+  top: string
+): { dir: string; error: string }[] {
+  const t = realOf(top);
+  for (let d = dir; d.startsWith(`${t}${path.sep}`); d = path.dirname(d)) {
+    try {
+      fs.rmdirSync(d);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') continue;
+      if (code === 'ENOTEMPTY' || code === 'EEXIST') break;
+      return [{ dir: d, error: (e as Error).message }];
+    }
+  }
+  return [];
 }
 
 /** What the worktree commands reach outside their arguments: git, the state directory, the install, pm2; tests pass fakes. */
@@ -159,6 +387,8 @@ export interface WorktreeDeps {
   stopAll(root: string, opts: { force: boolean }): Promise<string[]>;
   exists?(p: string): boolean;
   glob?(pattern: string, cwd: string): string[];
+  /** tests only: runs once a copy is staged complete, just before it is published at `to` */
+  beforePublish?(to: string): void;
 }
 /** What `worktree add` made: the checkout, its branch, slot and project slug, what it copied, linked and installed, its vars and how to go on. */
 export interface WorktreeAdded {
@@ -168,12 +398,102 @@ export interface WorktreeAdded {
   slot: number;
   project: string;
   repo: string;
+  /** whose manifest decided the slot var, the copies and the install: the new worktree's own, or the main checkout's when the worktree has none that loads */
+  manifest: 'worktree' | 'main';
   copied: string[];
   linked: string[];
+  /** the copy and link entries that came from the main checkout's override, not from a manifest */
+  from_override: string[];
+  /** the links as root-anchored patterns written to git's exclude file of the repository */
+  excluded: string[];
   missing: string[];
+  /** the missing entries a manifest or the override requires: the worktree was made without them only because allowMissing was given */
+  missing_required: string[];
   installed: string | null;
   vars: VarInfo[];
   next: string;
+}
+
+/** The new worktree's own manifest, or null when it has none of its own or it does not load (logged, with what the main checkout's decides instead). Read with `override` when one is given, in place of any override file there. */
+function ownManifest(
+  target: string,
+  log: (line: string) => void,
+  instead: string,
+  override?: Override
+): Manifest | null {
+  if (!ownsManifest(target)) return null;
+  try {
+    if (!override) return loadManifest(target);
+    const file = path.join(target, MANIFEST_REL);
+    return parseManifest(fs.readFileSync(file, 'utf8'), target, file, override);
+  } catch (e) {
+    log(
+      `the manifest of ${target} does not load (${describeErrorWithHint(e)}): the main checkout's decides ${instead}`
+    );
+    return null;
+  }
+}
+
+/**
+ * A path relative to the checkout root as a gitignore pattern that matches exactly it: root-anchored, forward slashes,
+ * `./` and doubled slashes folded, the wildcard characters and a trailing space escaped. Null for a path outside the root.
+ */
+export function excludePattern(rel: string): string | null {
+  // a trailing slash would make the pattern match directories only, and a symlink is not one to git
+  const p = path.posix
+    .normalize(rel.split(path.sep).join('/'))
+    .replace(/\/+$/, '');
+  if (
+    p === '.' ||
+    p === '' ||
+    p === '..' ||
+    p.startsWith('../') ||
+    p.startsWith('/')
+  )
+    return null;
+  return `/${p.replace(/[\\*?[\]]/g, (c) => `\\${c}`).replace(/ $/, '\\ ')}`;
+}
+
+/**
+ * Writes each link as a root-anchored pattern into git's exclude file of the repository (`git rev-parse --git-path
+ * info/exclude`: shared by its worktrees, never tracked), once each; answers the patterns. A git that cannot name the file
+ * is logged, and the links stay visible to `git status`.
+ */
+async function excludeLinks(
+  target: string,
+  links: string[],
+  git: GitRunner,
+  log: (line: string) => void
+): Promise<string[]> {
+  if (!links.length) return [];
+  const patterns: string[] = [];
+  for (const l of links) {
+    const p = excludePattern(l);
+    if (p === null)
+      log(
+        `link ${l} is outside the checkout: not written to git's exclude file`
+      );
+    else if (!patterns.includes(p)) patterns.push(p);
+  }
+  if (!patterns.length) return [];
+  const r = await git(['rev-parse', '--git-path', 'info/exclude'], target);
+  if (r.code !== 0) {
+    log(
+      `git names no exclude file for ${target} (${r.stderr.trim()}): the links stay visible to git status`
+    );
+    return [];
+  }
+  const file = path.resolve(target, r.stdout.trim());
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const had = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const lines = new Set(had.split('\n'));
+  const add = patterns.filter((p) => !lines.has(p));
+  if (add.length)
+    fs.appendFileSync(
+      file,
+      `${had.length && !had.endsWith('\n') ? '\n' : ''}${add.join('\n')}\n`
+    );
+  return patterns;
 }
 
 /**
@@ -243,7 +563,7 @@ async function worktreeList(
 }
 
 /** The real path of `p` as far as it exists, the rest joined as given: a folder about to be made gets its real path. */
-function realAhead(p: string): string {
+export function realAhead(p: string): string {
   const rest: string[] = [];
   let d = path.resolve(p);
   while (!present(d) && path.dirname(d) !== d) {
@@ -256,11 +576,72 @@ function realAhead(p: string): string {
 /** A path as a shell word: bare when it needs no quoting. */
 const shPath = (p: string): string => (/^[\w./@%+:-]+$/.test(p) ? p : shq(p));
 
+/** `a`, `a and b`, `a, b and c`. */
+const listOf = (xs: string[]): string =>
+  xs.length > 1
+    ? `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`
+    : xs.join('');
+
+/**
+ * Takes back what `worktree add` made before it found a required entry missing: the worktree as git made it (nothing
+ * was written into it yet), the branch when this add made it, the folders a branch with slashes made, the slot.
+ * Answers the tail of the refusal: that nothing was kept, or what was and how to clear it. A worktree git does not
+ * remove keeps the branch it has checked out, and its slot stays with the folder (the next add frees it once the folder
+ * is gone), so nothing more is undone then; any later step that fails is named, and the slot is released all the same.
+ */
+async function rollBackAdd(
+  a: {
+    main: string;
+    target: string;
+    top: string;
+    branch: string;
+    created: boolean;
+    slot: number;
+    giveBack: () => Promise<void>;
+  },
+  git: GitRunner
+): Promise<string> {
+  const newBranch = a.created ? [`its new branch ${a.branch}`] : [];
+  const rm = await git(
+    ['worktree', 'remove', '--force', '--', a.target],
+    a.main
+  );
+  if (rm.code !== 0)
+    return `the rollback failed (git worktree remove: ${rm.stderr.trim() || `exit ${rm.code}`}) and kept ${listOf([`the worktree ${a.target}`, ...newBranch, `slot ${a.slot}`])}: clear them with git worktree remove --force ${shPath(a.target)}${a.created ? ` && git branch -D ${shPath(a.branch)}` : ''} (the next worktree add takes the slot back once the folder is gone)`;
+  const kept: string[] = [];
+  const clear: string[] = [];
+  if (a.created) {
+    const br = await git(['branch', '-D', '--', a.branch], a.main);
+    if (br.code !== 0) {
+      kept.push(
+        `its new branch ${a.branch} (git branch: ${br.stderr.trim() || `exit ${br.code}`})`
+      );
+      clear.push(`git branch -D ${shPath(a.branch)}`);
+    }
+  }
+  for (const f of pruneEmptyParents(path.dirname(a.target), a.top)) {
+    kept.push(`the folder ${f.dir} (${f.error})`);
+    clear.push(`rmdir ${shPath(f.dir)}`);
+  }
+  try {
+    await a.giveBack();
+  } catch (e) {
+    kept.push(
+      `slot ${a.slot} in the registry (${(e as Error).message}; the next worktree add takes it back, its folder being gone)`
+    );
+  }
+  if (!kept.length)
+    return `nothing was kept: ${a.created ? `the worktree, its new branch ${a.branch} and slot ${a.slot}` : `the worktree and slot ${a.slot}`}`;
+  return `the worktree is removed, but the rollback kept ${listOf(kept)}${clear.length ? `: clear ${clear.length > 1 ? 'them' : 'it'} with ${clear.join(' and ')}` : ''}`;
+}
+
 /**
  * A worktree of this repository on `branch` (made from `from`, default the main checkout's HEAD, when the branch is
  * new) in the sibling folder, with the declared copies and links, the override that gives it its slot and project
  * slug, the install, and its slot in the registry. The slot is claimed and the folder made under the host's lease
- * lock, so parallel runs never share a slot; when git then fails, the slot is given back.
+ * lock, so parallel runs never share a slot; when git then fails, the slot is given back. A required entry missing in
+ * the main checkout refuses the worktree before anything is written into it, copied, linked or installed, and takes
+ * back all this add made (the worktree, its new branch, its slot), unless `allowMissing`.
  */
 export async function worktreeAdd(
   m: Manifest,
@@ -270,6 +651,7 @@ export async function worktreeAdd(
     slot?: number;
     project?: string;
     install: boolean;
+    allowMissing?: boolean;
   },
   deps: WorktreeDeps
 ): Promise<WorktreeAdded> {
@@ -294,6 +676,13 @@ export async function worktreeAdd(
       `"${opts.branch}" is not a valid branch name`
     );
   const main = await mainCheckout(m.root, deps.git);
+  // the main checkout's own override may add copy, link and required entries for every new worktree; a bad one
+  // refuses here, before anything is made
+  const extras = loadOverride(main)?.worktree ?? {
+    copy: [],
+    link: [],
+    required: [],
+  };
   const prefix = (
     await gitOk(deps.git, ['rev-parse', '--show-prefix'], m.root)
   ).trim();
@@ -362,6 +751,13 @@ export async function worktreeAdd(
         main
       )
     ).code === 0;
+  /** gives the slot back under the lock, read afresh: only while it still names this checkout */
+  const giveBack = () =>
+    store.withLock(() => {
+      const r = readRegistry(file);
+      if (r?.slots[String(slot)]?.path === target)
+        writeRegistry(file, releaseSlot(r, slot));
+    });
   try {
     await gitOk(
       deps.git,
@@ -377,39 +773,75 @@ export async function worktreeAdd(
             target,
             opts.from ?? 'HEAD',
           ],
-      main
+      main,
+      // a post-checkout hook mcproc installed steps aside: this add copies the files itself, and a miss rolls back
+      { MCPROC_WORKTREE_ADD: '1' }
     );
   } catch (e) {
     try {
       fs.rmdirSync(target); // only while empty: whatever git left stays for a look
     } catch {}
-    await store.withLock(() => {
-      const r = readRegistry(file);
-      if (r?.slots[String(slot)]?.path === target)
-        writeRegistry(file, releaseSlot(r, slot));
-    });
+    await giveBack();
     throw e;
   }
-  // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
-  writeOverride(target, {
+  // the new worktree's own manifest says what it gets (a branch that introduces the slot scheme gets it from its first
+  // worktree); the main checkout's only when the worktree has none that loads. It is read first as it is, only to learn
+  // whether it declares `slot`, and again with the override this checkout gets, held in memory until the required
+  // entries are checked, so that its templates (an install command, a copy or required entry) see this checkout's slug
+  // and slot, as every later command does
+  const probe = ownManifest(
+    target,
+    deps.log,
+    'the slot var, the copies and the install'
+  );
+  const override: { project: string; repo: string; vars: Override['vars'] } = {
     project,
     repo: main,
-    vars: m.slot !== null ? { slot } : undefined,
-  });
+    vars: (probe ?? m).slot !== null ? { slot } : {},
+  };
+  const own = probe
+    ? ownManifest(target, deps.log, 'the copies and the install', {
+        path: path.join(target, OVERRIDE_REL),
+        ...override,
+      })
+    : null;
+  const dm = own ?? m;
+  const plan = worktreePlan(main, target, dm, extras, deps);
+  // checked before anything is written into the worktree, copied, linked or installed: a refusal takes back only what
+  // git and the slot claim made
+  if (plan.missingRequired.length && !opts.allowMissing)
+    throw requiredMissing(
+      plan.missingRequired,
+      main,
+      await rollBackAdd(
+        {
+          main,
+          target,
+          top: worktreeDir(m, main),
+          branch: opts.branch,
+          created: !exists,
+          slot,
+          giveBack,
+        },
+        deps.git
+      )
+    );
+  // the override first: whatever fails after it, the registered checkout never runs under the main's slug and vars
+  writeOverride(target, override);
   // a .mcproc/.gitignore of the branch (a whitelist) already hides the override; else one that hides everything here
   const gi = path.join(target, '.mcproc', '.gitignore');
   if (!present(gi)) fs.writeFileSync(gi, '*\n');
-  const plan = planCopies(main, target, m.worktree.copy, m.worktree.link, deps);
   let step = '';
   try {
     for (const c of plan.copies) {
       step = `copying ${c.from}`;
-      fs.mkdirSync(path.dirname(c.to), { recursive: true });
-      fs.cpSync(c.from, c.to, {
-        recursive: true,
-        force: false,
-        errorOnExist: false,
-      });
+      // a place the branch's tree takes already gets, as ever, what it lacks; an absent one is published only whole
+      if (!copyWhole(c.from, c.to, deps.beforePublish))
+        fs.cpSync(c.from, c.to, {
+          recursive: true,
+          force: false,
+          errorOnExist: false,
+        });
     }
     for (const l of plan.links) {
       step = `linking ${l.from}`;
@@ -425,9 +857,18 @@ export async function worktreeAdd(
       }
     );
   }
+  const required = plan.missingRequired.map((r) => r.entry);
   for (const miss of plan.missing)
-    deps.log(`copy: ${miss} is not in ${main}, skipped`);
-  const install = opts.install ? installCommand(m, target) : null;
+    deps.log(
+      `copy: ${miss} is not in ${main}, skipped${required.includes(miss) ? ' (required, allowed)' : ''}`
+    );
+  const excluded = await excludeLinks(
+    target,
+    plan.links.map((l) => path.relative(target, l.to)),
+    deps.git,
+    deps.log
+  );
+  const install = opts.install ? installCommand(dm, target) : null;
   if (install) {
     const code = await deps.run(install, target);
     if (code !== 0)
@@ -440,15 +881,12 @@ export async function worktreeAdd(
     deps.log(
       `${target} has no manifest of its own (${MANIFEST_REL}): no vars, nothing to start`
     );
-  else
-    try {
-      const wm = loadManifest(target);
-      vars = wm.vars;
-      const first = Object.keys(wm.profiles)[0] ?? Object.keys(wm.apps)[0];
-      if (first) next += ` && mcproc start ${first}`;
-    } catch (e) {
-      deps.log(`the manifest of ${target} does not load: ${describeError(e)}`);
-    }
+  else if (own) {
+    // the manifest as read with its override: the vars carry the slot
+    vars = own.vars;
+    const first = Object.keys(own.profiles)[0] ?? Object.keys(own.apps)[0];
+    if (first) next += ` && mcproc start ${first}`;
+  }
   return {
     path: target,
     branch: opts.branch,
@@ -456,12 +894,204 @@ export async function worktreeAdd(
     slot,
     project,
     repo: main,
+    manifest: own ? 'worktree' : 'main',
     copied: plan.copies.map((c) => path.relative(main, c.from)),
     linked: plan.links.map((l) => path.relative(main, l.from)),
+    from_override: plan.fromOverride,
+    excluded,
     missing: plan.missing,
+    missing_required: required,
     installed: install,
     vars,
     next,
+  };
+}
+
+/** What `worktree sync` did in an existing worktree: whose manifest decided, what it copied and linked, what it found there already. */
+export interface WorktreeSynced {
+  path: string;
+  repo: string;
+  /** whose manifest decided the copies: the worktree's own, the main checkout's when the worktree has none that loads, none when neither has one */
+  manifest: 'worktree' | 'main' | null;
+  /** what this sync copied, relative to the main checkout */
+  copied: string[];
+  /** the copies and links whose place in the worktree was taken already: left as they are */
+  kept: string[];
+  /** the links this sync made */
+  linked: string[];
+  /** the copy and link entries that came from the main checkout's override, not from a manifest */
+  from_override: string[];
+  /** the links as root-anchored patterns in git's exclude file of the repository */
+  excluded: string[];
+  missing: string[];
+  /** the missing entries a manifest or the override requires: synced without them only because allowMissing was given */
+  missing_required: string[];
+}
+
+/** Whether a post-checkout hook's previous ref is all zeros: git checked the tree out from nothing, as in a new worktree. */
+export const isFreshCheckout = (prevRef: string): boolean =>
+  /^0+$/.test(prevRef);
+
+/**
+ * The checkout `dir` is in, as git's top level (real path; never the root a manifest search finds: a worktree nested in
+ * the main checkout would find the main's), and the main checkout of its repository.
+ */
+export async function checkoutOf(
+  dir: string,
+  git: GitRunner
+): Promise<{ top: string; main: string }> {
+  const d = path.resolve(dir);
+  // git cannot even start in a folder that is not there: its error would read as if git were missing
+  if (!fs.existsSync(d))
+    throw new McprocError('BAD_ARGUMENT', `${d} does not exist`);
+  const top = realOf(
+    (await gitOk(git, ['rev-parse', '--show-toplevel'], d)).trim()
+  );
+  return { top, main: await mainCheckout(top, git) };
+}
+
+/**
+ * Brings the worktree `dir` is in (see checkoutOf) the files a new worktree gets, copied from the main checkout: the
+ * copy, required and link entries of the worktree's own manifest when it loads, else of the main checkout's, plus the
+ * main checkout's override. A file or link already in its place is kept as it is, so a second sync changes nothing,
+ * and a copy is published only whole, so a failed one leaves nothing a second sync would keep. A readonly local host in
+ * the deciding manifest refuses the sync before anything is written, and so does a required entry missing in the main
+ * checkout, unless `allowMissing`; `fromHook` says in either refusal that the worktree exists without its files (git
+ * keeps a worktree whatever its post-checkout hook answers).
+ * No slot, override or install: those make a stand, and only worktree add makes one.
+ */
+export async function worktreeSync(
+  opts: { dir: string; allowMissing: boolean; fromHook: boolean },
+  deps: Pick<WorktreeDeps, 'git' | 'log' | 'exists' | 'glob' | 'beforePublish'>
+): Promise<WorktreeSynced> {
+  const { top, main } = await checkoutOf(opts.dir, deps.git);
+  if (top === main)
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `${top} is the main checkout: worktree sync copies from it into a worktree of the repository`,
+      {
+        hint: 'Run it in a worktree (git worktree list names them), or pass its path as --project (MCP: project).',
+      }
+    );
+  let dm: Manifest | null = null;
+  let broken: string | null = null;
+  if (ownsManifest(top))
+    try {
+      dm = loadManifest(top);
+    } catch (e) {
+      broken = describeErrorWithHint(e);
+    }
+  const manifest: WorktreeSynced['manifest'] = dm
+    ? 'worktree'
+    : ownsManifest(main)
+      ? 'main'
+      : null;
+  if (broken !== null)
+    deps.log(
+      `the manifest of ${top} does not load (${broken}): ${manifest === 'main' ? "the main checkout's decides the copies" : `${main} has none either: nothing to copy`}`
+    );
+  if (manifest === null) {
+    if (broken === null)
+      deps.log(`no manifest in ${top} or ${main}: nothing to copy`);
+    return {
+      path: top,
+      repo: main,
+      manifest,
+      copied: [],
+      kept: [],
+      linked: [],
+      from_override: [],
+      excluded: [],
+      missing: [],
+      missing_required: [],
+    };
+  }
+  dm ??= loadManifest(main);
+  // a readonly local host takes no writes, these copies and links included: refused before anything is written, the
+  // same way exec is (and from the hook as loudly as a required miss: git keeps the worktree, without its files)
+  if (dm.hosts.local?.readonly)
+    throw new McprocError(
+      'READONLY_HOST',
+      `${dm.path} declares the local host readonly: worktree sync is refused; ${
+        opts.fromHook
+          ? `the worktree ${top} exists without its files (git keeps a worktree whose post-checkout hook fails)`
+          : `nothing was copied into ${top}`
+      }`,
+      {
+        hint: opts.fromHook
+          ? `Remove hosts.local.readonly from ${dm.path}, then run mcproc worktree sync in ${top}; or copy the files by hand. While the host stays readonly a git worktree add here fails like this; to make worktrees without the files, delete mcproc's hook (git rev-parse --git-path hooks/post-checkout names it).`
+          : `Remove hosts.local.readonly from ${dm.path}, then run it again; or copy the files by hand.`,
+      }
+    );
+  const extras = loadOverride(main)?.worktree ?? {
+    copy: [],
+    link: [],
+    required: [],
+  };
+  const plan = worktreePlan(main, top, dm, extras, deps);
+  if (plan.missingRequired.length && !opts.allowMissing)
+    throw requiredMissing(
+      plan.missingRequired,
+      main,
+      opts.fromHook
+        ? `the worktree ${top} exists without them (git keeps a worktree whose post-checkout hook fails); put them into ${main}, then run mcproc worktree sync in ${top}`
+        : `nothing was copied into ${top}`,
+      `Put them into ${main} (machine-local files, not in git) and run it again, or pass --allow-missing (MCP: allow_missing) to sync without them.`
+    );
+  const copied: string[] = [];
+  const kept: string[] = [];
+  const linked: string[] = [];
+  let step = '';
+  try {
+    for (const c of plan.copies) {
+      step = `copying ${c.from}`;
+      // only a whole copy is published: a failed one leaves nothing a second sync would keep as done
+      (copyWhole(c.from, c.to, deps.beforePublish) ? copied : kept).push(
+        path.relative(main, c.from)
+      );
+    }
+    for (const l of plan.links) {
+      const rel = path.relative(main, l.from);
+      if (present(l.to)) {
+        kept.push(rel);
+        continue;
+      }
+      step = `linking ${l.from}`;
+      fs.mkdirSync(path.dirname(l.to), { recursive: true });
+      fs.symlinkSync(l.from, l.to);
+      linked.push(rel);
+    }
+  } catch (e) {
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `worktree sync into ${top}: ${step} failed: ${(e as Error).message}`,
+      {
+        hint: "Clear what is in the way or fix the manifest's worktree: section, then run it again: what is in place already is kept.",
+      }
+    );
+  }
+  const required = plan.missingRequired.map((r) => r.entry);
+  for (const miss of plan.missing)
+    deps.log(
+      `copy: ${miss} is not in ${main}, skipped${required.includes(miss) ? ' (required, allowed)' : ''}`
+    );
+  const excluded = await excludeLinks(
+    top,
+    plan.links.map((l) => path.relative(top, l.to)),
+    deps.git,
+    deps.log
+  );
+  return {
+    path: top,
+    repo: main,
+    manifest,
+    copied,
+    kept,
+    linked,
+    from_override: plan.fromOverride,
+    excluded,
+    missing: plan.missing,
+    missing_required: required,
   };
 }
 
@@ -603,19 +1233,9 @@ export async function worktreeRemove(
     main
   );
   // the folders a branch with slashes made (`feat/` of feat/x) go when they are left empty
-  const top = realOf(worktreeDir(m, main));
-  for (
-    let d = path.dirname(e.path);
-    d.startsWith(`${top}${path.sep}`);
-    d = path.dirname(d)
-  ) {
-    try {
-      fs.rmdirSync(d);
-    } catch {
-      break; // not empty
-    }
-  }
+  pruneEmptyParents(path.dirname(e.path), worktreeDir(m, main));
   await free();
+  forgetProject(e.project, e.path, deps.stateDir);
   return { path: e.path, slot: Number(k), branch: e.branch, stopped };
 }
 
@@ -639,7 +1259,7 @@ export async function stopCheckout(
   } catch (e) {
     if (!opts.force) throw e;
     opts.log(
-      `the manifest of ${root} does not load (${describeError(e)}): its apps are not stopped`
+      `the manifest of ${root} does not load (${describeErrorWithHint(e)}): its apps are not stopped`
     );
     return [];
   }

@@ -33,6 +33,43 @@ describe('override', () => {
     expect(() => parseOverride('apps: {}', '/p/o')).toThrow(McprocError);
     expect(() => parseOverride('project: Bad Name', '/p/o')).toThrow(/project/);
   });
+  it('accepts worktree copy and link extras, and refuses other keys under worktree', () => {
+    expect(
+      parseOverride(
+        'worktree:\n  copy: [.env.local]\n  link: [notes]\n',
+        '/p/o'
+      )
+    ).toEqual({
+      path: '/p/o',
+      project: undefined,
+      vars: {},
+      worktree: { copy: ['.env.local'], link: ['notes'], required: [] },
+    });
+    expect(
+      parseOverride('worktree:\n  link: [notes]\n', '/p/o').worktree
+    ).toEqual({
+      copy: [],
+      link: ['notes'],
+      required: [],
+    });
+    expect(parseOverride('worktree:\n', '/p/o').worktree).toBeUndefined();
+    expect(() => parseOverride('worktree:\n  dir: ../x\n', '/p/o')).toThrow(
+      /worktree\.dir|worktree/
+    );
+  });
+  it('accepts worktree required extras, empty when only copy is given; the unknown-key hint names them', () => {
+    expect(
+      parseOverride('worktree: { required: [secret.env] }\n', '/p/o').worktree
+    ).toEqual({ copy: [], link: [], required: ['secret.env'] });
+    expect(
+      parseOverride('worktree: { copy: [cache] }\n', '/p/o').worktree
+    ).toEqual({ copy: ['cache'], link: [], required: [] });
+    expect(() => parseOverride('apps: {}', '/p/o')).toThrowError(
+      expect.objectContaining({
+        hint: 'The override may set only project, repo, vars and worktree (copy, link, required).',
+      })
+    );
+  });
   it('loads from .mcproc/mcproc.local.yaml and writes it back', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-ov-'));
     fs.mkdirSync(path.join(root, '.mcproc'));

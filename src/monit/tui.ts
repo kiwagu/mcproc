@@ -4,6 +4,7 @@ import type { Manifest } from '../core/manifest.js';
 import { rowsFor, snapshot } from '../core/list.js';
 import { Fleet, actOn } from '../core/fleet.js';
 import { createFollower } from '../core/logfollow.js';
+import { followPids } from '../core/pm2watch.js';
 import {
   appInfos,
   CONFIRM_MS,
@@ -15,6 +16,7 @@ import {
 } from './state.js';
 import {
   logsTitle,
+  paintedText,
   paneTitle,
   renderFrame,
   scrollTo,
@@ -23,7 +25,9 @@ import {
 import { colorFor } from '../core/logstream.js';
 import { MonitLoop, peekView, reloadView, type LoopDeps } from './loop.js';
 import { screenDispatch } from './dispatch.js';
+import { onChange } from './coalesce.js';
 import { clearLogs, readStore, storePath } from '../core/incidents/store.js';
+import { takenPoints } from '../core/incidents/taken.js';
 
 const deps = (manifest: Manifest): LoopDeps => ({
   fleet: (requested) => new Fleet(manifest, requested),
@@ -35,19 +39,28 @@ const deps = (manifest: Manifest): LoopDeps => ({
   clear: (fleet, apps) => clearLogs(fleet, apps),
   cleared: (fleet) => {
     const s = readStore(storePath(fleet.manifest.path));
-    return { at: s.cleared, gen: s.clears };
+    return { at: s.cleared, gen: s.clears, taken: takenPoints(s) };
   },
   peekIncidents: (fleet, names, cursor, restart) =>
     peekView(fleet, names, cursor, restart),
+  events: followPids,
 });
 
-/** The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. */
+/** A blessed screen: monit's own, or the stacks overview's that monit draws on for a while. */
+export type Screen = ReturnType<typeof blessed.screen>;
+
+/**
+ * The blessed shell: it only paints frames from the pure renderer and forwards keys to the loop. On a screen the caller
+ * owns (the stacks overview) it draws there and leaves it as it found it, and with `back` esc returns 'back' to it.
+ */
 export async function runMonit(opts: {
   project?: string;
   host?: string;
   intervalMs: number;
   lines: number;
-}): Promise<void> {
+  screen?: Screen;
+  back?: boolean;
+}): Promise<'quit' | 'back'> {
   const { manifest } = prepare({ project: opts.project });
   // apps bound to a host (`host:`) are shown from there: without --host the screen opens on every app at its own host
   const views = monitViews(manifest);
@@ -58,13 +71,17 @@ export async function runMonit(opts: {
     host: viewLabel(fleet.requested),
     hosts: views.map(viewLabel),
     apps: appInfos(manifest),
+    toStacks: Boolean(opts.back),
   });
 
-  const screen = blessed.screen({
-    smartCSR: true,
-    title: 'mcproc monit',
-    fullUnicode: true,
-  });
+  const own = !opts.screen;
+  const screen =
+    opts.screen ??
+    blessed.screen({
+      smartCSR: true,
+      title: 'mcproc monit',
+      fullUnicode: true,
+    });
   // No frames: every pane is a one-line title rule plus full-width content, so a terminal drag-selection copies text only
   // (blessed enables mouse tracking only when something listens for mouse events, and nothing here does).
   // wrap: false everywhere — the renderer already cuts lines to the width.
@@ -83,7 +100,7 @@ export async function runMonit(opts: {
   const detailsTitle = box({ bottom: 7, height: 1 });
   const detailsBox = box({ bottom: 1, height: 6 });
   const footer = box({ bottom: 0, height: 1 });
-  for (const b of [
+  const boxes = [
     header,
     appsTitle,
     tableBox,
@@ -92,8 +109,8 @@ export async function runMonit(opts: {
     detailsTitle,
     detailsBox,
     footer,
-  ])
-    screen.append(b);
+  ];
+  for (const b of boxes) screen.append(b);
 
   // labels get the same ANSI colors as `mcproc logs`; blessed renders SGR codes in content, and the log text itself is
   // reduced by screen text to the apps' own color codes in the form blessed reads; tags are off, so no escaping is involved
@@ -110,7 +127,11 @@ export async function runMonit(opts: {
     width: screen.width as number,
     height: screen.height as number,
   });
+  /** monit has left the screen: a paint that a late dispatch or the first refresh still asks for touches nothing */
+  let left = false;
+  // everything this paints must be in paintedText's key (frame.ts), or a change in it alone would not be drawn
   const show = (f: Frame) => {
+    if (left) return;
     const { width: w, height: h } = size();
     header.setContent(f.header);
     footer.setContent(f.footer);
@@ -140,6 +161,11 @@ export async function runMonit(opts: {
     logBox.setScrollPerc(100);
     screen.render();
   };
+  // a frame equal to the one on screen is not painted again: a read that changed nothing costs no redraw
+  const showChanged = onChange(
+    (f: Frame) => paintedText(state, f, size()),
+    show
+  );
   // reduce at once, paint once per burst (a wheel notch is three key presses), clamp a scroll by the pane as it is now
   const { dispatch, paint } = screenDispatch({
     get: () => state,
@@ -147,7 +173,7 @@ export async function runMonit(opts: {
       state = s;
     },
     render: (s) => renderFrame(s, size()),
-    show,
+    show: showChanged,
     scrollTo: (s, delta) => scrollTo(s, size(), delta),
   });
   const loop = new MonitLoop(
@@ -158,50 +184,52 @@ export async function runMonit(opts: {
     dispatch
   );
 
-  return new Promise<void>((resolve) => {
-    const timer = setInterval(() => {
-      void loop.refresh();
-    }, opts.intervalMs);
-    const quit = () => {
-      clearInterval(timer);
+  return new Promise<'quit' | 'back'>((resolve) => {
+    // each host group on its own schedule: pm2's pid files on this machine, the interval elsewhere
+    loop.start(opts.intervalMs);
+    // a screen of its own goes with monit; the overview's screen is left as monit found it, its own boxes taken off
+    const leave = (why: 'quit' | 'back') => {
+      left = true;
       loop.close();
-      screen.destroy();
-      resolve();
+      screen.removeListener('keypress', onKey);
+      screen.removeListener('resize', paint);
+      if (own) screen.destroy();
+      else for (const b of boxes) b.detach();
+      resolve(why);
     };
-    screen.on(
-      'keypress',
-      (_ch: string, key: { full?: string; name?: string }) => {
-        const intent = keyIntent(key.full ?? key.name ?? '', state);
-        // a pending clear or reload waits for the second press of its key; any other key cancels it (c and R arm their own)
-        if (
-          state.armedAt !== null &&
-          !(intent?.kind === 'action' && intent.action.type === 'arm')
-        )
-          dispatch({ type: 'arm', at: null });
-        if (!intent) return;
-        if (intent.kind === 'quit') return quit();
-        if (intent.kind === 'action') {
-          if (intent.action.type === 'arm' && intent.action.at !== null) {
-            const { at, what } = intent.action;
-            setTimeout(() => {
-              if (state.armedAt === at && state.armed === what)
-                dispatch({ type: 'arm', at: null });
-            }, CONFIRM_MS + 50).unref();
-          }
-          if (intent.action.type === 'select')
-            loop.dispatchSelect(intent.action.delta);
-          else {
-            dispatch(intent.action);
-            if (intent.action.type === 'view') void loop.refresh();
-          } // fill the new view at once
-          return;
+    const onKey = (_ch: string, key: { full?: string; name?: string }) => {
+      const intent = keyIntent(key.full ?? key.name ?? '', state);
+      // a pending clear or reload waits for the second press of its key; any other key cancels it (c and R arm their own)
+      if (
+        state.armedAt !== null &&
+        !(intent?.kind === 'action' && intent.action.type === 'arm')
+      )
+        dispatch({ type: 'arm', at: null });
+      if (!intent) return;
+      if (intent.kind === 'quit') return leave('quit');
+      if (intent.kind === 'back') return leave('back');
+      if (intent.kind === 'action') {
+        if (intent.action.type === 'arm' && intent.action.at !== null) {
+          const { at, what } = intent.action;
+          setTimeout(() => {
+            if (state.armedAt === at && state.armed === what)
+              dispatch({ type: 'arm', at: null });
+          }, CONFIRM_MS + 50).unref();
         }
-        if (intent.kind === 'host-next') return void loop.nextView();
-        if (intent.kind === 'clear') return void loop.runClear(intent.apps);
-        if (intent.kind === 'reload-all') return void loop.reloadAll();
-        void loop.runCommand(intent.cmd, intent.app);
+        if (intent.action.type === 'select')
+          loop.dispatchSelect(intent.action.delta);
+        else {
+          dispatch(intent.action);
+          if (intent.action.type === 'view') void loop.refresh();
+        } // fill the new view at once
+        return;
       }
-    );
+      if (intent.kind === 'host-next') return void loop.nextView();
+      if (intent.kind === 'clear') return void loop.runClear(intent.apps);
+      if (intent.kind === 'reload-all') return void loop.reloadAll();
+      void loop.runCommand(intent.cmd, intent.app);
+    };
+    screen.on('keypress', onKey);
     screen.on('resize', paint);
     void loop.refresh().then(paint);
   });

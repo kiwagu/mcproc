@@ -4,10 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadManifest, type Manifest } from '../../src/core/manifest.js';
-import { doctor } from '../../src/core/doctor.js';
+import { doctor, type DoctorReport, monitMode } from '../../src/core/doctor.js';
+import type { Pm2Client } from '../../src/core/pm2.js';
+import { ProcReader } from '../../src/core/procfs.js';
+import { pickHost } from '../../src/core/resolve.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
 import { renderDoctor } from '../../src/mcp/render.js';
 import type { Spawner } from '../../src/transport/types.js';
+import { procWorld } from '../helpers/procfs.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const basic = path.join(here, '..', 'fixtures', 'projects', 'basic');
@@ -513,5 +517,227 @@ describe('doctor: environment and urls', () => {
     expect(renderDoctor([box])).toContain(
       '  url web: localhost → ::1 on box; answers from this machine (200); on box: no curl or wget'
     );
+  });
+});
+
+describe('renderDoctor: the daemon and how reads run', () => {
+  const rep: DoctorReport = {
+    host: 'local',
+    transport: 'local',
+    reachable: true,
+    error: null,
+    node: 'v22.1.0',
+    pm2: {
+      source: 'path',
+      bin: 'pm2',
+      version: '7.0.4',
+      reason: 'pm2 on the login-shell PATH',
+    },
+    tools: { ps: true, ss: true, tar: true },
+    pm2_home: null,
+    runtime_dir: '/p/.mcproc/runtime',
+    runtime_present: false,
+    runtime_pm2: null,
+    runtime_node: null,
+    daemon: 'answers',
+    processes: 2,
+    in_namespace: 1,
+    state_dir: null,
+    watcher: null,
+    memory: null,
+    recommendations: [],
+    environment: null,
+    urls: [],
+    reads: null,
+    monit: null,
+  };
+  it('a daemon that does not run', () => {
+    expect(
+      renderDoctor([
+        { ...rep, daemon: 'not-running', processes: 0, in_namespace: 0 },
+      ])
+    ).toContain('daemon: not running');
+  });
+  it('reads in plain sh, or through the host shell and why; nothing before any read', () => {
+    expect(
+      renderDoctor([
+        { ...rep, reads: { shell: 'plain', age_s: 3, reason: null } },
+      ])
+    ).toContain(
+      '\n  reads: plain sh with the login environment (read 3 s ago)'
+    );
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          reads: {
+            shell: 'host',
+            age_s: null,
+            reason: 'the host shell is a plain sh',
+          },
+        },
+      ])
+    ).toContain('\n  reads: the host shell (the host shell is a plain sh)');
+    expect(renderDoctor([rep])).not.toContain('reads:');
+  });
+  it('doctor says how the reads ran on a host it reached; an unreachable host has no reads', async () => {
+    const [local, stand] = await doctor(
+      loadManifest(basic),
+      undefined,
+      spawner,
+      neverHere
+    );
+    // the fake world prints no login environment, so the reads went through the host shell
+    expect(local.reads).toMatchObject({
+      shell: 'host',
+      // whole seconds since the capture: 0 unless the run crossed a second
+      age_s: expect.any(Number),
+      reason: expect.stringContaining('printed no environment'),
+    });
+    expect(stand.reads).toBeNull();
+  });
+  it('how monit reads a host: events with the in-process scan, or polled and why', () => {
+    expect(
+      renderDoctor([
+        { ...rep, monit: { mode: 'events', scan: 'in-process', why: null } },
+      ])
+    ).toContain('\n  monit: events + in-process scan');
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          monit: {
+            mode: 'polled',
+            scan: 'in-process',
+            why: 'PM2_DEFAULT_PID_PATH moves its pid files',
+          },
+        },
+      ])
+    ).toContain(
+      '\n  monit: polled every 2 s with the in-process scan (PM2_DEFAULT_PID_PATH moves its pid files)'
+    );
+    expect(
+      renderDoctor([
+        {
+          ...rep,
+          monit: { mode: 'polled', scan: 'script', why: 'another host' },
+        },
+      ])
+    ).toContain('\n  monit: polled every 2 s (another host)');
+    expect(renderDoctor([rep])).not.toContain('monit:');
+  });
+  it('doctor says how monit reads each host it reached', async () => {
+    const [local, stand, prod] = await doctor(
+      loadManifest(basic),
+      undefined,
+      spawner,
+      neverHere
+    );
+    // the injected spawner is a fake world: no in-process scan, no socket lister, so nothing to watch
+    expect(local.monit).toEqual({
+      mode: 'polled',
+      scan: 'script',
+      why: "pm2's list does not come over its socket here",
+    });
+    expect(stand.monit).toBeNull();
+    expect(prod.monit).toEqual({
+      mode: 'polled',
+      scan: 'script',
+      why: 'another host',
+    });
+  });
+});
+
+describe('monitMode: how monit reads this machine', () => {
+  const m = loadManifest(basic);
+  const local = pickHost(m, 'local');
+  const proc = new ProcReader(procWorld({ procs: [] }));
+  /** a client whose pids() answers `p` (or throws it) */
+  const pidsGive = (p: Awaited<ReturnType<Pm2Client['pids']>> | Error) =>
+    ({
+      pids: async () => {
+        if (p instanceof Error) throw p;
+        return p;
+      },
+    }) as unknown as Pm2Client;
+  const withTmp = async (f: (dir: string) => Promise<void>) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-monit-'));
+    try {
+      await f(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  it('an app whose pm2 options set pid_file: polled, though the pids directory is there', () =>
+    withTmp(async (dir) => {
+      const apps = {
+        ...m.apps,
+        worker: { ...m.apps.worker, pm2: { pid_file: '/tmp/w.pid' } },
+      };
+      expect(
+        await monitMode(
+          local,
+          pidsGive({ dir, why: null }),
+          apps,
+          undefined,
+          proc
+        )
+      ).toEqual({
+        mode: 'polled',
+        scan: 'in-process',
+        why: "worker's pm2.pid_file moves its pid file",
+      });
+    }));
+  it('a pids directory no daemon has made yet: polled; once it is there: events', () =>
+    withTmp(async (home) => {
+      const dir = path.join(home, 'pids');
+      const client = pidsGive({ dir, why: null });
+      expect(await monitMode(local, client, m.apps, undefined, proc)).toEqual({
+        mode: 'polled',
+        scan: 'in-process',
+        why: 'no daemon has made its pids directory yet',
+      });
+      fs.mkdirSync(dir);
+      expect(await monitMode(local, client, m.apps, undefined, proc)).toEqual({
+        mode: 'events',
+        scan: 'in-process',
+        why: null,
+      });
+    }));
+  it("no pids directory from pm2, or pids() fails: polled with pm2's reason", async () => {
+    const why = 'PM2_DEFAULT_PID_PATH moves its pid files';
+    expect(
+      await monitMode(
+        local,
+        pidsGive({ dir: null, why }),
+        m.apps,
+        undefined,
+        proc
+      )
+    ).toEqual({ mode: 'polled', scan: 'in-process', why });
+    expect(
+      await monitMode(
+        local,
+        pidsGive(new Error('the login shell hung')),
+        m.apps,
+        undefined,
+        proc
+      )
+    ).toEqual({
+      mode: 'polled',
+      scan: 'in-process',
+      why: 'the login shell hung',
+    });
+  });
+  it('no /proc on this machine: polled with the script', async () => {
+    expect(
+      await monitMode(
+        local,
+        pidsGive({ dir: null, why: 'unused' }),
+        m.apps,
+        undefined,
+        null
+      )
+    ).toEqual({ mode: 'polled', scan: 'script', why: 'no /proc here' });
   });
 });

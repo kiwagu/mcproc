@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { Command, Option } from 'commander';
+import { Argument, Command, Option } from 'commander';
 import { VERSION } from '../version.js';
 import { McprocError, isMcprocError } from '../core/errors.js';
 import { createTransport } from '../transport/index.js';
@@ -13,6 +13,7 @@ import {
   type Context,
 } from '../core/resolve.js';
 import { cancelLease, leasesView } from '../core/leases/view.js';
+import { StacksCollector } from '../core/stacks/collect.js';
 import { watcherEntry } from '../core/leases/ensure.js';
 import {
   defaultWatcherDeps,
@@ -22,11 +23,20 @@ import {
 import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
 import {
+  checkoutOf,
   defaultWorktreeDeps,
+  gitRunner,
+  isFreshCheckout,
   worktreeAdd,
   worktreeLs,
   worktreeRemove,
+  worktreeSync,
 } from '../core/worktree.js';
+import {
+  HOOK_ACTIONS,
+  worktreeHook,
+  type HookAction,
+} from '../core/worktree-hook.js';
 import { parseSizeMib } from '../core/sizes.js';
 import type { WaitRecord } from '../core/actions.js';
 import { portsReport, hostsInfo, describeProject } from '../core/list.js';
@@ -68,7 +78,10 @@ import {
   renderLeases,
   renderWorktreeAdded,
   renderWorktreeRemoved,
+  renderWorktreeSynced,
   renderWorktrees,
+  renderHook,
+  renderStacks,
   hostsOf,
   sinceNotes,
   urlNote,
@@ -77,10 +90,14 @@ import { serveStdio } from '../mcp/server.js';
 import { monitOnce } from '../monit/once.js';
 import { installShortcut } from './install.js';
 import { runMonit } from '../monit/tui.js';
+import { overviewOnce, runOverview } from '../monit/stacks-tui.js';
+import { findManifestPath } from '../core/manifest.js';
 
 export interface Io {
   out: (s: string) => void;
   err: (s: string) => void;
+  /** the terminal's columns when stdout is one; undefined when piped (text tables then keep one record per line) */
+  columns?: () => number | undefined;
 }
 type Globals = { project?: string; host?: string; json?: boolean };
 type Opts = Record<string, string | boolean | undefined>;
@@ -88,6 +105,8 @@ type Opts = Record<string, string | boolean | undefined>;
 const defaultIo: Io = {
   out: (s) => process.stdout.write(`${s}\n`),
   err: (s) => process.stderr.write(`${s}\n`),
+  columns: () =>
+    process.stdout.isTTY ? process.stdout.columns || undefined : undefined,
 };
 
 /**
@@ -170,9 +189,32 @@ export async function printLs(
   io.out(
     how.json
       ? JSON.stringify(rows, null, 2)
-      : renderLs(rows, fleet.fallback, unread)
+      : renderLs(rows, fleet.fallback, unread, io.columns?.())
   );
   if (errors.length) process.exitCode = 1; // the rows of the hosts that answered are printed; the exit code still says one did not
+}
+
+/**
+ * What `monit` opens: the stacks overview with --all, or where no manifest is found and no project was named (--project,
+ * MCPROC_PROJECT, CLAUDE_PROJECT_DIR); otherwise the project's monit, so a named folder without a manifest still fails
+ * as before. The overview starts on the checkout it was opened from, when there is one.
+ */
+export function monitMode(
+  g: { project?: string },
+  all: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd()
+): { mode: 'overview'; selected?: string } | { mode: 'project' } {
+  const named = g.project || env.MCPROC_PROJECT || env.CLAUDE_PROJECT_DIR;
+  const found = findManifestPath(
+    named ? resolveProjectDir(g.project, [], env) : cwd
+  );
+  if (all)
+    return found
+      ? { mode: 'overview', selected: found.root }
+      : { mode: 'overview' };
+  if (!named && !found) return { mode: 'overview' };
+  return { mode: 'project' };
 }
 
 export function buildProgram(io: Io = defaultIo): Command {
@@ -191,6 +233,8 @@ export function buildProgram(io: Io = defaultIo): Command {
 
   const emit = (g: Globals, text: string, data: unknown) =>
     io.out(g.json ? JSON.stringify(data, null, 2) : text);
+  /** the width text tables fit: the terminal's, none for --json or piped output */
+  const width = (g: Globals) => (g.json ? undefined : io.columns?.());
   const wrap =
     (fn: (g: Globals, opts: Opts, args: string[]) => Promise<void>) =>
     async (...all: unknown[]) => {
@@ -224,7 +268,13 @@ export function buildProgram(io: Io = defaultIo): Command {
     const fleet = fleetOf(g);
     const waits: WaitRecord[] = [];
     const rows = await actOn(fleet, target, act, { ...opts, waits });
-    const { text, failed } = renderMutation(rows, fleet.fallback, act, waits);
+    const { text, failed } = renderMutation(
+      rows,
+      fleet.fallback,
+      act,
+      waits,
+      width(g)
+    );
     emit(g, text, { ...hostsOf(rows, fleet.fallback), rows, waits });
     if (failed) process.exitCode = 1; // a host failed or was skipped: the first line says so, the exit code too
   };
@@ -261,7 +311,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest } = prepare({ project: g.project });
         const h = hostsInfo(manifest);
-        emit(g, renderHosts(h), h);
+        emit(g, renderHosts(h, width(g)), h);
       })
     );
   program
@@ -304,7 +354,7 @@ export function buildProgram(io: Io = defaultIo): Command {
         const fleet = fleetOf(g);
         if (!app) {
           const d = describeProject(fleet.manifest);
-          emit(g, renderProject(d), d);
+          emit(g, renderProject(d, width(g)), d);
           return;
         }
         const d = await describeFleetApp(fleet, app);
@@ -314,7 +364,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             `${d.app.name} [${d.app.kind}]: ${d.app.description}`,
             `run: ${d.app.run}`,
             `cwd: ${d.app.cwd}`,
-            renderLs([d.row], d.host),
+            renderLs([d.row], d.host, [], width(g)),
             urlNote(d.row),
             `logs: ${d.logs ? `${d.logs.out} | ${d.logs.err}` : 'not started yet'}`,
           ]
@@ -557,7 +607,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [port]) => {
         const ctx = await ctxOf(g);
         const r = await portsReport(ctx, port ? Number(port) : undefined);
-        emit(g, renderPorts(r, ctx.host.name), r);
+        emit(g, renderPorts(r, ctx.host.name, width(g)), r);
       })
     );
   program
@@ -602,7 +652,7 @@ export function buildProgram(io: Io = defaultIo): Command {
           ctx = undefined; // no manifest here: the queue is the host's and still reads
         }
         const v = await leasesView(undefined, ctx);
-        emit(g, renderLeases(v), v);
+        emit(g, renderLeases(v, width(g)), v);
       })
     );
   leases
@@ -612,6 +662,26 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g, _o, [id]) => {
         const l = await cancelLease(id);
         emit(g, `cancelled ${l.id} (${l.project} ${l.target})`, l);
+      })
+    );
+  program
+    .command('stacks')
+    .description(
+      'every mcproc stack on this host: the checkouts any mcproc call has seen and those found in the local pm2, with their hosts, apps, memory and ports'
+    )
+    .option('--all', 'also the recorded checkouts with nothing in pm2')
+    .action(
+      wrap(async (g, o) => {
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'stacks reads every host each stack declares; --host does not apply',
+            {
+              hint: 'Drop --host.',
+            }
+          );
+        const v = await new StacksCollector().collect({ all: Boolean(o.all) });
+        emit(g, renderStacks(v.answer, width(g)), v.answer);
       })
     );
   program
@@ -686,7 +756,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       })
     );
   // git runs here: the worktree commands act on the local checkout; their notes go to stderr, the answer to stdout
-  const worktreeCtx = async (g: Globals) => {
+  const worktreePrep = (g: Globals) => {
     const prep = prepare({ project: g.project, host: g.host });
     if (!prep.host.local)
       throw new McprocError(
@@ -694,7 +764,10 @@ export function buildProgram(io: Io = defaultIo): Command {
         `worktree runs on the local host only, not on ${prep.host.name}`,
         { hint: 'Drop --host; the checkout is on this machine.' }
       );
-    const ctx = await connect(prep);
+    return prep;
+  };
+  const worktreeCtx = async (g: Globals) => {
+    const ctx = await connect(worktreePrep(g));
     return {
       manifest: ctx.manifest,
       deps: await defaultWorktreeDeps(ctx, { out: io.err }),
@@ -708,7 +781,7 @@ export function buildProgram(io: Io = defaultIo): Command {
   worktree
     .command('add <branch>')
     .description(
-      'a worktree in the sibling folder on that branch: copies and links from the manifest, the override with its slot, the install'
+      "a worktree in the sibling folder on that branch: copies and links from its manifest and the main checkout's override, the override with its slot, the install"
     )
     .option(
       '--from <ref>',
@@ -720,6 +793,10 @@ export function buildProgram(io: Io = defaultIo): Command {
       'the project slug this checkout runs under (default: <project>-w<slot>)'
     )
     .option('--no-install', 'skip the install command')
+    .option(
+      '--allow-missing',
+      'make the worktree even when a worktree.required entry is missing in the main checkout'
+    )
     .action(
       wrap(async (g, o, [branch]) => {
         const { manifest, deps } = await worktreeCtx(g);
@@ -731,6 +808,7 @@ export function buildProgram(io: Io = defaultIo): Command {
             slot: o.slot === undefined ? undefined : Number(o.slot),
             project: o.slug === undefined ? undefined : String(o.slug),
             install: o.install !== false,
+            allowMissing: Boolean(o.allowMissing),
           },
           deps
         );
@@ -746,7 +824,7 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         const { manifest, deps } = await worktreeCtx(g);
         const rows = await worktreeLs(manifest, deps);
-        emit(g, renderWorktrees(rows), rows);
+        emit(g, renderWorktrees(rows, width(g)), rows);
       })
     );
   worktree
@@ -765,6 +843,84 @@ export function buildProgram(io: Io = defaultIo): Command {
           deps
         );
         emit(g, renderWorktreeRemoved(r), r);
+      })
+    );
+  worktree
+    .command('sync')
+    .description(
+      "bring this worktree (the one --project or the cwd is in) the files a new one gets: its manifest's (else the main checkout's) copy, required and link entries plus the main checkout's override, copied from the main checkout; files already there are kept; refused when the local host is readonly"
+    )
+    .option(
+      '--allow-missing',
+      'sync even when a worktree.required entry is missing in the main checkout'
+    )
+    .option(
+      '--hook <prev-ref>',
+      "the form git's post-checkout hook runs: only a fresh checkout (an all-zero previous ref) that mcproc worktree add did not make is synced"
+    )
+    .action(
+      wrap(async (g, o) => {
+        // no prepare(): the target is the git top level, which a manifest search from a nested worktree would miss
+        const hook = o.hook === undefined ? null : String(o.hook);
+        // the explicit flag or the folder it runs in: MCPROC_PROJECT and CLAUDE_PROJECT_DIR may name the main checkout
+        const dir = g.project ?? process.cwd();
+        if (hook !== null) {
+          // an ordinary checkout or switch, or mcproc's own add, which copies itself: nothing to do, nothing said,
+          // whatever else the command line carries
+          if (!isFreshCheckout(hook) || process.env.MCPROC_WORKTREE_ADD) return;
+          // git's variables for the repository that ran the hook (and a caller's GIT_COMMON_DIR, which git passes on to
+          // its hooks) would steer every git call here; this process is short-lived, so they go from its environment
+          // and git finds the worktree from the folder it runs in
+          for (const k of [
+            'GIT_DIR',
+            'GIT_WORK_TREE',
+            'GIT_INDEX_FILE',
+            'GIT_PREFIX',
+            'GIT_COMMON_DIR',
+          ])
+            delete process.env[k];
+          // the main checkout's first checkout of an unborn HEAD comes from nothing too: there is nothing to copy it
+          const { top, main } = await checkoutOf(dir, gitRunner);
+          if (top === main) return;
+        }
+        if (g.host)
+          throw new McprocError(
+            'BAD_ARGUMENT',
+            'worktree sync copies files on this machine; --host does not apply',
+            { hint: 'Drop --host; the checkout is on this machine.' }
+          );
+        const r = await worktreeSync(
+          {
+            dir,
+            allowMissing: Boolean(o.allowMissing),
+            fromHook: hook !== null,
+          },
+          { git: gitRunner, log: (line) => io.err(line) }
+        );
+        emit(g, renderWorktreeSynced(r), r);
+      })
+    );
+  worktree
+    .command('hook')
+    .description(
+      "mcproc's git post-checkout hook of this repository (in its own git directory, shared by every worktree): once installed, a worktree any tool makes through git gets the worktree: files, and a missing required entry fails that git worktree add; another tool's hook is never overwritten"
+    )
+    .addArgument(
+      new Argument('[action]', 'install, remove or status')
+        .choices(HOOK_ACTIONS)
+        .default('status')
+    )
+    .action(
+      wrap(async (g, _o, [action]) => {
+        // no pm2 here: the hook is a file in the repository's git directory
+        const prep = worktreePrep(g);
+        const r = await worktreeHook(
+          action as HookAction,
+          prep.manifest.root,
+          prep.host,
+          gitRunner
+        );
+        emit(g, renderHook(r), r);
       })
     );
   program
@@ -799,29 +955,41 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('monit')
     .description(
-      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame)'
+      'terminal dashboard: apps with real memory/cpu/ports, log tail, details (--once prints one frame); outside a project, or with --all, every stack of this host'
+    )
+    .option(
+      '--all',
+      'the stacks overview: every stack of this host, Enter opens one'
     )
     .option('--once', 'print one frame as text and exit')
     .option('--interval <ms>', 'refresh interval', '2000')
     .option('--lines <n>', 'log lines of history', '200')
     .action(
       wrap(async (g, o) => {
-        if (o.once) {
-          io.out(
-            await monitOnce({
-              project: g.project,
-              host: g.host,
-              lines: Number(o.lines) || 200,
-            })
-          );
+        const lines = Number(o.lines) || 200;
+        const intervalMs = Math.max(500, Number(o.interval) || 2000);
+        const m = monitMode(g, Boolean(o.all));
+        if (m.mode === 'overview') {
+          if (g.host)
+            throw new McprocError(
+              'BAD_ARGUMENT',
+              '--host names a host of one manifest; the overview reads every stack',
+              {
+                hint: 'Drop --host, or open the project: mcproc --project <root> monit --host <name>.',
+              }
+            );
+          if (o.once) {
+            io.out(await overviewOnce({ width: io.columns?.() }));
+            return;
+          }
+          await runOverview({ intervalMs, lines, selected: m.selected });
           return;
         }
-        await runMonit({
-          project: g.project,
-          host: g.host,
-          intervalMs: Math.max(500, Number(o.interval) || 2000),
-          lines: Number(o.lines) || 200,
-        });
+        if (o.once) {
+          io.out(await monitOnce({ project: g.project, host: g.host, lines }));
+          return;
+        }
+        await runMonit({ project: g.project, host: g.host, intervalMs, lines });
       })
     );
   program

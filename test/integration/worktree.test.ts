@@ -21,19 +21,21 @@ import {
   worktreeRemove,
   type WorktreeDeps,
 } from '../../src/core/worktree.js';
+import { stripGitVars } from '../helpers/git-env.js';
 
 const SERVER = `require('http').createServer((q, s) => s.end('ok')).listen(process.env.PORT, () => console.log('listening', process.env.PORT));`;
 const PORT = 38331; // slot 0; slot 1 is 100 above
-// the fixtures' own git calls run without the user's global or system config (commit signing, a hooks directory)
+// the fixtures' own git calls run without the user's global or system config (commit signing, a hooks directory) and
+// without any git variable from outside (another repository, object store or config file)
 const git = (args: string[], cwd: string) =>
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], {
     cwd,
     stdio: 'pipe',
-    env: {
+    env: stripGitVars({
       ...process.env,
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
-    },
+    }),
   }).toString();
 
 let base: string;

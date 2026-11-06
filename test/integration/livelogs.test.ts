@@ -142,12 +142,16 @@ describe.skipIf(process.env.MCPROC_IT_DOCKER !== '1')(
       );
       const p = prepare({ project: dir, host: 'box' });
       const real = createTransport(p.host);
-      let execs = 0;
+      let commands = 0; // shell commands, reads included
       const transport: Transport = {
         ...real,
         exec: (cmd, o) => {
-          execs++;
+          commands++;
           return real.exec(cmd, o);
+        },
+        read: (cmd, o) => {
+          commands++;
+          return real.read(cmd, o);
         },
       };
       const ctx = { manifest: p.manifest, host: p.host, transport } as Context;
@@ -166,7 +170,7 @@ describe.skipIf(process.env.MCPROC_IT_DOCKER !== '1')(
       });
       await until(() => seen.length >= 15, 15_000);
       f.close();
-      expect(execs).toBe(1); // the history; everything after came through the stream
+      expect(commands).toBe(1); // the history; everything after came through the stream
       for (let i = 1; i < seen.length; i++)
         expect(seen[i]).toBe(seen[i - 1] + 1);
       await sleep(1500);

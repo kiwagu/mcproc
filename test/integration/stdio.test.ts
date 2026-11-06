@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { stripGitVars } from '../helpers/git-env.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -18,12 +19,15 @@ describe('mcproc mcp over stdio (built dist)', () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [cli, 'mcp'],
-      env: { ...process.env, MCPROC_PROJECT: basic } as Record<string, string>,
+      env: {
+        ...stripGitVars({ ...process.env }),
+        MCPROC_PROJECT: basic,
+      } as Record<string, string>,
     });
     const client = new Client({ name: 'smoke', version: '0' });
     await client.connect(transport);
     const tools = await client.listTools();
-    expect(tools.tools).toHaveLength(21);
+    expect(tools.tools).toHaveLength(24);
     expect(tools.tools.map((t) => t.name)).toEqual(
       expect.arrayContaining([
         'incidents',
@@ -33,6 +37,9 @@ describe('mcproc mcp over stdio (built dist)', () => {
         'worktree_add',
         'worktree_ls',
         'worktree_remove',
+        'worktree_sync',
+        'worktree_hook',
+        'stacks',
       ])
     );
     const r: any = await client.callTool({ name: 'hosts', arguments: {} });

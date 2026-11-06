@@ -80,7 +80,7 @@ const CHUNK_MARK = ['__MCPROC_LF_out__', '__MCPROC_LF_err__'];
 function shellReader(ctx: Context): ChunkReader {
   return async (reqs) => {
     const res = ensureOk(
-      await ctx.transport.exec(chunkScript(reqs)),
+      await ctx.transport.read(chunkScript(reqs)),
       ctx.host,
       'follow logs'
     );

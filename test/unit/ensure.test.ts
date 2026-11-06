@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  builtCliEntry,
   ensureWatcher,
   watcherEntry,
   WATCHER_NAME,
@@ -32,6 +33,25 @@ describe('watcherEntry and ensureWatcher', () => {
     expect(watcherEntry({}, ['node', '/opt/mcproc/dist/cli.js'])).toBe(
       '/opt/mcproc/dist/cli.js'
     );
+    // an npm global bin is a symlink to dist/cli.js, and node keeps the link's path in argv[1]
+    const cli = path.join(dir, 'lib', 'mcproc', 'dist', 'cli.js');
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, '');
+    const bin = path.join(dir, 'bin', 'mcproc');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.symlinkSync(path.relative(path.dirname(bin), cli), bin);
+    expect(watcherEntry({}, ['node', bin])).toBe(fs.realpathSync(cli));
+    expect(watcherEntry({}, ['node', path.relative(process.cwd(), bin)])).toBe(
+      fs.realpathSync(cli)
+    );
+    // a link to the sources is still a dev checkout: refused with the hint
+    const src = path.join(dir, 'src', 'cli.ts');
+    fs.mkdirSync(path.dirname(src), { recursive: true });
+    fs.writeFileSync(src, '');
+    fs.symlinkSync(src, path.join(dir, 'bin', 'dev'));
+    expect(() =>
+      watcherEntry({}, ['node', path.join(dir, 'bin', 'dev')])
+    ).toThrowError(expect.objectContaining({ code: 'NOT_STARTED' }));
     expect(() =>
       watcherEntry({}, ['node', '/w/mcproc/src/cli.ts'])
     ).toThrowError(
@@ -39,6 +59,39 @@ describe('watcherEntry and ensureWatcher', () => {
         code: 'NOT_STARTED',
         hint: expect.stringContaining('MCPROC_CLI_ENTRY'),
       })
+    );
+  });
+
+  it('builtCliEntry: MCPROC_CLI_ENTRY wins, else the real path of a built cli.js the entry links to, else null', () => {
+    expect(builtCliEntry({}, ['node', 'src/cli.ts'])).toBeNull();
+    expect(builtCliEntry({}, ['node'])).toBeNull();
+    const cli = path.join(dir, 'pkg', 'dist', 'cli.js');
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, '');
+    const bin = path.join(dir, 'bin', 'mcproc');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.symlinkSync(cli, bin);
+    expect(builtCliEntry({}, ['node', bin])).toBe(fs.realpathSync(cli));
+    expect(
+      builtCliEntry({ MCPROC_CLI_ENTRY: 'elsewhere/cli.js' }, ['node', bin])
+    ).toBe(path.resolve('elsewhere/cli.js'));
+    expect(
+      builtCliEntry({ MCPROC_CLI_ENTRY: 'elsewhere/cli.js' }, [
+        'node',
+        'src/cli.ts',
+      ])
+    ).toBe(path.resolve('elsewhere/cli.js'));
+    // the watcher's refusal stays as it was
+    expect(() => watcherEntry({}, ['node', 'src/cli.ts'])).toThrowError(
+      expect.objectContaining({
+        code: 'NOT_STARTED',
+        message:
+          'cannot launch the lease watcher: this mcproc runs from src/cli.ts, not from a built cli.js',
+        hint: 'Set MCPROC_CLI_ENTRY to the dist/cli.js the watcher should run (a dev checkout: build it to the side).',
+      })
+    );
+    expect(() => watcherEntry({}, ['node'])).toThrowError(
+      'cannot launch the lease watcher: this mcproc runs from an unknown entry, not from a built cli.js'
     );
   });
 

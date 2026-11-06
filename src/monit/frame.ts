@@ -11,6 +11,7 @@ import {
 } from '../mcp/render.js';
 import type { Incident } from '../core/incidents/detect.js';
 import { DEFAULT_SINCE_MIN } from '../core/incidents/poll.js';
+import { isTaken } from '../core/incidents/taken.js';
 import {
   selectedRow,
   visibleFlat,
@@ -18,12 +19,17 @@ import {
   type FlatLine,
   type MonitState,
   type ReloadInfo,
+  visibleIncidents,
+  type ShownIncident,
 } from './state.js';
 import type { LogLine } from '../core/logfollow.js';
 import { cutWidth as cut, displayWidth, screenText } from './screentext.js';
 import { stripAnsi } from '../core/logs.js';
 import { markKey } from '../core/incidents/cursor.js';
 import { localStamp } from '../core/incidents/store.js';
+
+/** The legend's way back to the stacks overview, when monit was opened from it: first, so a narrow terminal never cuts it. */
+const stacksKey = (s: MonitState) => (s.toStacks ? 'esc stacks  ' : '');
 
 export interface Frame {
   header: string;
@@ -90,10 +96,19 @@ function paneSpec(
   const w = Math.max(40, size.width);
   if (s.view === 'incidents')
     return {
-      entries: s.incidents,
+      entries: visibleIncidents(s),
       // header, the pane title, footer, and one line per thing the last read could not do
       logH: Math.max(3, size.height - 3 - s.incidentsErrors.length),
-      rowsOf: (e) => incidentRows(e as Incident, w),
+      rowsOf: (e) =>
+        incidentRows(
+          e as ShownIncident,
+          w,
+          isTaken(
+            e as ShownIncident,
+            s.incidentsTaken,
+            (e as ShownIncident).end
+          )
+        ),
     };
   if (s.view === 'flat') {
     const label = Math.max(1, ...Object.keys(s.apps).map((a) => a.length));
@@ -199,14 +214,26 @@ function cachedRows(
 }
 
 const incidentCache: RowCache = new WeakMap();
-/** An incident's rows as the incidents tool writes it, wrapped to the width; its own line red, each row closing its color. */
-function incidentRows(i: Incident, w: number): string[] {
-  return cachedRows(incidentCache, i, `${w}`, () =>
-    incidentLines(i).flatMap((line) => {
-      const rows = wrapText(screenText(line), w, 4);
-      return line.startsWith('  ▶ ')
-        ? rows.map((r) => `\x1b[31m${r}${RESET}`)
-        : rows;
+/** The muted colors of what the agent has taken: grey text, and a soft red for the incident's own line. */
+const TAKEN_TEXT = '\x1b[90m';
+const TAKEN_LINE = '\x1b[38;5;131m';
+/**
+ * An incident's rows as the incidents tool writes it, wrapped to the width; its own line red, each row closing its
+ * color. One the agent has taken is muted throughout and says so on its first line.
+ */
+function incidentRows(i: Incident, w: number, taken = false): string[] {
+  return cachedRows(incidentCache, i, `${w}:${taken}`, () =>
+    incidentLines(i).flatMap((line, k) => {
+      const text = taken && k === 0 ? `${line} · taken` : line;
+      const rows = wrapText(screenText(text), w, 4);
+      const color = line.startsWith('  ▶ ')
+        ? taken
+          ? TAKEN_LINE
+          : '\x1b[31m'
+        : taken
+          ? TAKEN_TEXT
+          : '';
+      return color ? rows.map((r) => `${color}${r}${RESET}`) : rows;
     })
   );
 }
@@ -328,11 +355,12 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const empty = s.incidentsPolled
-      ? `no incidents in the last ${DEFAULT_SINCE_MIN} min`
-      : 'reading incidents…';
-    const keys =
-      '↑↓ scroll  i back  f flat  c clear  R reload all  h host  q quit';
+    const empty = !s.incidentsPolled
+      ? 'reading incidents…'
+      : s.incidents.length
+        ? 'every incident here is taken (t shows them)'
+        : `no incidents in the last ${DEFAULT_SINCE_MIN} min`;
+    const keys = `${stacksKey(s)}↑↓ scroll  i back  f flat  t ${s.hideTaken ? 'show' : 'hide'} taken  c clear  R reload all  h host  q quit`;
     return {
       header,
       table: [],
@@ -356,8 +384,7 @@ export function renderFrame(
       spec.logH,
       spec.rowsOf
     );
-    const keys =
-      '↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit';
+    const keys = `${stacksKey(s)}↑↓ scroll  c clear  R reload all  f dashboard  o/e/b logs  i incidents  h host  q quit`;
     return {
       header,
       table: [],
@@ -369,32 +396,37 @@ export function renderFrame(
     };
   }
   const multi = new Set(s.rows.map((r) => r.host)).size > 1; // apps of several hosts on one screen: say where each runs
-  const tableLines = table([
+  const o = multi ? 1 : 0;
+  const tableLines = table(
     [
-      '',
-      'APP',
-      ...(multi ? ['HOST'] : []),
-      'STATUS',
-      'UP',
-      'MEM',
-      'CPU',
-      'PORTS',
-      'URL',
-      'RUNTIME',
+      [
+        '',
+        'APP',
+        ...(multi ? ['HOST'] : []),
+        'STATUS',
+        'UP',
+        'MEM',
+        'CPU',
+        'PORTS',
+        'URL',
+        'RUNTIME',
+      ],
+      ...s.rows.map((r, i) => [
+        i === s.selected ? '▶' : ' ',
+        r.app,
+        ...(multi ? [r.host] : []),
+        r.status,
+        fmtUptime(r.uptime_ms),
+        r.memory ? fmtBytes(r.memory) : '-',
+        r.status === 'online' ? fmtCpu(r.cpu) : '-',
+        screenText(fmtPorts(r.ports)),
+        screenText(fmtUrl(r)),
+        r.runtime ? screenText(r.runtime) : '-',
+      ]),
     ],
-    ...s.rows.map((r, i) => [
-      i === s.selected ? '▶' : ' ',
-      r.app,
-      ...(multi ? [r.host] : []),
-      r.status,
-      fmtUptime(r.uptime_ms),
-      r.memory ? fmtBytes(r.memory) : '-',
-      r.status === 'online' ? fmtCpu(r.cpu) : '-',
-      cut(screenText(fmtPorts(r.ports)), 22),
-      cut(screenText(fmtUrl(r)), 36),
-      r.runtime ? cut(screenText(r.runtime), 40) : '-',
-    ]),
-  ])
+    // +2: the marker column's gutter is dropped below, so the table may use those two columns
+    { width: w + 2, flex: [6 + o, 7 + o, 8 + o], mode: 'fit' }
+  )
     .split('\n')
     .map((l) => cut(l.replace(/^(.)\s\s/, '$1'), w));
   const spec = paneSpec(s, size); // its height counts the table as s.rows.length + 1 lines, as drawn here
@@ -430,8 +462,7 @@ export function renderFrame(
           ),
         ]
       : ['no app selected'];
-  const keys =
-    'j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit';
+  const keys = `${stacksKey(s)}j/k app  ↑↓ scroll  r restart  R reload all  s start  x stop  c clear  o/e/b logs  f flat  i incidents  h host  q quit`;
   const footer = cut(right ? `${right}  │ ${keys}` : keys, w); // the error or notice first: on a narrow terminal the key legend is what gets cut
   return {
     header,
@@ -465,7 +496,13 @@ export function logsTitle(
     const since = s.incidentsCleared
       ? ` · since the clear ${clearedAt(s.incidentsCleared, now)}`
       : '';
-    return `incidents · last ${DEFAULT_SINCE_MIN} min${since} · ${s.incidents.length} shown${up}`;
+    const taken = s.incidents.filter((i) =>
+      isTaken(i, s.incidentsTaken, i.end)
+    ).length;
+    const marked = taken
+      ? ` · ${taken} taken${s.hideTaken ? ' hidden' : ''}`
+      : '';
+    return `incidents · last ${DEFAULT_SINCE_MIN} min${since} · ${visibleIncidents(s).length} shown${marked}${up}`;
   }
   const shown =
     s.view === 'flat'
@@ -479,6 +516,28 @@ export function logsTitle(
   const when = at ? ` · cleared ${clearedAt(at, now)}` : '';
   const who = s.view === 'flat' ? 'all apps' : (selectedRow(s)?.app ?? '-');
   return `logs · ${who} · ${s.stream}${when}${up}`;
+}
+
+/**
+ * Everything the screen shows for frame `f` of state `s` at `size`, as one string: two equal strings paint the same
+ * screen (the pane rules are drawn from the width and the log title).
+ */
+export function paintedText(
+  s: MonitState,
+  f: Frame,
+  size: { width: number; height: number }
+): string {
+  return JSON.stringify([
+    size.width,
+    size.height,
+    s.view,
+    f.header,
+    f.footer,
+    logsTitle(s, f.scroll),
+    f.table,
+    f.logs,
+    f.details,
+  ]);
 }
 
 /** A pane's one-line title rule: `── label ─────…` cut to the width. Panes have no frames, so a terminal selection copies text only. */

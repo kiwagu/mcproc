@@ -3,6 +3,7 @@ import path from 'node:path';
 import { LOG_STAMP } from '../ecosystem.js';
 import { McprocError } from '../errors.js';
 import type { Context } from '../resolve.js';
+import { realOf } from '../slots.js';
 import { stateDir } from '../state.js';
 import { LeaseStore } from './store.js';
 
@@ -32,14 +33,29 @@ function exitingAt(dir: string): number | null {
   }
 }
 
-/** The CLI file the watcher's node runs: MCPROC_CLI_ENTRY, else the running CLI's own entry when it is the built bundle. */
+/**
+ * The built CLI file a node started from outside this process should run (the lease watcher, the git hook):
+ * MCPROC_CLI_ENTRY, else the running CLI's own entry when it is the built bundle; null for a run from the sources.
+ * The entry is read through its symlinks: an npm global bin links to dist/cli.js, and node keeps the link's path in argv[1].
+ */
+export function builtCliEntry(
+  env: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv
+): string | null {
+  if (env.MCPROC_CLI_ENTRY) return path.resolve(env.MCPROC_CLI_ENTRY);
+  const own = argv[1] ?? '';
+  const real = own ? realOf(own) : '';
+  return real.endsWith('cli.js') ? real : null;
+}
+
+/** The CLI file the watcher's node runs: builtCliEntry's, refused with how to set it when there is none. */
 export function watcherEntry(
   env: NodeJS.ProcessEnv = process.env,
   argv: string[] = process.argv
 ): string {
-  if (env.MCPROC_CLI_ENTRY) return path.resolve(env.MCPROC_CLI_ENTRY);
+  const entry = builtCliEntry(env, argv);
+  if (entry !== null) return entry;
   const own = argv[1] ?? '';
-  if (own.endsWith('cli.js')) return path.resolve(own);
   throw new McprocError(
     'NOT_STARTED',
     `cannot launch the lease watcher: this mcproc runs from ${own || 'an unknown entry'}, not from a built cli.js`,

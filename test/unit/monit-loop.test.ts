@@ -1,9 +1,12 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import type { TakenPoints } from '../../src/core/incidents/taken.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
+import type { Context } from '../../src/core/resolve.js';
+import type { EventFeed, FeedNote } from '../../src/core/pm2watch.js';
 import { McprocError } from '../../src/core/errors.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import { Fleet, type Connector } from '../../src/core/fleet.js';
@@ -27,6 +30,7 @@ import {
 } from '../../src/core/incidents/store.js';
 import type { CursorState } from '../../src/core/incidents/cursor.js';
 import { fakeHosts, proc, S } from '../helpers/incidents.js';
+import { SAFETY_MS } from '../../src/monit/schedule.js';
 import {
   appInfos,
   initialState,
@@ -2158,5 +2162,519 @@ describe('MonitLoop incidents view and log clears', () => {
     expect(h.state.incidentsErrors.join(' ')).toMatch(
       /skipped .+ of api err on local/
     );
+  });
+});
+
+describe('what the agent has taken', () => {
+  it('each refresh hands the screen the taken points the store has, and only a change dispatches', async () => {
+    let taken: TakenPoints = {};
+    const h = harness(undefined, {
+      cleared: () => ({ at: {}, gen: {}, taken }),
+    });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+    taken = {
+      'local/api': {
+        err: { stamp: '2026-10-15T10:00:02.000', path: '/l/x-err', offset: 0 },
+      },
+    };
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual(taken);
+    const same = h.state;
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toBe(same.incidentsTaken); // nothing new: the same points
+  });
+  it('a store read without taken points (an older dep) leaves them as they are', async () => {
+    const h = harness(undefined, { cleared: () => ({ at: {}, gen: {} }) });
+    await h.loop.refresh();
+    expect(h.state.incidentsTaken).toEqual({});
+  });
+  it('the incidents a read finds reach the screen with where that read ended in their file', async () => {
+    const h = harness(undefined, {
+      cleared: () => ({ at: {}, gen: {}, taken: {} }),
+      peekIncidents: async () => ({
+        answer: {
+          incidents: [
+            {
+              app: 'api',
+              host: 'local',
+              kind: 'error',
+              stream: 'err',
+              time: '2026-10-15T10:00:02',
+              first_time: null,
+              count: 1,
+              line: 'TypeError',
+              before: [],
+              after: [],
+              fingerprint: 'f',
+            },
+          ],
+          skipped: [],
+          errors: [],
+          more: 0,
+          apps: 1,
+          hosts: 1,
+          latest: null,
+          taken: false,
+          cleared_at: null,
+        },
+        next: {
+          v: 1,
+          apps: {
+            'local/api': {
+              restarts: 0,
+              status: 'online',
+              err: { path: '/l/api-err', offset: 77 },
+            },
+          },
+        },
+      }),
+    });
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await h.loop.refresh();
+    expect(h.state.incidents[0].end).toEqual({
+      path: '/l/api-err',
+      offset: 77,
+    });
+  });
+});
+
+describe('MonitLoop after close (the screen went away, e.g. esc back to the stacks)', () => {
+  it('a refresh still in flight publishes nothing once the loop is closed', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness('local', {
+      snapshot: async () => {
+        snaps++;
+        await gate.promise;
+        return snap();
+      },
+    });
+    const pending = h.loop.refresh();
+    await tick();
+    const before = h.actions.length;
+    h.loop.close();
+    gate.resolve();
+    await pending;
+    await tick();
+    expect(h.actions.slice(before)).toEqual([]);
+    expect(snaps).toBe(1);
+  });
+  it('a refresh asked after close reads nothing', async () => {
+    let snaps = 0;
+    const h = harness('local', {
+      snapshot: async () => {
+        snaps++;
+        return snap();
+      },
+    });
+    h.loop.close();
+    await h.loop.refresh();
+    expect(snaps).toBe(0);
+    expect(h.actions).toEqual([]);
+  });
+  it('a host switch still connecting when the loop closes neither replaces the view nor reads it', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness(
+      undefined,
+      {
+        snapshot: async () => {
+          snaps++;
+          return snap();
+        },
+      },
+      { dir: fleetDir, gate: (host) => (host === 'box' ? gate.promise : null) }
+    );
+    const switching = h.loop.switchView('box');
+    await tick();
+    const before = h.actions.length;
+    h.loop.close();
+    gate.resolve();
+    await switching;
+    await tick();
+    expect(h.actions.slice(before)).toEqual([]);
+    expect(snaps).toBe(0);
+    expect(h.state.host).not.toBe('box');
+  });
+});
+
+describe('MonitLoop closed while a host is still connecting', () => {
+  it('starts no probe once the loop closed during the connect', async () => {
+    const gate = deferred<void>();
+    let snaps = 0;
+    const h = harness(
+      'local',
+      {
+        snapshot: async () => {
+          snaps++;
+          return snap();
+        },
+      },
+      { gate: (host) => (host === 'local' ? gate.promise : null) }
+    );
+    const pending = h.loop.refresh();
+    await tick();
+    h.loop.close();
+    gate.resolve();
+    await pending;
+    await tick();
+    expect(snaps).toBe(0);
+  });
+});
+
+describe('MonitLoop.start: when each host group is read', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+  };
+  const rowsWith =
+    (over: Partial<LsRow>): LoopDeps['rows'] =>
+    (ctx, _s, apps) =>
+      apps
+        .filter((a) => a !== 'api-build')
+        .map((a) => ({ ...row(a, ctx.host.name), ...over }));
+  const stopped = rowsWith({ status: 'stopped' });
+  const waiting = rowsWith({
+    ports: {
+      actual: [],
+      declared: [3310],
+      checks: [{ port: 3310, status: 'declared-not-listening' }],
+      undeclared: [],
+    },
+  });
+  /** a loop whose host reads are recorded by host name */
+  function counted(
+    over: Partial<LoopDeps> = {},
+    opts: Parameters<typeof harness>[2] = {}
+  ) {
+    const reads: string[] = [];
+    const h = harness(
+      undefined,
+      {
+        snapshot: async (ctx) => {
+          reads.push(ctx.host.name);
+          return snap();
+        },
+        rows: stopped,
+        ...over,
+      },
+      opts
+    );
+    return { h, reads };
+  }
+  /** a feed the test drives: `notify` stands for the daemon */
+  function feed() {
+    let notify: (n: FeedNote) => void = () => {};
+    let closed = 0;
+    const f: EventFeed = {
+      up: true,
+      close: () => {
+        closed++;
+      },
+    };
+    return {
+      events: async (_ctx: Context, on: (n: FeedNote) => void) => {
+        notify = on;
+        return f;
+      },
+      notify: (n: FeedNote) => notify(n),
+      closed: () => closed,
+    };
+  }
+  /** starts the loop and brings its feed up */
+  async function upNow(
+    h: { loop: MonitLoop },
+    fd: ReturnType<typeof feed>,
+    intervalMs = 2000
+  ) {
+    h.loop.start(intervalMs);
+    await flush();
+    fd.notify('up');
+    await flush();
+  }
+
+  it('no event feed: every group is read every interval, as before', async () => {
+    const { h, reads } = counted({ events: async () => null });
+    h.loop.start(2000);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(reads).toEqual(['local', 'local', 'local']);
+    h.loop.close();
+  });
+  it('a feed that never comes up (no daemon has made its pids directory yet) keeps the interval', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events });
+    h.loop.start(2000);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(reads).toEqual(['local', 'local']);
+    h.loop.close();
+  });
+  it('a feed that is up, nothing running: one read when it comes up, none for 25 s, then one safety read', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events });
+    await upNow(h, fd);
+    expect(reads).toEqual(['local']);
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(reads).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads).toHaveLength(2);
+    h.loop.close();
+  });
+  it('a pm2 event: one read 100 ms later for its burst', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events });
+    await upNow(h, fd);
+    fd.notify('event');
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(99);
+    expect(reads).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reads).toHaveLength(2);
+    h.loop.close();
+  });
+  it('an app running: a read every interval for its CPU', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events, rows: rowsWith({}) });
+    await upNow(h, fd);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(reads).toHaveLength(3);
+    h.loop.close();
+  });
+  it('a running app whose declared port does not listen yet: reads at 0.5, 1, 2, 4 and 8 s after an event', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events, rows: waiting });
+    await upNow(h, fd, 60_000);
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(reads).toHaveLength(7); // up, the event, five port checks
+    h.loop.close();
+  });
+  it('a feed that drops is read every interval until it is up again', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events });
+    await upNow(h, fd);
+    fd.notify('down');
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(reads).toHaveLength(3);
+    fd.notify('up');
+    await flush();
+    expect(reads).toHaveLength(4); // what happened while it was down
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(reads).toHaveLength(4);
+    h.loop.close();
+  });
+  it('a feed that comes up while a read of its group is under way reads again once that read is done', async () => {
+    const fd = feed();
+    const gate = deferred<void>();
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: fd.events,
+      rows: stopped,
+      snapshot: async (ctx) => {
+        reads.push(ctx.host.name);
+        if (reads.length === 1) await gate.promise; // begun before the start that 'up' stands for
+        return snap();
+      },
+    });
+    h.loop.start(2000);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(reads).toHaveLength(1);
+    fd.notify('up');
+    await flush();
+    gate.resolve();
+    await flush();
+    expect(reads).toHaveLength(2);
+    h.loop.close();
+  });
+  it("a pm2 event during a read begun before it: the event's read runs after that read and sees the change", async () => {
+    const fd = feed();
+    let status = 'stopped';
+    const seenBy = new WeakMap<Snapshot, string>(); // what pm2 said when each read began
+    let gate: { promise: Promise<void> } | null = null;
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: fd.events,
+      snapshot: async () => {
+        const s = snap();
+        seenBy.set(s, status);
+        reads.push(status);
+        if (gate) await gate.promise;
+        return s;
+      },
+      rows: (ctx, s, apps) =>
+        apps
+          .filter((a) => a !== 'api-build')
+          .map((a) => ({
+            ...row(a, ctx.host.name),
+            status: seenBy.get(s) ?? 'stopped',
+          })),
+    });
+    await upNow(h, fd);
+    expect(reads).toEqual(['stopped']);
+    const slow = deferred<void>();
+    gate = slow;
+    void h.loop.refresh(['local']); // a read under way before pm2 starts the app
+    await flush();
+    gate = null;
+    status = 'online';
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(150); // past the debounce, that read still runs
+    expect(reads).toEqual(['stopped', 'stopped']);
+    slow.resolve();
+    await flush();
+    expect(reads).toEqual(['stopped', 'stopped', 'online']);
+    expect(h.state.rows.find((r) => r.app === 'api')?.status).toBe('online');
+    h.loop.close();
+  });
+  it('a polled group whose tick lands during a read joins it: one read, not two', async () => {
+    const gate = deferred<void>();
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: async () => null,
+      rows: stopped,
+      snapshot: async (ctx) => {
+        reads.push(ctx.host.name);
+        if (reads.length === 1) await gate.promise; // a slow host: this read outlasts the interval
+        return snap();
+      },
+    });
+    h.loop.start(2000);
+    void h.loop.refresh(['local']);
+    await vi.advanceTimersByTimeAsync(2000); // the tick lands while that read is under way
+    expect(reads).toHaveLength(1);
+    gate.resolve();
+    await flush();
+    expect(reads).toHaveLength(1); // joined it, not chained after it
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(reads).toHaveLength(2);
+    h.loop.close();
+  });
+  it('a remote group keeps the interval while the local one follows events', async () => {
+    const fd = feed();
+    const { h, reads } = counted(
+      {
+        events: async (ctx, on) => (ctx.host.local ? fd.events(ctx, on) : null),
+      },
+      { dir: fleetDir }
+    );
+    await upNow(h, fd);
+    await vi.advanceTimersByTimeAsync(4000);
+    const count = (host: string) => reads.filter((r) => r === host).length;
+    expect(count('local')).toBe(1);
+    expect(count('box')).toBe(2);
+    expect(count('ro')).toBe(2);
+    h.loop.close();
+  });
+  it('close ends every read and closes the feeds', async () => {
+    const fd = feed();
+    const { h, reads } = counted({ events: fd.events });
+    await upNow(h, fd);
+    h.loop.close();
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reads).toHaveLength(1);
+    expect(fd.closed()).toBe(1);
+  });
+  it('close leaves no timer behind: no schedule, no store timer', async () => {
+    const fd = feed();
+    const { h } = counted({ events: fd.events, rows: waiting });
+    await upNow(h, fd);
+    fd.notify('event');
+    await vi.advanceTimersByTimeAsync(50); // the event's read is still to come
+    expect(vi.getTimerCount()).toBeGreaterThan(1);
+    h.loop.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('a read that fails still settles: the group is read again by the safety read 30 s after each failure', async () => {
+    const fd = feed();
+    const reads: string[] = [];
+    const h = harness(undefined, {
+      events: fd.events,
+      rows: stopped,
+      snapshot: async (ctx) => {
+        reads.push(ctx.host.name);
+        throw new McprocError('TRANSPORT_FAILED', 'pm2 did not answer');
+      },
+    });
+    await upNow(h, fd);
+    expect(reads).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(SAFETY_MS);
+    expect(reads).toHaveLength(2);
+    // armed again by the failed read itself: the feed coming up armed only the first
+    await vi.advanceTimersByTimeAsync(SAFETY_MS);
+    expect(reads).toHaveLength(3);
+    h.loop.close();
+  });
+  it('the store is read every interval while no host is', async () => {
+    const fd = feed();
+    let looks = 0;
+    const { h, reads } = counted({
+      events: fd.events,
+      cleared: () => {
+        looks++;
+        return { at: {}, gen: {} };
+      },
+    });
+    await upNow(h, fd);
+    const before = looks;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(reads).toHaveLength(1);
+    expect(looks - before).toBe(3);
+    h.loop.close();
+  });
+  it('the incidents view goes on being read while it is open, though no host is', async () => {
+    const fd = feed();
+    let peeks = 0;
+    const { h } = counted({
+      events: fd.events,
+      peekIncidents: async () => {
+        peeks++;
+        return {
+          answer: {
+            incidents: [],
+            skipped: [],
+            errors: [],
+            more: 0,
+            apps: 0,
+            hosts: 0,
+            latest: null,
+            taken: false,
+            cleared_at: null,
+          },
+          next: { v: 1, apps: {} },
+        };
+      },
+    });
+    await upNow(h, fd);
+    h.loop.dispatch({ type: 'view', view: 'incidents' });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(peeks).toBeGreaterThanOrEqual(2);
+    h.loop.close();
+  });
+  it("a host switch follows the new view's groups and closes the old feeds", async () => {
+    const fd = feed();
+    const asked: string[] = [];
+    const { h } = counted(
+      {
+        events: async (ctx, on) => {
+          asked.push(ctx.host.name);
+          return fd.events(ctx, on);
+        },
+      },
+      { dir: fleetDir }
+    );
+    h.loop.start(2000);
+    await flush();
+    expect([...asked].sort()).toEqual(['box', 'local', 'ro']);
+    await h.loop.nextView(); // all → local
+    await flush();
+    expect(fd.closed()).toBe(3);
+    expect(asked.slice(3)).toEqual(['local']);
+    h.loop.close();
   });
 });
