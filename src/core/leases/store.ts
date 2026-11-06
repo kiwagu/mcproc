@@ -10,6 +10,7 @@ import {
   processState,
   realProcFs,
 } from '../procfs.js';
+import { dropCallerEnv, sweepCallerEnvs } from './callerenv.js';
 import { memoryPosition, memoryQueue } from './queue.js';
 
 /** Where a lease stands: queued (pending), handed to a watcher (starting), up (running), or ended (freed, cancelled, failed). */
@@ -226,6 +227,8 @@ function readHeld(file: string): Held | null {
  */
 export class LeaseStore {
   readonly dir: string;
+  /** the state directory the lease directory is in: the queued starts' kept environments are there too */
+  readonly stateDir: string;
   private readonly now: () => number;
   private readonly pid: number;
   private readonly beforeUnlink: (() => void) | undefined;
@@ -240,6 +243,7 @@ export class LeaseStore {
     stateDir: string,
     deps: { now?: () => number; pid?: number; beforeUnlink?: () => void } = {}
   ) {
+    this.stateDir = stateDir;
     this.dir = path.join(stateDir, 'leases');
     this.now = deps.now ?? (() => Date.now());
     this.pid = deps.pid ?? process.pid;
@@ -603,7 +607,16 @@ export class LeaseStore {
     }
     if (ENDED.has(to)) next.ended_at = at;
     if (to !== 'pending') next.waiting_for = null;
-    return this.write(next);
+    const written = await this.write(next);
+    // the environment its caller kept is for the watcher's start alone: a lease that ends, or runs without that start,
+    // never needs it (what this misses, prune sweeps)
+    if (to !== 'starting')
+      try {
+        dropCallerEnv(this.stateDir, id);
+      } catch {
+        // swept by the next prune
+      }
+    return written;
   }
   /**
    * Rewrites fields of a lease without a state change: the watcher's `waiting_for`, a child pid, a refreshed estimate.
@@ -644,16 +657,22 @@ export class LeaseStore {
   positionOf(id: string): number {
     return memoryPosition(this.list(), id);
   }
-  /** Removes ended leases older than `maxAgeMs` (a day); returns how many. */
+  /**
+   * Removes ended leases older than `maxAgeMs` (a day); returns how many. The kept environments of leases no longer
+   * waiting go too: what a crash between a lease's end and their drop left.
+   */
   prune(maxAgeMs = PRUNE_AFTER_MS): number {
     let n = 0;
+    const waiting = new Set<string>();
     for (const l of this.list()) {
+      if (l.state === 'pending' || l.state === 'starting') waiting.add(l.id);
       if (!ENDED.has(l.state) || !l.ended_at) continue;
       if (this.now() - Date.parse(l.ended_at) > maxAgeMs) {
         fs.rmSync(this.file(l), { force: true });
         n++;
       }
     }
+    sweepCallerEnvs(this.stateDir, waiting);
     return n;
   }
 }

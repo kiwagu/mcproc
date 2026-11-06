@@ -26,7 +26,9 @@ apps:
   when the queue changes, exits after a minute idle, and the next queued start launches it again. While the head waits,
   each tick reads the memory alone; its siblings are measured again when that reading lets it fit, when the queue
   changes, and every 30 s. Each full judgement budgets the head again (apps that came up meanwhile drop out of its need),
-  and a queued start keeps the `--host` it was given. It ends leases whose owner is gone (`checkout gone`, `requester gone`) and an admitted exec
+  and a queued start keeps the `--host` it was given. It runs with its caller's environment, as it would have at once:
+  the gate keeps that environment beside the lease until the watcher hands it to the start (see State), and a start
+  that joins one already queued runs with the first caller's. It ends leases whose owner is gone (`checkout gone`, `requester gone`) and an admitted exec
   that has not run within 60 s (`the exec did not take its turn`). An exec waiting in the queue whose mcproc is gone is
   cancelled wherever it stands; a running one is freed only once both its mcproc and its command are gone (each known by
   its pid, start time and boot, so a reused pid does not count). While a start brings its apps up and settles, the
@@ -41,7 +43,9 @@ apps:
   refused: stop its target instead. `ls` shows a queued app as `queued #N`, `wait` rides through the queue, `doctor`
   reports the state directory and the watcher. `start --note <text>` keeps a reason on the lease.
 - **State** lives in `~/.local/state/mcproc` (or `$XDG_STATE_HOME/mcproc`, or `MCPROC_STATE_DIR`): `leases/`, `slots/`,
-  `watcher.json` and `watcher.ecosystem.json`. A dev checkout runs the watcher from the bundle `MCPROC_CLI_ENTRY` names.
+  `caller-env/`, `watcher.json` and `watcher.ecosystem.json`. `caller-env/<lease>.json` is a queued start's environment,
+  readable by its owner alone: whatever its caller exported, secrets too, kept while the start waits and deleted once
+  the watcher hands it over or the lease ends (`mcproc leases` and the watcher sweep what a crash left). A dev checkout runs the watcher from the bundle `MCPROC_CLI_ENTRY` names.
 
 ## Exec: one-off work under a lease
 
@@ -81,6 +85,11 @@ it exits within a minute). A watcher from before 0.19 knows no groups: until it 
 group as an ordinary exec, alongside the holder, and the starts it admits come up in its own pm2 namespace (`mcproc`).
 An MCP server started before the upgrade keeps the old code until it restarts: its `exec` has no `exclusive`, and its
 starts count the runs waiting for a group as ahead of them, so they only wait longer. Restart it to use groups.
+
+**Upgrading from 0.19.0.** Install while no watcher runs, as above. A 0.19.0 watcher runs every queued start with the
+environment of whoever launched it and leaves the kept ones in `caller-env/` (the next `mcproc leases` deletes them). A
+start queued by an MCP server started before the upgrade keeps none, so it runs with the watcher's environment (the
+watcher's log says so) until that server restarts.
 
 ## Limits
 
