@@ -27,7 +27,8 @@ branch (a new branch starts at `--from`, default the main checkout's HEAD), then
 `<project>-w<slot>`) and, when that manifest declares a `slot` var, `vars.slot`, copies and links what that manifest
 declares, and runs its install. So a branch that introduces the slot scheme gets a correct worktree from the first try,
 whatever the main checkout's manifest says. It prints the path, which manifest decided, and how to go on; if git fails
-the slot is given back.
+the slot is given back. A `readonly` local host in the manifest it runs from refuses it before anything is made (no
+worktree, branch or slot).
 
 Machine-local extras stay out of the repository: the main checkout's own `.mcproc/mcproc.local.yaml` may add to the
 lists, and every link, from either source, is written as a root-anchored pattern to git's exclude file of the repository
@@ -48,6 +49,13 @@ path; a slot whose folder is gone shows `(gone)`, and `add` and `remove` reclaim
 the worktree's apps (freeing its leases), removes the checkout and frees the slot; the branch stays. Uncommitted or
 untracked changes refuse it unless `--force`, and the main checkout is never removed. The registry is
 `<state>/slots/<project>-<hash>.json`.
+
+The main checkout is the repository's own working tree, whatever git's layout: a submodule's checkout (git's
+`core.worktree` names it), and the checkout of a repository made with `--separate-git-dir`. From one of that
+repository's worktrees it is found only once `core.worktree` names it, since git keeps no path back to it there; the
+refusal names the command that records it (`git config --file <git dir>/config core.worktree <its path>`, or with
+`extensions.worktreeConfig` on, `git --git-dir=<git dir> config --worktree core.worktree <its path>`). A `core.worktree`
+that names no checkout of the repository is refused, and so are a bare repository's worktrees: it has no main checkout.
 
 The agent then passes `project: <worktree path>` on every call for that stand (`start`, `wait`, `logs`...).
 

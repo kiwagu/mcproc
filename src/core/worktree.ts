@@ -163,15 +163,97 @@ function copyWhole(
   }
 }
 
-/** The main checkout of the repository `root` belongs to: the parent of git's common dir, real path. */
+/**
+ * The main checkout of the repository `root` belongs to, as a real path. git keeps no path back to it from a worktree:
+ * it is `root`'s own top when `root` is in it (its git dir is the repository's common dir), else the checkout the common
+ * dir's `core.worktree` names (a submodule's, or one set by hand), else the parent of a common dir named `.git`. A bare
+ * repository has none, and neither has a common dir elsewhere that names no `core.worktree` (a repository made with
+ * --separate-git-dir, asked from one of its worktrees): both are refused, never guessed from the git dir's parent, and
+ * so is a `core.worktree` naming no checkout of this repository. `core.bare` and `core.worktree` are read the way git's
+ * own repository setup reads them: from the common dir's config file, without its includes, the main checkout's
+ * config.worktree first while extensions.worktreeConfig is on (git reads that file only then).
+ */
 export async function mainCheckout(
   root: string,
   git: GitRunner
 ): Promise<string> {
-  const common = (
-    await gitOk(git, ['rev-parse', '--git-common-dir'], root)
-  ).trim();
-  return fs.realpathSync(path.dirname(path.resolve(root, common)));
+  const [own, common, top] = (
+    await gitOk(
+      git,
+      [
+        'rev-parse',
+        '--absolute-git-dir',
+        '--git-common-dir',
+        '--show-toplevel',
+      ],
+      root
+    )
+  )
+    .trim()
+    .split('\n');
+  const dir = realOf(path.resolve(root, common));
+  const at = realOf(top);
+  const read = async (file: string, key: string, type: string[] = []) => {
+    const r = await git(
+      ['config', '--file', file, ...type, '--get', key],
+      root
+    );
+    return r.code === 0 ? r.stdout.trim() : null;
+  };
+  const shared = path.join(dir, 'config');
+  const files =
+    (await read(shared, 'extensions.worktreeConfig', ['--type=bool'])) ===
+    'true'
+      ? [path.join(dir, 'config.worktree'), shared]
+      : [shared];
+  /** a key as git's setup reads it, and the file it came from; null when no file sets it */
+  const config = async (key: string, type: string[] = []) => {
+    for (const file of files) {
+      const value = await read(file, key, type);
+      if (value !== null) return { value, file };
+    }
+    return null;
+  };
+  if ((await config('core.bare', ['--type=bool']))?.value === 'true')
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `${at} is a worktree of the bare repository ${dir}, which has no main checkout to take a worktree's files, override and slot from`,
+      {
+        hint: 'Run mcproc in a clone with a checkout of its own (git clone without --bare), and make the worktrees from it.',
+      }
+    );
+  if (realOf(own) === dir) return at;
+  const named = await config('core.worktree');
+  if (named) {
+    const checkout = realOf(path.resolve(dir, named.value));
+    // a checkout of this repository: there, and its git dir this common dir (git cannot start in a missing folder)
+    const there = fs.existsSync(checkout);
+    const ours =
+      there &&
+      (await (async () => {
+        const r = await git(['rev-parse', '--absolute-git-dir'], checkout);
+        return r.code === 0 && realOf(r.stdout.trim()) === dir;
+      })());
+    if (!ours)
+      throw new McprocError(
+        'BAD_ARGUMENT',
+        `the main checkout of ${at} is not usable: core.worktree in ${named.file} names ${checkout}, which is ${there ? `no checkout of the repository ${dir}` : 'not there'}`,
+        {
+          hint: `Correct it (git config --file ${named.file} core.worktree <the main checkout>), or remove it, then run it again.`,
+        }
+      );
+    return checkout;
+  }
+  if (path.basename(dir) === '.git') return path.dirname(dir);
+  throw new McprocError(
+    'BAD_ARGUMENT',
+    `the main checkout of ${at} is not known: its repository's git directory ${dir} is no checkout's .git and names no core.worktree (a repository made with --separate-git-dir)`,
+    {
+      // git takes a shared core.worktree for the main checkout alone, unless extensions.worktreeConfig is on: then it
+      // belongs in the main checkout's config.worktree, which `config --worktree` writes from the common dir
+      hint: `Run it from the main checkout, or name that checkout once: ${files.length > 1 ? `git --git-dir=${dir} config --worktree core.worktree` : `git config --file ${shared} core.worktree`} <its path>`,
+    }
+  );
 }
 
 /** Where worktrees go: the manifest's `worktree.dir` resolved from the main checkout, else `<main>.worktrees`. */
@@ -664,6 +746,13 @@ export async function worktreeAdd(
     throw new McprocError(
       'BAD_ARGUMENT',
       `project slug "${opts.project}" must match ${NAME_RE.source}`
+    );
+  // a readonly local host takes no writes: no worktree, branch, slot, override, copy or install (sync refuses the same)
+  if (m.hosts.local?.readonly)
+    throw new McprocError(
+      'READONLY_HOST',
+      `${m.path} declares the local host readonly: worktree add is refused; nothing was made`,
+      { hint: `Remove hosts.local.readonly from ${m.path}, then run it again.` }
     );
   // the branch names the folder: a name git refuses never reaches the filesystem. No `--` here: check-ref-format
   // refuses one, and `--branch` takes the next argument as the name whatever it looks like (`-x` is refused as a name)
