@@ -118,21 +118,38 @@ async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
         // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal). A waiting one is
         // cancelled wherever it stands, so a dead waiter never holds its group's line; a running one stays held while
         // the command it ran still lives (a SIGKILLed mcproc leaves it running), so its group is not run twice
+        // read again under the lock, on the lease as it is then: its command may have been recorded since the listing
+        const gone = (cur: Lease) => !requesterAlive(cur);
         const requester = requesterAlive(l);
         if (l.state === 'pending' && !requester) {
-          const c = await moveIf(store, l.id, 'pending', 'cancelled', {
-            error: 'requester gone',
-          });
+          const c = await moveIf(
+            store,
+            l.id,
+            'pending',
+            'cancelled',
+            { error: 'requester gone' },
+            gone
+          );
           if (c)
             deps.log(`cancel ${l.id}: requester gone (pid ${l.requester_pid})`);
         } else if (l.state === 'starting' && !requester)
-          await moveIf(store, l.id, 'starting', 'failed', {
-            error: 'requester gone',
-          });
+          await moveIf(
+            store,
+            l.id,
+            'starting',
+            'failed',
+            { error: 'requester gone' },
+            gone
+          );
         else if (l.state === 'running' && !requester && !commandAlive(l))
-          await moveIf(store, l.id, 'running', 'freed', {
-            error: 'requester gone',
-          });
+          await moveIf(
+            store,
+            l.id,
+            'running',
+            'freed',
+            { error: 'requester gone' },
+            (cur) => gone(cur) && !commandAlive(cur)
+          );
         else if (
           l.state === 'starting' &&
           l.admitted_at &&

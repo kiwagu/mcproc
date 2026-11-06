@@ -365,6 +365,46 @@ describe('watchLeases', () => {
     });
   });
 
+  it('keeps a running exec whose command was recorded after the tick listed it', async () => {
+    // a start listed before the exec: the tick awaits its apps, and meanwhile the exec records its command
+    await store.create(input(), 'running');
+    const e = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    const d = deps();
+    d.onlineApps = async () => {
+      await store.withLock(() =>
+        store.patch(e.id, {
+          command_pid: process.pid,
+          command_start: processStart(process.pid),
+        })
+      );
+      return online;
+    };
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(e.id)?.state).toBe('running');
+  });
+
+  it.skipIf(!procAvailable())(
+    'a command pid now used by another process does not keep the lease',
+    async () => {
+      const l = await store.create(
+        input({ ...execOf, requester_pid: deadPid() }),
+        'running'
+      );
+      await store.patch(l.id, {
+        command_pid: process.pid,
+        command_start: (processStart(process.pid) as number) + 1,
+      });
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      expect(store.get(l.id)).toMatchObject({
+        state: 'freed',
+        error: 'requester gone',
+      });
+    }
+  );
+
   it.skipIf(!procAvailable())(
     'a living pid with another start time or boot is gone',
     async () => {
