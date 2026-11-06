@@ -6,6 +6,13 @@ import type { Pm2Process } from '../pm2.js';
 import type { Context } from '../resolve.js';
 import { stateDir } from '../state.js';
 import { WATCHER_NAME, WATCHER_NS } from './ensure.js';
+import {
+  groupReason,
+  groupWait,
+  holderNote,
+  memoryPosition,
+  type GroupWait,
+} from './queue.js';
 import { LeaseStore, type Lease } from './store.js';
 
 /** The host's queue as `leases` shows it: the state directory, the memory reading, the watcher and every lease. */
@@ -15,18 +22,28 @@ export interface LeasesView {
   memory: HostMemory | null;
   /** the watcher's pm2 process; null without a local context */
   watcher: { online: boolean; pid: number | null } | null;
-  /** oldest first, each with its 1-based position among the pending ones (0 when not pending) */
-  leases: (Lease & { position: number })[];
+  /**
+   * oldest first, each with its 1-based position in the memory queue (0 when not in it), what it waits for in its
+   * group (null when it does not), and the reason shown for it: what it waits for in its group, or, for a holder, how
+   * long and by whom it holds it (null otherwise)
+   */
+  leases: (Lease & {
+    position: number;
+    group: GroupWait | null;
+    reason: string | null;
+  })[];
 }
 
 /**
- * The host's queue as `leases` shows it: every lease with its position, the memory reading and the watcher's state when
- * a context is given. A read never fails on the extras: the prune is skipped when the lease lock cannot be taken, and
- * the memory or the watcher is null when meminfo or pm2's list does not answer.
+ * The host's queue as `leases` shows it: every lease with its position, its group's wait or hold (all from one
+ * listing, ages as of `now`), the memory reading and the watcher's state when a context is given. A read never fails
+ * on the extras: the prune is skipped when the lease lock cannot be taken, and the memory or the watcher is null when
+ * meminfo or pm2's list does not answer.
  */
 export async function leasesView(
   dir = stateDir(),
-  ctx?: Context
+  ctx?: Context,
+  now = Date.now()
 ): Promise<LeasesView> {
   const store = new LeaseStore(dir);
   // a host that never queued anything keeps no state directory: the read does not make one
@@ -36,9 +53,22 @@ export async function leasesView(
       .catch(() => {
         /* the lock is busy: the ended leases are pruned by a later read or the watcher */
       });
-  const leases = store
-    .list()
-    .map((l) => ({ ...l, position: store.positionOf(l.id) }));
+  const all = store.list();
+  const leases = all.map((l) => {
+    const group = groupWait(all, l);
+    const holds =
+      l.exclusive !== null && (l.state === 'starting' || l.state === 'running');
+    return {
+      ...l,
+      position: memoryPosition(all, l.id),
+      group,
+      reason: group
+        ? groupReason(group, now)
+        : holds
+          ? holderNote(l, now)
+          : null,
+    };
+  });
   let memory: HostMemory | null = null;
   let watcher: LeasesView['watcher'] = null;
   if (ctx?.host.local) {

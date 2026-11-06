@@ -24,6 +24,7 @@ import {
   renderAdopted,
   queuedNote,
   renderLeases,
+  renderExec,
   renderWorktreeAdded,
   renderWorktrees,
   renderWorktreeRemoved,
@@ -1465,8 +1466,10 @@ describe('queued starts and the lease queue', () => {
       memory: { total_mib: 31836, available_mib: 9100 },
       watcher: { online: true, pid: 42 },
       leases: [
-        { ...lease({}), position: 0 },
+        { ...lease({}), position: 0, group: null, reason: null },
         {
+          group: null,
+          reason: null,
           ...lease({
             id: 'l_bbbbbbbbbb',
             seq: 2,
@@ -1495,7 +1498,7 @@ describe('queued starts and the lease queue', () => {
       'watcher: online pid 42',
     ]);
     expect(lines[3]).toMatch(
-      /^POS +STATE +KIND +PROJECT +TARGET +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
+      /^POS +STATE +KIND +PROJECT +TARGET +GROUP +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
     );
     expect(lines[4]).toMatch(
       /^ +running +start +demo \(slot 0\) +dev +768M → 922M +declared +l_aaaaaaaaaa$/
@@ -1511,6 +1514,78 @@ describe('queued starts and the lease queue', () => {
         leases: [],
       })
     ).toContain('watcher: not running');
+  });
+  it('renderLeases: the GROUP column marks the holder, and the reason column names what each waits for', () => {
+    const held = 'holds suite 3m, pid 1234, command 1240';
+    const behind =
+      'group suite: held by l_aaaaaaaaaa (demo slot 0, pid 1234, 3m), #1 in group';
+    const lines = renderLeases({
+      state_dir: '/s',
+      memory: null,
+      watcher: null,
+      leases: [
+        {
+          ...lease({ kind: 'exec', target: 'bun test', exclusive: 'suite' }),
+          position: 0,
+          group: null,
+          reason: held,
+        },
+        {
+          ...lease({
+            id: 'l_bbbbbbbbbb',
+            seq: 2,
+            state: 'pending',
+            kind: 'exec',
+            target: 'bun test',
+            exclusive: 'suite',
+            waiting_for: 'group suite',
+          }),
+          position: 0,
+          group: null,
+          reason: behind,
+        },
+        {
+          ...lease({ id: 'l_cccccccccc', seq: 3 }),
+          position: 0,
+          group: null,
+          reason: null,
+        },
+      ],
+    }).split('\n');
+    const header = lines[2];
+    expect(header).toMatch(/ TARGET +GROUP +EST → NEED /);
+    const col = header.indexOf('GROUP');
+    const cell = (l: string) => l.slice(col, header.indexOf('EST')).trim();
+    expect(cell(lines[3])).toBe('suite (holds)');
+    expect(lines[3]).toContain(held);
+    expect(cell(lines[4])).toBe('suite');
+    expect(lines[4]).toContain(behind);
+    expect(cell(lines[5])).toBe('');
+  });
+  it('renderExec names the group it waited for', () => {
+    const r = {
+      code: 0,
+      output: '',
+      waited_ms: 120_000,
+      env: {},
+      lease: lease({
+        kind: 'exec',
+        target: 'bun test',
+        exclusive: 'suite',
+        state: 'freed',
+      }),
+    };
+    expect(renderExec(['bun', 'test'], r)).toBe(
+      'exec bun test: exit 0 after 120 s in the queue for group suite (lease l_aaaaaaaaaa, freed)'
+    );
+    expect(
+      renderExec(['bun', 'test'], {
+        ...r,
+        lease: { ...r.lease, exclusive: null },
+      })
+    ).toBe(
+      'exec bun test: exit 0 after 120 s in the queue (lease l_aaaaaaaaaa, freed)'
+    );
   });
 });
 

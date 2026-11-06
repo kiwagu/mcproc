@@ -722,11 +722,16 @@ export function renderLeases(v: LeasesView, width?: number): string {
     l.kind,
     l.project + (l.slot !== null ? ` (slot ${l.slot})` : ''),
     l.target,
+    !l.exclusive
+      ? ''
+      : l.state === 'starting' || l.state === 'running'
+        ? `${l.exclusive} (holds)`
+        : l.exclusive,
     `${fmtMib(l.estimate_mib)} → ${fmtMib(l.need_mib)}`,
     Object.values(l.sources).some((s) => s.source.startsWith('measured'))
       ? 'measured'
       : 'declared',
-    l.waiting_for ?? l.error ?? '',
+    l.reason ?? l.waiting_for ?? l.error ?? '',
     l.id,
   ]);
   return [
@@ -739,6 +744,7 @@ export function renderLeases(v: LeasesView, width?: number): string {
           'KIND',
           'PROJECT',
           'TARGET',
+          'GROUP',
           'EST → NEED',
           'FROM',
           'WAITING FOR / ERROR',
@@ -746,7 +752,7 @@ export function renderLeases(v: LeasesView, width?: number): string {
         ],
         ...rows,
       ],
-      { width, flex: [4, 7], mode: 'wrap' }
+      { width, flex: [4, 8], mode: 'wrap' }
     ),
   ].join('\n');
 }
@@ -806,7 +812,8 @@ export function renderAdopted(r: AdoptResult): {
 
 /** An exec's answer: the command, how long it waited, its lease, the exit code, then the captured tail. */
 export function renderExec(command: string[], r: ExecResult): string {
-  const head = `exec ${command.join(' ')}: exit ${r.code}${r.waited_ms > 1000 ? ` after ${Math.round(r.waited_ms / 1000)} s in the queue` : ''}${r.lease ? ` (lease ${r.lease.id}, ${r.lease.state})` : ''}`;
+  const group = r.lease?.exclusive ? ` for group ${r.lease.exclusive}` : '';
+  const head = `exec ${command.join(' ')}: exit ${r.code}${r.waited_ms > 1000 ? ` after ${Math.round(r.waited_ms / 1000)} s in the queue${group}` : ''}${r.lease ? ` (lease ${r.lease.id}, ${r.lease.state})` : ''}`;
   return r.output ? `${head}\n${r.output}` : head;
 }
 
