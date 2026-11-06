@@ -1743,6 +1743,47 @@ describe('width-aware CLI tables', () => {
     expect(lines).toHaveLength(4); // state, memory, header, the lease
     expect(lines[3]).toContain('not from a built cli.js');
   });
+  it('leases keeps a filled GROUP column within the width: a holder and its waiter', () => {
+    const of = (over: Record<string, unknown>) => ({
+      ...lease,
+      error: null,
+      exclusive: 'e2e-suite',
+      group: null,
+      position: 0,
+      ...over,
+    });
+    const v = {
+      ...view,
+      leases: [
+        of({
+          id: 'l_hhhhhhhhhh',
+          state: 'running',
+          reason: 'holds e2e-suite 3m, pid 123456, command 123460',
+        }),
+        of({
+          id: 'l_wwwwwwwwww',
+          state: 'pending',
+          waiting_for: 'group e2e-suite',
+          reason:
+            'group e2e-suite: held by l_hhhhhhhhhh (demo-w5 slot 5, pid 123456, 3m), #1 in group',
+        }),
+      ],
+    } as unknown as LeasesView;
+    for (const width of [120, 200]) {
+      const lines = renderLeases(v, width).split('\n').slice(2);
+      for (const l of lines) expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      const col = lines[0].indexOf('GROUP');
+      const end = lines[0].indexOf('EST');
+      expect(
+        lines
+          .slice(1)
+          .map((l) => l.slice(col, end).trim())
+          .filter(Boolean)
+      ).toEqual(['e2e-suite (holds)', 'e2e-suite']);
+      // the holder's id: in its ID column, and in its waiter's reason
+      expect(lines.join('\n').split('l_hhhhhhhhhh').length - 1).toBe(2);
+    }
+  });
   it('hosts wraps its CWD within a narrow width', () => {
     const info = [
       {

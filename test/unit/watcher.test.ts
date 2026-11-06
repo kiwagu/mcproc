@@ -669,6 +669,47 @@ describe('watchLeases', () => {
     expect(store.get(s.id)?.state).toBe('running');
   });
 
+  it("settles a start from its child's end, not from its admission", async () => {
+    const s1 = await store.create(input(), 'pending');
+    const s2 = await store.create(
+      input({ project: 'demo-w2', root: '/w/b' }),
+      'pending'
+    );
+    const admitted = new Map<string, number>();
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let ended = 0;
+    const ac = new AbortController();
+    const d = deps();
+    d.settleMs = () => 5000;
+    d.log = (line) => {
+      const m = /^admit (l_\w+)/.exec(line);
+      if (m && !admitted.has(m[1])) admitted.set(m[1], now);
+    };
+    d.runStart = async (l) => {
+      started.push(l.id);
+      if (l.id === s1.id) await held;
+      await store.transition(l.id, 'running', { child_pid: null });
+    };
+    const t0 = now;
+    d.sleep = yielding(() => {
+      // S1's child brings its apps up for 3 s
+      if (!ended && now - t0 >= 3000) {
+        ended = now;
+        release();
+      }
+      if (admitted.has(s2.id)) ac.abort();
+    });
+    expect(await watchLeases(d, { tickMs: 10, signal: ac.signal })).toBe(
+      'aborted'
+    );
+    expect(admitted.get(s1.id)).toBeLessThan(t0 + 3000);
+    expect(ended).toBeGreaterThan(0);
+    expect(admitted.get(s2.id)).toBeGreaterThanOrEqual(ended + 5000);
+  });
+
   it('stops on the signal', async () => {
     await store.create(input(), 'pending');
     const ac = new AbortController();
