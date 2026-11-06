@@ -1,9 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  onTestFinished,
+} from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import {
   LeaseStore,
   type Lease,
@@ -22,6 +30,7 @@ import { parseJlist } from '../../src/core/pm2.js';
 import { ownsManifest } from '../../src/core/leases/siblings.js';
 import { McprocError } from '../../src/core/errors.js';
 import { abortableSleep } from '../../src/core/wait.js';
+import { procAvailable, processStart } from '../../src/core/procfs.js';
 
 const vars = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -319,6 +328,182 @@ describe('watchLeases', () => {
     expect(store.get(young.id)?.state).toBe('starting');
   });
 
+  /** A pid no process has any more: one that ran and exited. */
+  const deadPid = () => spawnSync(process.execPath, ['-e', '0']).pid as number;
+  const execOf = { kind: 'exec' as const, apps: [], target: 'bun test' };
+
+  it('cancels a pending exec whose requester is gone anywhere in the queue', async () => {
+    available = 100; // the head, a start, waits for memory
+    const s = await store.create(input(), 'pending');
+    const e = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'pending'
+    );
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(e.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'requester gone',
+    });
+    expect(store.get(s.id)?.state).toBe('pending');
+  });
+
+  it('keeps a running exec while its command lives after its requester died', async () => {
+    const l = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    await store.patch(l.id, {
+      command_pid: process.pid,
+      command_start: processStart(process.pid),
+    });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(l.id)?.state).toBe('running');
+    await store.patch(l.id, { command_pid: deadPid() });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(l.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+  });
+
+  it('keeps a running exec whose command was recorded after the tick listed it', async () => {
+    // a start listed before the exec: the tick awaits its apps, and meanwhile the exec records its command
+    await store.create(input(), 'running');
+    const e = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    const d = deps();
+    d.onlineApps = async () => {
+      await store.withLock(() =>
+        store.patch(e.id, {
+          command_pid: process.pid,
+          command_start: processStart(process.pid),
+        })
+      );
+      return online;
+    };
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(e.id)?.state).toBe('running');
+  });
+
+  it.skipIf(!procAvailable())(
+    'a command pid now used by another process does not keep the lease',
+    async () => {
+      const l = await store.create(
+        input({ ...execOf, requester_pid: deadPid() }),
+        'running'
+      );
+      await store.patch(l.id, {
+        command_pid: process.pid,
+        command_start: (processStart(process.pid) as number) + 1,
+      });
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      expect(store.get(l.id)).toMatchObject({
+        state: 'freed',
+        error: 'requester gone',
+      });
+    }
+  );
+
+  it.skipIf(!procAvailable())(
+    'a living pid with another start time or boot is gone',
+    async () => {
+      const a = await store.create(
+        input({
+          ...execOf,
+          requester_start: (processStart(process.pid) as number) + 1,
+        }),
+        'running'
+      );
+      const b = await store.create(
+        input({ ...execOf, boot_id: 'another-boot' }),
+        'running'
+      );
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      for (const l of [a, b])
+        expect(store.get(l.id)).toMatchObject({
+          state: 'freed',
+          error: 'requester gone',
+        });
+    }
+  );
+
+  it.skipIf(!procAvailable())(
+    'a zombie requester or command is gone, with or without its start recorded',
+    async () => {
+      // `exec sleep 5` never collects the background sleep the shell left it: once that one exits, it stays a zombie
+      const sh = spawn('sh', ['-c', 'sleep 0.2 & echo $!; exec sleep 5'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      onTestFinished(() => {
+        sh.kill('SIGKILL');
+      });
+      const [out] = await once(sh.stdout!, 'data');
+      const zombie = Number(String(out).trim());
+      const start = processStart(zombie);
+      const stat = () => fs.readFileSync(`/proc/${zombie}/stat`, 'utf8');
+      for (let i = 0; i < 60 && !/\) Z /.test(stat()); i++)
+        await new Promise((r) => setTimeout(r, 50));
+      expect(stat()).toMatch(/\) Z /);
+      const asRequester = await store.create(
+        input({ ...execOf, requester_pid: zombie, requester_start: start }),
+        'running'
+      );
+      // a lease written before identities: the pid alone
+      const asOldRequester = await store.create(
+        input({ ...execOf, requester_pid: zombie }),
+        'running'
+      );
+      const asCommand = await store.create(
+        input({ ...execOf, requester_pid: deadPid() }),
+        'running'
+      );
+      await store.patch(asCommand.id, {
+        command_pid: zombie,
+        command_start: start,
+      });
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      for (const l of [asRequester, asOldRequester, asCommand])
+        expect(store.get(l.id)).toMatchObject({
+          state: 'freed',
+          error: 'requester gone',
+        });
+    }
+  );
+
+  it('a running exec lease from before groups is freed by its pid alone', async () => {
+    const dead = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    const live = await store.create(input(execOf), 'running');
+    // the files as an earlier version wrote them: none of the group, identity or command fields
+    for (const l of [dead, live]) {
+      const file = path.join(
+        dir,
+        'leases',
+        `${String(l.seq).padStart(6, '0')}-${l.id}.json`
+      );
+      const old = JSON.parse(fs.readFileSync(file, 'utf8'));
+      for (const k of [
+        'exclusive',
+        'boot_id',
+        'requester_start',
+        'command_pid',
+        'command_start',
+      ])
+        delete old[k];
+      fs.writeFileSync(file, JSON.stringify(old));
+    }
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(dead.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+    expect(store.get(live.id)?.state).toBe('running');
+  });
+
   it('cancels a pending exec at the head whose requester is gone and judges the next one at once', async () => {
     const t0 = now;
     const gone = spawnSync(process.execPath, ['-e', '0']).pid as number;
@@ -353,6 +538,220 @@ describe('watchLeases', () => {
     await watchLeases(deps(), { tickMs: 10, once: true });
     expect(store.get(a.id)).toMatchObject({ state: 'cancelled' });
     expect(store.get(a.id)?.error).toMatch(/never/);
+  });
+
+  /** A requester that lives until the test kills it: a `sleep` child, killed in onTestFinished too. */
+  const liveChild = () => {
+    const child = spawn('sleep', ['60'], { stdio: 'ignore' });
+    onTestFinished(() => {
+      child.kill('SIGKILL');
+    });
+    return child;
+  };
+  /** A sleep that moves the clock and lets the event loop run (timers, child exits), so the loop does not spin it dry. */
+  const yielding = (on?: () => Promise<void> | void) => async (ms: number) => {
+    now += ms;
+    await on?.();
+    await new Promise((r) => setImmediate(r));
+  };
+  const suite = (over: Partial<NewLease> = {}): NewLease =>
+    input({ ...execOf, exclusive: 'suite', ...over });
+  const groupOnlyOf = (over: Partial<NewLease> = {}): NewLease =>
+    suite({ estimate_mib: 0, need_mib: 0, ...over });
+
+  it("frees a dead holder and admits its group waiter while a start's child still runs", async () => {
+    const child = liveChild();
+    const h = await store.create(
+      suite({ requester_pid: child.pid }),
+      'running'
+    );
+    const w = await store.create(groupOnlyOf(), 'pending');
+    const s = await store.create(input(), 'pending');
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const ac = new AbortController();
+    const d = deps();
+    d.runStart = async (l) => {
+      started.push(l.id);
+      child.kill('SIGKILL');
+      await held;
+      await store.transition(l.id, 'running', { child_pid: null });
+    };
+    let wBeforeRelease: string | undefined;
+    d.sleep = yielding(async () => {
+      if (
+        store.get(w.id)?.state === 'starting' &&
+        wBeforeRelease === undefined
+      ) {
+        wBeforeRelease = store.get(s.id)?.state;
+        release();
+      }
+      if (store.get(s.id)?.state === 'running') ac.abort();
+    });
+    expect(await watchLeases(d, { tickMs: 10, signal: ac.signal })).toBe(
+      'aborted'
+    );
+    expect(started).toEqual([s.id]);
+    expect(store.get(h.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+    // W took its turn while S's child still ran
+    expect(wBeforeRelease).toBe('starting');
+    expect(store.get(w.id)?.state).toBe('starting');
+    expect(store.get(s.id)?.state).toBe('running');
+  });
+
+  it('reconciles during the settle and judges the next memory head only after it', async () => {
+    const child = liveChild();
+    await store.create(suite({ requester_pid: child.pid }), 'running');
+    const w = await store.create(groupOnlyOf(), 'pending');
+    const e1 = await store.create(input(execOf), 'pending');
+    const e2 = await store.create(input(execOf), 'pending');
+    const admitted = new Map<string, number>();
+    const ac = new AbortController();
+    const d = deps();
+    d.settleMs = () => 5000;
+    d.log = (line) => {
+      const m = /^admit (l_\w+)/.exec(line);
+      if (m && !admitted.has(m[1])) admitted.set(m[1], now);
+    };
+    d.sleep = yielding(async () => {
+      // E1's owner takes its turn, and H's requester dies after E1 was admitted
+      if (store.get(e1.id)?.state === 'starting') {
+        await store.transition(e1.id, 'running');
+        child.kill('SIGKILL');
+      }
+      if (store.get(e2.id)?.state === 'starting') ac.abort();
+    });
+    expect(await watchLeases(d, { tickMs: 10, signal: ac.signal })).toBe(
+      'aborted'
+    );
+    const t1 = admitted.get(e1.id) as number;
+    expect(admitted.get(w.id)).toBeGreaterThan(t1);
+    expect(admitted.get(w.id)).toBeLessThan(t1 + 5000);
+    expect(admitted.get(e2.id)).toBeGreaterThanOrEqual(t1 + 5000);
+  });
+
+  it('re-checks the head under the lock: an older group waiter that became eligible during the estimate goes first', async () => {
+    const h = await store.create(suite(), 'running');
+    const a = await store.create(suite(), 'pending');
+    const b = await store.create(input(), 'pending');
+    const d = deps();
+    const estimate = d.estimate;
+    d.estimate = async (l) => {
+      if (l.id === b.id && store.get(h.id)?.state === 'running')
+        await store.transition(h.id, 'freed');
+      return estimate(l);
+    };
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(b.id)?.state).toBe('pending');
+    expect(started).toEqual([]);
+    await watchLeases(d, { tickMs: 10, once: true });
+    expect(store.get(a.id)?.state).toBe('starting');
+    expect(store.get(b.id)?.state).toBe('pending');
+  });
+
+  it("a fresh watcher keeps a living holder's group", async () => {
+    const h = await store.create(suite(), 'running');
+    const w = await store.create(groupOnlyOf(), 'pending');
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(w.id)?.state).toBe('pending');
+    expect(store.get(h.id)?.state).toBe('running');
+  });
+
+  it('stays up while a lease waits for its group', async () => {
+    await store.create(suite(), 'running');
+    await store.create(groupOnlyOf(), 'pending');
+    const ac = new AbortController();
+    const t0 = now;
+    const d = deps();
+    d.sleep = yielding(() => {
+      if (now - t0 >= 1000) ac.abort();
+    });
+    expect(
+      await watchLeases(d, { tickMs: 10, idleExitMs: 50, signal: ac.signal })
+    ).toBe('aborted');
+  });
+
+  it('a starting group-only lease does not hold up the memory head', async () => {
+    const g = await store.create(groupOnlyOf(), 'pending');
+    await store.transition(g.id, 'starting');
+    const s = await store.create(input(), 'pending');
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(started).toEqual([s.id]);
+  });
+
+  it("the loop awaits a running start's child before it returns on the signal", async () => {
+    const s = await store.create(input(), 'pending');
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const ac = new AbortController();
+    const d = deps();
+    d.runStart = async (l) => {
+      started.push(l.id);
+      ac.abort();
+      await held;
+      await store.transition(l.id, 'running', { child_pid: null });
+    };
+    d.sleep = yielding();
+    let done = false;
+    const loop = watchLeases(d, { tickMs: 10, signal: ac.signal }).then((r) => {
+      done = true;
+      return r;
+    });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    expect(started).toEqual([s.id]);
+    expect(done).toBe(false);
+    release();
+    expect(await loop).toBe('aborted');
+    expect(store.get(s.id)?.state).toBe('running');
+  });
+
+  it("settles a start from its child's end, not from its admission", async () => {
+    const s1 = await store.create(input(), 'pending');
+    const s2 = await store.create(
+      input({ project: 'demo-w2', root: '/w/b' }),
+      'pending'
+    );
+    const admitted = new Map<string, number>();
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let ended = 0;
+    const ac = new AbortController();
+    const d = deps();
+    d.settleMs = () => 5000;
+    d.log = (line) => {
+      const m = /^admit (l_\w+)/.exec(line);
+      if (m && !admitted.has(m[1])) admitted.set(m[1], now);
+    };
+    d.runStart = async (l) => {
+      started.push(l.id);
+      if (l.id === s1.id) await held;
+      await store.transition(l.id, 'running', { child_pid: null });
+    };
+    const t0 = now;
+    d.sleep = yielding(() => {
+      // S1's child brings its apps up for 3 s
+      if (!ended && now - t0 >= 3000) {
+        ended = now;
+        release();
+      }
+      if (admitted.has(s2.id)) ac.abort();
+    });
+    expect(await watchLeases(d, { tickMs: 10, signal: ac.signal })).toBe(
+      'aborted'
+    );
+    expect(admitted.get(s1.id)).toBeLessThan(t0 + 3000);
+    expect(ended).toBeGreaterThan(0);
+    expect(admitted.get(s2.id)).toBeGreaterThanOrEqual(ended + 5000);
   });
 
   it('stops on the signal', async () => {
@@ -718,6 +1117,58 @@ describe('defaultWatcherDeps', () => {
       error: 'child exited 3',
       exit_code: 3,
       child_pid: null,
+    });
+  });
+
+  it("runStart gives the child the watcher's environment without pm2's keys", async () => {
+    // what pm2 puts into the environment of the watcher it manages, and what the watcher was launched with
+    const set: Record<string, string> = {
+      namespace: 'mcproc',
+      pm_id: '7',
+      name: 'mcproc-watcher',
+      'mcproc-watcher': '{}',
+      cwd: dir,
+      unique_id: 'u',
+      KEEP_ME: '1',
+      PM2_HOME: path.join(dir, 'home'),
+    };
+    const prev = Object.fromEntries(
+      Object.keys(set).map((k) => [k, process.env[k]])
+    );
+    onTestFinished(() => {
+      for (const [k, v] of Object.entries(prev))
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    });
+    Object.assign(process.env, set);
+    const entry = path.join(dir, 'cli.js');
+    const envFile = path.join(dir, 'env.json');
+    fs.writeFileSync(
+      entry,
+      `require('node:fs').writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(process.env)); process.exit(3);`
+    );
+    const deps = defaultWatcherDeps(dir, entry);
+    const l = await deps.store.withLock(() =>
+      deps.store.create(input({ root: vars }), 'pending')
+    );
+    const admitted = await deps.store.withLock(() =>
+      deps.store.transition(l.id, 'starting')
+    );
+    await deps.runStart(admitted);
+    const env = JSON.parse(fs.readFileSync(envFile, 'utf8'));
+    for (const k of [
+      'namespace',
+      'pm_id',
+      'name',
+      'mcproc-watcher',
+      'cwd',
+      'unique_id',
+    ])
+      expect(env, k).not.toHaveProperty([k]);
+    expect(env).toMatchObject({
+      KEEP_ME: '1',
+      PM2_HOME: path.join(dir, 'home'),
+      MCPROC_STATE_DIR: dir,
     });
   });
 

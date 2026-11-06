@@ -120,7 +120,7 @@ export class ProcReader {
         continue; // gone since the listing
       }
       // "pid (comm) state ppid … utime stime …": comm may hold spaces and parentheses, so cut after the last ")"
-      const f = s.slice(s.lastIndexOf(')') + 2).split(' ');
+      const f = statFields(s);
       const pid = Number(d);
       tree.set(pid, Number(f[1]));
       ticks.set(pid, Number(f[11]) + Number(f[12]));
@@ -292,6 +292,54 @@ export class ProcReader {
       seen: new Set(sweep.sockets.map((s) => s.inode)),
     };
     return owners;
+  }
+}
+
+/**
+ * The fields of a `/proc/<pid>/stat` line after its comm: index 0 is the state (field 3), 1 the parent, 11 and 12 the
+ * CPU ticks, 19 the start time. The comm may hold spaces and parentheses, so the line is cut after its last ")".
+ */
+export function statFields(stat: string): string[] {
+  return stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+}
+
+/**
+ * When a process started, in clock ticks after boot (field 22 of its stat): with its pid and the boot it tells one
+ * process apart from a later one that reuses the pid. Null when the stat cannot be read (gone, no /proc).
+ */
+export function processStart(
+  pid: number,
+  f: ProcFs = realProcFs
+): number | null {
+  try {
+    const v = Number(statFields(f.read(`/proc/${pid}/stat`))[19]);
+    return Number.isInteger(v) && v >= 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A process's state letter (field 3 of its stat): R, S, D, ..., Z for a zombie (exited, its parent has not collected it
+ * yet), X for one being reaped. Null when the stat cannot be read (gone, no /proc).
+ */
+export function processState(
+  pid: number,
+  f: ProcFs = realProcFs
+): string | null {
+  try {
+    return statFields(f.read(`/proc/${pid}/stat`))[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+/** This boot of the machine, as the kernel names it; null without /proc. */
+export function bootId(f: ProcFs = realProcFs): string | null {
+  try {
+    return f.read('/proc/sys/kernel/random/boot_id').trim() || null;
+  } catch {
+    return null;
   }
 }
 

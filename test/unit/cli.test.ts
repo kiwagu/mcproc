@@ -871,6 +871,110 @@ describe('cli', () => {
       process.exitCode = 0;
     }
   });
+  it('exec takes --exclusive and refuses a bad group before anything else', async () => {
+    const cmd = buildProgram(capture().io).commands.find(
+      (c) => c.name() === 'exec'
+    )!;
+    expect(cmd.options.map((o) => o.long)).toEqual(
+      expect.arrayContaining(['--exclusive', '--memory', '--timeout'])
+    );
+    expect(cmd.options.find((o) => o.long === '--timeout')!.description).toBe(
+      'seconds to wait in the queue (default 600, 3600 with --exclusive; max 3600)'
+    );
+    // a project that does not exist: the group is refused before the manifest is even looked for
+    const c = capture();
+    await buildProgram(c.io).parseAsync(
+      [
+        'exec',
+        '--exclusive',
+        'a:b',
+        '--project',
+        '/nonexistent-mcproc-project',
+        '--',
+        'echo',
+        'hi',
+      ],
+      { from: 'user' }
+    );
+    expect(c.err[0]).toMatch(
+      /^BAD_ARGUMENT: exclusive group "a:b": ":" is reserved$/m
+    );
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+  });
+  it('exec --exclusive says once on stderr whom it waits for, and cancels its lease when the wait cannot go on', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-excl-'));
+    const st = new LeaseStore(process.env.MCPROC_STATE_DIR as string);
+    const holder = await st.withLock(() =>
+      st.create(
+        {
+          kind: 'exec',
+          project: 'other',
+          root: '/o',
+          slot: 3,
+          repo: '/o',
+          target: 'bun test',
+          host: null,
+          apps: [],
+          reload: false,
+          estimate_mib: 0,
+          need_mib: 0,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: process.pid,
+          exclusive: 'suite',
+        },
+        'running'
+      )
+    );
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      // an explicit pm2 binary that fails: the watcher cannot be asked, so the wait ends at once
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: excl-cli',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      const c = capture();
+      await buildProgram(c.io).parseAsync(
+        [
+          'exec',
+          '--exclusive',
+          'suite',
+          '--project',
+          dir,
+          '--',
+          process.execPath,
+          '-e',
+          '0',
+        ],
+        { from: 'user' }
+      );
+      expect(c.err[0]).toMatch(
+        new RegExp(
+          `^exec: waiting for group suite: held by ${holder.id} \\(other slot 3, pid ${process.pid}, \\d+s\\), #1 in group$`
+        )
+      );
+      expect(c.err[1]).toMatch(/^[A-Z0-9_]+: /);
+      expect(process.exitCode).toBe(1);
+      expect(
+        st.list().filter((l) => l.exclusive === 'suite' && l.id !== holder.id)
+      ).toEqual([expect.objectContaining({ state: 'cancelled' })]);
+    } finally {
+      process.exitCode = 0;
+      await st.withLock(() => st.transition(holder.id, 'freed'));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('exec takes its options before -- and the command after it verbatim, runs it from the root with exec.env and exits with its code', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-cli-exec-'));
     try {

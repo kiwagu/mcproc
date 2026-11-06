@@ -3,6 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from '../errors.js';
+import {
+  bootId,
+  type ProcFs,
+  processStart,
+  processState,
+  realProcFs,
+} from '../procfs.js';
+import { memoryPosition, memoryQueue } from './queue.js';
 
 /** Where a lease stands: queued (pending), handed to a watcher (starting), up (running), or ended (freed, cancelled, failed). */
 export type LeaseState =
@@ -50,7 +58,24 @@ export interface Lease {
   waiting_for: string | null;
   error: string | null;
   exit_code: number | null;
+  /** the host-wide group an exec takes its turn in, one holder at a time; null for a start or a plain exec */
+  exclusive: string | null;
+  /** the boot the lease was made in, and when its requester started (clock ticks after boot): with `requester_pid`
+   * they tell the requester apart from a later process that reuses its pid; null where /proc cannot tell */
+  boot_id: string | null;
+  requester_start: number | null;
+  /** the command an exec runs, and when it started: the lease is held while it lives, even past its requester */
+  command_pid: number | null;
+  command_start: number | null;
 }
+/** The group and identity fields a lease written by an earlier version lacks: each reads as null. */
+const LATER_FIELDS = {
+  exclusive: null,
+  boot_id: null,
+  requester_start: null,
+  command_pid: null,
+  command_start: null,
+} as const;
 /** The fields a caller supplies to create a lease; the store fills in the id, sequence and times. */
 export type NewLease = Omit<
   Lease,
@@ -65,7 +90,13 @@ export type NewLease = Omit<
   | 'waiting_for'
   | 'error'
   | 'exit_code'
->;
+  | 'exclusive'
+  | 'boot_id'
+  | 'requester_start'
+  | 'command_pid'
+  | 'command_start'
+> &
+  Partial<Pick<Lease, 'exclusive' | 'boot_id' | 'requester_start'>>;
 
 /** The lease state machine: for each state, the states it may move to. */
 export const ALLOWED: Record<LeaseState, readonly LeaseState[]> = {
@@ -90,6 +121,48 @@ export function pidAlive(pid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+/**
+ * Whether `pid` is still the process that was recorded: alive and not a zombie (one that exited and waits to be
+ * collected holds nothing), in the recorded boot and with the recorded start time, each checked only where it was
+ * recorded and can be read now. A pid reused after a crash or a reboot is not.
+ */
+export function sameProcess(
+  pid: number,
+  start: number | null,
+  boot: string | null,
+  f: ProcFs = realProcFs
+): boolean {
+  if (boot !== null) {
+    const now = bootId(f);
+    if (now !== null && now !== boot) return false;
+  }
+  if (!pidAlive(pid)) return false;
+  const state = processState(pid, f);
+  if (state === 'Z' || state === 'X') return false;
+  if (start !== null) {
+    const now = processStart(pid, f);
+    if (now !== null && now !== start) return false;
+  }
+  return true;
+}
+
+/** Whether the process that asked for the lease is still there (see sameProcess). */
+export function requesterAlive(
+  l: Pick<Lease, 'requester_pid' | 'requester_start' | 'boot_id'>
+): boolean {
+  return sameProcess(l.requester_pid, l.requester_start, l.boot_id);
+}
+
+/** Whether the command an exec lease runs is still there; false when none was recorded. */
+export function commandAlive(
+  l: Pick<Lease, 'command_pid' | 'command_start' | 'boot_id'>
+): boolean {
+  return (
+    l.command_pid !== null &&
+    sameProcess(l.command_pid, l.command_start, l.boot_id)
+  );
 }
 
 /** How long a lease's live starter is trusted after its start began, in milliseconds: ten minutes. */
@@ -156,6 +229,9 @@ export class LeaseStore {
   private readonly now: () => number;
   private readonly pid: number;
   private readonly beforeUnlink: (() => void) | undefined;
+  /** whether a caller of withLock on this store has its turn now, and who waits for one, first first */
+  private turnTaken = false;
+  private readonly turns: (() => void)[] = [];
   /**
    * Opens the lease directory under the given state directory, with optional clock and pid overrides for tests;
    * `beforeUnlink` (tests only) runs while a breaker holds the break guard, before the re-read that decides the unlink.
@@ -190,9 +266,44 @@ export class LeaseStore {
    * Runs `fn` holding the lock (not reentrant). A lock is stale when it is older than LOCK_STALE_MS and its holder is
    * dead, when it was taken before this boot, when it names this process with a token this process does not hold, or,
    * unparseable, when its file's mtime is older than LOCK_STALE_MS; a stale lock is broken under the break guard (see
-   * breakIfStale), never by moving it aside, so the lock path is never left free while a live holder has it.
+   * breakIfStale), never by moving it aside, so the lock path is never left free while a live holder has it. Callers of
+   * this store in one process take their turns first, without polling (the watcher's loop and the start it runs beside
+   * it); a turn that does not come within LOCK_WAIT_MS goes on to the lock file, which then fails as a held lock does.
    */
   async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+    // free, it goes straight on to the lock file, in this very call
+    let mine = true;
+    if (this.turnTaken) mine = await this.awaitTurn();
+    else this.turnTaken = true;
+    try {
+      return await this.fileLock(fn);
+    } finally {
+      if (mine) this.passTurn();
+    }
+  }
+  /** Waits for the callers of this store before it: true once its turn came, false once LOCK_WAIT_MS passed first. */
+  private awaitTurn(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const take = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        const i = this.turns.indexOf(take);
+        if (i >= 0) this.turns.splice(i, 1);
+        resolve(false);
+      }, LOCK_WAIT_MS);
+      this.turns.push(take);
+    });
+  }
+  /** Hands the turn to the next caller waiting for it, or leaves it free. */
+  private passTurn(): void {
+    const next = this.turns.shift();
+    if (next) next();
+    else this.turnTaken = false;
+  }
+  /** Runs `fn` holding the lock file (see withLock). */
+  private async fileLock<T>(fn: () => Promise<T> | T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true });
     const lock = path.join(this.dir, '.lock');
     const token = `${this.pid}-${crypto.randomBytes(6).toString('hex')}`;
@@ -398,9 +509,11 @@ export class LeaseStore {
       .flatMap((f) => {
         try {
           return [
-            JSON.parse(
-              fs.readFileSync(path.join(this.dir, f), 'utf8')
-            ) as Lease,
+            {
+              // a lease an earlier version wrote has none of the later fields
+              ...LATER_FIELDS,
+              ...JSON.parse(fs.readFileSync(path.join(this.dir, f), 'utf8')),
+            } as Lease,
           ];
         } catch {
           return []; // half-written by a crashed writer: skipped
@@ -437,7 +550,11 @@ export class LeaseStore {
     fs.mkdirSync(this.dir, { recursive: true });
     const at = this.stamp();
     const l: Lease = {
+      ...LATER_FIELDS,
       ...input,
+      exclusive: input.exclusive ?? null,
+      boot_id: input.boot_id ?? null,
+      requester_start: input.requester_start ?? null,
       id: `l_${crypto
         .randomBytes(8)
         .toString('base64url')
@@ -516,18 +633,16 @@ export class LeaseStore {
   pending(): Lease[] {
     return this.list().filter((l) => l.state === 'pending');
   }
-  /** The pending lease at the front of the queue, or null when the queue is empty. */
+  /** The lease at the front of the memory queue (see memoryQueue: a lease waiting for its group is not in it), or null. */
   head(): Lease | null {
-    return this.pending()[0] ?? null;
+    return memoryQueue(this.list())[0] ?? null;
   }
-  /** 1-based place in the queue, the starting leases counted ahead of every pending one; 0 when the lease is not pending. */
+  /**
+   * 1-based place in the memory queue, the starting leases that claim memory counted ahead; 0 when the lease is not in
+   * it (not pending, waiting for its group, or waiting for its group alone).
+   */
   positionOf(id: string): number {
-    const all = this.list();
-    const i = all
-      .filter((l) => l.state === 'pending')
-      .findIndex((l) => l.id === id);
-    if (i < 0) return 0;
-    return all.filter((l) => l.state === 'starting').length + i + 1;
+    return memoryPosition(this.list(), id);
   }
   /** Removes ended leases older than `maxAgeMs` (a day); returns how many. */
   prune(maxAgeMs = PRUNE_AFTER_MS): number {

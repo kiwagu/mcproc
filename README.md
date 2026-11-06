@@ -100,7 +100,7 @@ fields, the kinds and the process naming: [the manifest](docs/manifest.md).
 | `unpack` | bring pm2, and Node when the host has none, to a host ([hosts](docs/hosts.md#hosts-without-pm2-unpack)) |
 | `leases`, `lease_cancel` (CLI `leases cancel <id>`) | this machine's memory lease queue; cancel a pending lease ([memory](docs/memory.md)) |
 | `stacks` | every mcproc stack on this machine, not only this project: the checkouts any mcproc call has seen and those found in the local pm2, with their hosts, apps, memory and ports, plus pm2 processes no manifest knows; `all` adds the recorded ones with nothing running ([monit](docs/monit.md#every-stack-of-the-host)) |
-| `exec -- <command>` | a one-off command from the project root with the manifest's `exec.env`, under a lease with `--memory` |
+| `exec -- <command>` | a one-off command from the project root with the manifest's `exec.env`, under a lease with `--memory`; one run at a time per `--exclusive <group>` |
 | `worktree_add`, `worktree_ls`, `worktree_remove`, `worktree_sync`, `worktree_hook` (CLI `worktree add \| ls \| remove \| sync \| hook`) | an isolated checkout per branch with its own slot, slug and ports; required files refuse a worktree without them, and a git hook gives worktrees made by other tools the same files ([worktrees](docs/worktrees.md)) |
 
 Every tool takes `project`; the tools that act on apps take `host` too, and without it each app is reached where it

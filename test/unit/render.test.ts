@@ -24,6 +24,7 @@ import {
   renderAdopted,
   queuedNote,
   renderLeases,
+  renderExec,
   renderWorktreeAdded,
   renderWorktrees,
   renderWorktreeRemoved,
@@ -1440,6 +1441,11 @@ describe('queued starts and the lease queue', () => {
     waiting_for: null,
     error: null,
     exit_code: null,
+    exclusive: null,
+    boot_id: null,
+    requester_start: null,
+    command_pid: null,
+    command_start: null,
     ...over,
   });
   it('renderLeases: the state directory, the memory and the watcher, then no leases', () => {
@@ -1460,8 +1466,10 @@ describe('queued starts and the lease queue', () => {
       memory: { total_mib: 31836, available_mib: 9100 },
       watcher: { online: true, pid: 42 },
       leases: [
-        { ...lease({}), position: 0 },
+        { ...lease({}), position: 0, group: null, reason: null },
         {
+          group: null,
+          reason: null,
           ...lease({
             id: 'l_bbbbbbbbbb',
             seq: 2,
@@ -1490,7 +1498,7 @@ describe('queued starts and the lease queue', () => {
       'watcher: online pid 42',
     ]);
     expect(lines[3]).toMatch(
-      /^POS +STATE +KIND +PROJECT +TARGET +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
+      /^POS +STATE +KIND +PROJECT +TARGET +GROUP +EST → NEED +FROM +WAITING FOR \/ ERROR +ID$/
     );
     expect(lines[4]).toMatch(
       /^ +running +start +demo \(slot 0\) +dev +768M → 922M +declared +l_aaaaaaaaaa$/
@@ -1506,6 +1514,78 @@ describe('queued starts and the lease queue', () => {
         leases: [],
       })
     ).toContain('watcher: not running');
+  });
+  it('renderLeases: the GROUP column marks the holder, and the reason column names what each waits for', () => {
+    const held = 'holds suite 3m, pid 1234, command 1240';
+    const behind =
+      'group suite: held by l_aaaaaaaaaa (demo slot 0, pid 1234, 3m), #1 in group';
+    const lines = renderLeases({
+      state_dir: '/s',
+      memory: null,
+      watcher: null,
+      leases: [
+        {
+          ...lease({ kind: 'exec', target: 'bun test', exclusive: 'suite' }),
+          position: 0,
+          group: null,
+          reason: held,
+        },
+        {
+          ...lease({
+            id: 'l_bbbbbbbbbb',
+            seq: 2,
+            state: 'pending',
+            kind: 'exec',
+            target: 'bun test',
+            exclusive: 'suite',
+            waiting_for: 'group suite',
+          }),
+          position: 0,
+          group: null,
+          reason: behind,
+        },
+        {
+          ...lease({ id: 'l_cccccccccc', seq: 3 }),
+          position: 0,
+          group: null,
+          reason: null,
+        },
+      ],
+    }).split('\n');
+    const header = lines[2];
+    expect(header).toMatch(/ TARGET +GROUP +EST → NEED /);
+    const col = header.indexOf('GROUP');
+    const cell = (l: string) => l.slice(col, header.indexOf('EST')).trim();
+    expect(cell(lines[3])).toBe('suite (holds)');
+    expect(lines[3]).toContain(held);
+    expect(cell(lines[4])).toBe('suite');
+    expect(lines[4]).toContain(behind);
+    expect(cell(lines[5])).toBe('');
+  });
+  it('renderExec names the group it waited for', () => {
+    const r = {
+      code: 0,
+      output: '',
+      waited_ms: 120_000,
+      env: {},
+      lease: lease({
+        kind: 'exec',
+        target: 'bun test',
+        exclusive: 'suite',
+        state: 'freed',
+      }),
+    };
+    expect(renderExec(['bun', 'test'], r)).toBe(
+      'exec bun test: exit 0 after 120 s in the queue for group suite (lease l_aaaaaaaaaa, freed)'
+    );
+    expect(
+      renderExec(['bun', 'test'], {
+        ...r,
+        lease: { ...r.lease, exclusive: null },
+      })
+    ).toBe(
+      'exec bun test: exit 0 after 120 s in the queue (lease l_aaaaaaaaaa, freed)'
+    );
   });
 });
 
@@ -1662,6 +1742,47 @@ describe('width-aware CLI tables', () => {
     const lines = renderLeases(view).split('\n');
     expect(lines).toHaveLength(4); // state, memory, header, the lease
     expect(lines[3]).toContain('not from a built cli.js');
+  });
+  it('leases keeps a filled GROUP column within the width: a holder and its waiter', () => {
+    const of = (over: Record<string, unknown>) => ({
+      ...lease,
+      error: null,
+      exclusive: 'e2e-suite',
+      group: null,
+      position: 0,
+      ...over,
+    });
+    const v = {
+      ...view,
+      leases: [
+        of({
+          id: 'l_hhhhhhhhhh',
+          state: 'running',
+          reason: 'holds e2e-suite 3m, pid 123456, command 123460',
+        }),
+        of({
+          id: 'l_wwwwwwwwww',
+          state: 'pending',
+          waiting_for: 'group e2e-suite',
+          reason:
+            'group e2e-suite: held by l_hhhhhhhhhh (demo-w5 slot 5, pid 123456, 3m), #1 in group',
+        }),
+      ],
+    } as unknown as LeasesView;
+    for (const width of [120, 200]) {
+      const lines = renderLeases(v, width).split('\n').slice(2);
+      for (const l of lines) expect(displayWidth(l)).toBeLessThanOrEqual(width);
+      const col = lines[0].indexOf('GROUP');
+      const end = lines[0].indexOf('EST');
+      expect(
+        lines
+          .slice(1)
+          .map((l) => l.slice(col, end).trim())
+          .filter(Boolean)
+      ).toEqual(['e2e-suite (holds)', 'e2e-suite']);
+      // the holder's id: in its ID column, and in its waiter's reason
+      expect(lines.join('\n').split('l_hhhhhhhhhh').length - 1).toBe(2);
+    }
   });
   it('hosts wraps its CWD within a narrow width', () => {
     const info = [

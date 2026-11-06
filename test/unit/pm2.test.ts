@@ -11,6 +11,7 @@ import {
   resolvePm2Bin,
   bundledPm2Bin,
   type DaemonLister,
+  withoutPm2Keys,
 } from '../../src/core/pm2.js';
 import { FakeTransport, type Rule } from '../helpers/fake-transport.js';
 import { McprocError } from '../../src/core/errors.js';
@@ -691,5 +692,47 @@ describe('Pm2Client.pids', () => {
     const p = await c().pids();
     expect(p.dir).toBeNull();
     expect(p.why).toMatch(why);
+  });
+});
+
+describe('withoutPm2Keys', () => {
+  it("withoutPm2Keys drops pm2's process keys and keeps the rest", () => {
+    // what pm2 puts into the environment of a process it manages, beside what the process was launched with
+    const env: Record<string, string | undefined> = {
+      PATH: '/bin',
+      UNSET: undefined,
+      PM2_HOME: '/h',
+      MCPROC_STATE_DIR: '/s',
+      MCPROC_CLI_ENTRY: '/e',
+      KEEP_ME: '1',
+      namespace: 'mcproc',
+      cwd: '/s',
+      name: 'mcproc-watcher',
+      'mcproc-watcher': '{}',
+      pm_id: '3',
+      unique_id: 'u',
+      NODE_APP_INSTANCE: '0',
+      instance_var: 'MY_INST',
+      MY_INST: '0',
+      version: '0.18.0',
+      km_link: 'false',
+      vizion_running: 'false',
+      PM2_USAGE: 'CLI',
+      PM2_JSON_PROCESSING: 'true',
+      PM2_INTERACTOR_PROCESSING: 'true',
+      log_date_format: 'x',
+      treekill: 'true',
+      status: 'online',
+      script: '/n',
+    };
+    const before = { ...env };
+    expect(withoutPm2Keys(env, ['script'])).toStrictEqual({
+      PATH: '/bin',
+      PM2_HOME: '/h',
+      MCPROC_STATE_DIR: '/s',
+      MCPROC_CLI_ENTRY: '/e',
+      KEEP_ME: '1',
+    });
+    expect(env).toEqual(before);
   });
 });

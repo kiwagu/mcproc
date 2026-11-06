@@ -15,7 +15,12 @@ import {
 } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
 import { readHostMemory } from '../memory.js';
-import { findProcess, isRunning, type Pm2Process } from '../pm2.js';
+import {
+  findProcess,
+  isRunning,
+  type Pm2Process,
+  withoutPm2Keys,
+} from '../pm2.js';
 import { connect, pickHost, prepare } from '../resolve.js';
 import { abortableSleep } from '../wait.js';
 import {
@@ -25,7 +30,8 @@ import {
   rampingMib,
   reserveMib,
 } from './admission.js';
-import { WATCHER_NOTE } from './ensure.js';
+import { WATCHER_NOTE, watcherApp } from './ensure.js';
+import { groupBlocked, groupOnly } from './queue.js';
 import {
   listCheckout,
   measureSiblings,
@@ -37,7 +43,9 @@ import {
   type LeaseSource,
   type LeaseState,
   LeaseStore,
+  commandAlive,
   pidAlive,
+  requesterAlive,
   starterAlive,
 } from './store.js';
 
@@ -90,29 +98,57 @@ async function moveIf(
 /** How long an exec lease may stay starting before the watcher fails it, in milliseconds: its owner polls every second. */
 const EXEC_TURN_GRACE_MS = 60_000;
 
+/** The keys of the watcher's own pm2 entry: pm2 puts them into the watcher's environment as well. */
+const WATCHER_APP_KEYS = Object.keys(watcherApp('', '', undefined));
+
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
  * their starter lives, for at most STARTER_TRUST_MS, see starterAlive); a starting one whose recorded child is gone is
- * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester: once that
- * process is gone, a running one is freed and a starting one failed at once; a starting one its live owner has not
- * taken within EXEC_TURN_GRACE_MS (its wait ended without the cancel landing) is failed too, so it cannot hold the queue.
+ * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester (its pid, and
+ * where recorded its start time and boot, see requesterAlive): once that process is gone, a pending one is cancelled
+ * wherever it stands, a starting one failed, and a running one freed once the command it runs is gone too; a starting
+ * one its live owner has not taken within EXEC_TURN_GRACE_MS (its wait ended without the cancel landing) is failed too,
+ * so it cannot hold the queue.
  */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
       if (l.kind === 'exec') {
-        // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal)
-        if (
-          (l.state === 'running' || l.state === 'starting') &&
-          !pidAlive(l.requester_pid)
-        )
+        // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal). A waiting one is
+        // cancelled wherever it stands, so a dead waiter never holds its group's line; a running one stays held while
+        // the command it ran still lives (a SIGKILLed mcproc leaves it running), so its group is not run twice
+        // read again under the lock, on the lease as it is then: its command may have been recorded since the listing
+        const gone = (cur: Lease) => !requesterAlive(cur);
+        const requester = requesterAlive(l);
+        if (l.state === 'pending' && !requester) {
+          const c = await moveIf(
+            store,
+            l.id,
+            'pending',
+            'cancelled',
+            { error: 'requester gone' },
+            gone
+          );
+          if (c)
+            deps.log(`cancel ${l.id}: requester gone (pid ${l.requester_pid})`);
+        } else if (l.state === 'starting' && !requester)
           await moveIf(
             store,
             l.id,
-            l.state,
-            l.state === 'running' ? 'freed' : 'failed',
-            { error: 'requester gone' }
+            'starting',
+            'failed',
+            { error: 'requester gone' },
+            gone
+          );
+        else if (l.state === 'running' && !requester && !commandAlive(l))
+          await moveIf(
+            store,
+            l.id,
+            'running',
+            'freed',
+            { error: 'requester gone' },
+            (cur) => gone(cur) && !commandAlive(cur)
           );
         else if (
           l.state === 'starting' &&
@@ -201,7 +237,8 @@ async function judgeHead(
   deps: WatcherDeps,
   head: Lease,
   last: { id: string | null; at: number },
-  full: boolean
+  full: boolean,
+  launch: (l: Lease) => void
 ): Promise<'admitted' | 'waiting' | 'changed'> {
   const { store } = deps;
   // its checkout was removed (or is now only a path inside another one): it can never start, and it must not hold
@@ -211,15 +248,6 @@ async function judgeHead(
       error: 'checkout gone',
     });
     if (c) deps.log(`cancel ${head.id}: checkout gone (${head.root})`);
-    return 'changed';
-  }
-  // an exec whose requester is gone would be marked starting for nobody, and hold every later lease behind it
-  if (head.kind === 'exec' && !pidAlive(head.requester_pid)) {
-    const c = await moveIf(store, head.id, 'pending', 'cancelled', {
-      error: 'requester gone',
-    });
-    if (c)
-      deps.log(`cancel ${head.id}: requester gone (pid ${head.requester_pid})`);
     return 'changed';
   }
   let memory: HostMemory | null;
@@ -289,29 +317,22 @@ async function judgeHead(
     ramping_mib,
   });
   if (d.ok) {
-    const admitted = await moveIf(store, head.id, 'pending', 'starting', {
-      ...est,
-      waiting_for: null,
-    });
+    // still the head, under the lock: a lease ahead of it may have become free to go while it was estimated (an older
+    // waiter whose group was freed meanwhile), and that one is judged first
+    const admitted = await moveIf(
+      store,
+      head.id,
+      'pending',
+      'starting',
+      { ...est, waiting_for: null },
+      () => store.head()?.id === head.id
+    );
     if (!admitted) return 'changed';
     deps.log(
       `admit ${admitted.id} ${admitted.project} ${admitted.target} (${est.need_mib}M, free ${d.free_mib ?? '?'}M)`
     );
-    if (admitted.kind === 'start') {
-      try {
-        await deps.runStart(admitted);
-      } catch (e) {
-        await moveIf(store, admitted.id, 'starting', 'failed', {
-          error: describeError(e),
-          child_pid: null,
-        });
-      }
-      // a start that ended without its answer (the child threw before it, or was killed) is over
-      await moveIf(store, admitted.id, 'starting', 'failed', {
-        error: 'the start ended without an answer',
-        child_pid: null,
-      });
-    }
+    // the start runs beside the loop: reconciling and the group turns go on while its child brings the apps up
+    if (admitted.kind === 'start') launch(admitted);
     return 'admitted';
   }
   if (d.reason === 'never') {
@@ -324,6 +345,54 @@ async function judgeHead(
   if (cur.waiting_for !== d.waiting_for || cur.need_mib !== est.need_mib)
     await noteWaiting(store, head, { ...est, waiting_for: d.waiting_for });
   return 'waiting';
+}
+
+/**
+ * Runs an admitted start to its end: the child writes running or failed, and a start that ended without its answer
+ * (the child threw before it, or was killed) is failed here.
+ */
+async function runAdmitted(deps: WatcherDeps, l: Lease): Promise<void> {
+  const { store } = deps;
+  try {
+    await deps.runStart(l);
+  } catch (e) {
+    await moveIf(store, l.id, 'starting', 'failed', {
+      error: describeError(e),
+      child_pid: null,
+    });
+  }
+  await moveIf(store, l.id, 'starting', 'failed', {
+    error: 'the start ended without an answer',
+    child_pid: null,
+  });
+}
+
+/**
+ * Lets each lease that waits for its group alone take its turn once the group is free: pending → starting, its owner
+ * runs it. It claims no memory, so no memory judgement, start or settle holds it up. The group is checked again under
+ * the lock, on a fresh listing.
+ */
+async function admitGroupTurns(deps: WatcherDeps): Promise<void> {
+  const { store } = deps;
+  for (const l of store.list()) {
+    if (l.state !== 'pending' || !groupOnly(l)) continue;
+    try {
+      const a = await moveIf(
+        store,
+        l.id,
+        'pending',
+        'starting',
+        { waiting_for: null },
+        (cur) => !groupBlocked(store.list(), cur)
+      );
+      if (a)
+        deps.log(
+          `admit ${a.id} ${a.project} ${a.target} (group ${a.exclusive})`
+        );
+    } catch (e) {
+      deps.log(`error: ${l.id}: ${describeError(e)}`);
+    }
+  }
 }
 
 /**
@@ -350,17 +419,20 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
 }
 
 /**
- * The watcher loop: on every tick (or wake) prune, reconcile running leases against what is online, then judge the
- * head of the FIFO: admit it (starting → the child runs the start → running / failed; an exec lease is only marked
- * starting, its owner runs it), then settle before the next head; or record why it waits. The running leases that
+ * The watcher loop: on every tick (or wake) prune, reconcile running leases against what is online, let each lease
+ * that waits for its group alone take its turn once its group is free, then judge the head of the memory queue (see
+ * memoryQueue): admit it (starting → the child runs the start → running / failed; an exec lease is only marked
+ * starting, its owner runs it), or record why it waits. A start's child runs beside the loop, so the ticks go on
+ * while it brings the apps up; the next head is judged only once that child has ended and the settle after it (after
+ * an exec, from its admission) has passed, and it is admitted only if it is still the head under the lock. The running leases that
  * have not settled yet are charged on top of the memory reading, and a running lease whose starter still lives is not
  * reconciled. A head is estimated in full when it becomes the head, when the queue changed, when the memory reading
  * lets its last need fit, and at least every ESTIMATE_EVERY_MS; the ticks between read the memory alone. A lease
  * directory that cannot be read is logged once (a failing prune too) and the tick goes on as if nothing were queued,
- * never into an idle exit it cannot judge. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
- * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
- * is gone is ended at once (cancelled at the head, failed while starting, freed while running), and one left starting
- * for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
+ * never into an idle exit it cannot judge. Exits once nothing has been pending or starting, and no start's child running, for `idleExitMs` (leaving the exit note, see
+ * leaveIdle); on the signal it returns once the start it runs has ended. A starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
+ * is gone is ended at once (cancelled while pending, failed while starting, freed while running once its command is
+ * gone too), and one left starting for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
  */
 export async function watchLeases(
   deps: WatcherDeps,
@@ -385,6 +457,20 @@ export async function watchLeases(
   // the head's last full estimate, and whether the queue changed since the last judgement: both call for a new one
   const last: { id: string | null; at: number } = { id: null, at: 0 };
   let woken = false;
+  // the admitted start whose child runs now, and until when the reading may not show the last admission yet: the
+  // next memory judgement waits for both, the rest of each tick does not
+  let inflight: Promise<void> | null = null;
+  let settleUntil = 0;
+  const launch = (l: Lease) => {
+    const run = runAdmitted(deps, l)
+      .catch((e) => deps.log(`error: ${l.id}: ${describeError(e)}`))
+      .finally(() => {
+        settleUntil = deps.now() + deps.settleMs(l);
+        if (inflight === run) inflight = null;
+        tick?.abort();
+      });
+    inflight = run;
+  };
   // a failure that repeats every tick is logged once, and again only once it changed or cleared
   const said = new Map<string, string>();
   const sayOnce = (key: string, line: string | null) => {
@@ -440,14 +526,21 @@ export async function watchLeases(
       } catch (e) {
         unreadable(e); // its own list: each lease's errors are caught inside
       }
+      try {
+        await admitGroupTurns(deps);
+      } catch (e) {
+        unreadable(e);
+      }
+      // after its own turns: a lease it let take its group's turn is not a change that wakes it
       asleepOn = queueOf();
-      const starting = readable(
-        () => store.list().some((l) => l.state === 'starting'),
-        false
-      );
+      const all = readable(() => store.list(), [] as Lease[]);
+      const pending = all.some((l) => l.state === 'pending');
+      const starting = all.some((l) => l.state === 'starting');
+      // a lease admitted for its group alone claims nothing: it does not hold up the memory judgement
+      const claiming = all.some((l) => l.state === 'starting' && !groupOnly(l));
       const head = readable(() => store.head(), null);
       const now = deps.now();
-      if (!head && !starting && !blind) {
+      if (!pending && !starting && !inflight && !blind) {
         if (now - idleSince >= idleExitMs) {
           if (await leaveIdle(deps)) return 'idle';
           // a start queued in the moment before the exit: it is taken first
@@ -455,7 +548,7 @@ export async function watchLeases(
           continue;
         }
       } else idleSince = now;
-      if (head && !starting) {
+      if (head && !claiming && !inflight && now >= settleUntil) {
         const full =
           woken ||
           last.id !== head.id ||
@@ -463,18 +556,25 @@ export async function watchLeases(
         woken = false;
         let r: 'admitted' | 'waiting' | 'changed' = 'waiting';
         try {
-          r = await judgeHead(deps, head, last, full);
+          r = await judgeHead(deps, head, last, full, launch);
         } catch (e) {
           deps.log(`error: ${head.id}: ${describeError(e)}`);
         }
-        if (r === 'admitted')
-          await deps.sleep(deps.settleMs(head), opts.signal);
+        // an exec admitted settles from now; a start, once its child has ended (see launch)
+        if (r === 'admitted' && head.kind === 'exec')
+          settleUntil = deps.now() + deps.settleMs(head);
         if (r !== 'waiting') {
-          if (opts.once) return 'idle';
+          if (opts.once) {
+            await inflight;
+            return 'idle';
+          }
           continue;
         }
       }
-      if (opts.once) return 'idle';
+      if (opts.once) {
+        await inflight;
+        return 'idle';
+      }
       if (queueOf() !== asleepOn) {
         woken = true;
         continue;
@@ -489,6 +589,8 @@ export async function watchLeases(
     }
   } finally {
     unwatch?.();
+    // the child of a start it admitted runs to its end: the lease is left as the child answered
+    await inflight;
   }
 }
 
@@ -608,7 +710,15 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             '--lease',
             l.id,
           ],
-          { stdio: 'inherit', env: { ...process.env, MCPROC_STATE_DIR: dir } }
+          // the watcher runs under pm2, which put its own description into this environment (namespace, cwd, ...):
+          // the child's pm2 CLI would hand those to the apps it starts, so it gets the environment without them
+          {
+            stdio: 'inherit',
+            env: {
+              ...withoutPm2Keys(process.env, WATCHER_APP_KEYS),
+              MCPROC_STATE_DIR: dir,
+            },
+          }
         );
         const pid = child.pid;
         const patched = pid

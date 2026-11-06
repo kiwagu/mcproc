@@ -195,9 +195,20 @@ describe('mcp server', () => {
     });
     expect(byName.exec.description).toMatch(/THIS machine/);
     expect(byName.exec.description).toMatch(/last 200 lines/);
+    expect(byName.exec.description).toContain(
+      'With exclusive it runs in turn with the other runs of that group (timeout_s default 3600).'
+    );
     expect(
       Object.keys(byName.exec.inputSchema.properties as object).sort()
-    ).toEqual(['command', 'host', 'memory', 'note', 'project', 'timeout_s']);
+    ).toEqual([
+      'command',
+      'exclusive',
+      'host',
+      'memory',
+      'note',
+      'project',
+      'timeout_s',
+    ]);
     // what this start is for rides on its lease; the lease id itself is the watcher's business
     const startProps = byName.start.inputSchema.properties as Record<
       string,
@@ -374,6 +385,19 @@ describe('mcp server', () => {
     });
     expect(size.isError).toBe(true);
     expect(text(size)).toMatch(/^BAD_ARGUMENT: not a size/);
+    // a project that does not exist: the group is refused before the manifest is even looked for
+    const group: any = await cl.callTool({
+      name: 'exec',
+      arguments: {
+        project: '/nonexistent-mcproc-project',
+        exclusive: 'a b',
+        command: ['echo', 'hi'],
+      },
+    });
+    expect(group.isError).toBe(true);
+    expect(text(group)).toMatch(
+      /^BAD_ARGUMENT: exclusive group "a b" must match/
+    );
   });
   it('worktree_add makes a checkout with its slot and slug, the failed install in its notes; worktree_ls and worktree_remove read and refuse', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcp-'));
@@ -811,6 +835,103 @@ describe('mcp server', () => {
       expect(ok.isError).toBeFalsy();
       expect(text(ok)).toBe(`exec ${process.execPath} -e 0: exit 0`);
     } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('exec with exclusive waits its turn in its group and says whom it waited for', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-exec-mcp-'));
+    const st = new LeaseStore(process.env.MCPROC_STATE_DIR as string);
+    const holder = await st.withLock(() =>
+      st.create(
+        {
+          kind: 'exec',
+          project: 'other',
+          root: '/o',
+          slot: 3,
+          repo: '/o',
+          target: 'bun test',
+          host: null,
+          apps: [],
+          reload: false,
+          estimate_mib: 0,
+          need_mib: 0,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: process.pid,
+          exclusive: 'suite',
+        },
+        'running'
+      )
+    );
+    try {
+      fs.mkdirSync(path.join(dir, '.mcproc'));
+      fs.writeFileSync(
+        path.join(dir, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: exec-mcp',
+          'hosts:',
+          '  local: { pm2: /bin/false }',
+          'apps:',
+          '  tool: { description: a one-shot, kind: task, run: echo done }',
+          '',
+        ].join('\n')
+      );
+      // a watcher online on this (fake) daemon: the wait trusts it and launches none; the test takes its part
+      const watcher = JSON.stringify([
+        {
+          pid: 77,
+          name: 'mcproc-watcher',
+          pm_id: 0,
+          pm2_env: { status: 'online', namespace: 'mcproc' },
+        },
+      ]);
+      const spawner: Spawner = async (argv) => {
+        const cmd = argv[argv.length - 1];
+        if (cmd.includes('jlist'))
+          return { code: 0, stdout: watcher, stderr: '' };
+        return { code: 1, stdout: '', stderr: `unexpected ${cmd}` };
+      };
+      const cl = await client(spawner, undefined, dir);
+      const call = cl.callTool({
+        name: 'exec',
+        arguments: {
+          command: [process.execPath, '-e', '0'],
+          exclusive: 'suite',
+        },
+      });
+      let waiting: { id: string } | undefined;
+      for (let i = 0; i < 200 && !waiting; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+        waiting = st
+          .list()
+          .find((l) => l.state === 'pending' && l.exclusive === 'suite');
+      }
+      expect(waiting).toBeDefined();
+      // what the watcher does once the holder is gone: the waiter takes its turn
+      await st.withLock(async () => {
+        await st.transition(holder.id, 'freed');
+        await st.transition(waiting!.id, 'starting');
+      });
+      const r: any = await call;
+      expect(r.isError).toBeFalsy();
+      const lines = text(r).split('\n');
+      expect(lines[0]).toMatch(
+        new RegExp(`: exit 0 .*\\(lease ${waiting!.id}, freed\\)$`)
+      );
+      expect(lines.slice(1)).toEqual([
+        expect.stringMatching(
+          new RegExp(
+            `^exec: waiting for group suite: held by ${holder.id} \\(other slot 3, pid ${process.pid}, \\d+s\\), #1 in group$`
+          )
+        ),
+      ]);
+    } finally {
+      await st
+        .withLock(() => st.transition(holder.id, 'freed'))
+        .catch(() => undefined);
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

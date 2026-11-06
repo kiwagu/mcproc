@@ -2,9 +2,17 @@ import { spawn } from 'node:child_process';
 import { describeError, McprocError } from './errors.js';
 import { admit, needOf, rampingMib, reserveMib } from './leases/admission.js';
 import { ensureWatcher } from './leases/ensure.js';
+import {
+  aheadOf,
+  assertGroupName,
+  groupBusy,
+  groupReason,
+  groupWait,
+} from './leases/queue.js';
 import { LeaseStore, type Lease, type NewLease } from './leases/store.js';
 import type { Host } from './manifest.js';
 import { readHostMemory, type HostMemory } from './memory.js';
+import { bootId, processStart } from './procfs.js';
 import type { Context } from './resolve.js';
 import { stateDir } from './state.js';
 import { abortableSleep } from './wait.js';
@@ -13,6 +21,8 @@ import { abortableSleep } from './wait.js';
 export const EXEC_TIMEOUT_DEFAULT_MS = 600_000;
 /** The longest an exec may wait in the queue, in milliseconds: an hour. */
 export const EXEC_TIMEOUT_MAX_MS = 3_600_000;
+/** How long an exec of an exclusive group waits when the caller names no timeout: an hour, for a line of full runs. */
+export const EXEC_EXCLUSIVE_TIMEOUT_DEFAULT_MS = 3_600_000;
 const POLL_MS = 1000;
 const OUTPUT_LINES = 200;
 /** How long the captured pipes are read after the command exited, in milliseconds: something it left behind may hold them. */
@@ -33,18 +43,28 @@ export interface ExecDeps {
       env: Record<string, string>;
       capture: boolean;
       signal?: AbortSignal;
+      /** called once with the command's pid, as soon as it runs */
+      onSpawn?: (pid: number) => void;
     }
   ): Promise<{ code: number; output: string }>;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
   now(): number;
   /** the requester's pid kept on the lease; default this process */
   pid?: number;
+  /** told once, with one line, that the exec waits for its group (the CLI prints it to stderr) */
+  notice?(line: string): void;
+  /** when a process started (see processStart), kept on the lease with its pid; absent, nothing is kept */
+  startOf?(pid: number): number | null;
+  /** this boot of the machine (see bootId), kept on the lease; absent, nothing is kept */
+  bootId?(): string | null;
 }
 /** One exec: the command as argv, what it needs in memory (no lease without it), a note, the queue timeout and the abort. */
 export interface ExecOptions {
   command: string[];
   memoryMib?: number;
   note?: string;
+  /** the host-wide group it runs in, one at a time (see the queue rules); without memoryMib it waits for its group alone */
+  exclusive?: string;
   timeoutMs?: number;
   /** capture the last lines for the answer (MCP); false inherits the terminal (CLI) */
   capture: boolean;
@@ -109,6 +129,7 @@ export function spawnRun(
     capture: boolean;
     stdoutToStderr?: boolean;
     signal?: AbortSignal;
+    onSpawn?: (pid: number) => void;
   }
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve, reject) => {
@@ -121,6 +142,7 @@ export function spawnRun(
           ? ['inherit', 2, 2]
           : 'inherit',
     });
+    if (child.pid !== undefined) opts.onSpawn?.(child.pid);
     const tail = new Tail();
     child.stdout?.on('data', (c: Buffer) => tail.take('out', c));
     child.stderr?.on('data', (c: Buffer) => tail.take('err', c));
@@ -179,6 +201,8 @@ export function defaultExecDeps(dir = stateDir()): ExecDeps {
     run: spawnRun,
     sleep: abortableSleep,
     now: () => Date.now(),
+    startOf: (pid) => processStart(pid),
+    bootId: () => bootId(),
   };
 }
 
@@ -208,7 +232,10 @@ async function waitTurn(
   deps: ExecDeps
 ): Promise<Lease> {
   const timeoutMs = Math.min(
-    opts.timeoutMs ?? EXEC_TIMEOUT_DEFAULT_MS,
+    opts.timeoutMs ??
+      (opts.exclusive !== undefined
+        ? EXEC_EXCLUSIVE_TIMEOUT_DEFAULT_MS
+        : EXEC_TIMEOUT_DEFAULT_MS),
     EXEC_TIMEOUT_MAX_MS
   );
   const deadline = t0 + timeoutMs;
@@ -221,14 +248,21 @@ async function waitTurn(
       );
     if (cur.state === 'starting')
       return deps.store.withLock(() => deps.store.transition(id, 'running'));
-    if (deps.now() >= deadline)
+    if (deps.now() >= deadline) {
+      // what it waits for now, read again: its group may have freed and its memory not, or the other way round
+      const group = groupWait(deps.store.list(), cur);
       throw new McprocError(
         'TIMEOUT',
-        `exec waited ${timeoutMs / 1000} s in the queue (${cur.waiting_for ?? 'pending'})`,
+        group
+          ? `exec waited ${timeoutMs / 1000} s for ${groupReason(group, deps.now())}`
+          : `exec waited ${timeoutMs / 1000} s in the queue (${cur.waiting_for ?? 'pending'})`,
         {
-          hint: 'leases shows the queue; raise --timeout, or free memory by stopping a stand.',
+          hint: group
+            ? 'leases shows who holds the group; raise --timeout, or end the holding run.'
+            : 'leases shows the queue; raise --timeout, or free memory by stopping a stand.',
         }
       );
+    }
     if (opts.signal?.aborted)
       throw new McprocError('NOT_STARTED', 'exec aborted while queued');
     await deps.sleep(POLL_MS, opts.signal);
@@ -239,8 +273,10 @@ async function waitTurn(
  * One-off work in the stand's environment (`exec.env`, interpolated, plus MCPROC_PROJECT) from the project root, on
  * the local host only. With a memory size it is a lease like a start: run at once when the queue is empty and the
  * host has room (the running leases that have not settled yet charged on top of the reading), else queued behind the
- * others until the watcher marks it starting; the lease is freed with the exit code. A wait that ends without a turn
- * (the timeout, the signal, a watcher that cannot be launched) cancels the lease and fails.
+ * others until the watcher marks it starting; the lease is freed with the exit code. With an exclusive group it also
+ * takes its turn in that group, one run at a time host-wide: queued while the group has a holder or older waiters (it
+ * says so once through `notice`), and without a memory size it waits for its group alone. A wait that ends without a
+ * turn (the timeout, the signal, a watcher that cannot be launched) cancels the lease and fails.
  */
 export async function runExec(
   ctx: Context,
@@ -248,16 +284,22 @@ export async function runExec(
   deps: ExecDeps
 ): Promise<ExecResult> {
   const m = ctx.manifest;
+  const group = opts.exclusive ?? null;
+  // a bad request is refused before any host is touched
+  if (group !== null) assertGroupName(group);
   assertExecHost(ctx.host);
   if (opts.command.length === 0)
     throw new McprocError('BAD_ARGUMENT', 'exec needs a command after --');
   const env = { ...m.exec.env, MCPROC_PROJECT: m.root };
   const t0 = deps.now();
   let lease: Lease | null = null;
-  if (opts.memoryMib !== undefined) {
-    const memory = await deps.memory(ctx);
-    const need_mib = needOf(opts.memoryMib, m.resources.margin);
+  if (opts.memoryMib !== undefined || group !== null) {
+    const estimate_mib = opts.memoryMib ?? 0;
+    // a lease of its group alone reads no memory: nothing of it is judged by memory
+    const memory = opts.memoryMib !== undefined ? await deps.memory(ctx) : null;
+    const need_mib = needOf(estimate_mib, m.resources.margin);
     const reserve_mib = reserveMib(m.resources.reserve, memory);
+    const pid = deps.pid ?? process.pid;
     const input: NewLease = {
       kind: 'exec',
       project: m.project,
@@ -268,36 +310,55 @@ export async function runExec(
       host: null,
       apps: [],
       reload: false,
-      estimate_mib: opts.memoryMib,
+      estimate_mib,
       need_mib,
       margin: m.resources.margin,
       reserve_mib,
       sources: {},
       note: opts.note ?? null,
-      requester_pid: deps.pid ?? process.pid,
+      requester_pid: pid,
+      exclusive: group,
+      boot_id: deps.bootId?.() ?? null,
+      requester_start: deps.startOf?.(pid) ?? null,
     };
+    let notice: string | null = null;
     const taken = await deps.store.withLock(async () => {
       const all = deps.store.list();
-      const ahead = all.filter(
-        (l) => l.state === 'pending' || l.state === 'starting'
-      ).length;
       // a stand admitted seconds ago is not in the reading yet: an exec must not be admitted on what it will take
       const ramping_mib = rampingMib(
         all,
         deps.now(),
         m.resources.settle * 1000
       );
-      const d = admit({ ahead, memory, need_mib, reserve_mib, ramping_mib });
-      if (!d.ok && d.reason === 'never')
+      const d = admit({
+        ahead: aheadOf(all),
+        memory,
+        need_mib,
+        reserve_mib,
+        ramping_mib,
+      });
+      if (need_mib > 0 && !d.ok && d.reason === 'never')
         throw new McprocError('NEVER_FITS', `exec: ${d.waiting_for}`, {
           hint: 'Lower --memory or the resources.reserve.',
         });
+      if (group !== null && groupBusy(all, group)) {
+        // its group is held, or others wait for it first: it waits, whatever the memory says
+        const l = await deps.store.create(input, 'pending');
+        const queued = await deps.store.patch(l.id, {
+          waiting_for: `group ${group}`,
+        });
+        const w = groupWait(deps.store.list(), queued);
+        if (w) notice = `exec: waiting for ${groupReason(w, deps.now())}`;
+        return queued;
+      }
       // the exec process itself is the requester: no child pid, the watcher's stuck rule reads requester_pid
-      if (d.ok) return deps.store.create(input, 'running');
+      if ((group !== null && need_mib === 0) || d.ok)
+        return deps.store.create(input, 'running');
       const l = await deps.store.create(input, 'pending');
       return deps.store.patch(l.id, { waiting_for: d.waiting_for });
     });
     lease = taken;
+    if (notice !== null) deps.notice?.(notice);
     if (taken.state === 'pending') {
       // outside the lock: the launch takes the lock itself
       try {
@@ -311,19 +372,42 @@ export async function runExec(
   }
   const waited_ms = deps.now() - t0;
   const id = lease?.id;
+  // the command's pid and start, kept on the lease as soon as it runs: the lease is held while it lives
+  let recorded: Promise<unknown> = Promise.resolve();
+  const onSpawn = id
+    ? (pid: number) => {
+        recorded = deps.store
+          .withLock(() =>
+            deps.store.patch(
+              id,
+              { command_pid: pid, command_start: deps.startOf?.(pid) ?? null },
+              { expect: 'running' }
+            )
+          )
+          // the command runs on without it: said once, since a killed mcproc would then free the lease under it
+          .catch((e) =>
+            deps.notice?.(
+              `exec: the command's pid is not on lease ${id} (${describeError(e)}): if this mcproc is killed, the lease is freed while the command still runs`
+            )
+          );
+      }
+    : undefined;
+  const free = async (fields: Partial<Lease>) => {
+    if (!id) return;
+    await recorded;
+    await deps.store
+      .withLock(() => deps.store.transition(id, 'freed', fields))
+      .catch(() => undefined);
+  };
   try {
     const r = await deps.run(opts.command, {
       cwd: m.root,
       env,
       capture: opts.capture,
       signal: opts.signal,
+      onSpawn,
     });
-    if (id)
-      await deps.store
-        .withLock(() =>
-          deps.store.transition(id, 'freed', { exit_code: r.code })
-        )
-        .catch(() => undefined);
+    await free({ exit_code: r.code });
     return {
       ...r,
       lease: id ? deps.store.get(id) : null,
@@ -331,12 +415,7 @@ export async function runExec(
       env,
     };
   } catch (e) {
-    if (id)
-      await deps.store
-        .withLock(() =>
-          deps.store.transition(id, 'freed', { error: describeError(e) })
-        )
-        .catch(() => undefined);
+    await free({ error: describeError(e) });
     throw e;
   }
 }

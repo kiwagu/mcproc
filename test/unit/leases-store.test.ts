@@ -1,17 +1,26 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { stateDir } from '../../src/core/state.js';
 import {
+  commandAlive,
   LOCK_STALE_MS,
   LeaseStore,
   pidAlive,
+  requesterAlive,
+  sameProcess,
   starterAlive,
   STARTER_TRUST_MS,
   type NewLease,
 } from '../../src/core/leases/store.js';
+import {
+  bootId,
+  procAvailable,
+  processStart,
+  type ProcFs,
+} from '../../src/core/procfs.js';
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -50,6 +59,89 @@ describe('stateDir', () => {
   });
 });
 
+describe('process identity', () => {
+  const dead = () => spawnSync('true').pid as number;
+  it.skipIf(!procAvailable())(
+    'sameProcess: the pid alive, and the start time and boot as recorded when they were',
+    () => {
+      const start = processStart(process.pid);
+      expect(sameProcess(process.pid, null, null)).toBe(true);
+      expect(sameProcess(process.pid, start, bootId())).toBe(true);
+      expect(sameProcess(process.pid, (start as number) + 1, null)).toBe(false);
+      expect(sameProcess(process.pid, null, 'another-boot')).toBe(false);
+      expect(sameProcess(dead(), null, null)).toBe(false);
+    }
+  );
+  it('sameProcess answers by the pid alone where /proc cannot be read now', () => {
+    const thrower = (f: string): string => {
+      throw new Error(`ENOENT ${f}`);
+    };
+    const reading = (files: Record<string, string>): ProcFs => ({
+      readdir: () => [],
+      read: (f) => (f in files ? files[f] : thrower(f)),
+      readlink: thrower,
+    });
+    const stat = `${process.pid} (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0`;
+    // nothing readable: a live pid is the recorded process, whatever was recorded
+    expect(sameProcess(process.pid, 1, 'recorded-boot', reading({}))).toBe(
+      true
+    );
+    // the boot reads the same, the stat does not read: the pid decides
+    const bootOnly = reading({
+      '/proc/sys/kernel/random/boot_id': 'recorded-boot\n',
+    });
+    expect(sameProcess(process.pid, 1, 'recorded-boot', bootOnly)).toBe(true);
+    // the boot does not read, the stat does: the start time decides
+    const statOnly = reading({ [`/proc/${process.pid}/stat`]: stat });
+    expect(sameProcess(process.pid, 5000, 'recorded-boot', statOnly)).toBe(
+      true
+    );
+    expect(sameProcess(process.pid, 5001, 'recorded-boot', statOnly)).toBe(
+      false
+    );
+  });
+
+  it('sameProcess takes a zombie for gone, whether or not its start was recorded', () => {
+    const stat = (state: string) =>
+      `${process.pid} (node) ${state} 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0`;
+    const withState = (state: string): ProcFs => ({
+      readdir: () => [],
+      read: (f) => {
+        if (f === `/proc/${process.pid}/stat`) return stat(state);
+        throw new Error(`ENOENT ${f}`);
+      },
+      readlink: (f) => {
+        throw new Error(`ENOENT ${f}`);
+      },
+    });
+    for (const state of ['Z', 'X']) {
+      expect(
+        sameProcess(process.pid, 5000, null, withState(state)),
+        state
+      ).toBe(false);
+      expect(
+        sameProcess(process.pid, null, null, withState(state)),
+        state
+      ).toBe(false);
+    }
+    expect(sameProcess(process.pid, 5000, null, withState('S'))).toBe(true);
+  });
+
+  it('requesterAlive reads the requester; commandAlive is false without a command', () => {
+    const l = {
+      requester_pid: process.pid,
+      requester_start: null,
+      boot_id: null,
+      command_pid: null,
+      command_start: null,
+    };
+    expect(requesterAlive(l)).toBe(true);
+    expect(commandAlive(l)).toBe(false);
+    expect(commandAlive({ ...l, command_pid: process.pid })).toBe(true);
+    expect(requesterAlive({ ...l, requester_pid: dead() })).toBe(false);
+  });
+});
+
 describe('LeaseStore', () => {
   let dir: string;
   let now = 1_700_000_000_000;
@@ -78,6 +170,45 @@ describe('LeaseStore', () => {
       `000001-${a.id}.json`,
       `000002-${b.id}.json`,
     ]);
+  });
+
+  it('create fills the group and identity fields with null when not given', async () => {
+    const a = await store.create(input(), 'pending');
+    expect(a).toMatchObject({
+      exclusive: null,
+      boot_id: null,
+      requester_start: null,
+      command_pid: null,
+      command_start: null,
+    });
+    const b = await store.create(
+      input({ exclusive: 'suite', boot_id: 'b-1', requester_start: 77 }),
+      'running'
+    );
+    expect(store.get(b.id)).toMatchObject({
+      exclusive: 'suite',
+      boot_id: 'b-1',
+      requester_start: 77,
+      command_pid: null,
+      command_start: null,
+    });
+  });
+
+  it('a lease written before groups reads with null fields', async () => {
+    const a = await store.create(input(), 'running');
+    // the file as an earlier version wrote it: none of the group or identity fields
+    const file = path.join(dir, 'leases', `000001-${a.id}.json`);
+    const old = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const k of [
+      'exclusive',
+      'boot_id',
+      'requester_start',
+      'command_pid',
+      'command_start',
+    ])
+      delete old[k];
+    fs.writeFileSync(file, JSON.stringify(old));
+    expect(store.get(a.id)).toEqual(a);
   });
 
   it('walks the allowed transitions and refuses the others', async () => {
@@ -192,6 +323,44 @@ describe('LeaseStore', () => {
     const old = new Date(Date.now() - 60_000);
     fs.utimesSync(lock, old, old);
     await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
+  });
+
+  it('callers in one process take the lock in turn, without polling for it', async () => {
+    const one = new LeaseStore(dir);
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const a = one.withLock(async () => {
+        order.push('a in');
+        await Promise.resolve();
+        order.push('a out');
+      });
+      const b = one.withLock(async () => {
+        order.push('b');
+      });
+      // no timer runs: a lock waited for by polling would never be taken
+      await Promise.all([a, b]);
+      expect(order).toEqual(['a in', 'a out', 'b']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a caller whose turn never comes still fails as a held lock does', async () => {
+    const one = new LeaseStore(dir);
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      const outer = one.withLock(() => new Promise<void>((r) => (release = r)));
+      const inner = one.withLock(() => 'never');
+      const seen = inner.catch((e) => e);
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(await seen).toMatchObject({ code: 'TIMEOUT' });
+      release();
+      await outer;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe('the break guard', () => {
@@ -360,7 +529,9 @@ describe('LeaseStore', () => {
   });
 
   it("keeps this process's own live locks: two holders without a pid override still take turns", async () => {
+    // two stores: callers of one store take their turns before the lock file
     const real = new LeaseStore(dir, { now: () => now });
+    const twin = new LeaseStore(dir, { now: () => now });
     const order: string[] = [];
     await Promise.all([
       real.withLock(async () => {
@@ -368,7 +539,7 @@ describe('LeaseStore', () => {
         await new Promise((r) => setTimeout(r, 50));
         order.push('a-out');
       }),
-      real.withLock(async () => {
+      twin.withLock(async () => {
         order.push('b');
       }),
     ]);
@@ -412,10 +583,12 @@ describe('LeaseStore', () => {
     };
     const oldGuard = movedGuard('.lock.break.1-dead.stale', true);
     const freshGuard = movedGuard('.lock.break.2-live.stale', false);
+    // a second store contends for the lock file: callers of one store take their turns before it
+    const twin = new LeaseStore(dir, { now: () => now, pid: 4242 });
     await Promise.all([
       store.withLock(() => new Promise((r) => setTimeout(r, 100))),
       new Promise((r) => setTimeout(r, 20)).then(() =>
-        store.withLock(() => 'ok')
+        twin.withLock(() => 'ok')
       ),
     ]);
     expect(fs.existsSync(oldTmp)).toBe(false);
@@ -429,6 +602,8 @@ describe('LeaseStore', () => {
   it('writes its token file again when a sweep took it during a long wait, and takes the lock', async () => {
     const leases = path.join(dir, 'leases');
     let swept = 0;
+    // a second store waits on the lock file: callers of one store take their turns before it
+    const twin = new LeaseStore(dir, { now: () => now, pid: 4242 });
     await Promise.all([
       store.withLock(async () => {
         await new Promise((r) => setTimeout(r, 30));
@@ -441,7 +616,7 @@ describe('LeaseStore', () => {
         await new Promise((r) => setTimeout(r, 30));
       }),
       new Promise((r) => setTimeout(r, 10)).then(() =>
-        store.withLock(() => 'ok')
+        twin.withLock(() => 'ok')
       ),
     ]).then(([, b]) => expect(b).toBe('ok'));
     expect(swept).toBe(1);

@@ -7,6 +7,7 @@ import {
   builtCliEntry,
   ensureWatcher,
   watcherEntry,
+  watcherApp,
   WATCHER_NAME,
   WATCHER_NS,
 } from '../../src/core/leases/ensure.js';
@@ -156,6 +157,22 @@ describe('watcherEntry and ensureWatcher', () => {
       `'startOrRestart' '${file}' '--only' 'mcproc-watcher'`
     );
     expect(start.opts.env).toEqual({ PM2_HOME: '/tmp/pm2-home-w' });
+  });
+
+  it("watcherApp is what the watcher's ecosystem file holds", async () => {
+    vi.stubEnv('MCPROC_CLI_ENTRY', '/opt/mcproc/dist/cli.js');
+    const ctx = fakeCtx(vars, 'local', [
+      { match: /pm2 'jlist'/, result: { stdout: jlist('stopped') } },
+      { match: /startOrRestart/, result: {} },
+    ]);
+    ctx.pm2 = new Pm2Client(ctx.fake, ctx.host, 'pm2', '/tmp/pm2-home-w');
+    await ensureWatcher(ctx, dir);
+    const file = path.join(dir, 'watcher.ecosystem.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).apps[0]).toEqual(
+      watcherApp(dir, '/opt/mcproc/dist/cli.js', {
+        PM2_HOME: '/tmp/pm2-home-w',
+      })
+    );
   });
 
   it('ensureWatcher run from the built cli.js without MCPROC_CLI_ENTRY carries only the state dir', async () => {

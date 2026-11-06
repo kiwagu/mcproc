@@ -228,6 +228,39 @@ describe('gateStart', () => {
     });
   });
 
+  it('a lease waiting for its group is not ahead of a start', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const exec = (): NewLease => ({
+      kind: 'exec',
+      project: 'other',
+      root: '/o',
+      slot: null,
+      repo: '/o',
+      target: 'bun test',
+      host: null,
+      apps: [],
+      reload: false,
+      estimate_mib: 100,
+      need_mib: 100,
+      margin: 0,
+      reserve_mib: 0,
+      sources: {},
+      note: null,
+      requester_pid: 1,
+      exclusive: 'suite',
+    });
+    await store.create(exec(), 'running');
+    await store.create(exec(), 'pending');
+    const r = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      deps({ total_mib: 8000, available_mib: 7000 })
+    );
+    expect(r.kind).toBe('proceed');
+    expect(r.kind === 'proceed' && r.lease?.state).toBe('running');
+  });
+
   it('refuses what can never fit, and a budgeted app on a remote host', async () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     await expect(
@@ -757,6 +790,46 @@ describe('leasesView and cancelLease', () => {
       [a.id, 1],
       [b.id, 2],
     ]);
+  });
+
+  it("names each group's holder and what its waiters wait for", async () => {
+    const one = (state: 'pending' | 'running') =>
+      store.create(
+        {
+          kind: 'exec',
+          project: 'demo-w2',
+          root: varsProj,
+          slot: 2,
+          repo: '/w/demo',
+          target: 'bun test',
+          host: null,
+          apps: [],
+          reload: false,
+          estimate_mib: 0,
+          need_mib: 0,
+          margin: 0.2,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: process.pid,
+          exclusive: 'suite',
+        },
+        state
+      );
+    const h = await one('running');
+    await store.patch(h.id, { command_pid: 1240 });
+    const w = await one('pending');
+    const now = Date.parse(h.running_at as string) + 192_000;
+    const v = await leasesView(dir, undefined, now);
+    const [vh, vw] = v.leases;
+    expect(vw.group).toMatchObject({ name: 'suite', place: 1 });
+    expect(vw.group?.holder?.id).toBe(h.id);
+    expect(vw.reason).toBe(
+      `group suite: held by ${h.id} (demo-w2 slot 2, pid ${process.pid}, 3m), #1 in group`
+    );
+    expect(vw.id).toBe(w.id);
+    expect(vh.group).toBeNull();
+    expect(vh.reason).toBe(`holds suite 3m, pid ${process.pid}, command 1240`);
   });
 
   it('reads the memory and the watcher on a local context', async () => {

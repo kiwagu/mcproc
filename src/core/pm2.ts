@@ -103,6 +103,91 @@ export function pm2Name(project: string, app: string): string {
   return `${project}-${app}`;
 }
 
+/**
+ * The keys pm2 writes into the environment of a process it manages, besides what the process was launched with: pm2
+ * forks it with every scalar field of its description (pm2 7.0.4, lib/God/ForkMode.js). A pm2 CLI run from such a
+ * process hands that environment to the daemon with `--update-env`, which lets `namespace`, `cwd` and the like override
+ * the app's own; pm2's own guard for that case (`Common.safeExtend`, its list below) misses those. The list is pm2
+ * 7.0.4's safeExtend list plus what it misses and what pm2 adds once a process is up (`version`, the instance variable).
+ */
+export const PM2_PROCESS_KEYS: readonly string[] = [
+  // Common.safeExtend's list
+  'name',
+  'exec_mode',
+  'env',
+  'args',
+  'pm_cwd',
+  'exec_interpreter',
+  'pm_exec_path',
+  'node_args',
+  'pm_out_log_path',
+  'pm_err_log_path',
+  'pm_pid_path',
+  'pm_id',
+  'status',
+  'pm_uptime',
+  'created_at',
+  'windowsHide',
+  'username',
+  'merge_logs',
+  'kill_retry_time',
+  'prev_restart_delay',
+  'instance_var',
+  'unstable_restarts',
+  'restart_time',
+  'axm_actions',
+  'pmx_module',
+  'command',
+  'watch',
+  'filter_env',
+  'versioning',
+  'vizion_runing',
+  'MODULE_DEBUG',
+  'pmx',
+  'axm_options',
+  'vizion',
+  'axm_dynamic',
+  'axm_monitor',
+  'instances',
+  'automation',
+  'autostart',
+  'autorestart',
+  'stop_exit_codes',
+  'unstable_restart',
+  'treekill',
+  'exit_code',
+  // what it misses
+  'namespace',
+  'cwd',
+  'unique_id',
+  'log_date_format',
+  'km_link',
+  'vizion_running',
+  'version',
+  'NODE_APP_INSTANCE',
+  'PM2_USAGE',
+  'PM2_JSON_PROCESSING',
+  'PM2_INTERACTOR_PROCESSING',
+];
+
+/**
+ * A copy of `env` without the keys pm2 wrote into it as the environment of a process it manages (PM2_PROCESS_KEYS,
+ * `extra`, the key named after the process and its instance variable), so a pm2 CLI run with it acts as one run from
+ * a shell. PM2_HOME and everything else stay; the input is left as it was.
+ */
+export function withoutPm2Keys(
+  env: Record<string, string | undefined>,
+  extra: readonly string[] = []
+): Record<string, string> {
+  const drop = new Set([...PM2_PROCESS_KEYS, ...extra]);
+  if (env.name) drop.add(env.name);
+  if (env.instance_var) drop.add(env.instance_var);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env))
+    if (v !== undefined && !drop.has(k)) out[k] = v;
+  return out;
+}
+
 export function findProcess(
   procs: Pm2Process[],
   project: string,
