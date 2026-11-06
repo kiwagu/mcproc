@@ -76,6 +76,12 @@ runs, and is freed within a watcher tick once that command has ended too. A hung
 or with Ctrl-C on its `exec`. A group is shared by the callers of one state directory (`MCPROC_STATE_DIR`): runs under
 another state directory do not see it.
 
+**Upgrading from 0.18.** Install while no watcher runs: `mcproc leases` says `watcher: not running` (with an empty queue
+it exits within a minute). A watcher from before 0.19 knows no groups: until it exits it admits a run waiting for its
+group as an ordinary exec, alongside the holder, and the starts it admits come up in its own pm2 namespace (`mcproc`).
+An MCP server started before the upgrade keeps the old code until it restarts: its `exec` has no `exclusive`, and its
+starts count the runs waiting for a group as ahead of them, so they only wait longer. Restart it to use groups.
+
 ## Limits
 
 - Leases are local: `exec` and the worktree commands run on this machine only (a `host` other than `local` is refused), and a `start` of an app bound to a remote host that
