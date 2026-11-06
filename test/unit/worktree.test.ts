@@ -17,6 +17,7 @@ import { probeOut } from '../helpers/probe.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 import { projectFile, recordProject } from '../../src/core/registry.js';
 import { registryOf } from '../../src/core/leases/siblings.js';
+import { hookPath } from '../../src/core/worktree-hook.js';
 import {
   excludePattern,
   installCommand,
@@ -2076,5 +2077,203 @@ describe('planCopies: copy and required entries', () => {
     const p = plan({ copy: ['cache'] });
     expect(p.missing).toEqual(['cache']);
     expect(p.missingRequired).toEqual([]);
+  });
+});
+
+describe('the main checkout in other repository layouts', () => {
+  let base: string;
+  let state: string;
+  const deps = (): WorktreeDeps => ({
+    git: isolatedGit,
+    stateDir: state,
+    run: async () => 0,
+    log: () => undefined,
+    jlist: async () => [],
+    stopAll: async () => [],
+  });
+  const commit = (cwd: string, msg: string) =>
+    git(
+      [
+        '-c',
+        'user.email=t@t',
+        '-c',
+        'user.name=t',
+        'commit',
+        '-q',
+        '--allow-empty',
+        '-m',
+        msg,
+      ],
+      cwd
+    );
+  /** a repository at `dir` (made by `init`) whose tracked manifest requires local.yml, a file only the main checkout has */
+  const stand = (dir: string, init: string[] = []) => {
+    fs.mkdirSync(path.join(dir, '.mcproc'), { recursive: true });
+    git(['init', '-q', '-b', 'main', ...init], dir);
+    fs.writeFileSync(
+      path.join(dir, '.mcproc', 'mcproc.yaml'),
+      [
+        'version: 1',
+        'project: lay',
+        'worktree: { required: [local.yml], install: false }',
+        'apps:',
+        '  db: { description: db, run: node db.js }',
+        '',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, '.mcproc', '.gitignore'),
+      '*\n!.gitignore\n!mcproc.yaml\n'
+    );
+    fs.writeFileSync(path.join(dir, '.gitignore'), 'local.yml\n');
+    git(['add', '-A'], dir);
+    commit(dir, 'init');
+  };
+  const sync = (dir: string) =>
+    worktreeSync({ dir, allowMissing: false, fromHook: false }, deps());
+  beforeEach(() => {
+    base = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-layout-'))
+    );
+    state = path.join(base, 'state');
+  });
+  afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
+
+  it('a plain repository: the parent of its .git, from the checkout and from a worktree', async () => {
+    const repo = path.join(base, 'plain');
+    stand(repo);
+    const side = path.join(base, 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], repo);
+    expect(await mainCheckout(repo, isolatedGit)).toBe(repo);
+    expect(await mainCheckout(side, isolatedGit)).toBe(repo);
+  });
+
+  it("a submodule: its checkout, not its git dir's parent, for add, ls, sync, remove and the hook", async () => {
+    const src = path.join(base, 'src');
+    stand(src);
+    const sup = path.join(base, 'super');
+    fs.mkdirSync(sup);
+    git(['init', '-q', '-b', 'main'], sup);
+    commit(sup, 'init');
+    git(
+      [
+        '-c',
+        'protocol.file.allow=always',
+        'submodule',
+        'add',
+        '-q',
+        src,
+        'sub',
+      ],
+      sup
+    );
+    commit(sup, 'sub');
+    const sub = path.join(sup, 'sub');
+    fs.writeFileSync(path.join(sub, 'local.yml'), 'local');
+    const side = path.join(base, 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], sub);
+    expect(await mainCheckout(sub, isolatedGit)).toBe(sub);
+    expect(await mainCheckout(side, isolatedGit)).toBe(sub);
+    const m = loadManifest(sub);
+    const added = await worktreeAdd(
+      m,
+      { branch: 'feat', install: false },
+      deps()
+    );
+    expect(added).toMatchObject({
+      path: path.join(`${sub}.worktrees`, 'feat'),
+      repo: sub,
+      slot: 1,
+      copied: ['local.yml'],
+    });
+    expect((await worktreeLs(m, deps())).map((r) => [r.slot, r.path])).toEqual([
+      [0, sub],
+      [1, added.path],
+    ]);
+    expect(await sync(side)).toMatchObject({
+      repo: sub,
+      copied: ['local.yml'],
+      missing_required: [],
+    });
+    expect(await hookPath(sub, isolatedGit)).toBe(
+      path.join(sup, '.git', 'modules', 'sub', 'hooks', 'post-checkout')
+    );
+    await worktreeRemove(m, '1', { force: true }, deps());
+    expect(fs.existsSync(added.path)).toBe(false);
+  });
+
+  it('a separate git dir: found from its checkout; from a worktree only once core.worktree names it', async () => {
+    const sep = path.join(base, 'sep');
+    const dotGit = path.join(base, 'sep.git');
+    stand(sep, ['--separate-git-dir', dotGit]);
+    fs.writeFileSync(path.join(sep, 'local.yml'), 'local');
+    const side = path.join(base, 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], sep);
+    expect(await mainCheckout(sep, isolatedGit)).toBe(sep);
+    const added = await worktreeAdd(
+      loadManifest(sep),
+      { branch: 'feat', install: false },
+      deps()
+    );
+    expect(added).toMatchObject({
+      path: path.join(`${sep}.worktrees`, 'feat'),
+      copied: ['local.yml'],
+    });
+    const unknown = {
+      code: 'BAD_ARGUMENT',
+      message: `the main checkout of ${side} is not known: its repository's git directory ${dotGit} is no checkout's .git and names no core.worktree (a repository made with --separate-git-dir)`,
+      hint: `Run it from the main checkout, or name that checkout once: git config --file ${path.join(dotGit, 'config')} core.worktree <its path>`,
+    };
+    await expect(mainCheckout(side, isolatedGit)).rejects.toMatchObject(
+      unknown
+    );
+    await expect(sync(side)).rejects.toMatchObject(unknown);
+    git(
+      ['config', '--file', path.join(dotGit, 'config'), 'core.worktree', sep],
+      sep
+    );
+    // git applies it to the main checkout alone: the worktree stays its own top
+    expect(git(['rev-parse', '--show-toplevel'], side).trim()).toBe(side);
+    expect(await mainCheckout(side, isolatedGit)).toBe(sep);
+    expect(await sync(side)).toMatchObject({
+      repo: sep,
+      copied: ['local.yml'],
+    });
+  });
+
+  it("core.worktree in the main checkout's config.worktree counts too", async () => {
+    const sep = path.join(base, 'sep');
+    const dotGit = path.join(base, 'sep.git');
+    stand(sep, ['--separate-git-dir', dotGit]);
+    const side = path.join(base, 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], sep);
+    git(['config', 'extensions.worktreeConfig', 'true'], sep);
+    git(['config', '--worktree', 'core.worktree', sep], sep);
+    expect(
+      fs.readFileSync(path.join(dotGit, 'config.worktree'), 'utf8')
+    ).toContain('worktree');
+    expect(await mainCheckout(side, isolatedGit)).toBe(sep);
+  });
+
+  it('a bare repository has no main checkout: its worktrees are refused with why, before anything is made', async () => {
+    const src = path.join(base, 'src');
+    stand(src);
+    const bare = path.join(base, 'b.git');
+    git(['clone', '-q', '--bare', src, bare], base);
+    const wt = path.join(base, 'wt');
+    git(['worktree', 'add', '-q', wt, 'main'], bare);
+    const refused = {
+      code: 'BAD_ARGUMENT',
+      message: `${wt} is a worktree of the bare repository ${bare}, which has no main checkout to take a worktree's files, override and slot from`,
+    };
+    await expect(mainCheckout(wt, isolatedGit)).rejects.toMatchObject(refused);
+    const m = loadManifest(wt);
+    await expect(worktreeLs(m, deps())).rejects.toMatchObject(refused);
+    await expect(
+      worktreeAdd(m, { branch: 'feat', install: false }, deps())
+    ).rejects.toMatchObject(refused);
+    expect(fs.existsSync(`${wt}.worktrees`)).toBe(false);
+    expect(fs.existsSync(state)).toBe(false);
+    await expect(hookPath(wt, isolatedGit)).rejects.toMatchObject(refused);
   });
 });

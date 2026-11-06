@@ -163,15 +163,64 @@ function copyWhole(
   }
 }
 
-/** The main checkout of the repository `root` belongs to: the parent of git's common dir, real path. */
+/**
+ * The main checkout of the repository `root` belongs to, as a real path. git keeps no path back to it from a worktree:
+ * it is `root`'s own top when `root` is in it (its git dir is the repository's common dir), else the `core.worktree`
+ * the common dir names (a submodule's, or one set by hand; config.worktree first, where extensions.worktreeConfig puts
+ * it), else the parent of a common dir named `.git`. A bare repository has none, and neither has a common dir elsewhere
+ * that names no `core.worktree` (a repository made with --separate-git-dir, asked from one of its worktrees): both are
+ * refused, never guessed from the git dir's parent.
+ */
 export async function mainCheckout(
   root: string,
   git: GitRunner
 ): Promise<string> {
-  const common = (
-    await gitOk(git, ['rev-parse', '--git-common-dir'], root)
-  ).trim();
-  return fs.realpathSync(path.dirname(path.resolve(root, common)));
+  const [own, common, top] = (
+    await gitOk(
+      git,
+      [
+        'rev-parse',
+        '--absolute-git-dir',
+        '--git-common-dir',
+        '--show-toplevel',
+      ],
+      root
+    )
+  )
+    .trim()
+    .split('\n');
+  const dir = realOf(path.resolve(root, common));
+  const at = realOf(top);
+  /** a key of the repository's config, its main checkout's config.worktree first; null when neither sets it */
+  const config = async (key: string, type: string[] = []) => {
+    for (const file of ['config.worktree', 'config']) {
+      const r = await git(
+        ['config', '--file', path.join(dir, file), ...type, '--get', key],
+        root
+      );
+      if (r.code === 0) return r.stdout.trim();
+    }
+    return null;
+  };
+  if ((await config('core.bare', ['--type=bool'])) === 'true')
+    throw new McprocError(
+      'BAD_ARGUMENT',
+      `${at} is a worktree of the bare repository ${dir}, which has no main checkout to take a worktree's files, override and slot from`,
+      {
+        hint: 'Run mcproc in a clone with a checkout of its own (git clone without --bare), and make the worktrees from it.',
+      }
+    );
+  if (realOf(own) === dir) return at;
+  const named = await config('core.worktree');
+  if (named) return realOf(path.resolve(dir, named));
+  if (path.basename(dir) === '.git') return path.dirname(dir);
+  throw new McprocError(
+    'BAD_ARGUMENT',
+    `the main checkout of ${at} is not known: its repository's git directory ${dir} is no checkout's .git and names no core.worktree (a repository made with --separate-git-dir)`,
+    {
+      hint: `Run it from the main checkout, or name that checkout once: git config --file ${path.join(dir, 'config')} core.worktree <its path>`,
+    }
+  );
 }
 
 /** Where worktrees go: the manifest's `worktree.dir` resolved from the main checkout, else `<main>.worktrees`. */

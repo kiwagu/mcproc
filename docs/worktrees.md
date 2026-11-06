@@ -49,6 +49,11 @@ the worktree's apps (freeing its leases), removes the checkout and frees the slo
 untracked changes refuse it unless `--force`, and the main checkout is never removed. The registry is
 `<state>/slots/<project>-<hash>.json`.
 
+The main checkout is the repository's own working tree, whatever git's layout: a submodule's checkout (git's
+`core.worktree` names it), and the checkout of a repository made with `--separate-git-dir`; from one of that
+repository's worktrees only once `git config --file <git dir>/config core.worktree <its path>` names it, since git keeps
+no path back to it there. A bare repository has none: `worktree` commands in its worktrees are refused.
+
 The agent then passes `project: <worktree path>` on every call for that stand (`start`, `wait`, `logs`...).
 
 ## Required files
