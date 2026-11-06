@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -299,6 +299,44 @@ describe('LeaseStore', () => {
     await expect(store.withLock(() => 'ok')).resolves.toBe('ok');
   });
 
+  it('callers in one process take the lock in turn, without polling for it', async () => {
+    const one = new LeaseStore(dir);
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const a = one.withLock(async () => {
+        order.push('a in');
+        await Promise.resolve();
+        order.push('a out');
+      });
+      const b = one.withLock(async () => {
+        order.push('b');
+      });
+      // no timer runs: a lock waited for by polling would never be taken
+      await Promise.all([a, b]);
+      expect(order).toEqual(['a in', 'a out', 'b']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a caller whose turn never comes still fails as a held lock does', async () => {
+    const one = new LeaseStore(dir);
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      const outer = one.withLock(() => new Promise<void>((r) => (release = r)));
+      const inner = one.withLock(() => 'never');
+      const seen = inner.catch((e) => e);
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(await seen).toMatchObject({ code: 'TIMEOUT' });
+      release();
+      await outer;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   describe('the break guard', () => {
     let leases: string;
     let lock: string;
@@ -465,7 +503,9 @@ describe('LeaseStore', () => {
   });
 
   it("keeps this process's own live locks: two holders without a pid override still take turns", async () => {
+    // two stores: callers of one store take their turns before the lock file
     const real = new LeaseStore(dir, { now: () => now });
+    const twin = new LeaseStore(dir, { now: () => now });
     const order: string[] = [];
     await Promise.all([
       real.withLock(async () => {
@@ -473,7 +513,7 @@ describe('LeaseStore', () => {
         await new Promise((r) => setTimeout(r, 50));
         order.push('a-out');
       }),
-      real.withLock(async () => {
+      twin.withLock(async () => {
         order.push('b');
       }),
     ]);
@@ -517,10 +557,12 @@ describe('LeaseStore', () => {
     };
     const oldGuard = movedGuard('.lock.break.1-dead.stale', true);
     const freshGuard = movedGuard('.lock.break.2-live.stale', false);
+    // a second store contends for the lock file: callers of one store take their turns before it
+    const twin = new LeaseStore(dir, { now: () => now, pid: 4242 });
     await Promise.all([
       store.withLock(() => new Promise((r) => setTimeout(r, 100))),
       new Promise((r) => setTimeout(r, 20)).then(() =>
-        store.withLock(() => 'ok')
+        twin.withLock(() => 'ok')
       ),
     ]);
     expect(fs.existsSync(oldTmp)).toBe(false);
@@ -534,6 +576,8 @@ describe('LeaseStore', () => {
   it('writes its token file again when a sweep took it during a long wait, and takes the lock', async () => {
     const leases = path.join(dir, 'leases');
     let swept = 0;
+    // a second store waits on the lock file: callers of one store take their turns before it
+    const twin = new LeaseStore(dir, { now: () => now, pid: 4242 });
     await Promise.all([
       store.withLock(async () => {
         await new Promise((r) => setTimeout(r, 30));
@@ -546,7 +590,7 @@ describe('LeaseStore', () => {
         await new Promise((r) => setTimeout(r, 30));
       }),
       new Promise((r) => setTimeout(r, 10)).then(() =>
-        store.withLock(() => 'ok')
+        twin.withLock(() => 'ok')
       ),
     ]).then(([, b]) => expect(b).toBe('ok'));
     expect(swept).toBe(1);

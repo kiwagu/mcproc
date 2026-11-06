@@ -220,6 +220,9 @@ export class LeaseStore {
   private readonly now: () => number;
   private readonly pid: number;
   private readonly beforeUnlink: (() => void) | undefined;
+  /** whether a caller of withLock on this store has its turn now, and who waits for one, first first */
+  private turnTaken = false;
+  private readonly turns: (() => void)[] = [];
   /**
    * Opens the lease directory under the given state directory, with optional clock and pid overrides for tests;
    * `beforeUnlink` (tests only) runs while a breaker holds the break guard, before the re-read that decides the unlink.
@@ -254,9 +257,44 @@ export class LeaseStore {
    * Runs `fn` holding the lock (not reentrant). A lock is stale when it is older than LOCK_STALE_MS and its holder is
    * dead, when it was taken before this boot, when it names this process with a token this process does not hold, or,
    * unparseable, when its file's mtime is older than LOCK_STALE_MS; a stale lock is broken under the break guard (see
-   * breakIfStale), never by moving it aside, so the lock path is never left free while a live holder has it.
+   * breakIfStale), never by moving it aside, so the lock path is never left free while a live holder has it. Callers of
+   * this store in one process take their turns first, without polling (the watcher's loop and the start it runs beside
+   * it); a turn that does not come within LOCK_WAIT_MS goes on to the lock file, which then fails as a held lock does.
    */
   async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+    // free, it goes straight on to the lock file, in this very call
+    let mine = true;
+    if (this.turnTaken) mine = await this.awaitTurn();
+    else this.turnTaken = true;
+    try {
+      return await this.fileLock(fn);
+    } finally {
+      if (mine) this.passTurn();
+    }
+  }
+  /** Waits for the callers of this store before it: true once its turn came, false once LOCK_WAIT_MS passed first. */
+  private awaitTurn(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const take = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        const i = this.turns.indexOf(take);
+        if (i >= 0) this.turns.splice(i, 1);
+        resolve(false);
+      }, LOCK_WAIT_MS);
+      this.turns.push(take);
+    });
+  }
+  /** Hands the turn to the next caller waiting for it, or leaves it free. */
+  private passTurn(): void {
+    const next = this.turns.shift();
+    if (next) next();
+    else this.turnTaken = false;
+  }
+  /** Runs `fn` holding the lock file (see withLock). */
+  private async fileLock<T>(fn: () => Promise<T> | T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true });
     const lock = path.join(this.dir, '.lock');
     const token = `${this.pid}-${crypto.randomBytes(6).toString('hex')}`;
