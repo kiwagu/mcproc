@@ -103,6 +103,36 @@ async function watcherOnline(ctx: Context): Promise<boolean> {
 }
 
 /**
+ * The watcher's pm2 app, as its ecosystem file in the state directory holds it: the bundle `entry` running
+ * `watch-leases` in the `mcproc` namespace, with the state directory, the CLI entry when MCPROC_CLI_ENTRY names one,
+ * and the daemon's own environment (`pm2Env`, its PM2_HOME).
+ */
+export function watcherApp(
+  dir: string,
+  entry: string,
+  pm2Env: Record<string, string> | undefined
+): Record<string, unknown> {
+  return {
+    name: WATCHER_NAME,
+    namespace: WATCHER_NS,
+    cwd: dir,
+    script: process.execPath,
+    args: [entry, 'watch-leases'],
+    interpreter: 'none',
+    // the watcher reads this state directory, drives this daemon and spawns its children from this same
+    // bundle, whatever the shell pm2 inherits
+    env: {
+      MCPROC_STATE_DIR: dir,
+      ...(process.env.MCPROC_CLI_ENTRY ? { MCPROC_CLI_ENTRY: entry } : {}),
+      ...(pm2Env ?? {}),
+    },
+    autorestart: false,
+    treekill: true,
+    log_date_format: LOG_STAMP,
+  };
+}
+
+/**
  * ensureWatcher's look and launch, under the lease lock: an online watcher is left alone, else a fresh one is started.
  * `leaving` is the exit note a start waited on: while that note is still in place (no launch took it meanwhile), the
  * online watcher is the one on its way out and a fresh one is started over it, which is safe since it passed leaveIdle
@@ -125,34 +155,7 @@ async function lookAndLaunch(
   fs.rmSync(path.join(dir, WATCHER_NOTE), { force: true });
   fs.writeFileSync(
     file,
-    JSON.stringify(
-      {
-        apps: [
-          {
-            name: WATCHER_NAME,
-            namespace: WATCHER_NS,
-            cwd: dir,
-            script: process.execPath,
-            args: [entry, 'watch-leases'],
-            interpreter: 'none',
-            // the watcher reads this state directory, drives this daemon and spawns its children from this same
-            // bundle, whatever the shell pm2 inherits
-            env: {
-              MCPROC_STATE_DIR: dir,
-              ...(process.env.MCPROC_CLI_ENTRY
-                ? { MCPROC_CLI_ENTRY: entry }
-                : {}),
-              ...(ctx.pm2.env() ?? {}),
-            },
-            autorestart: false,
-            treekill: true,
-            log_date_format: LOG_STAMP,
-          },
-        ],
-      },
-      null,
-      2
-    )
+    JSON.stringify({ apps: [watcherApp(dir, entry, ctx.pm2.env())] }, null, 2)
   );
   await ctx.pm2.startOrRestart(file, WATCHER_NAME);
   return 'started';

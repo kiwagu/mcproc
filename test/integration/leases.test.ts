@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   prepare,
   connect,
@@ -313,21 +314,25 @@ describe('memory leases against real pm2', () => {
     expect(ensured).toEqual(['itl-w1']);
   }, 60_000);
 
-  // the watcher under pm2 runs a built cli.js: the side build that MCPROC_CLI names
-  (process.env.MCPROC_CLI ? it : it.skip)(
-    'ensureWatcher under pm2 starts mcproc-watcher once, then finds it online (needs MCPROC_CLI naming a side build)',
-    async () => {
-      process.env.MCPROC_CLI_ENTRY = process.env.MCPROC_CLI;
-      watcherLaunched = true;
-      expect(await ensureWatcher(ctxA, state)).toBe('started');
-      const w = (await ctxA.pm2.jlist()).find((p) => p.name === WATCHER_NAME);
-      expect(w).toMatchObject({ namespace: WATCHER_NS, status: 'online' });
-      expect(await ensureWatcher(ctxA, state)).toBe('online');
-      expect((await leasesView(state, ctxA)).watcher).toEqual({
-        online: true,
-        pid: w!.pid,
-      });
-    },
-    60_000
-  );
+  // the watcher under pm2 runs a built cli.js: dist/cli.js, or the side build that MCPROC_CLI names
+  it('ensureWatcher under pm2 starts mcproc-watcher once, then finds it online', async () => {
+    process.env.MCPROC_CLI_ENTRY =
+      process.env.MCPROC_CLI ??
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '..',
+        '..',
+        'dist',
+        'cli.js'
+      );
+    watcherLaunched = true;
+    expect(await ensureWatcher(ctxA, state)).toBe('started');
+    const w = (await ctxA.pm2.jlist()).find((p) => p.name === WATCHER_NAME);
+    expect(w).toMatchObject({ namespace: WATCHER_NS, status: 'online' });
+    expect(await ensureWatcher(ctxA, state)).toBe('online');
+    expect((await leasesView(state, ctxA)).watcher).toEqual({
+      online: true,
+      pid: w!.pid,
+    });
+  }, 60_000);
 });

@@ -15,7 +15,12 @@ import {
 } from '../manifest.js';
 import type { HostMemory } from '../memory.js';
 import { readHostMemory } from '../memory.js';
-import { findProcess, isRunning, type Pm2Process } from '../pm2.js';
+import {
+  findProcess,
+  isRunning,
+  type Pm2Process,
+  withoutPm2Keys,
+} from '../pm2.js';
 import { connect, pickHost, prepare } from '../resolve.js';
 import { abortableSleep } from '../wait.js';
 import {
@@ -25,7 +30,7 @@ import {
   rampingMib,
   reserveMib,
 } from './admission.js';
-import { WATCHER_NOTE } from './ensure.js';
+import { WATCHER_NOTE, watcherApp } from './ensure.js';
 import {
   listCheckout,
   measureSiblings,
@@ -89,6 +94,9 @@ async function moveIf(
 
 /** How long an exec lease may stay starting before the watcher fails it, in milliseconds: its owner polls every second. */
 const EXEC_TURN_GRACE_MS = 60_000;
+
+/** The keys of the watcher's own pm2 entry: pm2 puts them into the watcher's environment as well. */
+const WATCHER_APP_KEYS = Object.keys(watcherApp('', '', undefined));
 
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
@@ -608,7 +616,15 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             '--lease',
             l.id,
           ],
-          { stdio: 'inherit', env: { ...process.env, MCPROC_STATE_DIR: dir } }
+          // the watcher runs under pm2, which put its own description into this environment (namespace, cwd, ...):
+          // the child's pm2 CLI would hand those to the apps it starts, so it gets the environment without them
+          {
+            stdio: 'inherit',
+            env: {
+              ...withoutPm2Keys(process.env, WATCHER_APP_KEYS),
+              MCPROC_STATE_DIR: dir,
+            },
+          }
         );
         const pid = child.pid;
         const patched = pid

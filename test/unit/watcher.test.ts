@@ -1,4 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  onTestFinished,
+} from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -718,6 +725,58 @@ describe('defaultWatcherDeps', () => {
       error: 'child exited 3',
       exit_code: 3,
       child_pid: null,
+    });
+  });
+
+  it("runStart gives the child the watcher's environment without pm2's keys", async () => {
+    // what pm2 puts into the environment of the watcher it manages, and what the watcher was launched with
+    const set: Record<string, string> = {
+      namespace: 'mcproc',
+      pm_id: '7',
+      name: 'mcproc-watcher',
+      'mcproc-watcher': '{}',
+      cwd: dir,
+      unique_id: 'u',
+      KEEP_ME: '1',
+      PM2_HOME: path.join(dir, 'home'),
+    };
+    const prev = Object.fromEntries(
+      Object.keys(set).map((k) => [k, process.env[k]])
+    );
+    onTestFinished(() => {
+      for (const [k, v] of Object.entries(prev))
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    });
+    Object.assign(process.env, set);
+    const entry = path.join(dir, 'cli.js');
+    const envFile = path.join(dir, 'env.json');
+    fs.writeFileSync(
+      entry,
+      `require('node:fs').writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(process.env)); process.exit(3);`
+    );
+    const deps = defaultWatcherDeps(dir, entry);
+    const l = await deps.store.withLock(() =>
+      deps.store.create(input({ root: vars }), 'pending')
+    );
+    const admitted = await deps.store.withLock(() =>
+      deps.store.transition(l.id, 'starting')
+    );
+    await deps.runStart(admitted);
+    const env = JSON.parse(fs.readFileSync(envFile, 'utf8'));
+    for (const k of [
+      'namespace',
+      'pm_id',
+      'name',
+      'mcproc-watcher',
+      'cwd',
+      'unique_id',
+    ])
+      expect(env, k).not.toHaveProperty([k]);
+    expect(env).toMatchObject({
+      KEEP_ME: '1',
+      PM2_HOME: path.join(dir, 'home'),
+      MCPROC_STATE_DIR: dir,
     });
   });
 
