@@ -42,7 +42,9 @@ import {
   type LeaseSource,
   type LeaseState,
   LeaseStore,
+  commandAlive,
   pidAlive,
+  requesterAlive,
   starterAlive,
 } from './store.js';
 
@@ -101,27 +103,35 @@ const WATCHER_APP_KEYS = Object.keys(watcherApp('', '', undefined));
 /**
  * A running lease whose apps all left pm2 or stopped holds nothing, nor one whose checkout is gone (both spared while
  * their starter lives, for at most STARTER_TRUST_MS, see starterAlive); a starting one whose recorded child is gone is
- * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester: once that
- * process is gone, a running one is freed and a starting one failed at once; a starting one its live owner has not
- * taken within EXEC_TURN_GRACE_MS (its wait ended without the cancel landing) is failed too, so it cannot hold the queue.
+ * over at once, one that never recorded a child after `stuckMs`. An exec lease belongs to its requester (its pid, and
+ * where recorded its start time and boot, see requesterAlive): once that process is gone, a pending one is cancelled
+ * wherever it stands, a starting one failed, and a running one freed once the command it runs is gone too; a starting
+ * one its live owner has not taken within EXEC_TURN_GRACE_MS (its wait ended without the cancel landing) is failed too,
+ * so it cannot hold the queue.
  */
 async function reconcile(deps: WatcherDeps, stuckMs: number): Promise<void> {
   const { store } = deps;
   for (const l of store.list()) {
     try {
       if (l.kind === 'exec') {
-        // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal)
-        if (
-          (l.state === 'running' || l.state === 'starting') &&
-          !pidAlive(l.requester_pid)
-        )
-          await moveIf(
-            store,
-            l.id,
-            l.state,
-            l.state === 'running' ? 'freed' : 'failed',
-            { error: 'requester gone' }
-          );
+        // nothing else ends it: its process died without its own cleanup (a kill, a closed terminal). A waiting one is
+        // cancelled wherever it stands, so a dead waiter never holds its group's line; a running one stays held while
+        // the command it ran still lives (a SIGKILLed mcproc leaves it running), so its group is not run twice
+        const requester = requesterAlive(l);
+        if (l.state === 'pending' && !requester) {
+          const c = await moveIf(store, l.id, 'pending', 'cancelled', {
+            error: 'requester gone',
+          });
+          if (c)
+            deps.log(`cancel ${l.id}: requester gone (pid ${l.requester_pid})`);
+        } else if (l.state === 'starting' && !requester)
+          await moveIf(store, l.id, 'starting', 'failed', {
+            error: 'requester gone',
+          });
+        else if (l.state === 'running' && !requester && !commandAlive(l))
+          await moveIf(store, l.id, 'running', 'freed', {
+            error: 'requester gone',
+          });
         else if (
           l.state === 'starting' &&
           l.admitted_at &&
@@ -219,15 +229,6 @@ async function judgeHead(
       error: 'checkout gone',
     });
     if (c) deps.log(`cancel ${head.id}: checkout gone (${head.root})`);
-    return 'changed';
-  }
-  // an exec whose requester is gone would be marked starting for nobody, and hold every later lease behind it
-  if (head.kind === 'exec' && !pidAlive(head.requester_pid)) {
-    const c = await moveIf(store, head.id, 'pending', 'cancelled', {
-      error: 'requester gone',
-    });
-    if (c)
-      deps.log(`cancel ${head.id}: requester gone (pid ${head.requester_pid})`);
     return 'changed';
   }
   let memory: HostMemory | null;
@@ -367,8 +368,8 @@ async function leaveIdle(deps: WatcherDeps): Promise<boolean> {
  * directory that cannot be read is logged once (a failing prune too) and the tick goes on as if nothing were queued,
  * never into an idle exit it cannot judge. Exits once nothing has been pending or starting for `idleExitMs` (leaving the exit note, see
  * leaveIdle); a starting lease that never recorded a child for `stuckMs` is failed, an exec lease whose requester
- * is gone is ended at once (cancelled at the head, failed while starting, freed while running), and one left starting
- * for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
+ * is gone is ended at once (cancelled while pending, failed while starting, freed while running once its command is
+ * gone too), and one left starting for EXEC_TURN_GRACE_MS is failed. A tick that throws is logged, not fatal.
  */
 export async function watchLeases(
   deps: WatcherDeps,

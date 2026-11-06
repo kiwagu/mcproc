@@ -29,6 +29,7 @@ import { parseJlist } from '../../src/core/pm2.js';
 import { ownsManifest } from '../../src/core/leases/siblings.js';
 import { McprocError } from '../../src/core/errors.js';
 import { abortableSleep } from '../../src/core/wait.js';
+import { procAvailable, processStart } from '../../src/core/procfs.js';
 
 const vars = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -324,6 +325,99 @@ describe('watchLeases', () => {
       error: 'the exec did not take its turn',
     });
     expect(store.get(young.id)?.state).toBe('starting');
+  });
+
+  /** A pid no process has any more: one that ran and exited. */
+  const deadPid = () => spawnSync(process.execPath, ['-e', '0']).pid as number;
+  const execOf = { kind: 'exec' as const, apps: [], target: 'bun test' };
+
+  it('cancels a pending exec whose requester is gone anywhere in the queue', async () => {
+    available = 100; // the head, a start, waits for memory
+    const s = await store.create(input(), 'pending');
+    const e = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'pending'
+    );
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(e.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'requester gone',
+    });
+    expect(store.get(s.id)?.state).toBe('pending');
+  });
+
+  it('keeps a running exec while its command lives after its requester died', async () => {
+    const l = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    await store.patch(l.id, {
+      command_pid: process.pid,
+      command_start: processStart(process.pid),
+    });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(l.id)?.state).toBe('running');
+    await store.patch(l.id, { command_pid: deadPid() });
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(l.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+  });
+
+  it.skipIf(!procAvailable())(
+    'a living pid with another start time or boot is gone',
+    async () => {
+      const a = await store.create(
+        input({
+          ...execOf,
+          requester_start: (processStart(process.pid) as number) + 1,
+        }),
+        'running'
+      );
+      const b = await store.create(
+        input({ ...execOf, boot_id: 'another-boot' }),
+        'running'
+      );
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      for (const l of [a, b])
+        expect(store.get(l.id)).toMatchObject({
+          state: 'freed',
+          error: 'requester gone',
+        });
+    }
+  );
+
+  it('a running exec lease from before groups is freed by its pid alone', async () => {
+    const dead = await store.create(
+      input({ ...execOf, requester_pid: deadPid() }),
+      'running'
+    );
+    const live = await store.create(input(execOf), 'running');
+    // the files as an earlier version wrote them: none of the group, identity or command fields
+    for (const l of [dead, live]) {
+      const file = path.join(
+        dir,
+        'leases',
+        `${String(l.seq).padStart(6, '0')}-${l.id}.json`
+      );
+      const old = JSON.parse(fs.readFileSync(file, 'utf8'));
+      for (const k of [
+        'exclusive',
+        'boot_id',
+        'requester_start',
+        'command_pid',
+        'command_start',
+      ])
+        delete old[k];
+      fs.writeFileSync(file, JSON.stringify(old));
+    }
+    await watchLeases(deps(), { tickMs: 10, once: true });
+    expect(store.get(dead.id)).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+    expect(store.get(live.id)?.state).toBe('running');
   });
 
   it('cancels a pending exec at the head whose requester is gone and judges the next one at once', async () => {
