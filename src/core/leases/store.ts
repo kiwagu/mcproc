@@ -3,7 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { McprocError } from '../errors.js';
-import { bootId, type ProcFs, processStart, realProcFs } from '../procfs.js';
+import {
+  bootId,
+  type ProcFs,
+  processStart,
+  processState,
+  realProcFs,
+} from '../procfs.js';
 import { memoryPosition, memoryQueue } from './queue.js';
 
 /** Where a lease stands: queued (pending), handed to a watcher (starting), up (running), or ended (freed, cancelled, failed). */
@@ -118,8 +124,9 @@ export function pidAlive(pid: number): boolean {
 }
 
 /**
- * Whether `pid` is still the process that was recorded: alive, in the recorded boot and with the recorded start time,
- * each checked only where it was recorded and can be read now. A pid reused after a crash or a reboot is not.
+ * Whether `pid` is still the process that was recorded: alive and not a zombie (one that exited and waits to be
+ * collected holds nothing), in the recorded boot and with the recorded start time, each checked only where it was
+ * recorded and can be read now. A pid reused after a crash or a reboot is not.
  */
 export function sameProcess(
   pid: number,
@@ -132,6 +139,8 @@ export function sameProcess(
     if (now !== null && now !== boot) return false;
   }
   if (!pidAlive(pid)) return false;
+  const state = processState(pid, f);
+  if (state === 'Z' || state === 'X') return false;
   if (start !== null) {
     const now = processStart(pid, f);
     if (now !== null && now !== start) return false;

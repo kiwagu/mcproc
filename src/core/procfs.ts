@@ -319,6 +319,21 @@ export function processStart(
   }
 }
 
+/**
+ * A process's state letter (field 3 of its stat): R, S, D, ..., Z for a zombie (exited, its parent has not collected it
+ * yet), X for one being reaped. Null when the stat cannot be read (gone, no /proc).
+ */
+export function processState(
+  pid: number,
+  f: ProcFs = realProcFs
+): string | null {
+  try {
+    return statFields(f.read(`/proc/${pid}/stat`))[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 /** This boot of the machine, as the kernel names it; null without /proc. */
 export function bootId(f: ProcFs = realProcFs): string | null {
   try {

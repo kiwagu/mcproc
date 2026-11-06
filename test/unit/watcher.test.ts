@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import {
   LeaseStore,
   type Lease,
@@ -421,6 +422,49 @@ describe('watchLeases', () => {
       );
       await watchLeases(deps(), { tickMs: 10, once: true });
       for (const l of [a, b])
+        expect(store.get(l.id)).toMatchObject({
+          state: 'freed',
+          error: 'requester gone',
+        });
+    }
+  );
+
+  it.skipIf(!procAvailable())(
+    'a zombie requester or command is gone, with or without its start recorded',
+    async () => {
+      // `exec sleep 5` never collects the background sleep the shell left it: once that one exits, it stays a zombie
+      const sh = spawn('sh', ['-c', 'sleep 0.2 & echo $!; exec sleep 5'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      onTestFinished(() => {
+        sh.kill('SIGKILL');
+      });
+      const [out] = await once(sh.stdout!, 'data');
+      const zombie = Number(String(out).trim());
+      const start = processStart(zombie);
+      const stat = () => fs.readFileSync(`/proc/${zombie}/stat`, 'utf8');
+      for (let i = 0; i < 60 && !/\) Z /.test(stat()); i++)
+        await new Promise((r) => setTimeout(r, 50));
+      expect(stat()).toMatch(/\) Z /);
+      const asRequester = await store.create(
+        input({ ...execOf, requester_pid: zombie, requester_start: start }),
+        'running'
+      );
+      // a lease written before identities: the pid alone
+      const asOldRequester = await store.create(
+        input({ ...execOf, requester_pid: zombie }),
+        'running'
+      );
+      const asCommand = await store.create(
+        input({ ...execOf, requester_pid: deadPid() }),
+        'running'
+      );
+      await store.patch(asCommand.id, {
+        command_pid: zombie,
+        command_start: start,
+      });
+      await watchLeases(deps(), { tickMs: 10, once: true });
+      for (const l of [asRequester, asOldRequester, asCommand])
         expect(store.get(l.id)).toMatchObject({
           state: 'freed',
           error: 'requester gone',

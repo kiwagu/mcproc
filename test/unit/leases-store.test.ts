@@ -101,6 +101,32 @@ describe('process identity', () => {
     );
   });
 
+  it('sameProcess takes a zombie for gone, whether or not its start was recorded', () => {
+    const stat = (state: string) =>
+      `${process.pid} (node) ${state} 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0`;
+    const withState = (state: string): ProcFs => ({
+      readdir: () => [],
+      read: (f) => {
+        if (f === `/proc/${process.pid}/stat`) return stat(state);
+        throw new Error(`ENOENT ${f}`);
+      },
+      readlink: (f) => {
+        throw new Error(`ENOENT ${f}`);
+      },
+    });
+    for (const state of ['Z', 'X']) {
+      expect(
+        sameProcess(process.pid, 5000, null, withState(state)),
+        state
+      ).toBe(false);
+      expect(
+        sameProcess(process.pid, null, null, withState(state)),
+        state
+      ).toBe(false);
+    }
+    expect(sameProcess(process.pid, 5000, null, withState('S'))).toBe(true);
+  });
+
   it('requesterAlive reads the requester; commandAlive is false without a command', () => {
     const l = {
       requester_pid: process.pid,
