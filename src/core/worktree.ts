@@ -714,6 +714,13 @@ export async function worktreeAdd(
       'BAD_ARGUMENT',
       `project slug "${opts.project}" must match ${NAME_RE.source}`
     );
+  // a readonly local host takes no writes: no worktree, branch, slot, override, copy or install (sync refuses the same)
+  if (m.hosts.local?.readonly)
+    throw new McprocError(
+      'READONLY_HOST',
+      `${m.path} declares the local host readonly: worktree add is refused; nothing was made`,
+      { hint: `Remove hosts.local.readonly from ${m.path}, then run it again.` }
+    );
   // the branch names the folder: a name git refuses never reaches the filesystem. No `--` here: check-ref-format
   // refuses one, and `--branch` takes the next argument as the name whatever it looks like (`-x` is refused as a name)
   if (

@@ -27,7 +27,8 @@ branch (a new branch starts at `--from`, default the main checkout's HEAD), then
 `<project>-w<slot>`) and, when that manifest declares a `slot` var, `vars.slot`, copies and links what that manifest
 declares, and runs its install. So a branch that introduces the slot scheme gets a correct worktree from the first try,
 whatever the main checkout's manifest says. It prints the path, which manifest decided, and how to go on; if git fails
-the slot is given back.
+the slot is given back. A `readonly` local host in the manifest it runs from refuses it before anything is made (no
+worktree, branch or slot).
 
 Machine-local extras stay out of the repository: the main checkout's own `.mcproc/mcproc.local.yaml` may add to the
 lists, and every link, from either source, is written as a root-anchored pattern to git's exclude file of the repository

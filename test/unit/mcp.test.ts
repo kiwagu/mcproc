@@ -565,6 +565,51 @@ describe('mcp server', () => {
       fs.rmSync(base, { recursive: true, force: true });
     }
   });
+  it('worktree_add on a readonly local host is an error with READONLY_HOST, and no worktree is made', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpro-'));
+    const main = path.join(base, 'wro');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wro',
+          'hosts:',
+          '  local: { pm2: /bin/false, readonly: true }',
+          'worktree: { install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const cl = await client(neverSpawn, undefined, main);
+      const refused: any = await cl.callTool({
+        name: 'worktree_add',
+        arguments: { branch: 'q' },
+      });
+      expect(refused.isError).toBe(true);
+      expect(refused.structuredContent.error).toMatchObject({
+        code: 'READONLY_HOST',
+      });
+      expect(text(refused)).toContain(
+        'declares the local host readonly: worktree add is refused; nothing was made'
+      );
+      expect(git(['branch', '--list', 'q']).trim()).toBe('');
+      expect(fs.existsSync(`${main}.worktrees`)).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
   it('worktree_sync brings a worktree git made its files; a required miss is an error unless allow_missing; the main checkout is refused', async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-mcpsync-'));
     const main = path.join(base, 'wty');

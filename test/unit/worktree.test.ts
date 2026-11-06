@@ -204,6 +204,26 @@ describe('worktree', () => {
       expect(fs.existsSync(path.join(top, 'a'))).toBe(true);
     }
   );
+  it('a readonly local host refuses worktree add before anything is made: no worktree, branch, slot or install', async () => {
+    const manifest = path.join(main, '.mcproc', 'mcproc.yaml');
+    fs.appendFileSync(manifest, 'hosts:\n  local: { readonly: true }\n');
+    const m = loadManifest(main);
+    await expect(
+      worktreeAdd(m, { branch: 'ro', install: true }, deps())
+    ).rejects.toMatchObject({
+      code: 'READONLY_HOST',
+      message: `${manifest} declares the local host readonly: worktree add is refused; nothing was made`,
+      hint: `Remove hosts.local.readonly from ${manifest}, then run it again.`,
+    });
+    expect(git(['branch', '--list', 'ro'], main).trim()).toBe('');
+    expect(git(['worktree', 'list', '--porcelain'], main)).not.toContain(
+      'worktrees'
+    );
+    expect(fs.existsSync(`${main}.worktrees`)).toBe(false);
+    expect(readRegistry(registryPath(state, 'demo', real))).toBeNull();
+    expect(ran).toEqual([]);
+  });
+
   it('helpers: main checkout, worktree dir, install command, copy plan', async () => {
     expect(await mainCheckout(main, isolatedGit)).toBe(real);
     const m = loadManifest(main);

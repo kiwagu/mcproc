@@ -507,6 +507,49 @@ describe('cli', () => {
       fs.rmSync(base, { recursive: true, force: true });
     }
   });
+  it('worktree add on a readonly local host is refused with READONLY_HOST and leaves no branch', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-wt-ro-'));
+    const main = path.join(base, 'wro');
+    const git = (args: string[]) =>
+      execFileSync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args],
+        { cwd: main, stdio: 'pipe' }
+      ).toString();
+    try {
+      fs.mkdirSync(path.join(main, '.mcproc'), { recursive: true });
+      fs.writeFileSync(
+        path.join(main, '.mcproc', 'mcproc.yaml'),
+        [
+          'version: 1',
+          'project: wro',
+          'hosts:',
+          '  local: { pm2: /bin/false, readonly: true }',
+          'worktree: { install: false }',
+          'apps:',
+          '  db: { description: db, run: node db.js }',
+          '',
+        ].join('\n')
+      );
+      git(['init', '-q', '-b', 'main']);
+      git(['add', '-A']);
+      git(['commit', '-qm', 'init']);
+      const c = capture();
+      await buildProgram(c.io).parseAsync(
+        ['worktree', 'add', 'r', '--project', main],
+        { from: 'user' }
+      );
+      expect(c.err.join('\n')).toMatch(
+        /^READONLY_HOST: .*mcproc\.yaml declares the local host readonly: worktree add is refused; nothing was made\nHint: Remove hosts\.local\.readonly from /
+      );
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      expect(git(['branch', '--list', 'r']).trim()).toBe('');
+      expect(fs.existsSync(`${main}.worktrees`)).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
   describe('worktree sync', () => {
     let base: string;
     let main: string;
