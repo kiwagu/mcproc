@@ -757,12 +757,22 @@ describe('caller environments', () => {
     expect(takeCallerEnv(dir, 'l_aaaaaaaaaa')).toBeNull();
   });
 
-  it('an unreadable kept environment is dropped and taken as none', () => {
+  it('a kept environment that does not parse is dropped and taken as none', () => {
     fs.mkdirSync(path.join(dir, 'caller-env'), { recursive: true });
     fs.writeFileSync(fileOf('l_bbbbbbbbbb'), '{not json');
     expect(takeCallerEnv(dir, 'l_bbbbbbbbbb')).toBeNull();
     expect(fs.existsSync(fileOf('l_bbbbbbbbbb'))).toBe(false);
   });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'a kept environment that cannot be read is dropped and taken as none',
+    () => {
+      fs.mkdirSync(path.join(dir, 'caller-env'), { recursive: true });
+      fs.writeFileSync(fileOf('l_cccccccccc'), '{"X":"1"}', { mode: 0o000 });
+      expect(takeCallerEnv(dir, 'l_cccccccccc')).toBeNull();
+      expect(fs.existsSync(fileOf('l_cccccccccc'))).toBe(false);
+    }
+  );
 
   it('a lease that ends, or runs without the watcher starting it, drops its kept environment; one admitted keeps it', async () => {
     const a = await store.withLock(() => store.create(input(), 'pending'));

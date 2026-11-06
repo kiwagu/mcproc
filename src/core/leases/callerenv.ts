@@ -43,21 +43,23 @@ export function keepCallerEnv(
 }
 
 /**
- * The environment kept for lease `id`, deleted as it is taken; null when none is kept. One that cannot be read as an
- * environment is deleted too, and taken as none.
+ * The environment kept for lease `id`, deleted as it is taken; null when none is kept. One that cannot be read, or read
+ * as an environment, is deleted too, and taken as none. Throws when it cannot be deleted.
  */
 export function takeCallerEnv(
   stateDir: string,
   id: string
 ): Record<string, string> | null {
   const f = fileOf(stateDir, id);
-  let text: string;
+  let text: string | null = null;
   try {
     text = fs.readFileSync(f, 'utf8');
-  } catch {
-    return null;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    // what cannot be read is no environment to run with, and must not stay on disk either
   }
   fs.rmSync(f, { force: true });
+  if (text === null) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
