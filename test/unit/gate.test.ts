@@ -64,6 +64,69 @@ describe('gateStart', () => {
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  /** The environment a queued start's caller left beside its lease, or null. */
+  const keptEnv = (id: string) => {
+    const f = path.join(dir, 'caller-env', `${id}.json`);
+    return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
+  };
+
+  it("a queued start keeps its caller's environment beside its lease; one admitted at once keeps none", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const caller = { CALLER_MARK: 'caller', PATH: '/usr/bin:/bin' };
+    const queued = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      { ...deps({ total_mib: 8000, available_mib: 100 }), env: caller }
+    );
+    expect(queued.kind).toBe('queued');
+    expect(keptEnv(queued.lease!.id)).toEqual(caller);
+    // a second caller of the same start joins the lease: the first caller's environment stays
+    const joined = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      {
+        ...deps({ total_mib: 8000, available_mib: 100 }),
+        env: { CALLER_MARK: 'second' },
+      }
+    );
+    expect(joined.lease?.id).toBe(queued.lease!.id);
+    expect(keptEnv(queued.lease!.id)).toEqual(caller);
+    await store.withLock(() => store.transition(queued.lease!.id, 'cancelled'));
+    const atOnce = await gateStart(
+      ctx,
+      ['db'],
+      { target: 'db', procs: [] },
+      { ...deps({ total_mib: 8000, available_mib: 7000 }), env: caller }
+    );
+    expect(atOnce.kind).toBe('proceed');
+    expect(keptEnv(atOnce.lease!.id)).toBeNull();
+  });
+
+  it("a queued start whose caller's environment cannot be kept is cancelled, and says why", async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    // a file where the directory of kept environments goes: nothing can be written under it
+    fs.writeFileSync(path.join(dir, 'caller-env'), '');
+    await expect(
+      gateStart(
+        ctx,
+        ['db'],
+        { target: 'db', procs: [] },
+        { ...deps({ total_mib: 8000, available_mib: 100 }), env: { X: '1' } }
+      )
+    ).rejects.toThrow();
+    expect(store.list()).toEqual([
+      expect.objectContaining({
+        state: 'cancelled',
+        error: expect.stringMatching(
+          /^the caller's environment could not be kept: /
+        ),
+      }),
+    ]);
+    expect(ensured).toBe(0);
+  });
+
   it('proceeds without a lease when no app of the start declares memory', async () => {
     const ctx = fakeCtx(basic, 'local', []);
     const r = await gateStart(

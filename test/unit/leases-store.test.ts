@@ -5,6 +5,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { stateDir } from '../../src/core/state.js';
 import {
+  keepCallerEnv,
+  takeCallerEnv,
+} from '../../src/core/leases/callerenv.js';
+import {
   commandAlive,
   LOCK_STALE_MS,
   LeaseStore,
@@ -724,5 +728,70 @@ describe('LeaseStore', () => {
       `000003-${c.id}.json`,
       `000004-${d.id}.json`,
     ]);
+  });
+});
+
+describe('caller environments', () => {
+  let dir: string;
+  let store: LeaseStore;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-callerenv-'));
+    store = new LeaseStore(dir);
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fileOf = (id: string) => path.join(dir, 'caller-env', `${id}.json`);
+
+  it('keeps an environment only its owner can read, without pm2 keys, and hands it over once', () => {
+    keepCallerEnv(dir, 'l_aaaaaaaaaa', {
+      CALLER_MARK: 'caller',
+      namespace: 'mcproc',
+      pm_id: '3',
+      UNSET: undefined,
+    });
+    expect(fs.statSync(path.join(dir, 'caller-env')).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(fileOf('l_aaaaaaaaaa')).mode & 0o777).toBe(0o600);
+    expect(takeCallerEnv(dir, 'l_aaaaaaaaaa')).toEqual({
+      CALLER_MARK: 'caller',
+    });
+    expect(fs.existsSync(fileOf('l_aaaaaaaaaa'))).toBe(false);
+    expect(takeCallerEnv(dir, 'l_aaaaaaaaaa')).toBeNull();
+  });
+
+  it('an unreadable kept environment is dropped and taken as none', () => {
+    fs.mkdirSync(path.join(dir, 'caller-env'), { recursive: true });
+    fs.writeFileSync(fileOf('l_bbbbbbbbbb'), '{not json');
+    expect(takeCallerEnv(dir, 'l_bbbbbbbbbb')).toBeNull();
+    expect(fs.existsSync(fileOf('l_bbbbbbbbbb'))).toBe(false);
+  });
+
+  it('a lease that ends, or runs without the watcher starting it, drops its kept environment; one admitted keeps it', async () => {
+    const a = await store.withLock(() => store.create(input(), 'pending'));
+    const b = await store.withLock(() => store.create(input(), 'pending'));
+    const c = await store.withLock(() => store.create(input(), 'pending'));
+    keepCallerEnv(dir, a.id, { X: '1' });
+    keepCallerEnv(dir, b.id, { X: '2' });
+    keepCallerEnv(dir, c.id, { X: '3' });
+    await store.withLock(() => store.transition(a.id, 'cancelled'));
+    await store.withLock(() => store.transition(b.id, 'starting'));
+    await store.withLock(() => store.transition(c.id, 'running'));
+    expect(fs.existsSync(fileOf(a.id))).toBe(false);
+    expect(fs.existsSync(fileOf(b.id))).toBe(true);
+    expect(fs.existsSync(fileOf(c.id))).toBe(false);
+  });
+
+  it('prune sweeps the kept environments whose lease does not wait any more', async () => {
+    const waiting = await store.withLock(() =>
+      store.create(input(), 'pending')
+    );
+    keepCallerEnv(dir, waiting.id, { X: '1' });
+    // one whose lease is gone, and one left behind by a lease that ended without dropping it
+    keepCallerEnv(dir, 'l_gonegonego', { X: '2' });
+    const ended = await store.withLock(() => store.create(input(), 'running'));
+    await store.withLock(() => store.transition(ended.id, 'freed'));
+    keepCallerEnv(dir, ended.id, { X: '3' });
+    await store.withLock(() => store.prune());
+    expect(fs.existsSync(fileOf(waiting.id))).toBe(true);
+    expect(fs.existsSync(fileOf('l_gonegonego'))).toBe(false);
+    expect(fs.existsSync(fileOf(ended.id))).toBe(false);
   });
 });

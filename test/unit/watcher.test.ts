@@ -30,6 +30,7 @@ import { parseJlist } from '../../src/core/pm2.js';
 import { ownsManifest } from '../../src/core/leases/siblings.js';
 import { McprocError } from '../../src/core/errors.js';
 import { abortableSleep } from '../../src/core/wait.js';
+import { keepCallerEnv } from '../../src/core/leases/callerenv.js';
 import { procAvailable, processStart } from '../../src/core/procfs.js';
 
 const vars = path.join(
@@ -1118,6 +1119,41 @@ describe('defaultWatcherDeps', () => {
       exit_code: 3,
       child_pid: null,
     });
+  });
+
+  it("runStart gives the child the environment its caller kept, not the watcher's, and drops it", async () => {
+    const prev = process.env.LAUNCHER_MARK;
+    onTestFinished(() => {
+      if (prev === undefined) delete process.env.LAUNCHER_MARK;
+      else process.env.LAUNCHER_MARK = prev;
+    });
+    process.env.LAUNCHER_MARK = 'launcher';
+    const entry = path.join(dir, 'cli.js');
+    const envFile = path.join(dir, 'env.json');
+    fs.writeFileSync(
+      entry,
+      `require('node:fs').writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(process.env)); process.exit(3);`
+    );
+    const deps = defaultWatcherDeps(dir, entry);
+    const l = await deps.store.withLock(() =>
+      deps.store.create(input({ root: vars }), 'pending')
+    );
+    keepCallerEnv(dir, l.id, {
+      CALLER_MARK: 'caller',
+      MCPROC_STATE_DIR: '/elsewhere',
+    });
+    const admitted = await deps.store.withLock(() =>
+      deps.store.transition(l.id, 'starting')
+    );
+    await deps.runStart(admitted);
+    const env = JSON.parse(fs.readFileSync(envFile, 'utf8'));
+    expect(env.CALLER_MARK).toBe('caller');
+    expect(env.LAUNCHER_MARK).toBeUndefined();
+    // the watcher's state directory wins: the child records its lease there
+    expect(env.MCPROC_STATE_DIR).toBe(dir);
+    expect(fs.existsSync(path.join(dir, 'caller-env', `${l.id}.json`))).toBe(
+      false
+    );
   });
 
   it("runStart gives the child the watcher's environment without pm2's keys", async () => {

@@ -30,6 +30,7 @@ import {
   rampingMib,
   reserveMib,
 } from './admission.js';
+import { takeCallerEnv } from './callerenv.js';
 import { WATCHER_NOTE, watcherApp } from './ensure.js';
 import { groupBlocked, groupOnly } from './queue.js';
 import {
@@ -695,6 +696,13 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
         });
         return;
       }
+      // it runs as it would have at once: with the environment its caller kept for it; a lease queued by an mcproc
+      // before 0.19.1 kept none, and runs with the watcher's, as it did there
+      const kept = takeCallerEnv(dir, l.id);
+      if (!kept)
+        deps.log(
+          `${l.id}: no caller environment kept, the start runs with the watcher's`
+        );
       await new Promise<void>((resolve, reject) => {
         const child = spawn(
           process.execPath,
@@ -710,12 +718,13 @@ export function defaultWatcherDeps(dir: string, entry: string): WatcherDeps {
             '--lease',
             l.id,
           ],
-          // the watcher runs under pm2, which put its own description into this environment (namespace, cwd, ...):
-          // the child's pm2 CLI would hand those to the apps it starts, so it gets the environment without them
+          // the watcher runs under pm2, which put its own description into its environment (namespace, cwd, ...):
+          // the child's pm2 CLI would hand those to the apps it starts, so a fallback to it goes without them; the
+          // child records its lease in this state directory, whatever the caller's said
           {
             stdio: 'inherit',
             env: {
-              ...withoutPm2Keys(process.env, WATCHER_APP_KEYS),
+              ...(kept ?? withoutPm2Keys(process.env, WATCHER_APP_KEYS)),
               MCPROC_STATE_DIR: dir,
             },
           }

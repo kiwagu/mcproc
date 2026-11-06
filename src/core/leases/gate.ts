@@ -13,6 +13,7 @@ import {
   reserveMib,
   type AppMeasure,
 } from './admission.js';
+import { keepCallerEnv } from './callerenv.js';
 import { ensureWatcher } from './ensure.js';
 import { aheadOf } from './queue.js';
 import { listCheckout, measureSiblings, registryOf } from './siblings.js';
@@ -35,6 +36,8 @@ export interface GateDeps {
   ensureWatcher(ctx: Context): Promise<unknown>;
   /** the requester's pid kept on the lease; default this process */
   pid?: number;
+  /** the environment a queued start runs with, the one it would have run with at once; default this process's */
+  env?: Record<string, string | undefined>;
 }
 /** A lease that still waits for memory: queued, or handed to the watcher and not up yet. */
 export type QueuedLease = Lease & { state: 'pending' | 'starting' };
@@ -178,6 +181,15 @@ export async function gateStart(
         return { result: { kind: 'proceed', lease }, created: true };
       }
       const created = await deps.store.create(input, 'pending');
+      // the watcher runs it later, in a process of its own: it gets the environment this caller would have started
+      // it with; kept under the lock, so the lease is never admitted without it
+      try {
+        keepCallerEnv(deps.store.stateDir, created.id, deps.env ?? process.env);
+      } catch (e) {
+        const error = `the caller's environment could not be kept: ${describeError(e)}`;
+        await deps.store.transition(created.id, 'cancelled', { error });
+        throw new Error(error, { cause: e });
+      }
       const lease = await deps.store.patch(created.id, {
         waiting_for: d.waiting_for,
       });

@@ -75,6 +75,7 @@ beforeAll(async () => {
   fs.mkdirSync(path.join(c, '.mcproc'), { recursive: true });
   fs.writeFileSync(path.join(c, 'db.js'), server(PORT_DB));
   fs.writeFileSync(path.join(c, 'api.js'), server(PORT_API));
+  fs.writeFileSync(path.join(c, 'mark.js'), 'setInterval(() => {}, 1 << 30);');
   // db declares no env and its host none either: pm2 gets an empty env for it, the case a queued start moved
   fs.writeFileSync(
     path.join(c, '.mcproc', 'mcproc.yaml'),
@@ -94,6 +95,10 @@ beforeAll(async () => {
       `    port: ${PORT_API}`,
       '    depends_on:',
       '      - { app: db, condition: ready }',
+      '  mark:',
+      '    description: an app that only stays up, to read the environment it got',
+      '    run: node mark.js',
+      '    memory: 16M',
       'hosts:',
       '  local:',
       `    pm2_home: ${home}`,
@@ -272,5 +277,47 @@ describe('the pm2-managed lease watcher', () => {
       state: 'freed',
       error: 'requester gone',
     });
+  }, 120_000);
+
+  it("a queued start runs with its caller's environment, not the watcher launcher's", async () => {
+    // a fresh watcher, launched from an environment of its own
+    await ctx.pm2.run(['delete', WATCHER_NAME]).catch(() => undefined);
+    process.env.LAUNCHER_MARK = 'launcher';
+    try {
+      await ensureWatcher(ctx, state);
+    } finally {
+      delete process.env.LAUNCHER_MARK;
+    }
+    const last = store().list().at(-1)?.seq ?? 0;
+    const rows = await actOn(fleetOf(), 'mark', 'start', {
+      gate: {
+        ...gateOf({ total_mib: 1000, available_mib: 1 }),
+        env: { ...process.env, CALLER_MARK: 'caller' },
+      },
+    });
+    expect(rows.map((r) => r.status)).toContain('queued #1');
+    const leaseOf = (): Lease | undefined =>
+      store()
+        .list()
+        .filter((l) => l.seq > last)
+        .at(-1);
+    await eventually(
+      () => !['pending', 'starting'].includes(leaseOf()?.state ?? 'pending'),
+      60_000
+    );
+    expect(leaseOf()).toMatchObject({ state: 'running', error: null });
+    const mark = findProcess(await ctx.pm2.jlist(), 'itw', 'mark');
+    expect(mark?.pid).toBeGreaterThan(0);
+    const env = new Map(
+      fs
+        .readFileSync(`/proc/${mark!.pid}/environ`, 'utf8')
+        .split('\0')
+        .filter(Boolean)
+        .map((e) => [e.slice(0, e.indexOf('=')), e.slice(e.indexOf('=') + 1)])
+    );
+    expect(env.get('CALLER_MARK')).toBe('caller');
+    expect(env.has('LAUNCHER_MARK')).toBe(false);
+    // handed over, so nothing of it is left on disk
+    expect(fs.readdirSync(path.join(state, 'caller-env'))).toEqual([]);
   }, 120_000);
 });
