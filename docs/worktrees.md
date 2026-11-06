@@ -51,9 +51,11 @@ untracked changes refuse it unless `--force`, and the main checkout is never rem
 `<state>/slots/<project>-<hash>.json`.
 
 The main checkout is the repository's own working tree, whatever git's layout: a submodule's checkout (git's
-`core.worktree` names it), and the checkout of a repository made with `--separate-git-dir`; from one of that
-repository's worktrees only once `git config --file <git dir>/config core.worktree <its path>` names it, since git keeps
-no path back to it there. A bare repository has none: `worktree` commands in its worktrees are refused.
+`core.worktree` names it), and the checkout of a repository made with `--separate-git-dir`. From one of that
+repository's worktrees it is found only once `core.worktree` names it, since git keeps no path back to it there; the
+refusal names the command that records it (`git config --file <git dir>/config core.worktree <its path>`, or with
+`extensions.worktreeConfig` on, `git --git-dir=<git dir> config --worktree core.worktree <its path>`). A `core.worktree`
+that names no checkout of the repository is refused, and so are a bare repository's worktrees: it has no main checkout.
 
 The agent then passes `project: <worktree path>` on every call for that stand (`start`, `wait`, `logs`...).
 

@@ -2248,9 +2248,10 @@ describe('the main checkout in other repository layouts', () => {
       unknown
     );
     await expect(sync(side)).rejects.toMatchObject(unknown);
+    // the hint, followed: without extensions.worktreeConfig the main checkout's path goes into the shared config
     git(
       ['config', '--file', path.join(dotGit, 'config'), 'core.worktree', sep],
-      sep
+      base
     );
     // git applies it to the main checkout alone: the worktree stays its own top
     expect(git(['rev-parse', '--show-toplevel'], side).trim()).toBe(side);
@@ -2261,18 +2262,102 @@ describe('the main checkout in other repository layouts', () => {
     });
   });
 
-  it("core.worktree in the main checkout's config.worktree counts too", async () => {
+  /** a repository made with --separate-git-dir and a worktree of it, the main checkout named by nothing yet */
+  const separate = () => {
     const sep = path.join(base, 'sep');
     const dotGit = path.join(base, 'sep.git');
     stand(sep, ['--separate-git-dir', dotGit]);
+    fs.writeFileSync(path.join(sep, 'local.yml'), 'local');
     const side = path.join(base, 'side');
     git(['worktree', 'add', '-q', '-b', 'side', side], sep);
+    return { sep, dotGit, side };
+  };
+
+  it("with extensions.worktreeConfig, the hint lands in the main checkout's config.worktree, and that file wins over the shared config", async () => {
+    const { sep, dotGit, side } = separate();
     git(['config', 'extensions.worktreeConfig', 'true'], sep);
-    git(['config', '--worktree', 'core.worktree', sep], sep);
+    await expect(mainCheckout(side, isolatedGit)).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      hint: `Run it from the main checkout, or name that checkout once: git --git-dir=${dotGit} config --worktree core.worktree <its path>`,
+    });
+    git(
+      ['--git-dir', dotGit, 'config', '--worktree', 'core.worktree', sep],
+      base
+    );
     expect(
-      fs.readFileSync(path.join(dotGit, 'config.worktree'), 'utf8')
-    ).toContain('worktree');
+      git(
+        [
+          'config',
+          '--file',
+          path.join(dotGit, 'config.worktree'),
+          'core.worktree',
+        ],
+        base
+      ).trim()
+    ).toBe(sep);
+    expect(git(['rev-parse', '--show-toplevel'], side).trim()).toBe(side);
     expect(await mainCheckout(side, isolatedGit)).toBe(sep);
+    // a shared value git ranks below the main checkout's own
+    git(
+      [
+        'config',
+        '--file',
+        path.join(dotGit, 'config'),
+        'core.worktree',
+        path.join(base, 'elsewhere'),
+      ],
+      base
+    );
+    expect(await mainCheckout(side, isolatedGit)).toBe(sep);
+  });
+
+  it('a config.worktree left behind with extensions.worktreeConfig off is ignored, as git ignores it', async () => {
+    const { sep, dotGit, side } = separate();
+    git(
+      ['config', '--file', path.join(dotGit, 'config'), 'core.worktree', sep],
+      base
+    );
+    fs.writeFileSync(
+      path.join(dotGit, 'config.worktree'),
+      `[core]\n\tworktree = ${path.join(base, 'old')}\n\tbare = true\n`
+    );
+    expect(await mainCheckout(side, isolatedGit)).toBe(sep);
+    expect(await mainCheckout(sep, isolatedGit)).toBe(sep);
+  });
+
+  it('a core.worktree naming no checkout of the repository is refused before sync or remove write anything', async () => {
+    const { dotGit, side } = separate();
+    const gone = path.join(base, 'gone');
+    git(
+      ['config', '--file', path.join(dotGit, 'config'), 'core.worktree', gone],
+      base
+    );
+    const refused = {
+      code: 'BAD_ARGUMENT',
+      message: `the main checkout of ${side} is not usable: core.worktree in ${path.join(dotGit, 'config')} names ${gone}, which is not there`,
+      hint: `Correct it (git config --file ${path.join(dotGit, 'config')} core.worktree <the main checkout>), or remove it, then run it again.`,
+    };
+    await expect(mainCheckout(side, isolatedGit)).rejects.toMatchObject(
+      refused
+    );
+    await expect(sync(side)).rejects.toMatchObject(refused);
+    expect(fs.existsSync(path.join(side, 'local.yml'))).toBe(false);
+    await expect(
+      worktreeRemove(loadManifest(side), '1', { force: true }, deps())
+    ).rejects.toMatchObject(refused);
+    expect(fs.existsSync(state)).toBe(false);
+    // a folder that is there but another repository's checkout is no main checkout either
+    const other = path.join(base, 'other');
+    fs.mkdirSync(other);
+    git(['init', '-q', '-b', 'main'], other);
+    git(
+      ['config', '--file', path.join(dotGit, 'config'), 'core.worktree', other],
+      base
+    );
+    await expect(mainCheckout(side, isolatedGit)).rejects.toMatchObject({
+      code: 'BAD_ARGUMENT',
+      message: `the main checkout of ${side} is not usable: core.worktree in ${path.join(dotGit, 'config')} names ${other}, which is no checkout of the repository ${dotGit}`,
+    });
   });
 
   it('a bare repository has no main checkout: its worktrees are refused with why, before anything is made', async () => {
