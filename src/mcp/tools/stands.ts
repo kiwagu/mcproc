@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { commonInput, MUT, RO, runTool, type ToolDeps } from '../common.js';
 import { connect, prepare, resolveProjectDir } from '../../core/resolve.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../../core/exec.js';
+import { assertGroupName } from '../../core/leases/queue.js';
 import { parseSizeMib } from '../../core/sizes.js';
 import { McprocError } from '../../core/errors.js';
 import {
@@ -52,7 +53,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
     {
       title: 'Exec',
       description:
-        'Run a one-off command (a test run, a build, a seed) from the project root on THIS machine with the manifest\'s exec.env (the stand\'s addresses, interpolated) and MCPROC_PROJECT set. With memory (e.g. "4G") it is a lease like a start: it runs at once when the host has room and the queue is empty, else waits its turn behind the pending leases (timeout_s, default 600, max 3600) and is freed when the command exits. Local host only; refused when the local host is readonly. Returns the exit code and the last 200 lines of output; isError when the code is not 0.',
+        'Run a one-off command (a test run, a build, a seed) from the project root on THIS machine with the manifest\'s exec.env (the stand\'s addresses, interpolated) and MCPROC_PROJECT set. With memory (e.g. "4G") it is a lease like a start: it runs at once when the host has room and the queue is empty, else waits its turn behind the pending leases (timeout_s, default 600, max 3600) and is freed when the command exits. With exclusive it runs in turn with the other runs of that group (timeout_s default 3600). Local host only; refused when the local host is readonly. Returns the exit code and the last 200 lines of output; isError when the code is not 0.',
       inputSchema: {
         project: commonInput.project,
         host: z
@@ -71,6 +72,12 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           .string()
           .optional()
           .describe('What it needs, as a size: 512M, 4G'),
+        exclusive: z
+          .string()
+          .optional()
+          .describe(
+            'A host-wide group, e.g. "e2e": runs of one group take their turn one at a time across every project and checkout of this machine; without memory it waits for its group only.'
+          ),
         note: z.string().max(200).optional(),
         timeout_s: z.number().int().min(1).max(3600).optional(),
       },
@@ -87,6 +94,7 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           } catch (e) {
             throw new McprocError('BAD_ARGUMENT', (e as Error).message);
           }
+        if (args.exclusive !== undefined) assertGroupName(args.exclusive);
         const prep = prepare({
           project: args.project ?? deps.project,
           host: args.host,
@@ -97,20 +105,23 @@ export function registerStandTools(server: McpServer, deps: ToolDeps): void {
           spawner: deps.spawner,
           hereCheck: deps.hereCheck,
         });
+        // what exec says along the way (whom it waited for in its group, a pid it could not keep) rides on its answer
+        const notes: string[] = [];
         const r = await runExec(
           ctx,
           {
             command: args.command,
             memoryMib,
+            exclusive: args.exclusive,
             note: args.note,
             timeoutMs: args.timeout_s ? args.timeout_s * 1000 : undefined,
             capture: true,
             signal: extra.signal,
           },
-          defaultExecDeps()
+          { ...defaultExecDeps(), notice: (line) => notes.push(line) }
         );
         return {
-          text: renderExec(args.command, r),
+          text: withNotes(renderExec(args.command, r), notes),
           data: { ...r },
           isError: r.code !== 0,
         };

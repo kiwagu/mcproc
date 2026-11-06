@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -180,4 +181,96 @@ describe('the pm2-managed lease watcher', () => {
     );
     expect(Object.keys(left)).toEqual([]);
   }, 60_000);
+
+  it('runs of one group take turns under the real watcher, another group runs beside them, and a killed requester keeps its group until its command ends', async () => {
+    const log = path.join(base, 'runs.log');
+    fs.writeFileSync(log, '');
+    // each run's command writes when it starts and when it ends, `ms` apart
+    const script = [
+      'const [f, n, ms] = process.argv.slice(1);',
+      "const fs = require('fs');",
+      "fs.appendFileSync(f, 'start ' + n + ' ' + Date.now() + '\\n');",
+      "setTimeout(() => fs.appendFileSync(f, 'end ' + n + ' ' + Date.now() + '\\n'), Number(ms));",
+    ].join(' ');
+    /** `mcproc exec --exclusive <group>` from the built CLI, with this file's state directory and CLI entry. */
+    const run = (name: string, group: string, ms: number) => {
+      const child = spawn(
+        process.execPath,
+        [
+          cli,
+          'exec',
+          '--exclusive',
+          group,
+          '--project',
+          c,
+          '--',
+          process.execPath,
+          '-e',
+          script,
+          log,
+          name,
+          String(ms),
+        ],
+        { stdio: ['ignore', 'ignore', 'pipe'] }
+      );
+      let err = '';
+      child.stderr?.on('data', (d) => {
+        err += d;
+      });
+      // exited: mcproc itself is gone; closed: its stdio too, which the command it ran shares
+      const exited = new Promise<NodeJS.Signals | number | null>((resolve) =>
+        child.on('exit', (code, signal) => resolve(signal ?? code))
+      );
+      const closed = new Promise<{ code: number | null; err: string }>(
+        (resolve) => child.on('close', (code) => resolve({ code, err }))
+      );
+      return { child, exited, closed };
+    };
+    const at = (kind: 'start' | 'end', name: string): number | null => {
+      const m = new RegExp(`^${kind} ${name} (\\d+)$`, 'm').exec(
+        fs.readFileSync(log, 'utf8')
+      );
+      return m ? Number(m[1]) : null;
+    };
+
+    const a = run('A', 'suite', 3000);
+    expect(await eventually(() => at('start', 'A') !== null, 30_000)).toBe(
+      true
+    );
+    const b = run('B', 'suite', 300);
+    const other = run('C', 'other', 300);
+    for (const r of await Promise.all([a.closed, b.closed, other.closed]))
+      expect(r.code, r.err).toBe(0);
+    expect(at('start', 'B')).toBeGreaterThanOrEqual(at('end', 'A') as number);
+    expect(at('start', 'C')).toBeLessThan(at('end', 'A') as number);
+    expect((await b.closed).err).toMatch(
+      /^exec: waiting for group suite: held by l_\w+ \(itw[^)]*\), #1 in group$/m
+    );
+
+    // D's mcproc is killed while its command runs: the group stays D's until the command ends
+    const d = run('D', 'suite', 4000);
+    expect(await eventually(() => at('start', 'D') !== null, 30_000)).toBe(
+      true
+    );
+    const leaseOfD = () =>
+      store()
+        .list()
+        .find((l) => l.requester_pid === d.child.pid);
+    expect(
+      await eventually(() => (leaseOfD()?.command_pid ?? null) !== null, 10_000)
+    ).toBe(true);
+    d.child.kill('SIGKILL');
+    expect(await d.exited).toBe('SIGKILL');
+    const e = run('E', 'suite', 300);
+    const done = await e.closed;
+    expect(done.code, done.err).toBe(0);
+    const dEnd = at('end', 'D');
+    expect(dEnd).not.toBeNull();
+    expect(at('start', 'E')).toBeGreaterThanOrEqual(dEnd as number);
+    expect((at('start', 'E') as number) - (dEnd as number)).toBeLessThan(8000);
+    expect(leaseOfD()).toMatchObject({
+      state: 'freed',
+      error: 'requester gone',
+    });
+  }, 120_000);
 });

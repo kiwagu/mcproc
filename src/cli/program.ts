@@ -22,6 +22,7 @@ import {
 } from '../core/leases/watcher.js';
 import { stateDir } from '../core/state.js';
 import { assertExecHost, defaultExecDeps, runExec } from '../core/exec.js';
+import { assertGroupName } from '../core/leases/queue.js';
 import {
   checkoutOf,
   defaultWorktreeDeps,
@@ -687,7 +688,7 @@ export function buildProgram(io: Io = defaultIo): Command {
   program
     .command('exec <command...>')
     .description(
-      "run a one-off command from the project root with the manifest's exec.env; with --memory, under a lease in the host's queue (use -- before the command)"
+      "run a one-off command from the project root with the manifest's exec.env; with --memory, under a lease in the host's queue; with --exclusive, one run of its group at a time on the host (use -- before the command)"
     )
     // no passThroughOptions: it needs positional options on the program, which would refuse the global options written
     // after a command (`ls --json`); `--` already ends exec's options and hands the rest over verbatim
@@ -695,10 +696,14 @@ export function buildProgram(io: Io = defaultIo): Command {
       '--memory <size>',
       'what the command needs, e.g. 4G: it waits its turn like a start'
     )
+    .option(
+      '--exclusive <group>',
+      'one run at a time with the other runs of this group on the host, e.g. e2e'
+    )
     .option('--note <text>', 'what this run is for, kept on its lease')
     .option(
       '--timeout <s>',
-      'seconds to wait in the queue (default 600, max 3600)'
+      'seconds to wait in the queue (default 600, 3600 with --exclusive; max 3600)'
     )
     .action(
       wrap(async (g, o, args) => {
@@ -719,6 +724,9 @@ export function buildProgram(io: Io = defaultIo): Command {
             'BAD_ARGUMENT',
             `--timeout is a number of seconds above 0, not "${o.timeout}"`
           );
+        const exclusive =
+          o.exclusive === undefined ? undefined : String(o.exclusive);
+        if (exclusive !== undefined) assertGroupName(exclusive);
         const prep = prepare({ project: g.project, host: g.host });
         assertExecHost(prep.host);
         const ctx = await connect(prep);
@@ -734,12 +742,14 @@ export function buildProgram(io: Io = defaultIo): Command {
             {
               command,
               memoryMib,
+              exclusive,
               note: o.note === undefined ? undefined : String(o.note),
               timeoutMs: timeoutS === undefined ? undefined : timeoutS * 1000,
               capture: false,
               signal: ac.signal,
             },
-            defaultExecDeps()
+            // what exec says along the way (whom it waits for in its group, a pid it could not keep) goes to stderr
+            { ...defaultExecDeps(), notice: (line) => io.err(line) }
           );
           if (g.json)
             io.out(
