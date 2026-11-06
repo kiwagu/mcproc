@@ -2,9 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import net from 'node:net';
 import {
+  bootId,
   HOLDER_WALK_MS,
   ProcReader,
   procAvailable,
+  processStart,
+  statFields,
   zoneOf,
   type ProcFs,
 } from '../../src/core/procfs.js';
@@ -291,6 +294,49 @@ describe('procAvailable', () => {
       },
     };
     expect(procAvailable(none)).toBe(false);
+  });
+});
+
+describe('process identity', () => {
+  const STAT =
+    '12 (a) (b) S 1 12 12 0 -1 4194560 1 0 0 0 5 6 0 0 20 0 1 0 98765 0';
+  const serving = (files: Record<string, string>): ProcFs => ({
+    readdir: () => [],
+    read: (f) => {
+      if (f in files) return files[f];
+      throw new Error(`ENOENT ${f}`);
+    },
+    readlink: () => {
+      throw new Error('ENOENT');
+    },
+  });
+  it('statFields cuts after the last ")" of the comm: index 0 is the state, 19 the start time', () => {
+    const f = statFields(STAT);
+    expect(f[0]).toBe('S');
+    expect(f[1]).toBe('1');
+    expect(f[19]).toBe('98765');
+  });
+  it('processStart reads field 22 of the stat, null when it cannot be read', () => {
+    expect(processStart(42, serving({ '/proc/42/stat': STAT }))).toBe(98765);
+    expect(processStart(43, serving({}))).toBeNull();
+    expect(
+      processStart(44, serving({ '/proc/44/stat': 'garbage' }))
+    ).toBeNull();
+  });
+  it.skipIf(!procAvailable())(
+    'processStart of this process is a positive integer, the same on every read',
+    () => {
+      const a = processStart(process.pid);
+      expect(Number.isInteger(a)).toBe(true);
+      expect(a).toBeGreaterThan(0);
+      expect(processStart(process.pid)).toBe(a);
+    }
+  );
+  it('bootId trims the kernel file, null when it cannot be read', () => {
+    expect(
+      bootId(serving({ '/proc/sys/kernel/random/boot_id': 'abc-123\n' }))
+    ).toBe('abc-123');
+    expect(bootId(serving({}))).toBeNull();
   });
 });
 

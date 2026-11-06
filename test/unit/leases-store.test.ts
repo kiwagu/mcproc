@@ -5,13 +5,17 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { stateDir } from '../../src/core/state.js';
 import {
+  commandAlive,
   LOCK_STALE_MS,
   LeaseStore,
   pidAlive,
+  requesterAlive,
+  sameProcess,
   starterAlive,
   STARTER_TRUST_MS,
   type NewLease,
 } from '../../src/core/leases/store.js';
+import { bootId, procAvailable, processStart } from '../../src/core/procfs.js';
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -50,6 +54,34 @@ describe('stateDir', () => {
   });
 });
 
+describe('process identity', () => {
+  const dead = () => spawnSync('true').pid as number;
+  it.skipIf(!procAvailable())(
+    'sameProcess: the pid alive, and the start time and boot as recorded when they were',
+    () => {
+      const start = processStart(process.pid);
+      expect(sameProcess(process.pid, null, null)).toBe(true);
+      expect(sameProcess(process.pid, start, bootId())).toBe(true);
+      expect(sameProcess(process.pid, (start as number) + 1, null)).toBe(false);
+      expect(sameProcess(process.pid, null, 'another-boot')).toBe(false);
+      expect(sameProcess(dead(), null, null)).toBe(false);
+    }
+  );
+  it('requesterAlive reads the requester; commandAlive is false without a command', () => {
+    const l = {
+      requester_pid: process.pid,
+      requester_start: null,
+      boot_id: null,
+      command_pid: null,
+      command_start: null,
+    };
+    expect(requesterAlive(l)).toBe(true);
+    expect(commandAlive(l)).toBe(false);
+    expect(commandAlive({ ...l, command_pid: process.pid })).toBe(true);
+    expect(requesterAlive({ ...l, requester_pid: dead() })).toBe(false);
+  });
+});
+
 describe('LeaseStore', () => {
   let dir: string;
   let now = 1_700_000_000_000;
@@ -78,6 +110,45 @@ describe('LeaseStore', () => {
       `000001-${a.id}.json`,
       `000002-${b.id}.json`,
     ]);
+  });
+
+  it('create fills the group and identity fields with null when not given', async () => {
+    const a = await store.create(input(), 'pending');
+    expect(a).toMatchObject({
+      exclusive: null,
+      boot_id: null,
+      requester_start: null,
+      command_pid: null,
+      command_start: null,
+    });
+    const b = await store.create(
+      input({ exclusive: 'suite', boot_id: 'b-1', requester_start: 77 }),
+      'running'
+    );
+    expect(store.get(b.id)).toMatchObject({
+      exclusive: 'suite',
+      boot_id: 'b-1',
+      requester_start: 77,
+      command_pid: null,
+      command_start: null,
+    });
+  });
+
+  it('a lease written before groups reads with null fields', async () => {
+    const a = await store.create(input(), 'running');
+    // the file as an earlier version wrote it: none of the group or identity fields
+    const file = path.join(dir, 'leases', `000001-${a.id}.json`);
+    const old = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const k of [
+      'exclusive',
+      'boot_id',
+      'requester_start',
+      'command_pid',
+      'command_start',
+    ])
+      delete old[k];
+    fs.writeFileSync(file, JSON.stringify(old));
+    expect(store.get(a.id)).toEqual(a);
   });
 
   it('walks the allowed transitions and refuses the others', async () => {

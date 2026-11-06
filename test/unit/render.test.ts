@@ -1440,6 +1440,11 @@ describe('queued starts and the lease queue', () => {
     waiting_for: null,
     error: null,
     exit_code: null,
+    exclusive: null,
+    boot_id: null,
+    requester_start: null,
+    command_pid: null,
+    command_start: null,
     ...over,
   });
   it('renderLeases: the state directory, the memory and the watcher, then no leases', () => {
