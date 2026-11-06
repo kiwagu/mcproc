@@ -698,8 +698,9 @@ describe('Pm2Client.pids', () => {
 describe('withoutPm2Keys', () => {
   it("withoutPm2Keys drops pm2's process keys and keeps the rest", () => {
     // what pm2 puts into the environment of a process it manages, beside what the process was launched with
-    const env: Record<string, string> = {
+    const env: Record<string, string | undefined> = {
       PATH: '/bin',
+      UNSET: undefined,
       PM2_HOME: '/h',
       MCPROC_STATE_DIR: '/s',
       MCPROC_CLI_ENTRY: '/e',
@@ -725,7 +726,7 @@ describe('withoutPm2Keys', () => {
       script: '/n',
     };
     const before = { ...env };
-    expect(withoutPm2Keys(env, ['script'])).toEqual({
+    expect(withoutPm2Keys(env, ['script'])).toStrictEqual({
       PATH: '/bin',
       PM2_HOME: '/h',
       MCPROC_STATE_DIR: '/s',

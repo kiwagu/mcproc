@@ -142,7 +142,8 @@ describe('the pm2-managed lease watcher', () => {
         .list()
         .filter((l) => l.seq > last)
         .at(-1);
-    expect(leaseOf()?.state).toBe('pending');
+    // the gate launched the real watcher before it answered: by now the lease may be pending, starting or running
+    expect(leaseOf()).toBeDefined();
     await eventually(
       () => !['pending', 'starting'].includes(leaseOf()?.state ?? 'pending'),
       60_000
