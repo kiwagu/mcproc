@@ -15,7 +15,12 @@ import {
   STARTER_TRUST_MS,
   type NewLease,
 } from '../../src/core/leases/store.js';
-import { bootId, procAvailable, processStart } from '../../src/core/procfs.js';
+import {
+  bootId,
+  procAvailable,
+  processStart,
+  type ProcFs,
+} from '../../src/core/procfs.js';
 
 const input = (over: Partial<NewLease> = {}): NewLease => ({
   kind: 'start',
@@ -67,6 +72,35 @@ describe('process identity', () => {
       expect(sameProcess(dead(), null, null)).toBe(false);
     }
   );
+  it('sameProcess answers by the pid alone where /proc cannot be read now', () => {
+    const thrower = (f: string): string => {
+      throw new Error(`ENOENT ${f}`);
+    };
+    const reading = (files: Record<string, string>): ProcFs => ({
+      readdir: () => [],
+      read: (f) => (f in files ? files[f] : thrower(f)),
+      readlink: thrower,
+    });
+    const stat = `${process.pid} (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0`;
+    // nothing readable: a live pid is the recorded process, whatever was recorded
+    expect(sameProcess(process.pid, 1, 'recorded-boot', reading({}))).toBe(
+      true
+    );
+    // the boot reads the same, the stat does not read: the pid decides
+    const bootOnly = reading({
+      '/proc/sys/kernel/random/boot_id': 'recorded-boot\n',
+    });
+    expect(sameProcess(process.pid, 1, 'recorded-boot', bootOnly)).toBe(true);
+    // the boot does not read, the stat does: the start time decides
+    const statOnly = reading({ [`/proc/${process.pid}/stat`]: stat });
+    expect(sameProcess(process.pid, 5000, 'recorded-boot', statOnly)).toBe(
+      true
+    );
+    expect(sameProcess(process.pid, 5001, 'recorded-boot', statOnly)).toBe(
+      false
+    );
+  });
+
   it('requesterAlive reads the requester; commandAlive is false without a command', () => {
     const l = {
       requester_pid: process.pid,
