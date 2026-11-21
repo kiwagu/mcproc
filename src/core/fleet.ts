@@ -320,6 +320,8 @@ export async function actOn(
       signal: opts.signal,
     });
   const gate = opts.gate ?? defaultGateDeps();
+  /** the apps the local runs brought up, by pm2's own state: what the watcher's start replaces is judged by them */
+  const startedHere = new Set<string>();
   for (const r of runs) {
     if (failed && act === 'start') {
       rows.push(
@@ -391,6 +393,7 @@ export async function actOn(
       if (stopping)
         await cancelBefore(gate.store, ctx, r.apps).catch(unrecorded);
       let runRows: LsRow[];
+      const started = new Set<string>();
       try {
         runRows = await (act === 'start'
           ? startApps(ctx, r.apps, {
@@ -400,6 +403,8 @@ export async function actOn(
               waits: opts.waits,
               failed: notStarted,
               signal: opts.signal,
+              lease: opts.lease ?? undefined,
+              started,
             })
           : act === 'restart'
             ? restartApps(ctx, r.apps)
@@ -410,9 +415,10 @@ export async function actOn(
         if (admitted) await freeOnFailure(gate.store, admitted, e);
         throw e;
       }
+      if (ctx.host.local) for (const a of started) startedHere.add(a);
       // the start went through: from now on the watcher may judge the lease by its apps
       if (admitted)
-        await endFastStart(gate.store, admitted).catch(() => {
+        await endFastStart(gate.store, admitted, [...started]).catch(() => {
           /* bookkeeping only: the apps run; the lease still names this process as its starter, which is trusted for at
              most ten minutes from its start (starterAlive), so until then a stop leaves it running, and after that a
              stop or the watcher frees it */
@@ -437,7 +443,7 @@ export async function actOn(
   // the watcher's start ends its lease once, over every local row (two local runs around a remote one included)
   const local = rows.filter((r) => pickHost(fleet.manifest, r.host).local);
   if (act === 'start' && opts.lease && local.length > 0)
-    await finishLeasedStart(gate.store, opts.lease, local);
+    await finishLeasedStart(gate.store, opts.lease, local, [...startedHere]);
   return rows;
 }
 

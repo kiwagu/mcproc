@@ -5,11 +5,8 @@ import { createTransport } from '../../transport/index.js';
 import { describeError, isMcprocError } from '../errors.js';
 import { Fleet } from '../fleet.js';
 import {
-  DEFAULT_SHELL,
-  type Host,
   loadManifest,
   type Manifest,
-  parseShell,
   type Resources,
   SETTLE_DEFAULT_S,
 } from '../manifest.js';
@@ -32,6 +29,7 @@ import {
 } from './admission.js';
 import { takeCallerEnv } from './callerenv.js';
 import { WATCHER_NOTE, watcherApp } from './ensure.js';
+import { localHost } from './local.js';
 import { groupBlocked, groupOnly } from './queue.js';
 import {
   listCheckout,
@@ -627,17 +625,6 @@ export function appsToLaunch(
       return !(p && isRunning(p.status));
     });
 }
-
-/** The local host the watcher reads its memory on: a plain local shell in `cwd`, no ssh, no docker. */
-const localHost = (cwd: string): Host => ({
-  name: 'local',
-  local: true,
-  ssh_args: [],
-  cwd,
-  readonly: false,
-  shell: parseShell(DEFAULT_SHELL),
-  env: {},
-});
 
 /**
  * The real deps of the pm2-managed watcher: the state directory's store, the host's meminfo, each lease's checkout for

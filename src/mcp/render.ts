@@ -704,16 +704,24 @@ export function queuedNote(rows: LsRow[]): string {
     .join('\n');
 }
 
-/** The queue as a table, oldest first, with the host's memory and the watcher's state above it. */
+/**
+ * The queue as a table, oldest first, with this machine's memory and the watcher's state above it. Only a host that
+ * has no meminfo at all is said to admit without a check (the gate reads nothing there either); a read that failed
+ * says why.
+ */
 export function renderLeases(v: LeasesView, width?: number): string {
   const head = [
     `state: ${v.state_dir}`,
     v.memory
       ? `memory: ${fmtMib(v.memory.available_mib)} available of ${fmtMib(v.memory.total_mib)}`
-      : 'memory: no reading on this host (leases are admitted in FIFO order without a check)',
+      : v.memory_error
+        ? `memory: the reading failed: ${v.memory_error}`
+        : 'memory: no reading (no /proc/meminfo here): leases are admitted in FIFO order without a check',
     v.watcher
       ? `watcher: ${v.watcher.online ? `online pid ${v.watcher.pid}` : 'not running'}`
-      : '',
+      : v.watcher_error
+        ? `watcher: unknown (${v.watcher_error})`
+        : '',
   ].filter(Boolean);
   if (v.leases.length === 0) return [...head, 'no leases'].join('\n');
   const rows = v.leases.map((l) => [

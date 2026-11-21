@@ -14,6 +14,7 @@ import { S, answerReads } from '../helpers/incidents.js';
 import type { Spawner } from '../../src/transport/types.js';
 import type { UnpackDeps } from '../../src/runtime/unpack.js';
 import type { HereCheck } from '../../src/core/urlcheck.js';
+import type { MachineReads } from '../../src/core/leases/view.js';
 import { LeaseStore } from '../../src/core/leases/store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -25,13 +26,15 @@ async function client(
   spawner?: Spawner,
   unpackDeps?: UnpackDeps,
   project?: string,
-  hereCheck?: HereCheck
+  hereCheck?: HereCheck,
+  machine?: MachineReads
 ) {
   const server = createServer({
     spawner,
     unpack: unpackDeps,
     project,
     hereCheck,
+    machine,
   });
   const [c, s] = InMemoryTransport.createLinkedPair();
   await server.connect(s);
@@ -335,15 +338,21 @@ describe('mcp server', () => {
         },
         'pending'
       );
-      const cl = await client(neverSpawn, undefined, dir);
+      const cl = await client(neverSpawn, undefined, dir, undefined, {
+        memory: async () => ({ total_mib: 31836, available_mib: 9100 }),
+        list: async () => [],
+      });
       const r: any = await cl.callTool({ name: 'leases', arguments: {} });
       expect(r.isError).toBeFalsy();
       expect(r.structuredContent).toMatchObject({
         state_dir: state,
-        memory: null,
-        watcher: null,
+        memory: { total_mib: 31836, available_mib: 9100 },
+        memory_error: null,
+        watcher: { online: false, pid: null },
+        watcher_error: null,
         leases: [{ id: l.id, state: 'pending', position: 1 }],
       });
+      expect(text(r)).toContain('memory: 8.9G available of 31.1G');
       expect(text(r)).toContain(`state: ${state}`);
       expect(text(r)).toMatch(/#1 +pending +start +demo-w2 \(slot 2\)/);
       const c: any = await cl.callTool({

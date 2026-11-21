@@ -34,10 +34,16 @@ apps:
   its pid, start time and boot, so a reused pid does not count). While a start brings its apps up and settles, the
   watcher keeps ticking (it reconciles and gives the groups their turns); only the next memory judgement waits. `stop` and `delete` cancel the starts they overlap
   before stopping, and free the running leases afterwards.
+- **A start again replaces the old lease.** Apps that go down without `stop` (a reboot, a crash, `pm2 kill`) leave
+  their lease running. Once a start of the same checkout brings them up again, it frees every earlier running start
+  lease of that checkout whose apps are all among the ones it started (`superseded by <id>`). A wider earlier lease
+  (`all` after `dev`) still covers apps of its own and stays.
 - `docker stats` costs about 2 s per call, so the containers' memory is asked only by `ls` (its MEM column includes it for
   apps that declare `containers:`), `describe` and the sibling measurement; never by monit's loop or by `wait`.
 - **Looking and cancelling.** `mcproc leases` (tool `leases`) shows the host's queue: who runs, who waits and why, the
-  memory reading and the watcher. Its GROUP column names each run's exclusive group (`e2e (holds)` for the one holding
+  memory reading and the watcher. It reads this machine wherever it runs, inside a checkout or not. A failed read says
+  why (`memory: the reading failed: …`, `watcher: unknown (…)`); only a host without `/proc/meminfo` reads `no reading`,
+  and there leases are admitted in FIFO order without a memory check. Its GROUP column names each run's exclusive group (`e2e (holds)` for the one holding
   it); the holder's line says how long it has held it and its pids (`holds e2e 3m, pid 4242, command 4250`), and a run
   waiting for its group says who holds it and its place in the group. `leases cancel <id>` cancels a pending lease or a starting exec; a starting start is
   refused: stop its target instead. `ls` shows a queued app as `queued #N`, `wait` rides through the queue, `doctor`

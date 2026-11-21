@@ -374,6 +374,37 @@ describe('Pm2Client over the socket', () => {
     expect((await c.jlist()).map((p) => p.name)).toEqual(['p-web']);
     expect(t.calls.map((x) => x.read)).toEqual([true]);
   });
+  it('socketList: the socket alone, never the CLI that would start a daemon', async () => {
+    const t = new FakeTransport([]);
+    const none = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => null);
+    expect(await none.socketList()).toBeNull();
+    const up = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => [RAW]);
+    expect(await up.socketList()).toEqual(parseJlist(JSON.stringify([RAW])));
+    const hung = new Pm2Client(t, here_, 'pm2', '/h/.pm2', async () => {
+      throw new Error('hung');
+    });
+    await expect(hung.socketList()).rejects.toThrow('hung');
+    await expect(new Pm2Client(t, here_, 'pm2').socketList()).rejects.toThrow(
+      'does not come over its socket'
+    );
+    const moved = new Pm2Client(
+      new EnvTransport([], { HOME: '/h', PM2_DAEMON_RPC_PORT: '7000' }),
+      here_,
+      'pm2',
+      undefined,
+      async () => []
+    );
+    await expect(moved.socketList()).rejects.toThrow('PM2_DAEMON_RPC_PORT');
+    const unknown = new Pm2Client(
+      new EnvTransport([], null),
+      here_, // a login shell (bash -lc) whose environment could not be read
+      'pm2',
+      undefined,
+      async () => []
+    );
+    await expect(unknown.socketList()).rejects.toThrow('home is unknown');
+    expect(t.calls).toEqual([]);
+  });
   it('no lister: the CLI', async () => {
     const t = new FakeTransport([
       { match: /pm2 'jlist'/, result: { stdout: '[]' } },

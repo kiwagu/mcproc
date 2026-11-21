@@ -1,11 +1,15 @@
 import fs from 'node:fs';
-import { McprocError } from '../errors.js';
+import os from 'node:os';
+import { createTransport } from '../../transport/index.js';
+import { describeError, McprocError } from '../errors.js';
 import type { Manifest } from '../manifest.js';
-import { readHostMemory, type HostMemory } from '../memory.js';
-import type { Pm2Process } from '../pm2.js';
+import { readHostMemoryOrWhy, type HostMemory } from '../memory.js';
+import { type DaemonLister, Pm2Client, type Pm2Process } from '../pm2.js';
+import { listDaemon } from '../pm2socket.js';
 import type { Context } from '../resolve.js';
 import { stateDir } from '../state.js';
 import { WATCHER_NAME, WATCHER_NS } from './ensure.js';
+import { localHost } from './local.js';
 import {
   groupReason,
   groupWait,
@@ -18,10 +22,14 @@ import { LeaseStore, type Lease } from './store.js';
 /** The host's queue as `leases` shows it: the state directory, the memory reading, the watcher and every lease. */
 export interface LeasesView {
   state_dir: string;
-  /** the host's memory; null without a local context or where there is no reading */
+  /** this machine's memory; null where the reading failed (`memory_error` says why) or the host has none (no error) */
   memory: HostMemory | null;
-  /** the watcher's pm2 process; null without a local context */
+  /** why the memory reading failed; null when it answered */
+  memory_error: string | null;
+  /** the watcher's pm2 process; null where pm2's list could not be read (`watcher_error` says why) */
   watcher: { online: boolean; pid: number | null } | null;
+  /** why pm2's list could not be read; null when it answered */
+  watcher_error: string | null;
   /**
    * oldest first, each with its 1-based position in the memory queue (0 when not in it), what it waits for in its
    * group (null when it does not), and the reason shown for it: what it waits for in its group, or, for a holder, how
@@ -34,16 +42,61 @@ export interface LeasesView {
   })[];
 }
 
+/** How `leases` reads this machine: its memory, and pm2's list where the watcher shows. */
+export interface MachineReads {
+  memory(): Promise<HostMemory | null>;
+  list(): Promise<Pm2Process[]>;
+}
+
+/**
+ * This machine's reads. The queue lives in this machine's state directory, so they are always this machine's: through
+ * a local context's own transport and pm2 (the daemon its manifest pins), else through the watcher's kind of local host
+ * and this machine's default pm2 daemon, whatever checkout the caller stands in or names. The memory read says why it
+ * failed; only a host without /proc/meminfo reads as no reading. Without a local context pm2 is read over its socket
+ * alone: no pm2 command runs, so a read never starts a daemon, and none running reads as no watcher.
+ */
+export function machineReads(
+  ctx?: Context,
+  lister: DaemonLister = listDaemon
+): MachineReads {
+  if (ctx?.host.local)
+    return {
+      memory: () => readHostMemoryOrWhy(ctx.transport, ctx.host),
+      list: () => ctx.pm2.jlist(),
+    };
+  // the home directory, not the state directory: a host that never queued has none to run the read in
+  const host = localHost(os.homedir());
+  const transport = createTransport(host);
+  // the pm2 binary is never run: socketList reads the daemon's socket only
+  const pm2 = new Pm2Client(transport, host, 'pm2', undefined, lister);
+  return {
+    memory: () => readHostMemoryOrWhy(transport, host),
+    list: async () => (await pm2.socketList()) ?? [],
+  };
+}
+
+/** A read's answer, or null and why it failed. */
+async function settled<T>(
+  read: () => Promise<T>
+): Promise<[T | null, string | null]> {
+  try {
+    return [await read(), null];
+  } catch (e) {
+    return [null, describeError(e)];
+  }
+}
+
 /**
  * The host's queue as `leases` shows it: every lease with its position, its group's wait or hold (all from one
- * listing, ages as of `now`), the memory reading and the watcher's state when a context is given. A read never fails
- * on the extras: the prune is skipped when the lease lock cannot be taken, and the memory or the watcher is null when
- * meminfo or pm2's list does not answer.
+ * listing, ages as of `now`), this machine's memory reading and the watcher's state (`reads`, see machineReads). A
+ * read never fails on the extras: the prune is skipped when the lease lock cannot be taken, and the memory or the
+ * watcher is null, with the reason beside it, when meminfo or pm2's list does not answer.
  */
 export async function leasesView(
   dir = stateDir(),
   ctx?: Context,
-  now = Date.now()
+  now = Date.now(),
+  reads: MachineReads = machineReads(ctx)
 ): Promise<LeasesView> {
   const store = new LeaseStore(dir);
   // a host that never queued anything keeps no state directory: the read does not make one
@@ -69,13 +122,16 @@ export async function leasesView(
           : null,
     };
   });
-  let memory: HostMemory | null = null;
-  let watcher: LeasesView['watcher'] = null;
-  if (ctx?.host.local) {
-    memory = await readHostMemory(ctx.transport, ctx.host).catch(() => null);
-    watcher = await ctx.pm2.jlist().then(watcherIn, () => null);
-  }
-  return { state_dir: dir, memory, watcher, leases };
+  const [memory, memory_error] = await settled(reads.memory);
+  const [procs, watcher_error] = await settled(reads.list);
+  return {
+    state_dir: dir,
+    memory,
+    memory_error,
+    watcher: procs ? watcherIn(procs) : null,
+    watcher_error,
+    leases,
+  };
 }
 
 /** The watcher's state in a pm2 list: online or not, and its pid (null when it has none). */

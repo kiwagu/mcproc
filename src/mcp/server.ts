@@ -5,6 +5,7 @@ import { VERSION } from '../version.js';
 import type { Spawner } from '../transport/types.js';
 import type { UnpackDeps } from '../runtime/unpack.js';
 import type { HereCheck } from '../core/urlcheck.js';
+import type { MachineReads } from '../core/leases/view.js';
 import { registerReadTools } from './tools/read.js';
 import { registerWriteTools } from './tools/write.js';
 import { registerStandTools } from './tools/stands.js';
@@ -28,6 +29,7 @@ export function createServer(
     unpack?: UnpackDeps;
     project?: string;
     hereCheck?: HereCheck;
+    machine?: MachineReads;
   } = {}
 ): McpServer {
   const server = new McpServer(
@@ -51,6 +53,7 @@ export function createServer(
     unpack: deps.unpack,
     project: deps.project,
     hereCheck: deps.hereCheck,
+    machine: deps.machine,
   });
   registerWriteTools(server, {
     roots,

@@ -224,21 +224,67 @@ export async function gateStart(
   return result;
 }
 
-/** After the watcher's child ran the start, under the lock: running when any app came up (failures noted), failed when none did. */
+/**
+ * A start that went through replaces what earlier starts of its checkout brought up: every earlier running start lease
+ * of the same checkout whose apps are all among the ones this start brought up (`up`, within its own lease), and whose
+ * starter is gone, is freed (`superseded by <id>`). Without it a stand started again keeps each earlier lease running
+ * for good, since its apps are online again under the new one. A wider earlier lease (`all` after `dev`) still covers
+ * apps of its own and stays; so does one whose apps this start skipped or failed. Runs under the lock its caller holds;
+ * returns the freed ids.
+ */
+async function supersede(
+  store: LeaseStore,
+  lease: Lease,
+  up: readonly string[]
+): Promise<string[]> {
+  const came = new Set(up);
+  const mine = new Set(lease.apps.filter((a) => came.has(a)));
+  if (mine.size === 0) return [];
+  const freed: string[] = [];
+  for (const l of store.list()) {
+    if (
+      l.kind === 'start' &&
+      l.state === 'running' &&
+      l.seq < lease.seq &&
+      l.root === lease.root &&
+      l.project === lease.project &&
+      l.apps.every((a) => mine.has(a)) &&
+      !starterAlive(l)
+    ) {
+      await store.transition(l.id, 'freed', {
+        error: `superseded by ${lease.id}`,
+      });
+      freed.push(l.id);
+    }
+  }
+  return freed;
+}
+
+/**
+ * After the watcher's child ran the start, under the lock: running when any app came up (failures noted), failed when
+ * none did. A start that came up frees the earlier leases its started apps (`up`, by pm2's own state) replace (see
+ * supersede).
+ */
 export async function finishLeasedStart(
   store: LeaseStore,
   id: string,
-  rows: LsRow[]
+  rows: LsRow[],
+  up: readonly string[]
 ): Promise<Lease> {
   const bad = rows.filter((r) => r.error);
   const error = bad.length
     ? bad.map((r) => `${r.app}: ${r.error}`).join('; ')
     : null;
-  return store.withLock(() =>
-    bad.length === rows.length
-      ? store.transition(id, 'failed', { error, child_pid: null })
-      : store.transition(id, 'running', { error, child_pid: null })
-  );
+  return store.withLock(async () => {
+    if (bad.length === rows.length)
+      return store.transition(id, 'failed', { error, child_pid: null });
+    const lease = await store.transition(id, 'running', {
+      error,
+      child_pid: null,
+    });
+    await supersede(store, lease, up);
+    return lease;
+  });
 }
 
 /** A start admitted at once that then threw: its running lease is freed with the error and without its starter, under the lock. */
@@ -262,13 +308,16 @@ const END_FAST_TRIES = 3;
 const END_FAST_PAUSE_MS = 2000;
 
 /**
- * A start admitted at once that went through: its starter is cleared under the lock, while the lease is still running
- * and still names it. A clear that fails (the lock is busy) is tried END_FAST_TRIES times END_FAST_PAUSE_MS apart before
- * the last error is let through; a lease left naming its starter is then trusted no longer than STARTER_TRUST_MS.
+ * A start admitted at once that went through: under the lock, while the lease is still running and still names its
+ * starter, the earlier leases its started apps (`up`) replace are freed (see supersede), then the starter is cleared.
+ * In that order, so a try that fails halfway leaves the starter in place and the next try finishes the frees. A try
+ * that fails (the lock is busy, a write fails) is repeated END_FAST_TRIES times END_FAST_PAUSE_MS apart before the last
+ * error is let through; a lease left naming its starter is then trusted no longer than STARTER_TRUST_MS.
  */
 export async function endFastStart(
   store: LeaseStore,
   lease: Lease,
+  up: readonly string[],
   sleep: (ms: number) => Promise<void> = abortableSleep
 ): Promise<void> {
   for (let attempt = 1; ; attempt++) {
@@ -279,8 +328,10 @@ export async function endFastStart(
           cur?.state === 'running' &&
           cur.child_pid !== null &&
           cur.child_pid === lease.child_pid
-        )
+        ) {
+          await supersede(store, cur, up);
           await store.patch(lease.id, { child_pid: null });
+        }
       });
       return;
     } catch (e) {

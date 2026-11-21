@@ -7,8 +7,14 @@ import {
   ecosystemPath,
   generatedDir,
 } from './ecosystem.js';
-import { findProcess, pm2Name, type Pm2Process } from './pm2.js';
-import { rowsFor, snapshot, unreachableRow, type LsRow } from './list.js';
+import { findProcess, isRunning, pm2Name, type Pm2Process } from './pm2.js';
+import {
+  rowsFor,
+  snapshot,
+  statusWord,
+  unreachableRow,
+  type LsRow,
+} from './list.js';
 import { depFailure, waitDependency, type WaitResult } from './wait.js';
 import type { Context } from './resolve.js';
 import { shq } from '../transport/quote.js';
@@ -125,6 +131,16 @@ export interface StartOptions {
   failed?: Map<string, string>;
   /** ends the default dependency wait as `aborted` (a client that cancelled the call); a waitDep of the caller's own is not given it */
   signal?: AbortSignal;
+  /**
+   * the lease this start runs under (the watcher's child runs a queued start under its still starting lease): the rows
+   * show what its apps came to, a one-shot's `done` included, never that lease's own `starting`
+   */
+  lease?: string;
+  /**
+   * filled with the apps this start brought up, by pm2's own state after it (running, or a one-shot that finished
+   * `done`), whatever queue a lease shows their rows in: what the start's lease replaces is judged by it
+   */
+  started?: Set<string>;
 }
 
 /**
@@ -218,8 +234,25 @@ export async function startApps(
     await ctx.pm2.startOrRestart(file, pm2Name(ctx.manifest.project, n));
   }
   const live = names.filter((n) => !skipped.has(n));
-  const rows = live.length
-    ? rowsFor(ctx, await snapshot(ctx, { urls: live }), live)
+  const snap = live.length ? await snapshot(ctx, { urls: live }) : null;
+  // read from the processes, never from the rows: another start queued in this checkout shows its apps as queued there
+  if (snap && opts.started)
+    for (const n of live) {
+      const p = findProcess(snap.procs, ctx.manifest.project, n);
+      if (
+        p &&
+        (isRunning(p.status) || statusWord(p, ctx.manifest.apps[n]) === 'done')
+      )
+        opts.started.add(n);
+    }
+  const rows = snap
+    ? rowsFor(
+        ctx,
+        opts.lease
+          ? { ...snap, leases: snap.leases.filter((l) => l.id !== opts.lease) }
+          : snap,
+        live
+      )
     : [];
   const byApp = new Map(rows.map((r) => [r.app, r]));
   return names.map(

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeCtx } from '../helpers/ctx.js';
@@ -16,6 +17,7 @@ import {
   type WaitRecord,
 } from '../../src/core/actions.js';
 import { McprocError } from '../../src/core/errors.js';
+import { LeaseStore } from '../../src/core/leases/store.js';
 import { loadManifest } from '../../src/core/manifest.js';
 import type { WaitResult } from '../../src/core/wait.js';
 
@@ -125,6 +127,135 @@ describe('startApps', () => {
         .filter((x) => x.includes('startOrRestart'))
         .map((x) => /--only' '([^']+)'/.exec(x)![1])
     ).toEqual(['demo-api-build', 'demo-api']);
+  });
+});
+
+describe('startApps under its own lease', () => {
+  it("shows what the apps came to, never its own lease's starting; another lease still shows", async () => {
+    const prev = process.env.MCPROC_STATE_DIR;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-own-'));
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      const store = new LeaseStore(dir);
+      const own = await store.create(
+        {
+          kind: 'start',
+          project: 'demo',
+          root: basic,
+          slot: null,
+          repo: basic,
+          target: 'api-build',
+          host: null,
+          apps: ['api-build'],
+          reload: false,
+          estimate_mib: 1,
+          need_mib: 1,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      await store.transition(own.id, 'starting');
+      const mine = await startApps(
+        fakeCtx(basic, 'local', rules()),
+        ['api-build'],
+        {
+          lease: own.id,
+        }
+      );
+      expect(mine.map((r) => [r.app, r.status])).toEqual([
+        ['api-build', 'stopped'],
+      ]);
+      // a start that does not run under it (another caller's ls-like view) still sees the queue
+      const other = await startApps(fakeCtx(basic, 'local', rules()), [
+        'api-build',
+      ]);
+      expect(other.map((r) => [r.app, r.status])).toEqual([
+        ['api-build', 'starting'],
+      ]);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('startApps: what it brought up', () => {
+  const readiness = path.join(here, '..', 'fixtures', 'projects', 'readiness');
+  it("reads pm2's own state: a one-shot done counts even under another start's queue row; an errored app does not", async () => {
+    const prev = process.env.MCPROC_STATE_DIR;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-up-'));
+    process.env.MCPROC_STATE_DIR = dir;
+    try {
+      // another target of this checkout, queued meanwhile, that also takes the one-shot
+      const other = await new LeaseStore(dir).create(
+        {
+          kind: 'start',
+          project: 'ready',
+          root: readiness,
+          slot: null,
+          repo: readiness,
+          target: 'cli',
+          host: null,
+          apps: ['libs'],
+          reload: false,
+          estimate_mib: 1,
+          need_mib: 1,
+          margin: 0,
+          reserve_mib: 0,
+          sources: {},
+          note: null,
+          requester_pid: 1,
+        },
+        'pending'
+      );
+      const list = JSON.stringify([
+        {
+          pid: 0,
+          name: 'ready-libs',
+          pm_id: 0,
+          pm2_env: {
+            status: 'stopped',
+            namespace: 'ready',
+            pm_cwd: readiness,
+            exit_code: 0,
+          },
+        },
+        {
+          pid: 501,
+          name: 'ready-logger',
+          pm_id: 1,
+          pm2_env: { status: 'online', namespace: 'ready', pm_cwd: readiness },
+        },
+        {
+          pid: 0,
+          name: 'ready-cli',
+          pm_id: 2,
+          pm2_env: { status: 'errored', namespace: 'ready', pm_cwd: readiness },
+        },
+      ]);
+      const started = new Set<string>();
+      const rows = await startApps(
+        fakeCtx(readiness, 'local', rulesWith(list)),
+        ['libs', 'logger', 'cli'],
+        { started }
+      );
+      expect(rows.map((r) => [r.app, r.status])).toEqual([
+        ['libs', `queued #1`],
+        ['logger', 'online'],
+        ['cli', 'errored'],
+      ]);
+      expect(other.id).toMatch(/^l_/);
+      expect([...started].sort()).toEqual(['libs', 'logger']);
+    } finally {
+      if (prev === undefined) delete process.env.MCPROC_STATE_DIR;
+      else process.env.MCPROC_STATE_DIR = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

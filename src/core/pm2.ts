@@ -228,21 +228,34 @@ export class Pm2Client {
     const env = (await this.daemonEnv()) ?? process.env;
     return env.PM2_HOME || path.join(env.HOME || os.homedir(), '.pm2');
   }
+  /**
+   * pm2's processes over the daemon's socket alone, never through the CLI (which starts a daemon where none runs): null
+   * when no daemon runs. Throws where the socket cannot answer: no socket reader here, a home that is unknown (the
+   * login environment could not be read), an endpoint moved by PM2_DAEMON_RPC_PORT, a daemon that errs or hangs.
+   */
+  async socketList(): Promise<Pm2Process[] | null> {
+    if (!this.lister)
+      throw new Error("pm2's list does not come over its socket here");
+    const env = await this.daemonEnv();
+    if (!this.pm2Home && !env)
+      throw new Error(
+        "the login environment could not be read, so pm2's home is unknown"
+      );
+    if ((env ?? process.env).PM2_DAEMON_RPC_PORT)
+      throw new Error(
+        "PM2_DAEMON_RPC_PORT moves pm2's endpoint off its socket"
+      );
+    const list = await this.lister(await this.home());
+    return list === null ? null : (list as RawProc[]).map(normalize);
+  }
   /** pm2's processes; null when no daemon runs (only the socket can tell: `pm2 jlist` starts one and answers) */
   async daemonList(): Promise<Pm2Process[] | null> {
-    if (this.lister) {
-      const env = await this.daemonEnv();
-      // the socket only for a daemon whose home is known and that listens at <home>/rpc.sock: PM2_DAEMON_RPC_PORT
-      // moves that endpoint, and an environment that could not be read leaves the home unknown; the CLI finds both
-      if ((this.pm2Home || env) && !(env ?? process.env).PM2_DAEMON_RPC_PORT) {
-        try {
-          const list = await this.lister(await this.home());
-          return list === null ? null : (list as RawProc[]).map(normalize);
-        } catch {
-          /* a daemon that errs or hangs: the CLI answers this once */
-        }
+    if (this.lister)
+      try {
+        return await this.socketList();
+      } catch {
+        /* the socket cannot answer here (see socketList): the CLI finds the daemon, once */
       }
-    }
     return parseJlist((await this.run(['jlist'], { read: true })).stdout);
   }
   /**

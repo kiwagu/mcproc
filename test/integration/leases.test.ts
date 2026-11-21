@@ -314,6 +314,40 @@ describe('memory leases against real pm2', () => {
     expect(ensured).toEqual(['itl-w1']);
   }, 60_000);
 
+  it('a stand started again after its apps died unrecorded frees the lease it replaces', async () => {
+    // no watcher runs here (the queue case's has gone idle), so nothing but the new start can free the old lease
+    const gate = gateOf(() => ({ total_mib: 100000, available_mib: 100000 }));
+    const last = store().list().at(-1)!.seq;
+    await actOn(fleetOf(a), 'web', 'start', { gate });
+    expect(
+      await waitFor(ctxA, 'web', { kind: 'listening' }, { timeoutMs: 15_000 })
+    ).toMatchObject({ ok: true });
+    const first = leaseOf('itl', last);
+    expect(first.state).toBe('running');
+    // its app goes down without mcproc's stop, as on a reboot or a pm2 kill: its lease stays running
+    const web = findProcess(await ctxA.pm2.jlist(), 'itl', 'web')!;
+    await ctxA.pm2.stop(web.pm_id);
+    expect(store().get(first.id)?.state).toBe('running');
+    await actOn(fleetOf(a), 'web', 'start', { gate });
+    expect(
+      await waitFor(ctxA, 'web', { kind: 'listening' }, { timeoutMs: 15_000 })
+    ).toMatchObject({ ok: true });
+    const second = leaseOf('itl', first.seq);
+    expect(second.state).toBe('running');
+    expect(store().get(first.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${second.id}`,
+    });
+    // read from no checkout at all: this machine's memory and default pm2 daemon still answer
+    const view = await leasesView(state);
+    expect(view.memory?.total_mib).toBeGreaterThan(0);
+    expect(view.memory_error).toBeNull();
+    expect(view.watcher).not.toBeNull();
+    expect(view.watcher_error).toBeNull();
+    await actOn(fleetOf(a), 'web', 'delete');
+    expect(store().get(second.id)?.state).toBe('freed');
+  }, 60_000);
+
   // the watcher under pm2 runs a built cli.js: dist/cli.js, or the side build that MCPROC_CLI names
   it('ensureWatcher under pm2 starts mcproc-watcher once, then finds it online', async () => {
     process.env.MCPROC_CLI_ENTRY =

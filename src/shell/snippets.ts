@@ -100,6 +100,22 @@ export const MEM_SNIPPET = [
   `awk '/^(MemTotal|MemAvailable):/' /proc/meminfo 2>/dev/null`,
 ].join('\n');
 
+/** Why MEM_READ_SNIPPET printed no meminfo lines: the host has no /proc/meminfo (NONE), or one that could not be read (FAIL). */
+export const MEM_STATUS = {
+  NONE: '__MCPROC_MEM_NONE__',
+  FAIL: '__MCPROC_MEM_FAIL__',
+} as const;
+
+/**
+ * The host's memory alone, for one small round trip: MEM_SNIPPET's two lines, or a MEM_STATUS line saying why there are
+ * none. A failed awk keeps its exit status, so a 127 (not found) still has the transport read again with a fresh login
+ * environment.
+ */
+export const MEM_READ_SNIPPET = [
+  `echo ${MARK.MEM}`,
+  `if [ -e /proc/meminfo ]; then awk '/^(MemTotal|MemAvailable):/' /proc/meminfo 2>/dev/null || { r=$?; echo ${MEM_STATUS.FAIL}; exit $r; }; else echo ${MEM_STATUS.NONE}; fi`,
+].join('\n');
+
 /**
  * The memory of the declared containers that are running: one `docker stats --no-stream` over those names (a name
  * that is not running fails the whole call, so `docker ps` filters first). Measured at about 2 s per call, so it

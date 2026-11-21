@@ -20,7 +20,11 @@ import {
   gateStart,
   type GateDeps,
 } from '../../src/core/leases/gate.js';
-import { cancelLease, leasesView } from '../../src/core/leases/view.js';
+import {
+  cancelLease,
+  leasesView,
+  machineReads,
+} from '../../src/core/leases/view.js';
 import { unreachableRow } from '../../src/core/list.js';
 import { parseJlist } from '../../src/core/pm2.js';
 import { McprocError } from '../../src/core/errors.js';
@@ -530,25 +534,33 @@ describe('finishing and releasing', () => {
     const ctx = fakeCtx(varsProj, 'local', []);
     const a = await fresh();
     await store.transition(a.id, 'starting');
-    const ok = await finishLeasedStart(store, a.id, [
-      {
-        ...unreachableRow(ctx.manifest.apps.db, 'local', '', 'online'),
-        error: undefined,
-      },
-      unreachableRow(
-        ctx.manifest.apps.api,
-        'local',
-        'skipped: db was not started',
-        'skipped'
-      ),
-    ]);
+    const ok = await finishLeasedStart(
+      store,
+      a.id,
+      [
+        {
+          ...unreachableRow(ctx.manifest.apps.db, 'local', '', 'online'),
+          error: undefined,
+        },
+        unreachableRow(
+          ctx.manifest.apps.api,
+          'local',
+          'skipped: db was not started',
+          'skipped'
+        ),
+      ],
+      ['db']
+    );
     expect(ok.state).toBe('running');
     expect(ok.error).toBe('api: skipped: db was not started');
     const b = await fresh();
     await store.transition(b.id, 'starting');
-    const bad = await finishLeasedStart(store, b.id, [
-      unreachableRow(ctx.manifest.apps.db, 'local', 'boom', 'failed'),
-    ]);
+    const bad = await finishLeasedStart(
+      store,
+      b.id,
+      [unreachableRow(ctx.manifest.apps.db, 'local', 'boom', 'failed')],
+      []
+    );
     expect(bad.state).toBe('failed');
     expect(bad.error).toBe('db: boom');
   });
@@ -607,7 +619,7 @@ describe('finishing and releasing', () => {
       'running',
       { child_pid: process.pid }
     );
-    await endFastStart(store, own);
+    await endFastStart(store, own, []);
     expect(store.get(own.id)).toMatchObject({
       state: 'running',
       child_pid: null,
@@ -617,7 +629,7 @@ describe('finishing and releasing', () => {
       child_pid: process.pid,
     });
     await store.transition(freed.id, 'freed');
-    await endFastStart(store, freed);
+    await endFastStart(store, freed, []);
     expect(store.get(freed.id)).toMatchObject({
       state: 'freed',
       child_pid: process.pid,
@@ -660,7 +672,7 @@ describe('finishing and releasing', () => {
       if (++tries < 3) throw busy;
       return take(fn as () => Promise<unknown>);
     }) as LeaseStore['withLock'];
-    await endFastStart(flaky, own, sleep);
+    await endFastStart(flaky, own, [], sleep);
     expect(tries).toBe(3);
     expect(slept).toEqual([2000, 2000]);
     expect(store.get(own.id)?.child_pid).toBeNull();
@@ -672,7 +684,7 @@ describe('finishing and releasing', () => {
       throw busy;
     }) as LeaseStore['withLock'];
     slept.length = 0;
-    await expect(endFastStart(stuck, own, sleep)).rejects.toBe(busy);
+    await expect(endFastStart(stuck, own, [], sleep)).rejects.toBe(busy);
     expect(stuckTries).toBe(3);
     expect(slept).toEqual([2000, 2000]);
   });
@@ -811,6 +823,190 @@ describe('finishing and releasing', () => {
   });
 });
 
+describe('a start that went through frees the leases it replaces', () => {
+  let dir: string;
+  let store: LeaseStore;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcproc-gate-'));
+    store = new LeaseStore(dir);
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const lease = (
+    apps: string[],
+    state: 'pending' | 'running',
+    over: Partial<NewLease> = {},
+    child_pid: number | null = null
+  ) =>
+    store.create(
+      {
+        kind: 'start',
+        project: 'demo-w2',
+        root: varsProj,
+        slot: 2,
+        repo: '/w/demo',
+        target: 'dev',
+        host: null,
+        apps,
+        reload: false,
+        estimate_mib: 1,
+        need_mib: 1,
+        margin: 0,
+        reserve_mib: 0,
+        sources: {},
+        note: null,
+        requester_pid: 1,
+        ...over,
+      },
+      state,
+      { child_pid }
+    );
+  const stateOf = (id: string) => store.get(id)?.state;
+
+  it('endFastStart frees the earlier running start leases of this checkout whose apps it covers, and no other', async () => {
+    const same = await lease(['db', 'api'], 'running');
+    const part = await lease(['db'], 'running', { target: 'db' });
+    const wider = await lease(['db', 'api', 'web'], 'running', {
+      target: 'all',
+    });
+    const elsewhere = await lease(['db', 'api'], 'running', {
+      project: 'demo-w3',
+      root: '/w/demo.worktrees/c',
+    });
+    const starting = await lease(['db'], 'running', {}, process.pid);
+    const exec = await lease([], 'running', {
+      kind: 'exec',
+      target: 'bun test',
+    });
+    const neu = await lease(['db', 'api'], 'running', {}, process.pid);
+    const later = await lease(['db'], 'running');
+    await endFastStart(store, neu, ['db', 'api']);
+    expect(store.get(same.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${neu.id}`,
+    });
+    expect(store.get(part.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${neu.id}`,
+    });
+    for (const kept of [wider, elsewhere, starting, exec, later])
+      expect(stateOf(kept.id)).toBe('running');
+    expect(store.get(neu.id)).toMatchObject({
+      state: 'running',
+      child_pid: null,
+    });
+  });
+
+  it('endFastStart on a lease no longer running frees nothing', async () => {
+    const old = await lease(['db', 'api'], 'running');
+    const gone = await lease(['db', 'api'], 'running', {}, process.pid);
+    await store.transition(gone.id, 'freed');
+    await endFastStart(store, gone, ['db', 'api']);
+    expect(stateOf(old.id)).toBe('running');
+  });
+
+  it('endFastStart frees only what the apps it brought up cover', async () => {
+    const both = await lease(['db', 'api'], 'running');
+    const justDb = await lease(['db'], 'running', { target: 'db' });
+    const neu = await lease(['db', 'api'], 'running', {}, process.pid);
+    // api was skipped (a dependency timed out): the lease that also holds api stays
+    await endFastStart(store, neu, ['db']);
+    expect(store.get(justDb.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${neu.id}`,
+    });
+    expect(stateOf(both.id)).toBe('running');
+    // a start that brought nothing up frees nothing
+    const none = await lease(['db', 'api'], 'running', {}, process.pid);
+    await endFastStart(store, none, []);
+    expect(stateOf(both.id)).toBe('running');
+    // an app already running before the start is not in its lease, so it supersedes nothing either
+    const other = await lease(['api'], 'running', {}, process.pid);
+    await endFastStart(store, other, ['db']);
+    expect(stateOf(both.id)).toBe('running');
+  });
+
+  it('endFastStart finishes on its next try a supersede that failed halfway', async () => {
+    const one = await lease(['db'], 'running');
+    const two = await lease(['db'], 'running');
+    const neu = await lease(['db'], 'running', {}, process.pid);
+    const real = store.transition.bind(store);
+    let writes = 0;
+    const spy = vi
+      .spyOn(store, 'transition')
+      .mockImplementation(
+        async (...args: Parameters<LeaseStore['transition']>) => {
+          if (++writes === 2) throw new Error('no space left on device');
+          return real(...args);
+        }
+      );
+    try {
+      await endFastStart(store, neu, ['db'], async () => {});
+    } finally {
+      spy.mockRestore();
+    }
+    expect(stateOf(one.id)).toBe('freed');
+    expect(store.get(two.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${neu.id}`,
+    });
+    expect(store.get(neu.id)).toMatchObject({
+      state: 'running',
+      child_pid: null,
+    });
+  });
+
+  it('finishLeasedStart frees what its started apps cover, and nothing when the start failed', async () => {
+    const ctx = fakeCtx(varsProj, 'local', []);
+    const up = (app: 'db' | 'api') => ({
+      ...unreachableRow(ctx.manifest.apps[app], 'local', '', 'online'),
+      error: undefined,
+    });
+    const both = await lease(['db', 'api'], 'running');
+    const justDb = await lease(['db'], 'running', { target: 'db' });
+    const a = await lease(['db', 'api'], 'pending');
+    await store.transition(a.id, 'starting');
+    const partial = await finishLeasedStart(
+      store,
+      a.id,
+      [
+        up('db'),
+        unreachableRow(
+          ctx.manifest.apps.api,
+          'local',
+          'skipped: db was not started',
+          'skipped'
+        ),
+      ],
+      ['db']
+    );
+    expect(partial.state).toBe('running');
+    expect(store.get(justDb.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${a.id}`,
+    });
+    expect(stateOf(both.id)).toBe('running');
+    const c = await lease(['db', 'api'], 'pending');
+    await store.transition(c.id, 'starting');
+    await finishLeasedStart(store, c.id, [up('db'), up('api')], ['db', 'api']);
+    expect(store.get(both.id)).toMatchObject({
+      state: 'freed',
+      error: `superseded by ${c.id}`,
+    });
+    const kept = await lease(['db', 'api'], 'running');
+    const b = await lease(['db', 'api'], 'pending');
+    await store.transition(b.id, 'starting');
+    // a start that failed frees nothing, whatever it was told came up
+    const failed = await finishLeasedStart(
+      store,
+      b.id,
+      [unreachableRow(ctx.manifest.apps.db, 'local', 'boom', 'failed')],
+      ['db', 'api']
+    );
+    expect(failed.state).toBe('failed');
+    expect(stateOf(kept.id)).toBe('running');
+  });
+});
+
 describe('leasesView and cancelLease', () => {
   let dir: string;
   let store: LeaseStore;
@@ -819,6 +1015,18 @@ describe('leasesView and cancelLease', () => {
     store = new LeaseStore(dir);
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // this machine's reads answering nothing: a unit run never reads the real machine
+  const quiet = { memory: async () => null, list: async () => [] };
+  const watcherProc = parseJlist(
+    JSON.stringify([
+      {
+        pid: 77,
+        name: 'mcproc-watcher',
+        pm_id: 9,
+        pm2_env: { status: 'online', namespace: 'mcproc' },
+      },
+    ])
+  );
   const make = (state: 'pending' | 'running') =>
     store.create(
       {
@@ -842,12 +1050,18 @@ describe('leasesView and cancelLease', () => {
       state
     );
 
-  it('lists every lease with its position; without a context there is no memory or watcher', async () => {
+  it('lists every lease with its position', async () => {
     const r = await make('running');
     const a = await make('pending');
     const b = await make('pending');
-    const v = await leasesView(dir);
-    expect(v).toMatchObject({ state_dir: dir, memory: null, watcher: null });
+    const v = await leasesView(dir, undefined, Date.now(), quiet);
+    expect(v).toMatchObject({
+      state_dir: dir,
+      memory: null,
+      memory_error: null,
+      watcher: { online: false, pid: null },
+      watcher_error: null,
+    });
     expect(v.leases.map((l) => [l.id, l.position])).toEqual([
       [r.id, 0],
       [a.id, 1],
@@ -883,7 +1097,7 @@ describe('leasesView and cancelLease', () => {
     await store.patch(h.id, { command_pid: 1240 });
     const w = await one('pending');
     const now = Date.parse(h.running_at as string) + 192_000;
-    const v = await leasesView(dir, undefined, now);
+    const v = await leasesView(dir, undefined, now, quiet);
     const [vh, vw] = v.leases;
     expect(vw.group).toMatchObject({ name: 'suite', place: 1 });
     expect(vw.group?.holder?.id).toBe(h.id);
@@ -923,12 +1137,144 @@ describe('leasesView and cancelLease', () => {
     expect(v.watcher).toEqual({ online: true, pid: 77 });
   });
 
+  it("without a context it still reads this machine's memory and watcher", async () => {
+    const v = await leasesView(dir, undefined, Date.now(), {
+      memory: async () => ({ total_mib: 8000, available_mib: 4000 }),
+      list: async () => watcherProc,
+    });
+    expect(v).toMatchObject({
+      memory: { total_mib: 8000, available_mib: 4000 },
+      memory_error: null,
+      watcher: { online: true, pid: 77 },
+      watcher_error: null,
+    });
+  });
+
+  it('a context on another host does not answer for this machine: its own reads do', async () => {
+    const local = fakeCtx(varsProj, 'local', []);
+    const remote = { ...local, host: { ...local.host, local: false } };
+    const v = await leasesView(dir, remote, Date.now(), {
+      memory: async () => ({ total_mib: 8000, available_mib: 2000 }),
+      list: async () => watcherProc,
+    });
+    expect(v.memory).toEqual({ total_mib: 8000, available_mib: 2000 });
+    expect(v.watcher).toEqual({ online: true, pid: 77 });
+    expect(local.fake.calls).toEqual([]);
+  });
+
+  it('a read that throws leaves its reason beside the null', async () => {
+    const v = await leasesView(dir, undefined, Date.now(), {
+      memory: async () => {
+        throw new Error('meminfo: the shell did not start');
+      },
+      list: async () => {
+        throw new McprocError('PM2_FAILED', 'pm2 jlist failed (exit 1)');
+      },
+    });
+    expect(v).toMatchObject({
+      memory: null,
+      memory_error: 'meminfo: the shell did not start',
+      watcher: null,
+      watcher_error: 'PM2_FAILED: pm2 jlist failed (exit 1)',
+    });
+  });
+
+  it('a host without /proc/meminfo is no reading, not a failure', async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      {
+        match: '__MCPROC_MEM__',
+        result: { stdout: '__MCPROC_MEM__\n__MCPROC_MEM_NONE__\n' },
+      },
+      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+    ]);
+    expect(await leasesView(dir, ctx)).toMatchObject({
+      memory: null,
+      memory_error: null,
+      watcher: { online: false, pid: null },
+      watcher_error: null,
+    });
+  });
+
+  it.each([
+    [
+      '__MCPROC_MEM__\n__MCPROC_MEM_FAIL__\n',
+      '/proc/meminfo could not be read',
+    ],
+    [
+      '__MCPROC_MEM__\nMemTotal: 8192000 kB\n',
+      '/proc/meminfo has no MemTotal and MemAvailable lines',
+    ],
+    ['', 'the memory read printed nothing of its own'],
+  ])(
+    'a meminfo read that printed %j says why it failed',
+    async (stdout, why) => {
+      const ctx = fakeCtx(varsProj, 'local', [
+        { match: '__MCPROC_MEM__', result: { stdout } },
+        { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+      ]);
+      expect(await leasesView(dir, ctx)).toMatchObject({
+        memory: null,
+        memory_error: why,
+      });
+    }
+  );
+
+  it('machineReads: a local context reads through its own transport and pm2', async () => {
+    const ctx = fakeCtx(varsProj, 'local', [
+      {
+        match: '__MCPROC_MEM__',
+        result: {
+          stdout:
+            '__MCPROC_MEM__\nMemTotal: 8192000 kB\nMemAvailable: 4096000 kB\n',
+        },
+      },
+      { match: /pm2 'jlist'/, result: { stdout: '[]' } },
+    ]);
+    const reads = machineReads(ctx);
+    expect(await reads.memory()).toEqual({
+      total_mib: 8000,
+      available_mib: 4000,
+    });
+    expect(await reads.list()).toEqual([]);
+    expect(ctx.fake.calls).toHaveLength(2);
+  });
+
+  it('machineReads: a context on another host is never used, this machine is read', async () => {
+    const local = fakeCtx(varsProj, 'local', []);
+    const remote = { ...local, host: { ...local.host, local: false } };
+    const homes: string[] = [];
+    const reads = machineReads(remote, async (home) => {
+      homes.push(home);
+      return [
+        {
+          pid: 77,
+          name: 'mcproc-watcher',
+          pm_id: 9,
+          pm2_env: { status: 'online', namespace: 'mcproc' },
+        },
+      ];
+    });
+    // the real /proc/meminfo of the machine the suite runs on
+    const memory = await reads.memory();
+    expect(memory === null || memory.total_mib > 0).toBe(true);
+    // this machine's default daemon, over its socket
+    expect(await reads.list()).toEqual(watcherProc);
+    expect(homes).toHaveLength(1);
+    expect(local.fake.calls).toEqual([]);
+  });
+
   it('answers with the queue when meminfo and jlist fail: memory and watcher are null, the read does not fail', async () => {
     const a = await make('pending');
     // no rule answers: every command the context runs fails
     const ctx = fakeCtx(varsProj, 'local', []);
     const v = await leasesView(dir, ctx);
-    expect(v).toMatchObject({ state_dir: dir, memory: null, watcher: null });
+    expect(v).toMatchObject({
+      state_dir: dir,
+      memory: null,
+      memory_error: expect.any(String),
+      watcher: null,
+      watcher_error: expect.any(String),
+    });
     expect(v.leases.map((l) => [l.id, l.position])).toEqual([[a.id, 1]]);
     const jlistOnly = fakeCtx(varsProj, 'local', [
       {
@@ -944,7 +1290,9 @@ describe('leasesView and cancelLease', () => {
     ]);
     expect(await leasesView(dir, jlistOnly)).toMatchObject({
       memory: null,
+      memory_error: 'meminfo: the shell did not start',
       watcher: { online: false, pid: null },
+      watcher_error: null,
     });
   });
 
@@ -978,14 +1326,16 @@ describe('leasesView and cancelLease', () => {
         new McprocError('TIMEOUT', 'the lease lock is held by pid 9')
       );
     try {
-      const v = await leasesView(dir);
+      const v = await leasesView(dir, undefined, Date.now(), quiet);
       expect(busy).toHaveBeenCalled();
       // not pruned: the day-old cancelled lease is still listed
       expect(v.leases.map((l) => l.id)).toEqual([ended.id]);
     } finally {
       busy.mockRestore();
     }
-    expect((await leasesView(dir)).leases).toEqual([]);
+    expect(
+      (await leasesView(dir, undefined, Date.now(), quiet)).leases
+    ).toEqual([]);
   });
 
   it('cancels a pending lease and refuses a starting or running one', async () => {

@@ -648,7 +648,9 @@ export function buildProgram(io: Io = defaultIo): Command {
       wrap(async (g) => {
         let ctx: Context | undefined;
         try {
-          ctx = await ctxOf(g);
+          // only a context on this machine serves the queue's reads: another host is never connected
+          const prep = prepare({ project: g.project, host: g.host });
+          ctx = prep.host.local ? await connect(prep) : undefined;
         } catch {
           ctx = undefined; // no manifest here: the queue is the host's and still reads
         }

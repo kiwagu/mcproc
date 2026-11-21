@@ -343,14 +343,18 @@ export function registerReadTools(server: McpServer, deps: ToolDeps): void {
       runTool(async () => {
         let ctx: Context | undefined;
         try {
-          ctx = await connect(await prep({ project: args.project }), {
-            spawner: deps.spawner,
-            hereCheck: deps.hereCheck,
-          });
+          // only a context on this machine serves the queue's reads: another host is never connected
+          const p = await prep({ project: args.project });
+          ctx = p.host.local
+            ? await connect(p, {
+                spawner: deps.spawner,
+                hereCheck: deps.hereCheck,
+              })
+            : undefined;
         } catch {
           ctx = undefined; // no manifest here: the queue is the host's and still reads
         }
-        const v = await leasesView(undefined, ctx);
+        const v = await leasesView(undefined, ctx, undefined, deps.machine);
         return {
           text: renderLeases(v),
           data: v as unknown as Record<string, unknown>,

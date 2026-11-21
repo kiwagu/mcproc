@@ -1454,17 +1454,38 @@ describe('queued starts and the lease queue', () => {
         state_dir: '/s',
         memory: null,
         watcher: null,
+        memory_error: null,
+        watcher_error: null,
         leases: [],
       })
     ).toBe(
-      'state: /s\nmemory: no reading on this host (leases are admitted in FIFO order without a check)\nno leases'
+      'state: /s\nmemory: no reading (no /proc/meminfo here): leases are admitted in FIFO order without a check\nno leases'
     );
+  });
+  it('renderLeases: a failed read says why, never that leases go unchecked', () => {
+    const text = renderLeases({
+      state_dir: '/s',
+      memory: null,
+      memory_error: 'meminfo: the shell did not start',
+      watcher: null,
+      watcher_error: 'PM2_FAILED: pm2 jlist failed (exit 1)',
+      leases: [],
+    });
+    expect(text.split('\n')).toEqual([
+      'state: /s',
+      'memory: the reading failed: meminfo: the shell did not start',
+      'watcher: unknown (PM2_FAILED: pm2 jlist failed (exit 1))',
+      'no leases',
+    ]);
+    expect(text).not.toContain('FIFO');
   });
   it('renderLeases: one row per lease, oldest first, with its position, estimate, source and reason', () => {
     const text = renderLeases({
       state_dir: '/s',
       memory: { total_mib: 31836, available_mib: 9100 },
       watcher: { online: true, pid: 42 },
+      memory_error: null,
+      watcher_error: null,
       leases: [
         { ...lease({}), position: 0, group: null, reason: null },
         {
@@ -1511,6 +1532,8 @@ describe('queued starts and the lease queue', () => {
         state_dir: '/s',
         memory: null,
         watcher: { online: false, pid: null },
+        memory_error: null,
+        watcher_error: null,
         leases: [],
       })
     ).toContain('watcher: not running');
@@ -1523,6 +1546,8 @@ describe('queued starts and the lease queue', () => {
       state_dir: '/s',
       memory: null,
       watcher: null,
+      memory_error: null,
+      watcher_error: null,
       leases: [
         {
           ...lease({ kind: 'exec', target: 'bun test', exclusive: 'suite' }),
